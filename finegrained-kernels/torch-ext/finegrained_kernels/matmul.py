@@ -1365,6 +1365,7 @@ def block_fp8_weight_only_matmul_2d_kernel(
     # The same pointer/descriptor loaders as the quantized GEMMs, without scale loads.
     get_accelerator_autotuning_configs(
         tune_block_nk=True, warp_spec=True, tune_block_m=True,
+        swap_ab=True, swap_block_sizes_m=(1, 2, 4, 8),
         a_memory_modes=("descriptor", "pointer"), b_memory_modes=("descriptor", "pointer"),
         pre_hook=rebind_weight_only_descriptors,
     ),
@@ -1378,6 +1379,7 @@ def block_fp8_weight_only_matmul_2d_kernel(
     prune_configs_by={
         "early_config_prune": compose_pruners(
             block_within_dim_pruner("K"),
+            swap_max_m_pruner("M", max_m=8),
             matched_memory_modes_pruner(),
             descriptor_box_pruner(),
             gate_stacked_tmem_trap_pruner(),
@@ -1415,6 +1417,7 @@ def full_precision_matmul_2d_kernel(
     WARP_SPEC: tl.constexpr = False,
     A_MEMORY_MODE: tl.constexpr = "pointer",
     B_MEMORY_MODE: tl.constexpr = "pointer",
+    SWAP_AB: tl.constexpr = False,
     # Dense gate|up fusion: B is the (2N, K) gate|up stack, C the [M, N] GLU output. Folds out at
     # compile time when GATE=False (the plain dense GEMM).
     GATE: tl.constexpr = False,
@@ -1427,13 +1430,15 @@ def full_precision_matmul_2d_kernel(
     """Full-precision (BF16/FP16) 2D matmul — the single-GEMM sibling of
     ``full_precision_matmul_grouped/batched``: plain ``tl.dot``, fp32 accumulation, no scales.
     ``GATE`` loads the stacked (2N, K) gate|up weight as one ``[BK, 2*BN]`` dot and applies the
-    ``ACT_FN``/SwiGLU GLU; ``GATE=False`` is the plain dense GEMM. 2D grid with swizzle for L2 reuse."""
+    ``ACT_FN``/SwiGLU GLU; ``GATE=False`` is the plain dense GEMM. ``SWAP_AB`` (small-M decode) puts the
+    weight rows on the MMA lhs and keeps the logical ``[BM, N]`` accumulator (``plain_dot``). 2D grid
+    with swizzle for L2 reuse."""
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
     pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
         M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GATE=GATE
     )
     a_ptrs = operand_tile_ptrs(A, offs_am, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
-    b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, B_MEMORY_MODE)
+    b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, B_MEMORY_MODE, SWAP_AB)
 
     a_desc = operand_tile_descriptor(ADescriptor, A, M, K, stride_a_m, stride_a_k, BLOCK_SIZE_M, BLOCK_SIZE_K, A_MEMORY_MODE)
     b_desc = operand_tile_descriptor(BDescriptor, B, N, K, stride_b_n, stride_b_k, BLOCK_SIZE_N, BLOCK_SIZE_K, B_MEMORY_MODE, GATE)
@@ -1442,9 +1447,9 @@ def full_precision_matmul_2d_kernel(
         a, _ = load_act_plain(a_ptrs, a_desc, pid_m * BLOCK_SIZE_M, k * BLOCK_SIZE_K, None, offs_am, A_MEMORY_MODE, False)
         w, _ = load_weight_plain(
             b_ptrs, b_desc, 0, pid_n * n_width, k * BLOCK_SIZE_K,
-            GATE, False, B_MEMORY_MODE, False, BLOCK_SIZE_N, BLOCK_SIZE_K,
+            GATE, False, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
         )
-        accumulator = accumulator + fp8_dot(a, w, False, BLOCK_SIZE_K)
+        accumulator = plain_dot(accumulator, a, w, SWAP_AB)
         a_ptrs += BLOCK_SIZE_K * stride_a_k
         b_ptrs += BLOCK_SIZE_K * stride_b_k
 

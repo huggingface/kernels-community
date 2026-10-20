@@ -1030,7 +1030,7 @@ def int_weight_only_matmul_batched_kernel(
 
 
 @bayesian_autotune(
-    get_accelerator_autotuning_configs(tune_block_nk=True, swap_ab=True),
+    get_accelerator_autotuning_configs(tune_block_nk=True, swap_ab=True, swap_block_sizes_m=(1, 2)),
     # S (routed rows) keyed like the fp8/mx batched siblings — decode re-tunes per batch;
     # GATE keys the gate|up arm separately (its stacked dot is 2*BN wide).
     ["N", "K", "S", "GATE"],
@@ -1043,6 +1043,7 @@ def int_weight_only_matmul_batched_kernel(
         "early_config_prune": compose_pruners(
             block_within_dim_pruner("K"),
             block_within_dim_pruner("N", "BLOCK_SIZE_N"),
+            smem_pruner(),
         )
     },
 )
@@ -1089,8 +1090,8 @@ def full_precision_matmul_batched_kernel(
     """Full-precision batched expert matmul kernel: plain ``tl.dot`` over unquantized
     BF16/FP16 activations and weights, fp32 accumulation, no scales anywhere. ``GATE``
     computes gate|up as ONE stacked tile + dot (straight-line, both orientations) and
-    applies the ``ACT_FN``/SwiGLU ``glu``. ``SWAP_AB`` (tuner axis, M=1 decode): weight
-    output rows in the MMA M dim, the single token padded to the N=16 atom."""
+    applies the ``ACT_FN``/SwiGLU ``glu``. ``SWAP_AB`` (tuner axis, decode): weight
+    output rows in the MMA M dim, the logical ``[BM, N]`` accumulator kept (``plain_dot``)."""
     if PDL:
         gdc_wait()
     batch_id, pid_n, expert_id, A, B, C, _, in_row, out_row = expert_setup(
@@ -1122,13 +1123,13 @@ def full_precision_matmul_batched_kernel(
         B, offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB
     )
 
-    accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
+    accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False)
     for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a, _ = load_act_plain(a_ptrs, 0, 0, 0, None, 0, "pointer", False)
         w, _ = load_weight_plain(
             b_ptrs, b_ptrs, 0, 0, 0, GATE, False, "pointer", SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K
         )
-        accumulator = accumulator + fp8_dot(a, w, SWAP_AB, BLOCK_SIZE_K)
+        accumulator = plain_dot(accumulator, a, w, SWAP_AB)
         a_ptrs, _, b_ptrs, _, _, _ = advance_ptrs(
             a_ptrs, a_ptrs, b_ptrs, b_ptrs, b_ptrs, b_ptrs,
             BLOCK_SIZE_K * stride_a_k, 0, BLOCK_SIZE_K * stride_b_k, 0,
@@ -1141,7 +1142,7 @@ def full_precision_matmul_batched_kernel(
         C, None, accumulator, out_row, pid_n, 0, out_row, 1, stride_c_n, 1, 1,
         BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, BLOCK_SIZE_K,
         ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
-        COMPUTE_MODE="dot", SWAP_AB=SWAP_AB, FAKE_BATCH=True,
+        COMPUTE_MODE="dot", FAKE_BATCH=True,
         Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
         global_row=expert_id,
     )

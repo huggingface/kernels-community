@@ -237,6 +237,7 @@ def scenarios() -> list[Problem]:
         # decode shape (small M — inline act-quant on MX, the software/scalar arms elsewhere)
         Problem(weights="mxfp8", S=8),
         Problem(weights="nvfp4", S=8),
+        Problem(weights="bf16", S=4, gate=True),  # the full-precision swapped decode tiles
         # the TOP of the 2D swap decode band (mx_2d_swap_scope_pruner scopes SWAP_AB to M <= 16):
         # the arm's tile choices differ across the band, and an A-descriptor trap that is clean at
         # S=4 fires by S=16, so the edge is the cell that sees it
