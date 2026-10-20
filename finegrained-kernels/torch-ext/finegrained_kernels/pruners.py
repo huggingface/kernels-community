@@ -61,7 +61,7 @@ from .mma import MMA_N_ATOM_WIDTH
 #                               native staging: M operand < 128, num_warps outside {4, 8},
 #                               or a weight-only kernel (no As — never native)
 #     descriptor_box_pruner     TMA box > 256/dim is illegal — all descriptor-axis kernels
-#     smem_pruner               IR allocation bounds (B200-verified, keep-side error) —
+#     smem_pruner               empirical smem model (B200-sampled, keep-side error) —
 #                               bd/static/mx/weight-only 2D; tensor/mx/weight-only/fp grouped;
 #                               mx batched
 #   RACE guards (Triton 3.7.1 pipeliner, per-loop-structure flake maps):
@@ -1230,14 +1230,15 @@ def gate_stacked_tmem_trap_pruner():
 
 def smem_pruner(k_dim="BLOCK_SIZE_K", min_sets: float = 0.5):
     """``early_config_prune`` dropping configs whose shared memory certainly cannot fit,
-    with bounds derived from TTGIR allocations and checked against ``metadata.shared``:
+    with the bound picked by the operand dtypes (sampled from ``metadata.shared`` across
+    every kernel family, 22 cells):
 
     - both operands >= 2-byte floats (the unquantized loops): ``num_stages`` full
       buffers of both tiles (exact) plus the fixed barrier terms at their sampled
       MINIMA (+16 base; +28 warp-spec, observed up to 48 varying with warps; +32
       host-descriptor) — minima keep the bound below the true usage, so a config is
       only ever dropped when its operand buffers alone cannot fit.
-    - quantized ``dot_scaled``:
+    - quantized ``dot_scaled`` (the only quantized arm whose tiles can reach the limit):
       the per-allocation law, every term named by its TTGIR ``local_alloc`` and exact to
       the allocator's alignment/packing slack (<= 16 B observed; barriers pack into
       padding, so no fixed constant is added — the slack is keep-side) —
@@ -1245,12 +1246,8 @@ def smem_pruner(k_dim="BLOCK_SIZE_K", min_sets: float = 0.5):
       full-width even when fp4-packed; GATE shifts the A tile to a full ``num_stages``),
       or the bf16-upcast fallback below the gate (one single-buffered upcast tile,
       packed weights, no A-scale buffers).
-    - FP8 weight-only, natural-orientation K loop with host descriptors: ``num_stages``
-      BF16/FP16 A buffers, ``num_stages - 1`` raw FP8 B buffers (``num_stages`` under
-      warp specialization), plus one decoded BF16/FP16 B buffer. Scales, barriers and
-      alignment are omitted from this lower bound. Swapped/output-tile pipelines use
-      different storage and retain the raw floor.
-    - other quantized ``dot``/``scalar``: the raw-operand floor.
+    - quantized ``dot``/``scalar``: the raw-operand floor (their 32-wide K tiles cannot
+      reach the limit).
 
     ``min_sets`` scales the quantized ``dot_scaled`` bound: the default HALF a set is the
     family-wide keep-side envelope (the 2D nvfp4 arm sub-tiles a request into half a set);
@@ -1259,9 +1256,10 @@ def smem_pruner(k_dim="BLOCK_SIZE_K", min_sets: float = 0.5):
     120 of 162 dead ones did (every BK=512 request, 59/59), so ``min_sets=2`` there halves the
     dead compiles a 100-trial tune pays without dropping a single compiling config.
 
-    These are lower bounds on the observed IR allocations, not a complete allocator
-    model: omitted storage keeps borderline configs for the compiler to check. Samples
-    were taken on B200 (sm_100); the FP8 weight-only extension is scoped to that arch —
+    Both arms are EMPIRICAL models of this Triton's allocator, fit to and verified
+    against ``metadata.shared`` samples (not derived from a spec) — chosen so the error
+    direction under the sampled behavior is always toward KEEPING a config, which then
+    merely compiles and self-prunes as inf. All samples taken on B200 (sm_100) —
     re-verify on a Triton bump AND on H100 or the target device (smem capacity and
     allocator behavior are per-arch). Non-empty fallback."""
 
@@ -1315,22 +1313,9 @@ def smem_pruner(k_dim="BLOCK_SIZE_K", min_sets: float = 0.5):
             need = int(
                 (a_bytes + b_bytes + (bk // group) * bm + (bk // group) * tiles * bn) * min_sets
             )
-        elif (
-            torch.version.hip is None and is_sm10x()
-            and a.dtype in (torch.bfloat16, torch.float16) and b.dtype == FP8_DTYPE
-            and "BLOCK_K" in args
-            and not c.kwargs.get("SWAP_AB", False)
-            and c.kwargs.get("PIPELINE", "k_loop") == "k_loop"
-            and c.kwargs.get("A_MEMORY_MODE") == "host_descriptor"
-            and c.kwargs.get("B_MEMORY_MODE") == "host_descriptor"
-        ):
-            # Concurrent local_alloc buffers: staged raw A/B and one decoded rhs.
-            # Pointer loads can use fewer buffers; a swapped lhs can live in tmem.
-            b_stages = c.num_stages if c.kwargs.get("WARP_SPEC") else c.num_stages - 1
-            need = bk * (c.num_stages * a.element_size() * bm
-                         + (b_stages + a.element_size()) * tiles * bn)
         else:
-            # Other dot/scalar pipelines retain their raw-operand lower bound.
+            # dot (BK = the 32-group) / scalar: tiles too small to reach the limit —
+            # the raw-operand floor suffices
             need = stages * (bk * bm + (bk // packed) * tiles * bn)
         return need <= sm_shared_memory_limit()
 
