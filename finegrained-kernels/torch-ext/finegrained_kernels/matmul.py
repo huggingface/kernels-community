@@ -26,7 +26,7 @@ from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_desc
 from .formats import check_activation_format, global_scale_stride, normalize_global_scale, e2m1_as_uint8, is_mx, mx_scale_family, resolve_activation_format, resolve_output_dtype, ue8m0_as_uint8, validate_dense_2d_operands, weight_format
 from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, maybe_act_quant, mxfp8_act_quant, nvfp4_act_quant, quantize_rows_static, tensor_wide_act_operands
-from .loading.scales import apply_global_scale, mx_2d_scale_ptrs
+from .loading.scales import apply_global_scale, csf_weight_scales, mx_2d_scale_ptrs
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .loading.tiles import (
     advance_ptrs,
@@ -1912,6 +1912,8 @@ def matmul_2d(
     output_dtype: torch.dtype | None = None,
     a_global_scale: torch.Tensor | None = None,
     b_global_scale: torch.Tensor | None = None,
+    b_scale_exceptions: torch.Tensor | None = None,
+    b_scale_exception_offsets: torch.Tensor | None = None,
     output_global_scale: torch.Tensor | None = None,
 ) -> torch.Tensor | list[torch.Tensor]:
     """Dense (2D) quantized matmul dispatcher (W8A8 FP8, W4A8/W4A4 FP4) — the single-GEMM sibling of
@@ -1941,7 +1943,12 @@ def matmul_2d(
     with UE8M0 group-32 or E4M3 group-16 ``Bs``) → ``mx_dynamic_matmul``; tensor-wide FP8 (scalar
     ``Bs``) → ``w8a8_tensor_dynamic_fp8_matmul``; block FP8 → the static variant when ``As`` is a
     per-tensor scalar, else dynamic.
+    CSF-compressed NVFP4 weight scales (``prepare_nvfp4_csf_scales``) pass as ``Bs`` = the fixed
+    stream with ``b_scale_exceptions``/``b_scale_exception_offsets`` = its exceptions and expert
+    offsets; the op decodes them before the GEMM.
     """
+    if b_scale_exceptions is not None:  # one prepared matrix decodes as a 1-expert stack
+        Bs = csf_weight_scales(Bs, b_scale_exceptions, b_scale_exception_offsets)[0]
     check_activation_format(activation_format, quantize_output)
     assert (a_global_scale is None and b_global_scale is None) or (
         Bs is not None and weight_format(B, Bs) == "nvfp4"

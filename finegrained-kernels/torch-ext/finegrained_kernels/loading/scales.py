@@ -568,3 +568,21 @@ def decompress_nvfp4_csf_scales(
         raise ValueError("CSF expert_start must be a contiguous device int32/int64 vector of length experts + 1")
     _decompress_into(fixed, exceptions, expert_offsets, out, expert_start)
     return out
+
+
+def csf_weight_scales(
+    scales: torch.Tensor | None,
+    exceptions: torch.Tensor | None,
+    exception_offsets: torch.Tensor | None,
+    expert_start: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """A public op's weight scales: with ``exceptions`` given, ``scales`` is the prepared CSF fixed
+    stream and decodes here (only the experts with routed rows when ``expert_start`` is given) into
+    a fresh dense E4M3 buffer. The caching allocator recycles that buffer across calls and layers,
+    so callers keep only the compressed streams resident. Dense scales pass through."""
+    if exceptions is None:
+        return scales
+    return decompress_nvfp4_csf_scales(
+        scales, exceptions, exception_offsets, expert_start=expert_start
+    )
+

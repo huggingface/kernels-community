@@ -23,7 +23,7 @@ from finegrained_kernels.compat import (  # type: ignore
     NVFP4_SCALE_GROUP_K,
     is_sm10x,
 )
-from finegrained_kernels.loading.scales import decompress_nvfp4_csf_scales, prepare_nvfp4_csf_scales
+from finegrained_kernels.loading.scales import prepare_nvfp4_csf_scales
 
 
 # ── Device + capability ───────────────────────────────────────────────────────
@@ -508,26 +508,24 @@ def encode_csf_scales(scales):
 
 
 def prepare_csf(scales):
-    """Encode dense NVFP4 scales to prepared CSF buffers, plus a dense decode workspace
-    deliberately offset by one byte (a contiguous workspace need not be two-byte aligned)."""
+    """Encode dense NVFP4 scales to the prepared CSF streams ``(fixed, exceptions, expert_offsets)``."""
     fixed, exceptions = encode_csf_scales(scales)
-    buffers = prepare_nvfp4_csf_scales(
+    return prepare_nvfp4_csf_scales(
         fixed.to(scales.device), [stream.to(scales.device) for stream in exceptions]
     )
-    workspace = torch.empty(scales.numel() + 1, dtype=scales.dtype, device=scales.device)[1:]
-    return buffers, workspace.reshape(-1, *scales.shape[-2:])
 
 
 def prepare_weight_scales(scales, csf_encoding, fn, compiled=False):
-    """Wrap a matrix Problem's existing op; compiled cases capture decode + GEMM together."""
+    """Wrap a matrix Problem's existing op; CSF cases hand the op the compressed streams, which
+    it decodes itself (compiled cases capture decode + GEMM together)."""
     if not csf_encoding:
         return maybe_compile(fn, compiled)
-    buffers, workspace = prepare_csf(scales)
+    fixed, exceptions, expert_offsets = prepare_csf(scales)
 
     def run(A, B, As, Bs, **kwargs):
-        decoded = decompress_nvfp4_csf_scales(
-            *buffers, out=workspace, expert_start=kwargs.get("expert_start")
+        return fn(
+            A, B, As, fixed, b_scale_exceptions=exceptions,
+            b_scale_exception_offsets=expert_offsets, **kwargs,
         )
-        return fn(A, B, As, decoded.reshape(Bs.shape), **kwargs)
 
     return maybe_compile(run, compiled)

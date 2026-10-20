@@ -179,6 +179,15 @@ def compute_grouped_scheduling(
     return expert_start, gather_idx, scatter_idx
 
 
+def routed_expert_start(expert_ids: torch.Tensor, num_experts: int) -> torch.Tensor | None:
+    """``expert_start`` of an unsorted (batched) routing: its consumers only need which experts
+    have routed rows, to skip per-expert work on the rest. ``None`` (every expert) when the expert
+    count is not a power of 2, which the scheduling kernels cannot hold."""
+    if num_experts & (num_experts - 1):
+        return None
+    return compute_grouped_scheduling(expert_ids, num_experts, 1)[0]
+
+
 @compile_time_only_triton_op(
     add_op_namespace_prefix("compute_grouped_scheduling"), mutates_args=(), opaque=True
 )

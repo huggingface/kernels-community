@@ -29,8 +29,9 @@ from .formats import check_activation_format, global_scale_stride, normalize_glo
 from .epilogue import fused_glu
 from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, static_expert_act_operands, tensor_wide_act_operands
 from .swizzle import swizzled_scale_descriptor
-from .scheduling import is_off_rank
+from .scheduling import is_off_rank, routed_expert_start
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
+from .loading.scales import csf_weight_scales
 from .loading.tiles import (
     advance_ptrs,
     load_act_block_dynamic,
@@ -1785,6 +1786,8 @@ def matmul_batched(
     scatter_idx: torch.Tensor | None = None,
     a_global_scale: torch.Tensor | None = None,
     b_global_scale: torch.Tensor | None = None,
+    b_scale_exceptions: torch.Tensor | None = None,
+    b_scale_exception_offsets: torch.Tensor | None = None,
     output_global_scale: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Batched matmul dispatcher (W8A8 FP8, W4A8/W4A4 FP4, or full-precision). Routes one
@@ -1820,7 +1823,15 @@ def matmul_batched(
     - one scale per expert (``Bs`` ``(E,)``/``(E, 1, 1)``) →
       ``w8a8_tensor_dynamic_fp8_matmul_batched``.
     - block scales (``Bs`` ``(E, N/bn, K/bk)``) → ``w8a8_block_dynamic_fp8_matmul_batched``.
+    CSF-compressed NVFP4 weight scales (``prepare_nvfp4_csf_scales``) pass as ``Bs`` = the fixed
+    stream with ``b_scale_exceptions``/``b_scale_exception_offsets`` = its exceptions and expert
+    offsets; the op decodes them before the GEMM (only the routed experts when routing allows).
     """
+    if b_scale_exceptions is not None:
+        Bs = csf_weight_scales(
+            Bs, b_scale_exceptions, b_scale_exception_offsets,
+            routed_expert_start(expert_ids, B.shape[0]),
+        )
     check_activation_format(activation_format, quantize_output)
     assert (a_global_scale is None and b_global_scale is None) or (
         Bs is not None and weight_format(B, Bs) == "nvfp4"
