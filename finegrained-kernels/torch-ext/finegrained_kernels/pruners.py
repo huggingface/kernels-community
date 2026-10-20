@@ -201,10 +201,21 @@ def int_scale_group_tile_pruner(divides_k: bool = True):
             return False
         bk, group = c.kwargs["BLOCK_SIZE_K"], args["SCALE_GROUP_K"]
         if group > bk:
-            return bk >= 128 and group % bk == 0 and args["K"] % bk == 0
+            return group % bk == 0 and args["K"] % bk == 0
         return bk % group == 0 and (not divides_k or args["K"] % bk == 0)
 
-    return config_filter(ok)
+    def wide_tile(c, args):  # advisory: within-group tiles from 128, unless only narrower ones are correct
+        return c.kwargs["BLOCK_SIZE_K"] >= 128 or args["SCALE_GROUP_K"] <= c.kwargs["BLOCK_SIZE_K"]
+
+    def raise_no_tile(configs, args):
+        raise ValueError(
+            f"no K tile fits K={args['K']} with scale group {args['SCALE_GROUP_K']}: every remaining config "
+            f"would skip or straddle part of K"
+        )
+
+    # correctness vetoes raise when they empty the grid (the fallback would drop the K tail);
+    # the 128 preference only narrows what survives
+    return compose_pruners(config_filter(ok, on_empty=raise_no_tile), config_filter(wide_tile))
 
 
 def block_fits_dim_pruner(dim_arg: str, block_key: str = "BLOCK_SIZE_K"):

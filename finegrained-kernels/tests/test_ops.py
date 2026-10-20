@@ -371,6 +371,8 @@ def scenarios() -> list[Problem]:
         Problem(weights="int2", int_group=512, K=1024),
         Problem(weights="int4", int_group=512, K=1024, zero_points=True, gate=True, bias=True),
         Problem(weights="int8", int_group=None, K=1024, zero_points=True),
+        # per-channel with K off the 128 grid (gpt-oss K=2880): only a 64-wide K tile divides K
+        Problem(weights="int8", int_group=None, K=320),
         Problem(weights="int4", int_group=None, K=1024, compile=True),
         Problem(weights="int4", zero_points=True, compile=True),
         Problem(weights="int4", S=8, gate=True, bias=True, pre_quant_scale=True, compile=True),

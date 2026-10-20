@@ -1122,7 +1122,10 @@ def mx_weight_only_matmul_grouped_kernel(
 def _int_grouped_configs():
     configs = _grouped_dot_configs()
     for config in configs:
-        config.kwargs["PROGRAMS_PER_SM"] = persistent_programs_per_sm(config.kwargs["BLOCK_SIZE_M"])
+        # the small-tile oversubscription was measured on SM10x only; elsewhere one program per SM
+        config.kwargs["PROGRAMS_PER_SM"] = (
+            persistent_programs_per_sm(config.kwargs["BLOCK_SIZE_M"]) if is_sm10x() else 1
+        )
         config.kwargs["SWAP_AB"] = False
     # These narrower tiles fit twice per SM when the initial WS register reservation is capped.
     # Without the cap the vector partition reserves the whole register file, even with no spills.

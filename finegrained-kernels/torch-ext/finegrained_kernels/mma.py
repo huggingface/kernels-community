@@ -17,7 +17,7 @@ import triton.language as tl
 
 from .quant import e2m1_cols_to_bf16, e2m1_cols_to_e4m3, e2m1_cols_to_f32, e2m1_to_bf16, e2m1_to_e4m3, e2m1_to_f32
 from .loading.scales import decode_group_scale
-from .compat import get_active_device_type, is_sm10x
+from .compat import is_nvidia, is_sm10x
 
 
 @triton.jit
@@ -190,8 +190,8 @@ def mx_weight_only_scalar_swapped(
     )
 
 
-# PTX inline asm (round_f32_to_bf16_f32, the packed zero-point subtract) on the CUDA backend; elsewhere plain Triton
-_PTX = tl.constexpr(get_active_device_type() == "cuda")
+# PTX inline asm (round_f32_to_bf16_f32, the packed zero-point subtract) on NVIDIA; elsewhere plain Triton
+_PTX = tl.constexpr(is_nvidia())
 # Keep architecture-specific integer fast paths on the measured sm_10x target.
 _SM10X = tl.constexpr(is_sm10x())
 

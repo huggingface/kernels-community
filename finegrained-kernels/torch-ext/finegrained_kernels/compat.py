@@ -602,6 +602,14 @@ def narrow_dot_autotuning_configs(
 
 
 @functools.cache
+def is_nvidia() -> bool:
+    """Whether the CURRENT device is an NVIDIA GPU: ROCm also reports through ``torch.cuda`` (with
+    gfx capability majors that collide with NVIDIA's), so this is the guard for PTX and every
+    NVIDIA architecture check. Driverless-safe and cached like the checks below."""
+    return torch.cuda.is_available() and torch.version.hip is None
+
+
+@functools.cache
 def is_sm10x() -> bool:
     """Whether the CURRENT device is Blackwell-datacenter (sm_10x, TMEM scaled-MMA) —
     the target the ``dot_scaled`` compiler-bug guards are scoped to. False off-CUDA, on
@@ -609,11 +617,7 @@ def is_sm10x() -> bool:
     (``torch.cuda.is_available()`` short-circuits before the capability query, which would
     otherwise raise); cached (pruners call this per tune, and a process is pinned to one
     device)."""
-    return (
-        torch.cuda.is_available()
-        and torch.version.hip is None
-        and torch.cuda.get_device_capability()[0] == 10
-    )
+    return is_nvidia() and torch.cuda.get_device_capability()[0] == 10
 
 
 @functools.cache
@@ -621,11 +625,7 @@ def is_blackwell() -> bool:
     """Whether the CURRENT device is any Blackwell family: sm_10x (datacenter), sm_11x
     (Jetson Thor) or sm_12x (consumer). Wider than ``is_sm10x``: these share the FP4
     conversion instructions but not TMEM scaled-MMA."""
-    return (
-        torch.cuda.is_available()
-        and torch.version.hip is None
-        and torch.cuda.get_device_capability()[0] in (10, 11, 12)
-    )
+    return is_nvidia() and torch.cuda.get_device_capability()[0] in (10, 11, 12)
 
 
 @functools.cache
@@ -635,7 +635,7 @@ def is_sm90() -> bool:
     also true on XPU, ROCm and driverless build boxes, none of which run the CUDA codegen those
     guards were probed against, so scoping by negation would restrict backends no one measured.
     Same driverless-safe short-circuit and caching as ``is_sm10x``."""
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0)
+    return is_nvidia() and torch.cuda.get_device_capability() == (9, 0)
 
 
 

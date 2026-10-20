@@ -600,6 +600,8 @@ def w8a8_block_static_fp8_matmul_kernel(
 
 SPLIT_K_VALUES = (2, 4, 8)
 SPLIT_K_MAX_M = 16
+# the widest split-K N tile: the split-K partials buffers are sized for the tile grid at this width
+SPLIT_K_MAX_BLOCK_N = 64
 
 
 def _mx_matmul_configs():
@@ -1248,6 +1250,11 @@ def int_weight_only_matmul_2d_kernel(
             GlobalScale=output_scale, GlobalScaleA=AsGlobal,
             Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
         )
+
+assert all(
+    c.kwargs["BLOCK_SIZE_N"] <= SPLIT_K_MAX_BLOCK_N and c.kwargs.get("BLOCK_SIZE_M") == 16
+    for c in int_weight_only_matmul_2d_kernel.configs if c.kwargs.get("SPLIT_K", 1) > 1
+), "a split-K config outgrows the partials buffer int_weight_only_matmul_2d allocates"
 
 
 @bayesian_autotune(
@@ -2370,7 +2377,12 @@ def int_weight_only_matmul_2d(
     partials = counters = None
     if M <= SPLIT_K_MAX_M:
         tiles = triton.cdiv(M, 16) * triton.cdiv(N, 16)
-        partials = torch.empty(SPLIT_K_VALUES[-1] * tiles * 16 * 16 * (2 if gate else 1), device=A.device, dtype=torch.float32)
+        # the split tiles' padded grid: BM=16 rows, up to SPLIT_K_MAX_BLOCK_N columns per tile
+        partials = torch.empty(
+            SPLIT_K_VALUES[-1] * triton.cdiv(M, 16) * 16
+            * triton.cdiv(N, SPLIT_K_MAX_BLOCK_N) * SPLIT_K_MAX_BLOCK_N * (2 if gate else 1),
+            device=A.device, dtype=torch.float32,
+        )
         counters = torch.empty(tiles, device=A.device, dtype=torch.int32)  # zeroed by int_weight_only_pre_hook
 
     with device_context(A.device):
