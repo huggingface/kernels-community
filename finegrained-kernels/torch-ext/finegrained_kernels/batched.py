@@ -33,6 +33,7 @@ from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, static_expert_act_
 from .swizzle import swizzled_scale_descriptor
 from .scheduling import is_off_rank
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
+from .loading.scales import weight_scale_rows
 from .loading.tiles import (
     advance_ptrs,
     load_act_block_dynamic,
@@ -159,6 +160,9 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     SWAP_AB: tl.constexpr = False,
     # Gate|up fusion epilogue (GATE=False -> plain batched GEMM, every arm below folds out)
     GATE: tl.constexpr = False,
+    # B is an interleaved gate|up weight run ungated: its block scales still follow each
+    # projection's own grid, as under GATE
+    INTERLEAVED_GATE_UP: tl.constexpr = False,
     ACT_FN: tl.constexpr = "silu",
     SWIGLU_ALPHA: tl.constexpr = None,
     SWIGLU_LIMIT: tl.constexpr = None,
@@ -214,8 +218,8 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     # One gate|up weight tile + one block-scale pointer, like every other kernel: the n_width
     # span shares a tile + a single dot, each row's scale block following from its global row.
     b_ptrs = weight_tile_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB)
-    bs_ptr = Bs + (pid_n * n_width // BLOCK_N) * stride_bs_n
-    bs_off = ((pid_n * n_width % BLOCK_N + tl.arange(0, n_width)) // BLOCK_N) * stride_bs_n
+    bs_ptr = Bs
+    bs_off = weight_scale_rows(offs_bn, BLOCK_N, GATE or INTERLEAVED_GATE_UP) * stride_bs_n
     acc = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
 
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -301,6 +305,9 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
     SWAP_AB: tl.constexpr = False,
     # Gate|up fusion epilogue (GATE=False -> plain batched GEMM, every arm below folds out)
     GATE: tl.constexpr = False,
+    # B is an interleaved gate|up weight run ungated: its block scales still follow each
+    # projection's own grid, as under GATE
+    INTERLEAVED_GATE_UP: tl.constexpr = False,
     ACT_FN: tl.constexpr = "silu",
     SWIGLU_ALPHA: tl.constexpr = None,
     SWIGLU_LIMIT: tl.constexpr = None,
@@ -347,8 +354,8 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
     # One gate|up weight tile over the interleaved rows + one block-scale pointer;
     # each weight row's scale block follows from its global row.
     b_ptrs = weight_tile_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB)
-    bs_ptr = Bs + (pid_n * n_width // BLOCK_N) * stride_bs_n
-    bs_off = ((pid_n * n_width % BLOCK_N + tl.arange(0, n_width)) // BLOCK_N) * stride_bs_n
+    bs_ptr = Bs
+    bs_off = weight_scale_rows(offs_bn, BLOCK_N, GATE or INTERLEAVED_GATE_UP) * stride_bs_n
     acc = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
 
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -1018,6 +1025,7 @@ def w8a8_block_dynamic_fp8_matmul_batched(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
+    interleaved_gate_up: bool = False,
 ) -> List[torch.Tensor]:
     """Block-scale batched FP8 matmul: C[s] = A[s] @ B[expert_ids[s]].T; activations
     quantized offline in one pass. The ``gate``/``act_fn``/``swiglu_*``/``requant``/``output_dtype``
@@ -1029,6 +1037,10 @@ def w8a8_block_dynamic_fp8_matmul_batched(
     A:  (rows, K) raw bf16/fp16 activations — rows addressed via ``gather_idx``
     B:  (num_experts, N, K) FP8 weights; under ``gate`` the (num_experts, 2N, K) gate|up stack
     Bs: (num_experts, N // block_n, K // block_k) per-block weight scales (2N under gate)
+
+    ``interleaved_gate_up`` marks an ungated call over the interleaved gate|up weight (a host GLU,
+    or the unstacked ``gate`` band): gate and up are quantized separately, so each row's scale
+    comes from its own projection's blocks rather than ``row // block_n``.
     """
     validate_dense_operands(A, B)
 
@@ -1075,7 +1087,7 @@ def w8a8_block_dynamic_fp8_matmul_batched(
             lambda intermediate_dtype: w8a8_block_dynamic_fp8_matmul_batched(
                 A, B, As, Bs, expert_ids, block_size,
                 activation_format=activation_format, output_dtype=intermediate_dtype,
-                gather_idx=gather_idx, scatter_idx=scatter_idx, bias=bias,
+                gather_idx=gather_idx, scatter_idx=scatter_idx, bias=bias, interleaved_gate_up=True,
             ),
             output_dtype, simulate_unfused, act_fn, swiglu_alpha, swiglu_limit,
             quant_group=block_n if requant else None, use_ue8m0=bs_u8.dtype == torch.uint8,
@@ -1140,6 +1152,7 @@ def w8a8_block_dynamic_fp8_matmul_batched(
             BLOCK_K=block_k,
             num_experts=num_experts,
             GATE=gate,
+            INTERLEAVED_GATE_UP=interleaved_gate_up,
             ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha,
             SWIGLU_LIMIT=swiglu_limit,
@@ -1175,6 +1188,7 @@ def w8a8_block_static_fp8_matmul_batched(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
+    interleaved_gate_up: bool = False,
 ) -> List[torch.Tensor]:
     """Block-scale batched FP8 matmul with a static (per-tensor calibrated) activation scale — the
     block-dynamic batched sibling with the 2D ``block_static`` format. ``A`` is raw here: the op
@@ -1187,6 +1201,10 @@ def w8a8_block_static_fp8_matmul_batched(
     As: scalar / (1,) for one calibrated scale, or (num_experts,) for a MoE that
         calibrates each expert separately
     Bs: (num_experts, N // block_n, K // block_k) per-block weight scales (2N under gate)
+
+    ``interleaved_gate_up`` marks an ungated call over the interleaved gate|up weight (a host GLU,
+    or the unstacked ``gate`` band): gate and up are quantized separately, so each row's scale
+    comes from its own projection's blocks rather than ``row // block_n``.
     """
     validate_dense_operands(A, B)
 
@@ -1263,6 +1281,7 @@ def w8a8_block_static_fp8_matmul_batched(
             BLOCK_N=block_n,
             BLOCK_K=block_k,
             GATE=gate,
+            INTERLEAVED_GATE_UP=interleaved_gate_up,
             ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha,
             SWIGLU_LIMIT=swiglu_limit,
@@ -1777,6 +1796,7 @@ def matmul_batched(
     bias: torch.Tensor | None = None,  # (E, N_out) per-expert output bias; (N_out,) for 2D
     activation_format: str | None = None,
     gate: bool = False,
+    interleaved_gate_up: bool = False,
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
@@ -1800,7 +1820,10 @@ def matmul_batched(
     ``"mxfp4"`` = packed E2M1 activations). ``Bs`` ``None`` = unquantized BF16/FP16 weights.
     ``quantize_output`` requantizes the output into ``activation_format`` — the return is then
     ``(C, Cs)``. ``gate``/``act_fn``/``swiglu_alpha``/``swiglu_limit`` fuse the gate|up GLU into the
-    epilogue. ``As``/``Bs`` are each a bare block-scale tensor; the two-level NVFP4
+    epilogue; ``interleaved_gate_up`` runs that
+    interleaved gate|up weight ungated (a host-side GLU): block-FP8 scales still follow each
+    projection's own block grid; per-row and tensor-wide scales need nothing.
+    ``As``/``Bs`` are each a bare block-scale tensor; the two-level NVFP4
     second-level scales ride the separate ``a_global_scale``/``b_global_scale`` (fp32 per-tensor,
     weights per-expert ``(E,)``; from ``nvfp4_quantize_two_level``), and the op folds ``g_a · g_b``
     onto the accumulator. The activation global ``g_a`` is CALIBRATED (the checkpoint's
@@ -1860,6 +1883,7 @@ def matmul_batched(
             gather_idx,
             scatter_idx,
             bias=bias,
+            interleaved_gate_up=interleaved_gate_up,
         )
         return out[0] if len(out) == 1 else tuple(out)
 
@@ -1955,6 +1979,7 @@ def matmul_batched(
             gather_idx,
             scatter_idx,
             bias=bias,
+            interleaved_gate_up=interleaved_gate_up,
         )
     # bd/mx/full-precision ops return a list ([C] or [C, Cs]); the tensor op returns a bare tensor.
     if isinstance(out, (list, tuple)):

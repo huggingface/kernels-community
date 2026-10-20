@@ -30,6 +30,7 @@ from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, mx_act_quant_group
 from .swizzle import swizzled_scale_descriptor
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .scheduling import build_tile_layout, expand_gather_below_parity, expand_regime, build_packed_schedule, load_packed_schedule, prefetch_packed_entry, resolve_grouped_tile, resolve_grouped_tile_packed
+from .loading.scales import weight_scale_rows
 from .loading.tiles import (
     load_act_block_dynamic,
     load_act_mx,
@@ -129,6 +130,9 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     B_MEMORY_MODE: tl.constexpr = "pointer",
     # Gate|up fusion epilogue (GATE=False -> plain grouped GEMM, every arm below folds out)
     GATE: tl.constexpr = False,
+    # B is an interleaved gate|up weight run ungated: its block scales still follow each
+    # projection's own grid, as under GATE
+    INTERLEAVED_GATE_UP: tl.constexpr = False,
     ACT_FN: tl.constexpr = "silu",
     SWIGLU_ALPHA: tl.constexpr = None,
     SWIGLU_LIMIT: tl.constexpr = None,
@@ -207,9 +211,11 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
             stride_b_k,
             False,
         )
-        # under GATE the tile's two scale blocks are the adjacent pair at 2*pid_n; non-GATE reads
-        # the single block (up_s_ptr dead).
-        gate_s_ptr = Bs + expert_id64 * stride_bs_e + ((2 if GATE else 1) * pid_n) * stride_bs_n
+        # an interleaved gate|up tile reads the adjacent (gate, up) scale-block pair at its first
+        # row's block (2*pid_n under GATE); a plain tile reads its single block (up_s_ptr dead).
+        gate_s_ptr = Bs + expert_id64 * stride_bs_e + weight_scale_rows(
+            pid_n * (2 if GATE else 1) * BLOCK_SIZE_N, BLOCK_SIZE_N, GATE or INTERLEAVED_GATE_UP
+        ) * stride_bs_n
         up_s_ptr = gate_s_ptr + stride_bs_n
 
         acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
@@ -221,6 +227,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
             w, w_s = load_weight_block_dynamic(
                 b_ptrs, BDescriptor, gate_s_ptr, None, up_s_ptr, row0, n_off, k * BLOCK_SIZE_K, k,
                 stride_bs_k, GATE, True, B_MEMORY_MODE, False, BLOCK_SIZE_N, BLOCK_SIZE_K,
+                INTERLEAVED_GATE_UP=INTERLEAVED_GATE_UP,
             )
             acc = block_dynamic_dot(acc, a, a_s, w, w_s, BLOCK_SIZE_K, False, USE_DOT_SCALED, False)
             a_ptrs += BLOCK_SIZE_K * stride_a_k
@@ -334,6 +341,9 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
     B_MEMORY_MODE: tl.constexpr = "pointer",
     # Gate|up fusion epilogue (GATE=False -> plain grouped GEMM, every arm below folds out)
     GATE: tl.constexpr = False,
+    # B is an interleaved gate|up weight run ungated: its block scales still follow each
+    # projection's own grid, as under GATE
+    INTERLEAVED_GATE_UP: tl.constexpr = False,
     ACT_FN: tl.constexpr = "silu",
     SWIGLU_ALPHA: tl.constexpr = None,
     SWIGLU_LIMIT: tl.constexpr = None,
@@ -393,7 +403,9 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
             stride_b_k,
             False,
         )
-        gate_s_ptr = Bs + expert_id64 * stride_bs_e + ((2 if GATE else 1) * pid_n) * stride_bs_n
+        gate_s_ptr = Bs + expert_id64 * stride_bs_e + weight_scale_rows(
+            pid_n * (2 if GATE else 1) * BLOCK_SIZE_N, BLOCK_SIZE_N, GATE or INTERLEAVED_GATE_UP
+        ) * stride_bs_n
         up_s_ptr = gate_s_ptr + stride_bs_n
 
         # this tile's expert scale: stride 0 means one calibrated scale for every expert.
@@ -408,6 +420,7 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
             w, w_s = load_weight_static(
                 b_ptrs, BDescriptor, gate_s_ptr, None, up_s_ptr, row0, n_off, k * BLOCK_SIZE_K, k,
                 stride_bs_k, GATE, True, B_MEMORY_MODE, False, BLOCK_SIZE_N, BLOCK_SIZE_K,
+                INTERLEAVED_GATE_UP=INTERLEAVED_GATE_UP,
             )
             acc = static_dot(acc, a, w, w_s, False, BLOCK_SIZE_K, False)
             # Explicit advance like the block-dynamic grouped sibling — advance_ptrs does not
@@ -1312,6 +1325,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
+    interleaved_gate_up: bool = False,
 ) -> List[torch.Tensor]:
     """Block-scale grouped FP8 matmul over expert-sorted positions (per-tile
     gather/scatter, the sort is virtual — see ``compute_grouped_scheduling`` for the maps).
@@ -1331,6 +1345,10 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
 
     Returns the ``(S, N)`` output, or — under ``requant`` — the FP8 output plus its
     ``(S, N // block_n)`` per-row, per-N-tile scale tensor.
+
+    ``interleaved_gate_up`` marks an ungated call over the interleaved gate|up weight (a host GLU,
+    or the unstacked ``gate`` band): gate and up are quantized separately, so each row's scale
+    comes from its own projection's blocks rather than ``row // block_n``.
     """
     validate_dense_operands(A, B)
 
@@ -1432,6 +1450,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
             NUM_EXPERTS_POW2=triton.next_power_of_2(num_experts),
             NUM_SMS=num_sms,
             GATE=gate,
+            INTERLEAVED_GATE_UP=interleaved_gate_up,
             ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha,
             SWIGLU_LIMIT=swiglu_limit,
@@ -1466,6 +1485,7 @@ def w8a8_block_static_fp8_matmul_grouped(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
+    interleaved_gate_up: bool = False,
 ) -> List[torch.Tensor]:
     """Block-scale grouped FP8 matmul with a static (per-tensor calibrated) activation scale —
     the block-dynamic sibling with the 2D ``block_static`` format. ``A`` is raw here: the op
@@ -1479,6 +1499,10 @@ def w8a8_block_static_fp8_matmul_grouped(
     As: scalar / (1,) for one calibrated scale, or (num_experts,) for a MoE that
         calibrates each expert separately
     Bs: (num_experts, N // block_n, K // block_k) per-block weight scales (2N under gate)
+
+    ``interleaved_gate_up`` marks an ungated call over the interleaved gate|up weight (a host GLU,
+    or the unstacked ``gate`` band): gate and up are quantized separately, so each row's scale
+    comes from its own projection's blocks rather than ``row // block_n``.
     """
     validate_dense_operands(A, B)
 
@@ -1565,6 +1589,7 @@ def w8a8_block_static_fp8_matmul_grouped(
             NUM_EXPERTS_POW2=triton.next_power_of_2(num_experts),
             NUM_SMS=num_sms,
             GATE=gate,
+            INTERLEAVED_GATE_UP=interleaved_gate_up,
             ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha,
             SWIGLU_LIMIT=swiglu_limit,
@@ -2217,6 +2242,7 @@ def matmul_grouped(
     bias: torch.Tensor | None = None,  # (E, N_out) per-expert output bias; (N_out,) for 2D
     activation_format: str | None = None,
     gate: bool = False,
+    interleaved_gate_up: bool = False,
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
@@ -2242,7 +2268,9 @@ def matmul_grouped(
     packed E2M1 activations). ``Bs`` ``None`` = unquantized BF16/FP16 weights.
     ``quantize_output`` requantizes the output into ``activation_format`` — the return is then
     ``(C, Cs)``. ``gate``/``act_fn``/``swiglu_alpha``/``swiglu_limit`` fuse the gate|up GLU into the
-    epilogue.
+    epilogue; ``interleaved_gate_up`` runs that
+    interleaved gate|up weight ungated (a host-side GLU): block-FP8 scales still follow each
+    projection's own block grid; per-row and tensor-wide scales need nothing.
     ``As``/``Bs`` are each a bare block-scale tensor; the two-level NVFP4 second-level scales ride
     the separate ``a_global_scale``/``b_global_scale`` (fp32 per-tensor, weights per-expert ``(E,)``;
     from ``nvfp4_quantize_two_level``), and the op folds ``g_a · g_b`` onto the accumulator. The
@@ -2310,6 +2338,7 @@ def matmul_grouped(
             gather_idx,
             scatter_idx,
             bias=bias,
+            interleaved_gate_up=interleaved_gate_up,
         )
         return out[0] if len(out) == 1 else tuple(out)
 
@@ -2416,6 +2445,7 @@ def matmul_grouped(
             gather_idx,
             scatter_idx,
             bias=bias,
+            interleaved_gate_up=interleaved_gate_up,
         )
     # The ops return a list (torch custom ops can't return a Tensor-or-tuple union): [C] plain,
     # [C, Cs] under ``quantize_output``. Unwrap to the documented Tensor / (Tensor, Tensor) return.

@@ -410,6 +410,7 @@ def moe_fused_grouped(
         expert_start=expert_start,
         **glu,
         bias=gate_up_proj_bias,
+        interleaved_gate_up=gate and not glu,
         # fmt is the resolved format; "bf16" (weight-only) leaves the GLU intermediate bf16,
         # no requant. So does static, whose epilogue has no calibrated scale to requant against.
         activation_format=fmt,
@@ -522,6 +523,7 @@ def moe_fused_batched(
         expert_ids=expert_ids,
         **glu,
         bias=gate_up_proj_bias,
+        interleaved_gate_up=gate and not glu,
         # Decode (batched): "bf16" (weight-only) leaves the intermediate bf16, no requant.
         # Block-FP8: INSIDE the unstacked decode band the requant fuses into the GLU kernel
         # (``fused_glu(quant_group=...)`` — one launch, hands the down a ready fp8+scales intermediate and
@@ -639,6 +641,7 @@ def moe_unfused_grouped(
         b_global_scale=gate_up_proj_weight_global_scale,
         expert_start=expert_start,
         bias=gate_up_proj_bias,
+        interleaved_gate_up=gate,
         activation_format=fmt,
         output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,
@@ -908,6 +911,7 @@ def moe_unfused_batched(
         b_global_scale=gate_up_proj_weight_global_scale,
         expert_ids=expert_ids,
         bias=gate_up_proj_bias,
+        interleaved_gate_up=gate,
         activation_format=fmt,
         output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,

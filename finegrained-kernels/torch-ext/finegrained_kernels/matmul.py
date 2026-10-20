@@ -27,7 +27,7 @@ from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_desc
 from .formats import check_activation_format, global_scale_stride, normalize_global_scale, e2m1_as_uint8, is_mx, mx_scale_family, resolve_activation_format, resolve_output_dtype, ue8m0_as_uint8, validate_dense_2d_operands, weight_format
 from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, maybe_act_quant, mxfp8_act_quant, nvfp4_act_quant, quantize_rows_static, tensor_wide_act_operands
-from .loading.scales import apply_global_scale, mx_2d_scale_ptrs
+from .loading.scales import apply_global_scale, mx_2d_scale_ptrs, weight_scale_rows
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .loading.tiles import (
     advance_ptrs,
@@ -218,15 +218,14 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     # Explicit operand-tile pointers on the pointer arm; a scalar placeholder on a descriptor
     # arm (which reads its box via the descriptor — the [BM,BK]/[BK,BN] index tensor would stay
     # live across the K-loop for nothing and spill registers, ~460us / 20pp MFU at wide-N prefill).
-    # Under GATE the weight is the stacked (2N, K) gate|up tile (matmul_weight_ptrs; pointer-only, the
-    # descriptor box can't span the N-apart rows), and its per-weight-row block scale is a 2*BN gather
-    # (gate rows [0,N), up rows offset by N//block_n scale blocks) — the block_dynamic_dot broadcast
-    # then folds it per row exactly as in the dense case.
+    # Under GATE the weight is the interleaved (2N, K) gate|up tile (matmul_weight_ptrs), and its
+    # per-weight-row block scale is a 2*BN gather (``weight_scale_rows``) — the block_dynamic_dot
+    # broadcast then folds it per row exactly as in the dense case.
     a_ptrs = operand_tile_ptrs(A, offs_am, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, not SWAP_AB)
     b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, B_MEMORY_MODE, SWAP_AB)
     # the scale-index gather decouples the tile from the scale grid: a wide tile spans several
     # scale columns, a narrow one shares a column
-    bs_ptrs = Bs + (offs_bn_lin // block_n) * stride_bs_n
+    bs_ptrs = Bs + weight_scale_rows(offs_bn_lin, block_n, GATE) * stride_bs_n
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
 
     for k in tl.range(0, tl.cdiv(K, block_k), warp_specialize=WARP_SPEC):
@@ -500,7 +499,7 @@ def w8a8_block_static_fp8_matmul_kernel(
     # non-affine scale read the wrap induces, matching the block-dynamic kernel above.
     b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, B_MEMORY_MODE)
     offs_bn_lin = pid_n * n_width + tl.arange(0, n_width)
-    bs_ptrs = Bs + (offs_bn_lin // block_n) * stride_bs_n
+    bs_ptrs = Bs + weight_scale_rows(offs_bn_lin, block_n, GATE) * stride_bs_n
     bs_mask = offs_bn_lin < n_rows
     a_s_static = tl.load(As)
 
