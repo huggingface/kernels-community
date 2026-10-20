@@ -1286,8 +1286,7 @@ def mx_auxiliary_pruner():
     """Split the single-token decode reduction (the launch allocates the partials for M=1 without GATE), or persist
     across SVDQuant prefill tiles. Plain M=1 splits only the scalar BM=1 reduce: the native split tile pads the token
     to 128 MMA rows and never crowns there (B200 graph, NVFP4: 5120x5120 scalar 11.3us, scalar split 10.2us, native
-    split 26.2us; N1024 K14336 22.6 / 7.7 / 31.5us); SVDQuant keeps the native split (down: 27.4us vs FlashInfer 33.1us). A split launch also zeroes its arrival
-    counters (one small extra launch, ~10us in host-bound eager decode); graph replay hides it."""
+    split 26.2us; N1024 K14336 22.6 / 7.7 / 31.5us); SVDQuant keeps the native split (down: 27.4us vs FlashInfer 33.1us)."""
     def ok(c, args):
         split = c.kwargs.get("SPLIT_K", 1)
         persistent = c.kwargs.get("PERSISTENT", False)

@@ -69,21 +69,11 @@ def rebind_weight_only_descriptors(nargs):
     rebind_operand_box(nargs, "B_MEMORY_MODE", "BDescriptor", (2 if nargs.get("GATE") else 1) * nargs["BLOCK_SIZE_N"], bk // wvpb)
 
 
-def int_weight_only_pre_hook(nargs):
-    """Per-config pre_hook for the integer 2D kernel: the weight-only descriptor boxes, and, for a split-K config, the
-    zeroing of the launch's own arrival counters (only split configs read them, so the others skip the memset)."""
-    rebind_weight_only_descriptors(nargs)
-    if nargs.get("SPLIT_K", 1) > 1:
-        nargs["TileCounters"].zero_()
-
-
 def rebind_mx_descriptors(nargs):
     """Per-config pre_hook for the MX kernel — set the A/B host-TMA boxes to the tuned tile
     in BYTES over the (rows, K_bytes) packed matrices: ``[BM, BK // ACT_VALUES_PER_BYTE]`` and
     ``[BN, BK // WEIGHT_VALUES_PER_BYTE]`` (values-per-byte read off the operand dtype; uint8 =
     packed E2M1), plus the SWIZZLE_32_4_4 scale boxes on the offline (pre-quantized A) path."""
-    if nargs.get("SPLIT_K", 1) > 1:
-        nargs["TileCounters"].zero_()
     avpb = 2 if nargs["A"].dtype == torch.uint8 else 1
     wvpb = 2 if nargs["B"].dtype == torch.uint8 else 1
     bk = nargs["BLOCK_SIZE_K"]

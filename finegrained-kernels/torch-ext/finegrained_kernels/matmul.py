@@ -14,6 +14,7 @@
 
 
 import os
+import contextlib
 import functools
 from typing import List
 
@@ -26,7 +27,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from .bayesian_autotuner import bayesian_autotune
 from .bench import weight_input
 from .compat import add_op_namespace_prefix, FP8_DTYPE, is_sm10x, launches_skipped, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, pdl_launch_kwargs, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, narrow_dot_autotuning_configs, narrow_scalar_autotuning_configs, split_k_autotuning_configs, persistent_program_count
-from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_tiled_descriptors, rebind_weight_only_descriptors, int_weight_only_pre_hook
+from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_tiled_descriptors, rebind_weight_only_descriptors
 from .formats import FP8_WEIGHT_ONLY_DEQUANT_MIN_M, INT_WEIGHT_ONLY_DEQUANT_MIN_DIM, INT_WEIGHT_ONLY_DEQUANT_MIN_M, block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, normalize_global_scale, e2m1_as_uint8, is_mx, is_rowwise, mx_scale_family, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_2d_operands, weight_format, validate_int_operands, validate_svdquant_operands, INT_WEIGHT_DTYPES
 from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, maybe_act_quant, mxfp8_act_quant, nvfp4_act_quant, quantize_rows_static, tensor_wide_act_operands, prepare_fp8_mx_inputs, dequantize_int_weight, permute_act_cols, svdquant_act_quant
@@ -622,6 +623,36 @@ SPLIT_K_MAX_M = 16
 SPLIT_K_MAX_BLOCK_N = 64
 # the narrowest MX split-K N tile: mx_dynamic_matmul sizes its arrival counters for the tile grid at this width
 MX_SPLIT_K_MIN_BLOCK_N = 32
+_SPLIT_K_WORKSPACES: dict = {}
+
+
+@functools.cache
+def _split_k_pool():
+    return torch.cuda.MemPool()
+
+
+def split_k_workspace(device: torch.device, partials_numel: int, counters_numel: int):
+    """FP32 partials and INT32 arrival counters for ``split_k_reduce``. Each tile's last arrival re-zeroes its counter, so
+    eager launches reuse one pair per (device, stream), zeroed once at creation and grown when a launch needs more: the
+    stream orders the launches sharing it (the caching allocator also reuses a replaced pair in stream order), and a
+    concurrent stream has its own pair. Graph capture gets private scratch whose counter memset the graph replays, so a
+    graph never shares counters with eager launches or other graphs, whatever stream it is replayed on. The cached
+    pairs come from their own pool, out of a cudagraph-trees warmup's graph pool."""
+    cuda = device.type == "cuda"
+    if launches_skipped() or (cuda and torch.cuda.is_current_stream_capturing()):
+        return (torch.empty(partials_numel, device=device, dtype=torch.float32),
+                torch.zeros(counters_numel, device=device, dtype=torch.int32))
+    key = torch.accelerator.current_stream(device)
+    pair = _SPLIT_K_WORKSPACES.get(key)
+    if pair is None or pair[0].numel() < partials_numel or pair[1].numel() < counters_numel:
+        if pair is not None:
+            partials_numel, counters_numel = max(partials_numel, pair[0].numel()), max(counters_numel, pair[1].numel())
+        with torch.cuda.use_mem_pool(_split_k_pool(), device) if cuda else contextlib.nullcontext():
+            pair = _SPLIT_K_WORKSPACES[key] = (
+                torch.empty(partials_numel, device=device, dtype=torch.float32),
+                torch.zeros(counters_numel, device=device, dtype=torch.int32),
+            )
+    return pair
 
 
 def _mx_matmul_configs():
@@ -1062,9 +1093,9 @@ def mx_weight_only_matmul_2d_kernel(
 @triton.jit
 def split_k_reduce(acc, Partials, TileCounters, tile, num_tiles, BM: tl.constexpr, BN: tl.constexpr, SPLIT_K: tl.constexpr):
     """In-kernel split-K reduction for one output tile: store this split's fp32 partial, count the arrival
-    (``acq_rel`` at GPU scope, after a CTA barrier so the whole partial is written first) on the launch's own zeroed
-    counter, and in the last program to arrive sum every split's partial in split order (fixed order: the result does
-    not depend on arrival order). Returns ``(acc, is_last)``."""
+    (``acq_rel`` at GPU scope, after a CTA barrier so the whole partial is written first) on the tile's zeroed counter,
+    and in the last program to arrive sum every split's partial in split order (fixed order: the result does not depend
+    on arrival order) and re-zero the counter for the next launch (``split_k_workspace``). Returns ``(acc, is_last)``."""
     offs = tl.arange(0, BM)[:, None] * BN + tl.arange(0, BN)[None, :]
     split = tl.program_id(2)
     tl.store(Partials + (split * num_tiles + tile) * (BM * BN) + offs, acc)
@@ -1076,6 +1107,7 @@ def split_k_reduce(acc, Partials, TileCounters, tile, num_tiles, BM: tl.constexp
         for s in tl.static_range(SPLIT_K):
             total += tl.load(Partials + (s * num_tiles + tile) * (BM * BN) + offs, cache_modifier=".cg")
         acc = total
+        tl.store(TileCounters + tile, 0)
     return acc, last
 
 
@@ -1088,14 +1120,14 @@ def split_k_reduce(acc, Partials, TileCounters, tile, num_tiles, BM: tl.constexp
         warp_spec=True,
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
-        pre_hook=int_weight_only_pre_hook,
+        pre_hook=rebind_weight_only_descriptors,
     )
     # same branch-axis values as the union grid's BM=16 tiles, so coordinate descent steps BN 32 -> 16 within one basin
-    + narrow_dot_autotuning_configs(pre_hook=int_weight_only_pre_hook, WARP_SPEC=False)
+    + narrow_dot_autotuning_configs(pre_hook=rebind_weight_only_descriptors, WARP_SPEC=False)
     + narrow_dot_autotuning_configs(
-        block_ms=(1, 2, 4, 8), block_ns=(32, 64), pre_hook=int_weight_only_pre_hook, WARP_SPEC=False, SWAP_AB=True,
+        block_ms=(1, 2, 4, 8), block_ns=(32, 64), pre_hook=rebind_weight_only_descriptors, WARP_SPEC=False, SWAP_AB=True,
     )
-    + split_k_autotuning_configs(SPLIT_K_VALUES, pre_hook=int_weight_only_pre_hook, WARP_SPEC=False)
+    + split_k_autotuning_configs(SPLIT_K_VALUES, pre_hook=rebind_weight_only_descriptors, WARP_SPEC=False)
     + narrow_scalar_autotuning_configs(block_ms=(1, 2, 4)),
     # the width and the scale group decide which tiles fit and compile: part of the key
     ["N", "K", "m_bit_length", "GATE", "INT_BITS", "SCALE_GROUP_K"],
@@ -1133,7 +1165,7 @@ def int_weight_only_matmul_2d_kernel(
     C,  # (M, N) output (GLU intermediate under GATE)
     Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     Partials,  # (SPLIT_K_MAX, tiles, BM, n_width) fp32 split-K partial sums; read iff SPLIT_K > 1
-    TileCounters,  # (tiles,) int32 split-K arrival counters, zeroed per launch; read iff SPLIT_K > 1
+    TileCounters,  # (tiles,) int32 split-K arrival counters, zero between launches; read iff SPLIT_K > 1
     M,
     N,
     K,
@@ -2055,8 +2087,9 @@ def mx_dynamic_matmul(
     # partials cover the widest split over the BN=256 padded grid, and the counters the narrowest split tile's grid.
     partials = counters = None
     if M == 1 and not gate:
-        partials = torch.empty(SPLIT_K_VALUES[-1] * triton.cdiv(N, 256) * 256, device=A.device, dtype=torch.float32)
-        counters = torch.empty(triton.cdiv(N, MX_SPLIT_K_MIN_BLOCK_N), device=A.device, dtype=torch.int32)
+        partials, counters = split_k_workspace(
+            A.device, SPLIT_K_VALUES[-1] * triton.cdiv(N, 256) * 256, triton.cdiv(N, MX_SPLIT_K_MIN_BLOCK_N)
+        )
 
     with device_context(A.device):
         bias_stride_e, bias_stride_n = bias_strides(bias)
@@ -2418,20 +2451,16 @@ def int_weight_only_matmul_2d(
     def grid(META):
         return (triton.cdiv(M, META["BLOCK_SIZE_M"]), triton.cdiv(N, META["BLOCK_SIZE_N"]), META.get("SPLIT_K", 1))
 
-    # split-K scratch (decode band only, int_split_k_pruner), private to this launch: fp32 partials sized for the
-    # widest split and the narrowest tile, and arrival counters the split configs' pre_hook zeroes. Both come from
-    # the caching allocator on the launch's stream (a concurrent launch on another stream gets its own), and a
-    # captured graph replays the memset.
+    # split-K scratch (decode band only, int_split_k_pruner): fp32 partials sized for the widest split over the split
+    # tiles' padded grid (BM=16 rows, up to SPLIT_K_MAX_BLOCK_N columns per tile), counters for the narrowest tile's grid
     partials = counters = None
     if M <= SPLIT_K_MAX_M:
-        tiles = triton.cdiv(M, 16) * triton.cdiv(N, 16)
-        # the split tiles' padded grid: BM=16 rows, up to SPLIT_K_MAX_BLOCK_N columns per tile
-        partials = torch.empty(
+        partials, counters = split_k_workspace(
+            A.device,
             SPLIT_K_VALUES[-1] * triton.cdiv(M, 16) * 16
             * triton.cdiv(N, SPLIT_K_MAX_BLOCK_N) * SPLIT_K_MAX_BLOCK_N * (2 if gate else 1),
-            device=A.device, dtype=torch.float32,
+            triton.cdiv(M, 16) * triton.cdiv(N, 16),
         )
-        counters = torch.empty(tiles, device=A.device, dtype=torch.int32)  # zeroed by int_weight_only_pre_hook
 
     with device_context(A.device):
         bias_stride_e, bias_stride_n = bias_strides(bias)
