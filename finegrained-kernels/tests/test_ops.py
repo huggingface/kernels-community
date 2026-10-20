@@ -44,9 +44,11 @@ from utils import (  # type: ignore
     SUPPORTS_SWIZZLED_SCALES,
     TEST_DEVICE,
     WEIGHTS,
+    dequant_gate_up,
     dq_block_fp8,
     dq_grouped,
     dq_scale,
+    make_gate_up,
     make_static_activation_scale,
     maybe_compile,
     quant_dequant_a,
@@ -435,7 +437,8 @@ def _fp32_intermediate(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As
     the fp32 accumulator directly)."""
     row = WEIGHTS[problem.weights]
     A_dq = _act_dequant(problem, op, A, As, As_global, expert_ids)
-    W = row["dequant"](B, Bs, Bs_global)  # (E, rows, K) fp32
+    # (E, rows, K) fp32
+    W = dequant_gate_up(row, B, Bs, Bs_global) if problem.gate else row["dequant"](B, Bs, Bs_global)
     bias = _bias(problem, op)
     if op == "matmul":
         ref = A_dq @ W[0].T  # single linear, no routing
@@ -631,8 +634,10 @@ def _check(problem: Problem, dq_out, ref_cmp, expert_ids, op):
 
 
 def _make_weights(problem: Problem, row, E):
-    """The scenario's weights: ``(B, Bs, Bs_global)`` at the stack's row count (doubled under gate)."""
-    return row["make"](2 * problem.N if problem.gate else problem.N, problem.K, E)
+    """The scenario's weights: ``(B, Bs, Bs_global)``; under gate the interleaved gate|up stack."""
+    if problem.gate:
+        return make_gate_up(row, problem.N, problem.K, E)
+    return row["make"](problem.N, problem.K, E)
 
 
 def _skip_moe_only(problem: Problem, op: str) -> None:
@@ -725,6 +730,8 @@ _SWEEP_CELLS = [
     (Problem(weights="mxfp4", S=8), "batched", "mx_dynamic_matmul_batched_kernel"),
     (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "grouped", "mx_dynamic_matmul_grouped_kernel"),
     (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "matmul", "mx_dynamic_matmul_kernel"),
+    # non-128 N on the 2D gate|up tile (gpt-oss-style N=320): the BN=128 tile overhangs N
+    (Problem(weights="mxfp4", gate=True, activation_format="mxfp4", quantize_output=True, N=320, K=320), "matmul", "mx_dynamic_matmul_kernel"),
     (Problem(weights="nvfp4", gate=True, activation_format="nvfp4", quantize_output=True, swizzled=True, S=8), "batched", "mx_dynamic_matmul_batched_kernel"),
     # the calibrated (static) arm on per-tensor weights: it hands the kernel a RAW A to quantize
     # per tile, the one activation form that cannot ride the TMA gather, so its admitted set is

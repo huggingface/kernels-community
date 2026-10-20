@@ -364,12 +364,12 @@ def _weight_scale_block_dynamic(
     GROUPED: tl.constexpr, GATE: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
 ):
     """block_dynamic per-K-block weight scale. Grouped reads it at ``bs_ptrs + k*stride`` (GATE folds
-    gate on the first ``BN`` columns, up on the rest via ``up_s_ptr``); batched reads the pre-offset
+    gate on the even columns, up on the odd ones via ``up_s_ptr``); batched reads the pre-offset
     maskless pointer; 2D reads the bounds-masked advanced pointer."""
     if GROUPED:
-        if GATE:  # gate scale on the first BN columns, up on the rest
+        if GATE:  # gate|up rows interleave: gate scale on even columns, up on odd
             b_s = tl.where(
-                tl.arange(0, 2 * BLOCK_SIZE_N) < BLOCK_SIZE_N,
+                tl.arange(0, 2 * BLOCK_SIZE_N) % 2 == 0,
                 tl.load(bs_ptrs + k * stride_bs_k),
                 tl.load(up_s_ptr + k * stride_bs_k),
             )
@@ -397,9 +397,9 @@ def _weight_scale_static(
     vector so ``accumulate("static")`` applies it in N (the static act scale is a scalar folded
     post-loop)."""
     if GROUPED:
-        if GATE:  # gate on the first BN, up on the rest
+        if GATE:  # gate|up rows interleave: gate scale on even columns, up on odd
             b_s = tl.where(
-                tl.arange(0, 2 * BLOCK_SIZE_N) < BLOCK_SIZE_N,
+                tl.arange(0, 2 * BLOCK_SIZE_N) % 2 == 0,
                 tl.load(bs_ptrs + k * stride_bs_k),
                 tl.load(up_s_ptr + k * stride_bs_k),
             )
@@ -467,8 +467,8 @@ def load_weight_block_dynamic(
     GATE: tl.constexpr, GROUPED: tl.constexpr, B_MEMORY_MODE: tl.constexpr, SWAP_AB: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, WEIGHT_VALUES_PER_BYTE: tl.constexpr = 1,
 ):
-    """The block_dynamic weight path: value tile + per-K-block scale (gate on the first BN, up on the
-    rest via ``up_s_ptr``)."""
+    """The block_dynamic weight path: value tile + per-K-block scale (gate|up interleaved: gate on the
+    even columns, up on the odd via ``up_s_ptr``)."""
     KB: tl.constexpr = BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE
     w = _weight_value(b_ptrs, b_descriptor, row0, n_off, k_off, GATE, GROUPED, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, KB)
     w_s = _weight_scale_block_dynamic(bs_ptrs, up_s_ptr, bs_mask, k, stride_bs_k, GROUPED, GATE, BLOCK_SIZE_N)
