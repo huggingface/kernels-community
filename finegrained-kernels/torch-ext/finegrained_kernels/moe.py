@@ -246,6 +246,23 @@ def _torch_weighted_reduce(down_out, top_k_index, top_k_weights, num_experts):
     return contrib.view(num_tokens, num_top_k, down_out.size(1)).sum(dim=1)
 
 
+def _csf_weight_scales(
+    gate_up_proj_scale_inv, gate_up_proj_scale_exceptions, gate_up_proj_scale_exception_offsets,
+    down_proj_scale_inv, down_proj_scale_exceptions, down_proj_scale_exception_offsets, expert_start,
+):
+    """Both projections' weight scales for the GEMMs: a CSF fixed stream (given its exceptions)
+    decodes, only the experts with routed rows in ``expert_start``; dense scales pass through."""
+    return (
+        csf_weight_scales(
+            gate_up_proj_scale_inv, gate_up_proj_scale_exceptions, gate_up_proj_scale_exception_offsets,
+            expert_start,
+        ),
+        csf_weight_scales(
+            down_proj_scale_inv, down_proj_scale_exceptions, down_proj_scale_exception_offsets, expert_start
+        ),
+    )
+
+
 def _host_glu(gate_up_out, act_fn, swiglu_alpha, swiglu_limit, gate):
     """The activation on the host, for the arms the epilogue does not fuse: a callable takes the
     raw GEMM output (interleaved gate|up columns when ``gate``) and returns the intermediate —
@@ -393,13 +410,9 @@ def moe_fused_grouped(
     expert_start, gather_idx, scatter_idx = compute_grouped_scheduling(
         top_k_index, NUM_EXPERTS, num_top_k
     )
-    gate_up_proj_scale_inv = csf_weight_scales(
+    gate_up_proj_scale_inv, down_proj_scale_inv = _csf_weight_scales(
         gate_up_proj_scale_inv, gate_up_proj_scale_exceptions, gate_up_proj_scale_exception_offsets,
-        expert_start,
-    )
-    down_proj_scale_inv = csf_weight_scales(
-        down_proj_scale_inv, down_proj_scale_exceptions, down_proj_scale_exception_offsets,
-        expert_start,
+        down_proj_scale_inv, down_proj_scale_exceptions, down_proj_scale_exception_offsets, expert_start,
     )
     fmt = _block_format(
         gate_up_proj, gate_up_proj_scale_inv, down_proj, down_proj_scale_inv, activation_format
@@ -525,14 +538,10 @@ def moe_fused_batched(
     NUM_EXPERTS = gate_up_proj.size(0)
     expert_ids = top_k_index.reshape(-1)
     if gate_up_proj_scale_exceptions is not None or down_proj_scale_exceptions is not None:
-        expert_start = routed_expert_start(expert_ids, NUM_EXPERTS)  # decode only routed experts
-        gate_up_proj_scale_inv = csf_weight_scales(
-            gate_up_proj_scale_inv, gate_up_proj_scale_exceptions,
-            gate_up_proj_scale_exception_offsets, expert_start,
-        )
-        down_proj_scale_inv = csf_weight_scales(
+        gate_up_proj_scale_inv, down_proj_scale_inv = _csf_weight_scales(
+            gate_up_proj_scale_inv, gate_up_proj_scale_exceptions, gate_up_proj_scale_exception_offsets,
             down_proj_scale_inv, down_proj_scale_exceptions, down_proj_scale_exception_offsets,
-            expert_start,
+            routed_expert_start(expert_ids, NUM_EXPERTS),  # decode only the routed experts
         )
     fmt = _block_format(
         gate_up_proj, gate_up_proj_scale_inv, down_proj, down_proj_scale_inv, activation_format
@@ -663,13 +672,9 @@ def moe_unfused_grouped(
     expert_start, gather_idx, scatter_idx = compute_grouped_scheduling(
         top_k_index, NUM_EXPERTS, num_top_k
     )
-    gate_up_proj_scale_inv = csf_weight_scales(
+    gate_up_proj_scale_inv, down_proj_scale_inv = _csf_weight_scales(
         gate_up_proj_scale_inv, gate_up_proj_scale_exceptions, gate_up_proj_scale_exception_offsets,
-        expert_start,
-    )
-    down_proj_scale_inv = csf_weight_scales(
-        down_proj_scale_inv, down_proj_scale_exceptions, down_proj_scale_exception_offsets,
-        expert_start,
+        down_proj_scale_inv, down_proj_scale_exceptions, down_proj_scale_exception_offsets, expert_start,
     )
     fmt = _block_format(
         gate_up_proj, gate_up_proj_scale_inv, down_proj, down_proj_scale_inv, activation_format
@@ -953,14 +958,10 @@ def moe_unfused_batched(
     NUM_EXPERTS = gate_up_proj.size(0)
     expert_ids = top_k_index.reshape(-1)
     if gate_up_proj_scale_exceptions is not None or down_proj_scale_exceptions is not None:
-        expert_start = routed_expert_start(expert_ids, NUM_EXPERTS)  # decode only routed experts
-        gate_up_proj_scale_inv = csf_weight_scales(
-            gate_up_proj_scale_inv, gate_up_proj_scale_exceptions,
-            gate_up_proj_scale_exception_offsets, expert_start,
-        )
-        down_proj_scale_inv = csf_weight_scales(
+        gate_up_proj_scale_inv, down_proj_scale_inv = _csf_weight_scales(
+            gate_up_proj_scale_inv, gate_up_proj_scale_exceptions, gate_up_proj_scale_exception_offsets,
             down_proj_scale_inv, down_proj_scale_exceptions, down_proj_scale_exception_offsets,
-            expert_start,
+            routed_expert_start(expert_ids, NUM_EXPERTS),  # decode only the routed experts
         )
     fmt = _block_format(
         gate_up_proj, gate_up_proj_scale_inv, down_proj, down_proj_scale_inv, activation_format

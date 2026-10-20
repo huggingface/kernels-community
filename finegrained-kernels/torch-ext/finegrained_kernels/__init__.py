@@ -42,8 +42,9 @@ __all__ = [
     # the per-expert output norm a model can hand the forwards by name, and its standalone op
     "get_supported_norms",
     "rms_norm_rows",
-    # load-time helpers: the swizzled scale layout the SM100 scaled-MMA reads, and the row-wise
-    # quantizers a loader uses to quantize weights into the group formats
+    # load-time helpers: the swizzled scale layout the SM100 scaled-MMA reads, CSF scale-stream
+    # preparation/decoding, and the row-wise quantizers a loader uses to quantize weights into the
+    # group formats
     "swizzle_mx_scales",
     "unswizzle_mx_scales",
     "prepare_nvfp4_csf_scales",

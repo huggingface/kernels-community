@@ -86,13 +86,15 @@ def _exclusive_offsets_kernel(
     ExpertFreq, ExpertStart, Counters, NUM_EXPERTS: tl.constexpr
 ):
     """Exclusive cumsum of per-expert token counts → ``expert_start`` (leading 0, trailing the
-    local count), and zero the scatter counters, the EP-sentinel bucket's included — one launch."""
+    local count), and zero the scatter counters, the EP-sentinel bucket's included — one launch.
+    ``Counters`` None (no scatter follows) skips them."""
     offs = tl.arange(0, NUM_EXPERTS)
     incl = tl.cumsum(tl.load(ExpertFreq + offs), 0)
     tl.store(ExpertStart, 0)
     tl.store(ExpertStart + 1 + offs, incl)
-    tl.store(Counters + offs, tl.zeros([NUM_EXPERTS], tl.int32))
-    tl.store(Counters + NUM_EXPERTS, 0)
+    if Counters is not None:
+        tl.store(Counters + offs, tl.zeros([NUM_EXPERTS], tl.int32))
+        tl.store(Counters + NUM_EXPERTS, 0)
 
 
 @triton.jit
@@ -189,14 +191,15 @@ def routed_expert_start(expert_ids: torch.Tensor, num_experts: int) -> torch.Ten
     return _compute_expert_start(expert_ids, num_experts)
 
 
-def _launch_expert_start(expert_ids: torch.Tensor, num_experts: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """The count + exclusive-offset launches: ``(expert_start, counters)``, the latter the scatter's
-    per-expert cursors."""
+def _launch_expert_start(
+    expert_ids: torch.Tensor, num_experts: int, counters: torch.Tensor | None = None
+) -> torch.Tensor:
+    """The count + exclusive-offset launches → ``expert_start``; ``counters`` (the scatter's
+    per-expert cursors, when a sort follows) is zeroed in the same launch."""
     device = expert_ids.device
     num_routed_tokens = expert_ids.numel()  # S = num_tokens * num_top_k
     expert_freq = torch.zeros(num_experts, dtype=torch.int32, device=device)
     expert_start = torch.empty(num_experts + 1, dtype=torch.int32, device=device)
-    counters = torch.empty(num_experts + 1, dtype=torch.int32, device=device)
     with device_context(device):
         compile_time_only_triton_wrap(_count_kernel)[
             (triton.cdiv(num_routed_tokens, _ROUTING_BLOCK_SIZE),)
@@ -213,14 +216,14 @@ def _launch_expert_start(expert_ids: torch.Tensor, num_experts: int) -> tuple[to
             counters,
             NUM_EXPERTS=num_experts,
         )
-    return expert_start, counters
+    return expert_start
 
 
 @compile_time_only_triton_op(
     add_op_namespace_prefix("compute_expert_start"), mutates_args=(), opaque=True
 )
 def _compute_expert_start(expert_ids: torch.Tensor, num_experts: int) -> torch.Tensor:
-    return _launch_expert_start(expert_ids.int().contiguous(), num_experts)[0]
+    return _launch_expert_start(expert_ids.int().contiguous(), num_experts)
 
 
 @compile_time_only_triton_op(
@@ -232,7 +235,8 @@ def _compute_grouped_scheduling(
     device = expert_ids.device
     expert_ids = expert_ids.int().contiguous()  # routing kernels index with unit stride
     num_routed_tokens = expert_ids.numel()  # S = num_tokens * num_top_k
-    expert_start, counters = _launch_expert_start(expert_ids, num_experts)
+    counters = torch.empty(num_experts + 1, dtype=torch.int32, device=device)
+    expert_start = _launch_expert_start(expert_ids, num_experts, counters)
     perm = torch.empty(num_routed_tokens, dtype=torch.int32, device=device)
     perm_token = torch.empty(num_routed_tokens, dtype=torch.int32, device=device)
     with device_context(device):
