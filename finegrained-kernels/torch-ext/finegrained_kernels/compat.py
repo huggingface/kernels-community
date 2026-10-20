@@ -503,6 +503,18 @@ def is_sm10x() -> bool:
 
 
 @functools.cache
+def is_blackwell() -> bool:
+    """Whether the CURRENT device is any Blackwell family: sm_10x (datacenter), sm_11x
+    (Jetson Thor) or sm_12x (consumer). Wider than ``is_sm10x``: these share the FP4
+    conversion instructions but not TMEM scaled-MMA."""
+    return (
+        torch.cuda.is_available()
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability()[0] in (10, 11, 12)
+    )
+
+
+@functools.cache
 def is_sm90() -> bool:
     """Whether the CURRENT device is Hopper (sm_90) — the target the measured NVIDIA-backend
     MMA-lowering guards are scoped to. A POSITIVE arch test on purpose: ``not is_sm10x()`` is
