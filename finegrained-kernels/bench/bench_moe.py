@@ -52,6 +52,9 @@ Every (row, problem, regime, impl) cell runs in THREE modes:
   cudagraph  do_bench_cudagraph (decode's deployment mode)
   compile    torch.compile(mode="max-autotune", fullgraph=True), warmed, then do_bench
 
+CUDA modes rotate identical weight/input banks whose active weights exceed twice L2.
+Elapsed latency is normalized per invocation; cache eviction is never timed.
+
 Regimes: decode T=1 and prefill T=8192 (routed through top_k experts; attn row: M=T).
 
 --smoke: fast everything-compiles pass — FINEGRAINED_AUTOTUNE_CONFIG=fast (unless one is already set)
@@ -121,13 +124,13 @@ if SMOKE:
     os.environ.setdefault("FINEGRAINED_AUTOTUNE_CONFIG", "fast")
 
 import torch  # noqa: E402
-from triton.testing import do_bench, do_bench_cudagraph  # noqa: E402
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_ROOT, "torch-ext"))
 sys.path.insert(0, os.path.join(_ROOT, "tests"))
 import finegrained_kernels as fgm  # noqa: E402  local branch
+from finegrained_kernels.bench import do_bench, rotation_count  # noqa: E402
 from kernels import get_kernel  # noqa: E402
 
 # kernels-community IS a trusted publisher, so the check passes whenever it can reach the Hub
@@ -187,6 +190,7 @@ def _nvfp4_input_globals(cfg, hidden, gu, gus, gu_g):
         def amax(t):
             return (t.abs().amax() / (6.0 * 448.0)).clamp(min=1e-30).float().reshape(1)
         _NVFP4_GLOBALS[key] = (amax(hidden), amax(inter))
+        _mark_static(*_NVFP4_GLOBALS[key])
     return _NVFP4_GLOBALS[key]
 
 
@@ -581,6 +585,7 @@ ATTN_PROBLEMS = {
     ),
 }
 MODES = ["eager", "cudagraph", "compile"]
+CACHE_POLICY = "rotating_gt_2l2" if DEVICE == "cuda" else "backend_default"
 
 IMPL_COLORS = {
     "finegrained-kernels": "#1f77b4",
@@ -632,6 +637,7 @@ def _mark_static(*tensors):
             # a real model holds weights as Parameters (cudagraph-static); closure
             # tensors would be re-copied into the cudagraph buffers EVERY compiled
             # call (~150us/GB DtoD, measured 95% of compiled decode) — mark static.
+            # Captured views need their own mark; it is not inherited from their base.
             torch._dynamo.mark_static_address(t)
 
 
@@ -683,6 +689,7 @@ class _Experts:
         # the reference forwards read this like `act_fn`: a name when the model normalizes each
         # expert application before the routing weights, None when it does not
         self.post_expert_norm_name = None
+        self.has_post_expert_norm = False
         self._is_expert_parallel = False
         self.gate_up_proj, self.down_proj = gu, dn
         self.gate_up_proj_scale_inv, self.down_proj_scale_inv = gus, dns
@@ -805,6 +812,7 @@ def torch_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_):
               gate_up_proj_weight_global_scale=gu_g, down_proj_weight_global_scale=dn_g,
               **nvfp4_kw)
     gus_b, dns_b = _torch_preblock_weight_scale(gus), _torch_preblock_weight_scale(dns)
+    _mark_static(gu, gus_b, dns_b)
     return lambda: fgm.moe.moe_torch_grouped(hidden, idx, w, gu, dn, gus_b, dns_b, **kw)
 
 
@@ -999,6 +1007,8 @@ def _trtllm_fp4_arm(cfg, hidden, idx, packed, gu, gus, dn, dns, gu_g, dn_g):
         scale_c1 = scale_gate1 = scale_c2 = ones
     alpha, beta, limit = _trtllm_gated_scalars(cfg, E, hidden.device)
     act_format = _activation_format(cfg)
+    _mark_static(g1, g1s, d1, d1s, hidden_g, scale_c1, scale_gate1, scale_c2,
+                 alpha, beta, limit)
 
     def run():
         x = torch.nn.functional.pad(hidden, (0, Hp - H)) if Hp != H else hidden
@@ -1091,6 +1101,7 @@ def trtllm_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g=None, dn
     if cfg["weights"] == "mxfp8":
         g1, g1s, dn_s, d1s = _trtllm_mxfp8_prep(gu, gus, dn, dns)
         alpha, beta, limit = _trtllm_gated_scalars(cfg, E, hidden.device)
+        _mark_static(g1, g1s, dn_s, d1s, alpha, beta, limit)
 
         def run():
             hq, hsr = _fi_mxfp8_quantize(hidden, False)
@@ -1111,6 +1122,7 @@ def trtllm_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g=None, dn
     gus_f = gus.float()  # UE8M0 first: cat has no e8m0 kernel
     g1s = torch.cat([gus_f[:, inter // 128:], gus_f[:, : inter // 128]], dim=1).contiguous()
     dns_f = dns.float().contiguous()
+    _mark_static(g1, g1s, dns_f)
 
     def run():
         # the STACK's own act quant (vLLM's TRT-LLM integration runs this exact kernel) —
@@ -1155,6 +1167,8 @@ def vllm_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
             a2_scale=a["down_proj_activation_scale"].max().reshape(1).float(),
             per_act_token_quant=False, block_shape=None,
         )
+    if qc is not None:
+        _mark_static(qc.w1_scale, qc.w2_scale, qc.a1_scale, qc.a2_scale)
     return lambda: vllm_fused_experts(hidden, gu, dn, tkw, tki,
                                       activation=_VllmAct.SILU, quant_config=qc)
 
@@ -1188,6 +1202,7 @@ def triton_kernels_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_
         tw, ws = tfmx.quantize_to_mxfp4(
             bf16_w.transpose(-1, -2).contiguous(), triton_kernels_hub)
         tw, ws = tfmx.swizzle_mxfp4(tw, ws, triton_kernels_hub)
+        _mark_static(tw.storage.data, ws.storage.data)
         return tw, pc(weight_scale=ws, flex_ctx=flex(rhs_data=inflex()))
 
     experts = tfmx.Mxfp4GptOssExperts(
@@ -1264,6 +1279,7 @@ def megablocks_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
                     f"megablocks {name} wants {tuple(buf.shape)} ({buf.numel()} elems), "
                     f"source has {tuple(src.shape)} ({src.numel()})")
             buf.copy_(src.contiguous().reshape(buf.shape).to(torch.bfloat16))
+            _mark_static(buf)
     scores = torch.zeros(hidden.shape[0], E, device=hidden.device, dtype=torch.bfloat16)
     scores.scatter_(1, idx.long(), w.to(torch.bfloat16))
     # belt and braces: some builds still hand back (out, bias)
@@ -1313,27 +1329,67 @@ def _context_poisoned(tag, mode):
         return True
 
 
-def bench_modes(run, tag):
+def _tensor_bytes(tensors):
+    return sum(t.numel() * t.element_size() for t in tensors if t is not None)
+
+
+def _clone_tensors(tensors):
+    return tuple(None if t is None else t.clone() for t in tensors)
+
+
+def _weight_banks(weights, active_experts=None):
+    """Identical checkpoints with a cyclic active working set larger than CUDA L2."""
+    weight_bytes = _tensor_bytes(weights)
+    active_bytes = (weight_bytes if active_experts is None
+                    else weight_bytes * active_experts // weights[0].shape[0])
+    count = rotation_count(active_bytes, 0) if DEVICE == "cuda" else 1
+    if count is None:
+        raise RuntimeError("cold weight working set needs too many rotation banks")
+    if DEVICE == "cuda":
+        free, _ = ACCELERATOR.mem_get_info()
+        free += ACCELERATOR.memory_reserved() - ACCELERATOR.memory_allocated()
+        required = (count - 1) * weight_bytes
+        if required > free:
+            raise RuntimeError(f"cold weight banks need {required / 1024**3:.2f} GiB extra, "
+                               f"but only {free / 1024**3:.2f} GiB is free")
+    banks = [weights] + [_clone_tensors(weights) for _ in range(count - 1)]
+    for bank in banks:
+        _mark_static(*bank)
+    print(f"      cache: {CACHE_POLICY}; banks={count}, "
+          f"active weights={count * active_bytes / 1024**2:.1f} MiB, "
+          f"allocated weights={count * weight_bytes / 1024**3:.2f} GiB", flush=True)
+    return banks
+
+
+def bench_modes(runs, tag):
     """{mode: latency_us | None}, plus the eager output for parity. A mode that raises
     is a red CRASH cell — the other modes still run (fresh error printed inline)."""
-    res, out = {}, None
+    def run():
+        # Independent inputs prevent cross-bank CSE; all outputs must survive compilation.
+        return tuple(fn() for fn in runs)
+
+    count = len(runs)
+    res = {}
+    out = None
     try:
         out = run()
         torch.accelerator.synchronize()  # warm + tune before ANY timing/capture
-        res["eager"] = do_bench(run, return_mode="min") * 1e3
+        res["eager"] = do_bench(run, return_mode="min") * 1e3 / count
         print(f"      {tag:14s} eager      {res['eager']:9.1f}us", flush=True)
     except Exception as e:
         print(f"      [{tag} eager crashed: {type(e).__name__}: {str(e)[:90]}]", flush=True)
         res["eager"] = None
     _context_poisoned(tag, "eager")
     try:
-        res["cudagraph"] = do_bench_cudagraph(run, return_mode="min") * 1e3
+        res["cudagraph"] = do_bench(run, cudagraph=True, return_mode="min") * 1e3 / count
         print(f"      {tag:14s} cudagraph  {res['cudagraph']:9.1f}us", flush=True)
     except Exception as e:
         print(f"      [{tag} cudagraph crashed: {type(e).__name__}: {str(e)[:90]}]", flush=True)
         res["cudagraph"] = None
     _context_poisoned(tag, "cudagraph")
     try:
+        # This wrapper is shared across every arm and regime; isolate its Dynamo guards.
+        torch._dynamo.reset_code(run.__code__)
         crun = torch.compile(run, mode="max-autotune", fullgraph=True)
         cout = crun()
         torch.accelerator.synchronize()
@@ -1345,17 +1401,20 @@ def bench_modes(run, tag):
         # quantized path, and W4A8 spreads further than the cross-impl parity we already accept
         # on it (deepgemm-vs-ours 2.3e-2, its own compile-vs-eager 2.1e-2 — a 1e-2 bound flagged
         # the latter as a crash and put a false red X on the figure).
-        if isinstance(cout, torch.Tensor) and isinstance(out, torch.Tensor):
-            drift = rel_diff(cout, out)
-            if drift > 0.25:
-                raise RuntimeError(f"compiled output diverges from eager (rel {drift:.2e})")
-        res["compile"] = do_bench(crun, return_mode="min") * 1e3
+        if len(cout) != count:
+            raise RuntimeError("compiled graph dropped a weight bank output")
+        for compiled, eager in zip(cout, out):
+            if isinstance(compiled, torch.Tensor) and isinstance(eager, torch.Tensor):
+                drift = rel_diff(compiled, eager)
+                if drift > 0.25:
+                    raise RuntimeError(f"compiled output diverges from eager (rel {drift:.2e})")
+        res["compile"] = do_bench(crun, return_mode="min") * 1e3 / count
         print(f"      {tag:14s} compile    {res['compile']:9.1f}us", flush=True)
     except Exception as e:
         print(f"      [{tag} compile crashed: {type(e).__name__}: {str(e)[:90]}]", flush=True)
         res["compile"] = None
     _context_poisoned(tag, "compile")
-    return res, out
+    return res, None if out is None else out[0]
 
 
 def rel_diff(a, b):
@@ -1387,23 +1446,26 @@ def bench_problem_row(row, pname, cfg, arms, weights, rows_out):
     # state so shapes don't go automatic-dynamic across problems and the shared
     # frames can't hit the fullgraph recompile limit
     torch._dynamo.reset()
-    gu, gus, dn, dns, gu_g, dn_g = weights
     for regime, tokens, grouped in (("decode", DECODE_TOKENS, False),
                                     ("prefill", PREFILL_TOKENS, True)):
         print(f"   -- {regime}")
         hidden, idx, w, logits = routing(cfg, tokens)
-        args = (cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, logits)
+        banks = _weight_banks(weights, idx.unique().numel())
+        inputs = [(hidden, idx, w, logits)] + [
+            _clone_tensors((hidden, idx, w, logits)) for _ in banks[1:]
+        ]
         anchor_res, anchor_out = None, None
         for name in arms:
             try:
-                run = ARMS[name](*args)
+                runs = [ARMS[name](cfg, grouped, h, i, rw, *bank, rl)
+                        for bank, (h, i, rw, rl) in zip(banks, inputs)]
             except Exception as e:
                 print(f"      [{name} setup failed: {type(e).__name__}: {str(e)[:90]}]",
                       flush=True)
                 rows_out.append((row, pname, regime, _impl(name),
                                  {m: None for m in MODES}, None))
                 continue
-            res, out = bench_modes(run, name)
+            res, out = bench_modes(runs, name)
             parity = None
             if anchor_res is None:
                 anchor_res, anchor_out = res, out
@@ -1414,6 +1476,8 @@ def bench_problem_row(row, pname, cfg, arms, weights, rows_out):
                 print(f"      {name:14s} parity-vs-finegrained-kernels {parity:.1e}"
                       f"  finegrained-kernels-speedup {sp}", flush=True)
             rows_out.append((row, pname, regime, _impl(name), res, parity))
+            del runs
+        del banks, inputs
     print()
 
 
@@ -1422,27 +1486,9 @@ def _impl(arm_name):
     return arm_name.replace("_unfused", "").replace("_bf16", "")
 
 
-def bench_attn_row(row, pname, cfg, rows_out):
-    """One attn linear per model, in its deployment format (same weights across
-    impls; the finegrained-kernels arm's ``activation_format`` follows the model — GPT-OSS runs W4A4)."""
-    print(f"== [{row}] {pname}")
-    if MOCK:
-        _mock_rows(row, pname, ("finegrained-kernels",) + cfg["baselines"], rows_out)
-        return
-    torch._dynamo.reset()
+def _attn_arms(cfg, x, weights):
     N, K, block = cfg["N"], cfg["K"], cfg["block"]
-    W_g = None
-    if cfg["weights"] == "fp8_128x128_ue8m0":
-        W, Ws = make_weights(N, K, DEVICE, [128, 128],
-                             scale_dtype=torch.float8_e8m0fnu)
-    else:
-        # registry makers are expert-batched; build E=1 and index the slab off. NVFP4 returns a
-        # per-expert fp32 global as its 3rd value (None for single-level FP8/MX) — keep it so the
-        # two-level global multiply isn't dropped (it was, silently running NVFP4 at global=1).
-        W, Ws, W_g = WEIGHTS[cfg["weights"]]["make"](N, K, 1)
-        W, Ws = W[0], Ws[0]
-        W_g = W_g if W_g is None else W_g[0]
-    _mark_static(W, Ws)
+    W, Ws, W_g = weights
     Ws_fp8 = _fp8_scales(Ws, block)
     dg_block = tuple(block) if block else None
     # deployment layout for the LOCAL arm only (every baseline reads the raw row-major scale):
@@ -1452,6 +1498,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
     if (PRESWIZZLE and DEVICE == "cuda" and cfg["weights"] in _MX_WEIGHTS
             and _quantized_acts(cfg) and N % 128 == 0):
         Ws_fgm = fgm.swizzle_mx_scales(Ws)
+    _mark_static(Ws_fgm)
     # OpenAI triton_kernels dense mxfp4 matmul (matmul_ogs, no routing): the qkv linear
     # in the GPT-OSS MXFP4 format. Weight is a single (1, K, N) expert, swizzled once
     # at load (same as the fused arm); latency-only (its own weights).
@@ -1459,6 +1506,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
         tw_bf = torch.randn(1, K, N, device=DEVICE, dtype=torch.bfloat16) * 0.05
         tw, tws = _tfmx.quantize_to_mxfp4(tw_bf, triton_kernels_hub)
         tw, tws = _tfmx.swizzle_mxfp4(tw, tws, triton_kernels_hub)
+        _mark_static(tw.storage.data, tws.storage.data)
         tk_pc = triton_kernels_hub.matmul_ogs.PrecisionConfig(
             weight_scale=tws,
             flex_ctx=triton_kernels_hub.matmul_ogs.FlexCtx(
@@ -1489,6 +1537,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
             rb = [ScalingType.BlockWise1x16, ScalingType.TensorWise]
             swz = [SwizzleType.SWIZZLE_32_4_4, SwizzleType.NO_SWIZZLE]
             mat_b = W.view(FP4).t()
+            _mark_static(mat_b, *sb, one)
 
             def torch_mm(a, a_scale=None):
                 aq, a_s = fgm.nvfp4_act_quant(a)
@@ -1501,6 +1550,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
             rb = ScalingType.BlockWise1x32
             swz = SwizzleType.SWIZZLE_32_4_4
             mat_b = W.t()
+            _mark_static(mat_b, sb)
 
             def torch_mm(a, a_scale=None):
                 aq, a_s = fgm.mxfp8_act_quant(a)
@@ -1516,6 +1566,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
         from torch.nn.functional import ScalingType
 
         mat_b = W.t()
+        _mark_static(mat_b)
 
         def torch_mm(a, a_scale):
             return torch.nn.functional.scaled_mm(
@@ -1524,53 +1575,84 @@ def bench_attn_row(row, pname, cfg, rows_out):
                 Ws.reshape(()), ScalingType.TensorWise,
                 output_dtype=torch.bfloat16)
 
+    # a STATIC row's calibrated activation scale replaces the inline quant: one value, since a
+    # dense module is one quantized module (the MoE's per-expert form has no dense analogue)
+    attn_act_scale = (
+        (x.float().abs().amax() / 448.0).clamp(min=1e-12).reshape(1)
+        if cfg.get("static") else None
+    )
+    if attn_act_scale is not None:
+        _mark_static(attn_act_scale)
+    # act is inline-quantized (As=None) unless the row is static; Ws is the weight scale (Bs); activation_format is the
+    # activation precision (None follows the weight format).
+    attn_arms = {
+        "finegrained-kernels": lambda: fgm.matmul_2d(
+            x, W, attn_act_scale, Ws_fgm, activation_format=_activation_format(cfg), output_dtype=torch.bfloat16,
+            b_global_scale=W_g),
+    }
+    if torch_mm is not None:
+        attn_arms["torch_mm"] = lambda: torch_mm(x, attn_act_scale)
+    if "finegrained-fp8" in cfg["baselines"]:
+        attn_arms["finegrained-fp8"] = lambda: upstream_fp8.matmul_2d(x, W, Ws_fp8, block,
+                                                   torch.bfloat16)
+    if "deepgemm" in cfg["baselines"]:
+        attn_arms["deepgemm"] = lambda: deepgemm_fp8_fp4_linear(
+            x, W, Ws, block_size=dg_block, output_dtype=torch.bfloat16)
+    if "triton_kernels" in cfg["baselines"]:
+        attn_arms["triton_kernels"] = lambda: tk_ogs(
+            x, tw, None, None, precision_config=tk_pc)
+    # The dense GEMM is where transformers' NVFP4 path actually lives, so this is the
+    # apples-to-apples cell: same weight, its packer, its kernel. Packing is offline (the
+    # checkpoint conversion does it), so only `gemm` is timed.
+    if _nvfp4_gemm is not None and cfg["weights"] == "nvfp4":
+        # their packer takes a bf16 weight and produces its OWN layout, so feed it the
+        # dequantized tensor — `W` is already packed E2M1 (uint8, two values per byte), and
+        # casting those bytes to bf16 hands it a K/2-wide matrix ("expected 3072 input
+        # features, got 6144"). Same underlying weight, each stack quantizing it its own way,
+        # which is how every other baseline here is treated.
+        _w_bf16 = WEIGHTS["nvfp4"]["dequant"](
+            W[None], Ws[None], (W_g if W_g is not None else torch.ones(1, device=W.device))
+        )[0].to(torch.bfloat16)
+        _pw = _nvfp4_gemm.pack(_w_bf16, device=x.device)
+        _mark_static(_pw.qweight, _pw.sf, _pw.global_scale, _pw.sf_rowmajor)
+        attn_arms["nvfp4_gemm"] = lambda: _nvfp4_gemm.gemm(_pw, x)
+    return attn_arms
+
+
+def bench_attn_row(row, pname, cfg, rows_out):
+    """One attn linear per model, in its deployment format (same weights across
+    impls; the finegrained-kernels arm's ``activation_format`` follows the model — GPT-OSS runs W4A4)."""
+    print(f"== [{row}] {pname}")
+    if MOCK:
+        _mock_rows(row, pname, ("finegrained-kernels",) + cfg["baselines"], rows_out)
+        return
+    torch._dynamo.reset()
+    N, K = cfg["N"], cfg["K"]
+    W_g = None
+    if cfg["weights"] == "fp8_128x128_ue8m0":
+        W, Ws = make_weights(N, K, DEVICE, [128, 128],
+                             scale_dtype=torch.float8_e8m0fnu)
+    else:
+        # registry makers are expert-batched; build E=1 and index the slab off. NVFP4 returns a
+        # per-expert fp32 global as its 3rd value (None for single-level FP8/MX) — keep it so the
+        # two-level global multiply isn't dropped (it was, silently running NVFP4 at global=1).
+        W, Ws, W_g = WEIGHTS[cfg["weights"]]["make"](N, K, 1)
+        W, Ws = W[0], Ws[0]
+        W_g = W_g if W_g is None else W_g[0]
+    _mark_static(W, Ws)
+    weights = (W, Ws, W_g)
+
     for regime, tokens in (("decode", DECODE_TOKENS), ("prefill", PREFILL_TOKENS)):
         print(f"   -- {regime}")
         torch.manual_seed(0)
         x = torch.randn(tokens, K, device=DEVICE, dtype=torch.bfloat16)
-        # a STATIC row's calibrated activation scale replaces the inline quant: one value, since a
-        # dense module is one quantized module (the MoE's per-expert form has no dense analogue)
-        attn_act_scale = (
-            (x.float().abs().amax() / 448.0).clamp(min=1e-12).reshape(1)
-            if cfg.get("static") else None
-        )
-        if attn_act_scale is not None:
-            _mark_static(attn_act_scale)
-        # act is inline-quantized (As=None) unless the row is static; Ws is the weight scale (Bs); activation_format is the
-        # activation precision (None follows the weight format).
-        attn_arms = {
-            "finegrained-kernels": lambda: fgm.matmul_2d(
-                x, W, attn_act_scale, Ws_fgm, activation_format=_activation_format(cfg), output_dtype=torch.bfloat16,
-                b_global_scale=W_g),
-        }
-        if torch_mm is not None:
-            attn_arms["torch_mm"] = lambda: torch_mm(x, attn_act_scale)
-        if "finegrained-fp8" in cfg["baselines"]:
-            attn_arms["finegrained-fp8"] = lambda: upstream_fp8.matmul_2d(x, W, Ws_fp8, block,
-                                                       torch.bfloat16)
-        if "deepgemm" in cfg["baselines"]:
-            attn_arms["deepgemm"] = lambda: deepgemm_fp8_fp4_linear(
-                x, W, Ws, block_size=dg_block, output_dtype=torch.bfloat16)
-        if "triton_kernels" in cfg["baselines"]:
-            attn_arms["triton_kernels"] = lambda: tk_ogs(
-                x, tw, None, None, precision_config=tk_pc)
-        # The dense GEMM is where transformers' NVFP4 path actually lives, so this is the
-        # apples-to-apples cell: same weight, its packer, its kernel. Packing is offline (the
-        # checkpoint conversion does it), so only `gemm` is timed.
-        if _nvfp4_gemm is not None and cfg["weights"] == "nvfp4":
-            # their packer takes a bf16 weight and produces its OWN layout, so feed it the
-            # dequantized tensor — `W` is already packed E2M1 (uint8, two values per byte), and
-            # casting those bytes to bf16 hands it a K/2-wide matrix ("expected 3072 input
-            # features, got 6144"). Same underlying weight, each stack quantizing it its own way,
-            # which is how every other baseline here is treated.
-            _w_bf16 = WEIGHTS["nvfp4"]["dequant"](
-                W[None], Ws[None], (W_g if W_g is not None else torch.ones(1, device=W.device))
-            )[0].to(torch.bfloat16)
-            _pw = _nvfp4_gemm.pack(_w_bf16, device=x.device)
-            attn_arms["nvfp4_gemm"] = lambda: _nvfp4_gemm.gemm(_pw, x)
+        banks = _weight_banks(weights)
+        inputs = [x] + [x.clone() for _ in banks[1:]]
+        bank_arms = [_attn_arms(cfg, hidden, bank) for bank, hidden in zip(banks, inputs)]
         anchor_res, anchor_out = None, None
-        for name, run in attn_arms.items():
-            res, out = bench_modes(run, name)
+        for name in bank_arms[0]:
+            runs = [arms[name] for arms in bank_arms]
+            res, out = bench_modes(runs, name)
             parity = None
             if anchor_res is None:
                 anchor_res, anchor_out = res, out
@@ -1581,11 +1663,12 @@ def bench_attn_row(row, pname, cfg, rows_out):
                 print(f"      {name:14s} parity-vs-finegrained-kernels {parity:.1e}"
                       f"  finegrained-kernels-speedup {sp}", flush=True)
             rows_out.append((row, pname, regime, name, res, parity))
+        del runs, bank_arms, banks, inputs
     print()
 
 
 device_name = "MOCK (random values)" if MOCK else ACCELERATOR.get_device_name(0)
-print(f"device: {device_name}  torch {torch.__version__}"
+print(f"device: {device_name}  torch {torch.__version__}  cache={CACHE_POLICY}"
       f"{'  [SMOKE]' if SMOKE else ''}")
 print("finegrained-kernels = local build; baselines: finegrained-fp8 (upstream), DeepGEMM, "
       "vLLM fused MoE, FlashInfer's TRT-LLM routed MoE, transformers grouped_mm/batched_mm, "
@@ -1601,7 +1684,8 @@ def wanted(*names):
 # owning one device via CUDA_VISIBLE_DEVICES). The coordinator spawns GPUS workers, each
 # writes a shard CSV, then the coordinator merges + plots. A single GPU (GPUS=1) runs inline. ──
 _CSV = os.path.join(_HERE, "bench_moe.csv")
-_CSV_HEADER = "category,problem,regime,impl,mode,latency_us,parity_vs_finegrained_kernels\n"
+_CSV_HEADER = ("category,problem,regime,impl,mode,latency_us,parity_vs_finegrained_kernels,"
+               "cache_policy\n")
 
 
 def _write_rows_csv(path, rows_out):
@@ -1612,7 +1696,7 @@ def _write_rows_csv(path, rows_out):
                 v = res.get(mode)
                 f.write(f'"{rr}","{p}",{reg},{i},{mode},'
                         f'{"" if v is None else f"{v:.2f}"},'
-                        f'{"" if par is None else par}\n')
+                        f'{"" if par is None else par},{CACHE_POLICY}\n')
 
 
 def _load_rows_csv(path):
@@ -1638,6 +1722,9 @@ def _load_rows_csv(path):
         allowed["linear quantized", pn] = _allowed(c) | {"torch_mm", "nvfp4_gemm"}
     acc = {}  # (cat, problem, regime, impl) -> (res dict, parity)
     for r in csv.DictReader(open(path)):
+        if r.get("cache_policy") != CACHE_POLICY:
+            raise ValueError(f"{path}: missing/mismatched cache policy; rerun the benchmark "
+                             "instead of mixing old warm-graph results")
         if r["impl"] not in allowed.get((r["category"], r["problem"]), {"finegrained-kernels"}):
             continue
         key = (r["category"], r["problem"], r["regime"], r["impl"])
@@ -1936,9 +2023,10 @@ for ri, row in enumerate(present_rows):
             handles.append(mpatches.Patch(facecolor="none", edgecolor="black",
                                           hatch="..", label="eager (no cudagraph)"))
         ax.legend(handles=handles, loc="upper left", fontsize=8)
+cache_note = "cold weights (>2xL2)" if DEVICE == "cuda" else "backend cache defaults"
 fig.suptitle(f"MoE bench — finegrained-kernels vs finegrained-fp8 + references  "
              f"({device_name}, real model shapes; decode=cudagraph+compile, "
-             f"prefill=eager)", y=0.9995)
+             f"prefill=eager; {cache_note})", y=0.9995)
 fig.tight_layout(rect=(0, 0, 1, 0.99))
 out_png = os.path.join(_HERE, f"bench_moe{suffix}.png")
 fig.savefig(out_png, dpi=120)
