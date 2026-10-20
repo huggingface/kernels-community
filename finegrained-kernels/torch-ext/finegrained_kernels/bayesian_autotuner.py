@@ -59,6 +59,27 @@ logger = logging.getLogger(__name__)
 # Include the tuner implementation alongside Triton's kernel-source hash.
 _TUNER_SOURCE_HASH = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
+# Search phases ``FINEGRAINED_AUTOTUNE_CONFIG`` may override for every tuned kernel.
+_SEARCH_OVERRIDES = {"runoff": bool, "basin_probes": bool, "max_refine_iters": int}
+
+
+def _search_overrides() -> dict:
+    """Search-phase overrides from ``FINEGRAINED_AUTOTUNE_CONFIG``: inline JSON or a path to a
+    JSON file, e.g. ``{"runoff": false, "basin_probes": false, "max_refine_iters": 0}``. Tuner
+    kwargs are fixed where each kernel is decorated, so this is the one runtime control, meant
+    for fast correctness runs and search studies."""
+    value = os.environ.get("FINEGRAINED_AUTOTUNE_CONFIG")
+    if not value:
+        return {}
+    overrides = json.loads(value if value.lstrip().startswith("{") else Path(value).read_text())
+    unknown = set(overrides) - set(_SEARCH_OVERRIDES)
+    if unknown:
+        raise ValueError(
+            f"FINEGRAINED_AUTOTUNE_CONFIG has unknown keys {sorted(unknown)}; "
+            f"expected a subset of {sorted(_SEARCH_OVERRIDES)}"
+        )
+    return {k: _SEARCH_OVERRIDES[k](v) for k, v in overrides.items()}
+
 
 # Env-gated host-execution counter (FINEGRAINED_AUTOTUNE_CALLCOUNT=<path>): every
 # BayesianAutotuner.run() call increments its kernel's tally, dumped to <path> at exit.
@@ -117,9 +138,10 @@ class BayesianAutotuner(Autotuner):
         self.n_startup_trials = n_startup_trials
         # top fraction of measured configs the TPE treats as "good"
         self.gamma = gamma
-        self.runoff = os.environ.get("FINEGRAINED_AUTOTUNE_RUNOFF", str(int(runoff))) == "1"
-        self.basin_probes = os.environ.get("FINEGRAINED_AUTOTUNE_BASIN_PROBES", str(int(basin_probes))) == "1"
-        self.max_refine_iters = int(os.environ.get("FINEGRAINED_AUTOTUNE_MAX_REFINE_ITERS", str(max_refine_iters)))
+        overrides = _search_overrides()
+        self.runoff = overrides.get("runoff", runoff)
+        self.basin_probes = overrides.get("basin_probes", basin_probes)
+        self.max_refine_iters = overrides.get("max_refine_iters", max_refine_iters)
         # Branch axes (by kwarg name) that relocate the TILE optimum — the caller's
         # declaration, since it is configuration knowledge (the tuner never hardcodes
         # axis names). Each distinct value combination of these axes gets one guaranteed
@@ -700,7 +722,10 @@ class BayesianAutotuner(Autotuner):
         coarse_axes = [k for k in self.path_anchor_axes if k in basin_axes]
         for basin, idxs in groups.items():
             # Choose the middle of every ordinal axis together. Lexicographic sorting
-            # ignores M and can put the "median" at extreme K/warps/stages.
+            # ignores M and can put the "median" at extreme K/warps/stages. Each axis is
+            # scored by its value's rank normalized to [0, 1], so axes with many values
+            # do not outweigh axes with few; the anchor is the config closest to 0.5 on
+            # all of them (smallest squared distance), i.e. the basin's interior.
             values = [configs[i].all_kwargs() for i in idxs]
             axes = {
                 k: sorted({v[k] for v in values})
@@ -723,10 +748,13 @@ class BayesianAutotuner(Autotuner):
                 coarse_seen.add(coarse)
                 # The existing wide-tile anchor protects coupled output-tile ridges,
                 # with interior contraction/warps/stages rather than their largest corner.
-                wide = min(idxs, key=lambda i: (
-                    -configs[i].kwargs.get("BLOCK_SIZE_M", 1)
-                    * configs[i].kwargs.get("BLOCK_SIZE_N", 1), distance(i),
-                ))
+
+                def wide_order(i):
+                    # largest output tile first; interior on the other axes breaks ties
+                    kwargs = configs[i].kwargs
+                    return -kwargs.get("BLOCK_SIZE_M", 1) * kwargs.get("BLOCK_SIZE_N", 1), distance(i)
+
+                wide = min(idxs, key=wide_order)
                 if wide != anchors[-1]:
                     anchors.append(wide)
         return anchors
@@ -937,11 +965,9 @@ def bayesian_autotune(
     n_startup_trials:         random seed configs before the TPE model kicks in
     gamma:                    top fraction of measured configs treated as "good"
     runoff:                   remeasure the top candidates before choosing the winner
-                              (env override FINEGRAINED_AUTOTUNE_RUNOFF, 0 or 1)
     basin_probes:             measure categorical basin anchors before the TPE
-                              (env override FINEGRAINED_AUTOTUNE_BASIN_PROBES, 0 or 1)
-    max_refine_iters:         coordinate-descent iterations after the TPE (0 disables; env
-                              override FINEGRAINED_AUTOTUNE_MAX_REFINE_ITERS)
+    max_refine_iters:         coordinate-descent iterations after the TPE (0 disables)
+                              (all three overridable at runtime through FINEGRAINED_AUTOTUNE_CONFIG)
     path_anchor_axes:         branch axes (kwarg names) whose values relocate the tile
                               optimum — one guaranteed max-tile anchor per value combo
                               (see _basin_anchor_indices); the kernel declares them, the
