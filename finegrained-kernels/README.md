@@ -186,6 +186,14 @@ decode once with `decompress_nvfp4_csf_scales`.
 Every kernel is tuned by a Tree-structured Parzen Estimator (TPE, the Bayesian search Optuna
 uses) autotuner with per-shape disk caching, config pruners
 that fence compiler bugs and can't-win regions per (arch, format), and failed-compile memoization.
+Forward GEMMs tune with CUDA graph replay over identical weight banks whose active
+weight values exceed twice L2. Routed kernels count only selected expert planes. Weight
+strides and host TMA bindings are preserved; activations, scales and outputs stay shared.
+Banks are reused across candidates and released after the search. Unsupported layouts,
+excessive bank counts or insufficient memory use cold event timing, with cache clearing
+outside the measured interval. Kernels without a declared weight input also use cold events.
+Explicit benchmark callbacks, legacy timing options and user hooks retain their existing behavior.
+
 `FINEGRAINED_AUTOTUNE_CONFIG` overrides the tuner for every kernel, read when the kernels are
 imported. For correctness runs, `FINEGRAINED_AUTOTUNE_CONFIG=fast` measures one configuration per
 shape (retrying failed candidates) and skips the search phases. For finer control it takes inline
@@ -199,6 +207,8 @@ Unknown modes or keys raise. Keys are the tuner's options:
 - `basin_probes`: measure one anchor per categorical basin before the TPE (default `true`).
 - `max_refine_iters`: coordinate-refinement iterations (default `5`; `0` disables it).
 - `log_path`: append every measured config's timing as JSONL.
+- `rotate_weights`: rotate identical weight banks so tuning sees cold weights (default `true`);
+  `false` times warm graph replay instead. The two keep separate on-disk tuning results.
 - Debugging: `key_log_path` (tune-cache key decisions), `call_count_path` (per-kernel host launch
   counts, written at exit), `tracebacks` (full failure tracebacks), `lock_timeout` (seconds to wait
   for another rank's tune, default `1800`).
