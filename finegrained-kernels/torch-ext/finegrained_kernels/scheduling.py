@@ -193,16 +193,17 @@ def _launch_expert_start(expert_ids: torch.Tensor, num_experts: int) -> tuple[to
     """The count + exclusive-offset launches: ``(expert_start, counters)``, the latter the scatter's
     per-expert cursors."""
     device = expert_ids.device
+    num_routed_tokens = expert_ids.numel()  # S = num_tokens * num_top_k
     expert_freq = torch.zeros(num_experts, dtype=torch.int32, device=device)
     expert_start = torch.empty(num_experts + 1, dtype=torch.int32, device=device)
     counters = torch.empty(num_experts + 1, dtype=torch.int32, device=device)
     with device_context(device):
         compile_time_only_triton_wrap(_count_kernel)[
-            (triton.cdiv(expert_ids.numel(), _ROUTING_BLOCK_SIZE),)
+            (triton.cdiv(num_routed_tokens, _ROUTING_BLOCK_SIZE),)
         ](
             expert_ids,
             expert_freq,
-            expert_ids.numel(),
+            num_routed_tokens,
             NUM_EXPERTS=num_experts,
             BLOCK_SIZE=_ROUTING_BLOCK_SIZE,
         )
