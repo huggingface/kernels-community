@@ -54,7 +54,7 @@ Every (row, problem, regime, impl) cell runs in THREE modes:
 
 Regimes: decode T=1 and prefill T=8192 (routed through top_k experts; attn row: M=T).
 
---smoke: fast everything-compiles pass — 3-trial tunes (via FINEGRAINED_AUTOTUNE_TRIALS, set
+--smoke: fast everything-compiles pass — 3-trial tunes (``n_trials`` in FINEGRAINED_AUTOTUNE_CONFIG, set
 before the package import) and a 256-token prefill.
 
 Baselines ("all kinds"): finegrained-fp8 (upstream), DeepGEMM (fp8/fp4/bf16), transformers
@@ -74,6 +74,7 @@ Run: python bench/bench_moe.py                         (all rows, single GPU)
 """
 
 import csv
+import json
 import os
 import random
 import subprocess
@@ -117,8 +118,13 @@ REPLOT = ARGS.replot
 # BENCH_SHARD="g/n" marks a worker subprocess spawned by the --gpus coordinator (owns tasks where
 # i % n == g); it is the one switch that stays in the environment because the coordinator sets it.
 _SHARD = os.environ.get("BENCH_SHARD")
-if SMOKE:
-    os.environ.setdefault("FINEGRAINED_AUTOTUNE_TRIALS", "3")
+if SMOKE:  # merged into any FINEGRAINED_AUTOTUNE_CONFIG already set (inline JSON or a file)
+    _autotune_config = os.environ.get("FINEGRAINED_AUTOTUNE_CONFIG", "")
+    _autotune_config = json.loads(
+        _autotune_config if _autotune_config.lstrip().startswith("{") else open(_autotune_config).read()
+    ) if _autotune_config else {}
+    _autotune_config.setdefault("n_trials", 3)
+    os.environ["FINEGRAINED_AUTOTUNE_CONFIG"] = json.dumps(_autotune_config)
 
 import torch  # noqa: E402
 from triton.testing import do_bench, do_bench_cudagraph  # noqa: E402

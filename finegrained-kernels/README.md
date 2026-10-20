@@ -157,13 +157,17 @@ the offline activation quants the ops use internally, exposed for pre-quantized 
 Every kernel is tuned by a Tree-structured Parzen Estimator (TPE, the Bayesian search Optuna
 uses) autotuner with per-shape disk caching, config pruners
 that fence compiler bugs and can't-win regions per (arch, format), and failed-compile memoization.
-`FINEGRAINED_AUTOTUNE_TRIALS` overrides the trial budget. `FINEGRAINED_KERNELS_AUTOTUNE_CONFIG` takes
-inline JSON or a path to a JSON file overriding the search phases: `runoff` (winner remeasurement,
-default `true`), `basin_probes` (default `true`) and `max_refine_iters` (coordinate refinement,
-default `5`; `0` disables it). For correctness tests, set the trial budget to `1` and
-`FINEGRAINED_KERNELS_AUTOTUNE_CONFIG='{"runoff": false, "basin_probes": false, "max_refine_iters": 0}'`:
-only one successful configuration is measured, retrying failed candidates. `FINEGRAINED_AUTOTUNE_LOG=<path>`
-appends per-config timings as JSONL to `<path>`.
+`FINEGRAINED_AUTOTUNE_CONFIG` (inline JSON or a path to a JSON file, read when the kernels are
+imported) overrides the tuner for every kernel. Its keys are the tuner's own options:
+`n_trials` (trial budget), `max_failures` (failed compiles/runs before a tune aborts, default
+`n_trials`), `runoff` (winner remeasurement, default `true`), `basin_probes` (default `true`),
+`max_refine_iters` (coordinate refinement, default `5`; `0` disables it) and `log_path` (appends
+per-config timings as JSONL). For debugging: `key_log_path` (tune-cache key decisions),
+`call_count_path` (per-kernel host launch counts, written at exit), `tracebacks` (full failure
+tracebacks) and `lock_timeout` (seconds to wait for another rank's tune, default 1800). Unknown
+keys raise. For correctness tests,
+`FINEGRAINED_AUTOTUNE_CONFIG='{"n_trials": 1, "runoff": false, "basin_probes": false, "max_refine_iters": 0}'`
+measures one successful configuration, retrying failed candidates.
 
 ## Tests
 

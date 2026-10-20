@@ -306,7 +306,7 @@ def test_compile_failures_are_memoized_across_keys(caplog):
     -stage errors are excluded by design (a sticky-context cascade must never fence
     healthy configs).
 
-    The suite pins ``FINEGRAINED_AUTOTUNE_MAX_FAILURES=0`` so a config the tuner cannot compile
+    The suite pins ``max_failures: 0`` in FINEGRAINED_AUTOTUNE_CONFIG so a config the tuner cannot compile
     fails loudly instead of being forgiven (conftest). This test IS that machinery and compiles
     a deliberately doomed config, so it passes `max_failures` for its own tune — otherwise the
     first reject aborts before there is anything to memoize."""

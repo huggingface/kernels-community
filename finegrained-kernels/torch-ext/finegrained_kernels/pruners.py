@@ -253,7 +253,7 @@ def gated_pointer_weight_warp_spec_pruner():
     sub-128 M tile — plain pointer/pointer at BM=128 and w4/w8 compiles and is often the winner.
 
     Region measured by tuning the GPT-OSS W4A16 problem (N=K=2880) with a fresh Triton cache and
-    ``FINEGRAINED_AUTOTUNE_LOG``: of 129 WS configs, the 12 that failed are exactly the ones this
+    an autotune ``log_path``: of 129 WS configs, the 12 that failed are exactly the ones this
     predicate names, and it drops none of the 117 that compiled. Every failure sat in the GATE
     shape — the ungated shape's 63 WS configs all compiled. Unfenced these are wasted compiles per
     new shape (the tuner memoizes them only after paying once). The ``BM < 128`` clause rests on a

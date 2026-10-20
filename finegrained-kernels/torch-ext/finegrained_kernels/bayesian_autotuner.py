@@ -59,39 +59,44 @@ logger = logging.getLogger(__name__)
 # Include the tuner implementation alongside Triton's kernel-source hash.
 _TUNER_SOURCE_HASH = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
-# Search phases ``FINEGRAINED_KERNELS_AUTOTUNE_CONFIG`` may override for every tuned kernel.
-_SEARCH_OVERRIDES = {"runoff": bool, "basin_probes": bool, "max_refine_iters": int}
+# What ``FINEGRAINED_AUTOTUNE_CONFIG`` may override for every tuned kernel: tuner kwargs by name,
+# plus the debugging outputs (``key_log_path``, ``call_count_path``, ``tracebacks``).
+_TUNER_OVERRIDES = {
+    "n_trials": int, "max_failures": int, "runoff": bool, "basin_probes": bool,
+    "max_refine_iters": int, "log_path": str,
+    "key_log_path": str, "call_count_path": str, "tracebacks": bool, "lock_timeout": float,
+}
 
 
-def _search_overrides() -> dict:
-    """Search-phase overrides from ``FINEGRAINED_KERNELS_AUTOTUNE_CONFIG``: inline JSON or a path to a
-    JSON file, e.g. ``{"runoff": false, "basin_probes": false, "max_refine_iters": 0}``. Tuner
+def _tuner_overrides() -> dict:
+    """Tuner overrides from ``FINEGRAINED_AUTOTUNE_CONFIG``: inline JSON or a path to a JSON file,
+    e.g. ``{"n_trials": 1, "runoff": false, "basin_probes": false, "max_refine_iters": 0}``. Tuner
     kwargs are fixed where each kernel is decorated, so this is the one runtime control, meant
-    for fast correctness runs and search studies."""
-    value = os.environ.get("FINEGRAINED_KERNELS_AUTOTUNE_CONFIG")
+    for fast correctness runs, search studies and debugging."""
+    value = os.environ.get("FINEGRAINED_AUTOTUNE_CONFIG")
     if not value:
         return {}
     overrides = json.loads(value if value.lstrip().startswith("{") else Path(value).read_text())
-    unknown = set(overrides) - set(_SEARCH_OVERRIDES)
+    unknown = set(overrides) - set(_TUNER_OVERRIDES)
     if unknown:
         raise ValueError(
-            f"FINEGRAINED_KERNELS_AUTOTUNE_CONFIG has unknown keys {sorted(unknown)}; "
-            f"expected a subset of {sorted(_SEARCH_OVERRIDES)}"
+            f"FINEGRAINED_AUTOTUNE_CONFIG has unknown keys {sorted(unknown)}; "
+            f"expected a subset of {sorted(_TUNER_OVERRIDES)}"
         )
-    return {k: _SEARCH_OVERRIDES[k](v) for k, v in overrides.items()}
+    return {k: _TUNER_OVERRIDES[k](v) for k, v in overrides.items()}
 
 
-# Env-gated host-execution counter (FINEGRAINED_AUTOTUNE_CALLCOUNT=<path>): every
-# BayesianAutotuner.run() call increments its kernel's tally, dumped to <path> at exit.
+# Host-execution counter (``call_count_path`` in FINEGRAINED_AUTOTUNE_CONFIG): every
+# BayesianAutotuner.run() call increments its kernel's tally, dumped to that path at exit.
 # Discriminates cudagraph REPLAY (host code runs only at capture) from per-token
 # re-execution — the decode-gap forensics tool.
 _CALL_COUNTS = None
-if os.environ.get("FINEGRAINED_AUTOTUNE_CALLCOUNT"):
+if _tuner_overrides().get("call_count_path"):
     import atexit
 
     _CALL_COUNTS = {}
 
-    def _dump_call_counts(path=os.environ["FINEGRAINED_AUTOTUNE_CALLCOUNT"]):
+    def _dump_call_counts(path=_tuner_overrides()["call_count_path"]):
         with open(path, "w") as f:
             json.dump(_CALL_COUNTS, f, indent=1, sort_keys=True)
 
@@ -121,24 +126,22 @@ class BayesianAutotuner(Autotuner):
     ):
         super().__init__(*args, **kwargs)
         self.fn_name = getattr(self.fn, "__name__", str(self.fn))
-        # Bayesian trial budget — the per-decorator default, overridable via the
-        # FINEGRAINED_AUTOTUNE_TRIALS env var (quick sweeps / exhaustive runs without touching
-        # the decorators; set it >= grid size to fall back to stock exhaustive bench-all).
-        self.n_trials = int(os.environ.get("FINEGRAINED_AUTOTUNE_TRIALS") or n_trials)
+        overrides = _tuner_overrides()
+        # Bayesian trial budget — the per-decorator default, overridable via ``n_trials`` in
+        # FINEGRAINED_AUTOTUNE_CONFIG (quick sweeps / exhaustive runs without touching the
+        # decorators; set it >= grid size to fall back to stock exhaustive bench-all).
+        self.n_trials = overrides.get("n_trials", n_trials)
         # A tune aborts once this many configs have failed to compile/run without the measured
         # budget being met. Defaults to n_trials: a grid that cannot land its measurements without
         # that many rejects has a pruner gap, and the fix is to fence the dead region rather than
         # to tolerate the compiles. Its own axis so a kernel can raise it deliberately.
-        # an explicit argument wins over the env override, which wins over the default; `or`
-        # would drop a deliberate `max_failures=0`, the strictest setting there is
+        # an explicit argument wins over the config override, which wins over the default
         if max_failures is None:
-            env_max_failures = os.environ.get("FINEGRAINED_AUTOTUNE_MAX_FAILURES")
-            max_failures = env_max_failures if env_max_failures is not None else self.n_trials
+            max_failures = overrides.get("max_failures", self.n_trials)
         self.max_failures = int(max_failures)
         self.n_startup_trials = n_startup_trials
         # top fraction of measured configs the TPE treats as "good"
         self.gamma = gamma
-        overrides = _search_overrides()
         self.runoff = overrides.get("runoff", runoff)
         self.basin_probes = overrides.get("basin_probes", basin_probes)
         self.max_refine_iters = overrides.get("max_refine_iters", max_refine_iters)
@@ -159,9 +162,11 @@ class BayesianAutotuner(Autotuner):
         # validates — this veto closes the NaN half of the "wrong-answer configs win
         # tunes" class at negligible cost (one isfinite pass per benched config).
         self.finite_check_args = tuple(finite_check_args)
-        # JSONL log of every benched (key, config, ms) — set here or via the
-        # FINEGRAINED_AUTOTUNE_LOG env var. Analyse offline to prune bad configs.
-        self.log_path = log_path or os.environ.get("FINEGRAINED_AUTOTUNE_LOG")
+        # JSONL log of every benched (key, config, ms) — set here or via ``log_path`` in
+        # FINEGRAINED_AUTOTUNE_CONFIG. Analyse offline to prune bad configs.
+        self.log_path = log_path or overrides.get("log_path")
+        self.key_log_path = overrides.get("key_log_path")
+        self.tracebacks = overrides.get("tracebacks", False)
         # steady-state launch support: key extraction without dict builds (eager decode
         # is host-bound; the cache-hit path of run() is on the per-token critical path)
         self._arg_position = {name: i for i, name in enumerate(self.arg_names)}
@@ -231,7 +236,7 @@ class BayesianAutotuner(Autotuner):
             if root is not e:
                 msg += f" || root: {type(root).__name__}: {str(root)[-300:]}"
             err = f"{type(e).__name__}: {msg}"
-            if os.environ.get("FINEGRAINED_AUTOTUNE_TRACEBACKS"):
+            if self.tracebacks:
                 logger.warning(
                     "[autotune] %s failed on %s:\n%s",
                     self.fn_name,
@@ -806,7 +811,7 @@ class BayesianAutotuner(Autotuner):
             str(sorted(env_vars.items())),
             # Key NAMES and the search budget are determinants too: tuning_key holds
             # values only (renaming a key or swapping two same-typed keys would collide),
-            # and FINEGRAINED_AUTOTUNE_TRIALS is not in Triton's invalidating-env list —
+            # and the n_trials override is not in Triton's invalidating-env list —
             # without n_trials a 3-trial exploratory winner gets replayed at 100 trials.
             str(self.keys),
             f"n_trials={self.n_trials},n_startup_trials={self.n_startup_trials},gamma={self.gamma},"
@@ -817,7 +822,7 @@ class BayesianAutotuner(Autotuner):
         cache_key = hashlib.sha256("-".join(cache_key).encode("utf-8")).hexdigest()
         cache = get_cache_manager(cache_key)
         file_name = f"{fn.__name__[:150]}.bayes_autotune.json"
-        keylog = os.environ.get("FINEGRAINED_AUTOTUNE_KEYLOG")
+        keylog = self.key_log_path
         if keylog:
             with open(keylog, "a") as f:
                 f.write(json.dumps({
@@ -895,7 +900,7 @@ def _tuning_lock(cache, file_name: str):
     Held while a key is tuned and its crown published, so concurrent TP/EP ranks converge on the
     same config instead of each crowning its own (see ``check_disk_cache``). Advisory ``flock`` on
     a sidecar file next to the crown; entirely best-effort — no cache dir, no ``fcntl``, or a lock
-    that cannot be taken within ``FINEGRAINED_TUNE_LOCK_TIMEOUT`` (default 30 min, since the holder
+    that cannot be taken within ``lock_timeout`` seconds (FINEGRAINED_AUTOTUNE_CONFIG; default 30 min, since the holder
     is doing a real tune) all fall through to tuning locally. Losing the lock costs redundant work,
     never correctness."""
     lock_file = None
@@ -905,9 +910,7 @@ def _tuning_lock(cache, file_name: str):
         cache_dir = getattr(cache, "cache_dir", None)
         if cache_dir:
             os.makedirs(cache_dir, exist_ok=True)
-            deadline = time.time() + float(
-                os.environ.get("FINEGRAINED_TUNE_LOCK_TIMEOUT") or 1800
-            )
+            deadline = time.time() + _tuner_overrides().get("lock_timeout", 1800.0)
             lock_file = open(os.path.join(cache_dir, f"{file_name}.lock"), "w")
             while True:
                 try:
@@ -967,7 +970,7 @@ def bayesian_autotune(
     runoff:                   remeasure the top candidates before choosing the winner
     basin_probes:             measure categorical basin anchors before the TPE
     max_refine_iters:         coordinate-descent iterations after the TPE (0 disables)
-                              (all three overridable at runtime through FINEGRAINED_KERNELS_AUTOTUNE_CONFIG)
+                              (all three overridable at runtime through FINEGRAINED_AUTOTUNE_CONFIG)
     path_anchor_axes:         branch axes (kwarg names) whose values relocate the tile
                               optimum — one guaranteed max-tile anchor per value combo
                               (see _basin_anchor_indices); the kernel declares them, the
@@ -975,11 +978,11 @@ def bayesian_autotune(
     coupled_axes:             groups of config fields treated as joint choices by TPE and
                               refinement, including Config fields such as num_stages
     max_failures:             abort the tune once this many configs fail to compile/run before
-                              the measured budget is met (default n_trials; env override
-                              FINEGRAINED_AUTOTUNE_MAX_FAILURES). Without it a broadly broken
+                              the measured budget is met (default n_trials; runtime override
+                              ``max_failures`` in FINEGRAINED_AUTOTUNE_CONFIG). Without it a broadly broken
                               grid spins: failures don't consume the trial budget, so the search
                               keeps picking and each pick costs an O(configs) rescan.
-    log_path:                 JSONL of benched configs (or FINEGRAINED_AUTOTUNE_LOG)
+    log_path:                 JSONL of benched configs (or ``log_path`` in FINEGRAINED_AUTOTUNE_CONFIG)
     cache_results:            persist the tuned best config to disk (on by default) so later
                               runs skip the search+compile — see BayesianAutotuner.check_disk_cache"""
 
