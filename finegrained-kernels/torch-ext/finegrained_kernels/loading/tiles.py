@@ -362,13 +362,13 @@ def _weight_scale_mx(
 def _weight_scale_block_dynamic(
     bs_ptrs, up_s_ptr, bs_mask, k, stride_bs_k,
     GROUPED: tl.constexpr, GATE: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
-    INTERLEAVED_GATE_UP: tl.constexpr = False,
+    GATE_UP_SCALES: tl.constexpr = False,
 ):
     """block_dynamic per-K-block weight scale. Grouped reads it at ``bs_ptrs + k*stride`` (an
     interleaved gate|up tile folds gate on the even columns, up on the odd via ``up_s_ptr``);
     batched reads the pre-offset maskless pointer; 2D reads the bounds-masked advanced pointer."""
     if GROUPED:
-        if GATE or INTERLEAVED_GATE_UP:  # gate scale on even columns, up on odd
+        if GATE_UP_SCALES:  # gate scale on even columns, up on odd
             b_s = tl.where(
                 tl.arange(0, (2 if GATE else 1) * BLOCK_SIZE_N) % 2 == 0,
                 tl.load(bs_ptrs + k * stride_bs_k),
@@ -393,13 +393,13 @@ def _weight_scale_block_dynamic(
 def _weight_scale_static(
     bs_ptrs, up_s_ptr, bs_mask, k, stride_bs_k,
     GROUPED: tl.constexpr, GATE: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
-    INTERLEAVED_GATE_UP: tl.constexpr = False,
+    GATE_UP_SCALES: tl.constexpr = False,
 ):
     """static weight scale — as block_dynamic, but the grouped non-GATE scale broadcasts to a per-N
     vector so ``accumulate("static")`` applies it in N (the static act scale is a scalar folded
     post-loop)."""
     if GROUPED:
-        if GATE or INTERLEAVED_GATE_UP:  # gate scale on even columns, up on odd
+        if GATE_UP_SCALES:  # gate scale on even columns, up on odd
             b_s = tl.where(
                 tl.arange(0, (2 if GATE else 1) * BLOCK_SIZE_N) % 2 == 0,
                 tl.load(bs_ptrs + k * stride_bs_k),
@@ -468,14 +468,14 @@ def load_weight_block_dynamic(
     b_ptrs, b_descriptor, bs_ptrs, bs_mask, up_s_ptr, row0, n_off, k_off, k, stride_bs_k,
     GATE: tl.constexpr, GROUPED: tl.constexpr, B_MEMORY_MODE: tl.constexpr, SWAP_AB: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, WEIGHT_VALUES_PER_BYTE: tl.constexpr = 1,
-    INTERLEAVED_GATE_UP: tl.constexpr = False,
+    GATE_UP_SCALES: tl.constexpr = False,
 ):
     """The block_dynamic weight path: value tile + per-K-block scale (gate|up interleaved: gate on the
     even columns, up on the odd via ``up_s_ptr``)."""
     KB: tl.constexpr = BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE
     w = _weight_value(b_ptrs, b_descriptor, row0, n_off, k_off, GATE, GROUPED, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, KB)
     w_s = _weight_scale_block_dynamic(
-        bs_ptrs, up_s_ptr, bs_mask, k, stride_bs_k, GROUPED, GATE, BLOCK_SIZE_N, INTERLEAVED_GATE_UP
+        bs_ptrs, up_s_ptr, bs_mask, k, stride_bs_k, GROUPED, GATE, BLOCK_SIZE_N, GATE_UP_SCALES
     )
     return w, w_s
 
@@ -485,14 +485,14 @@ def load_weight_static(
     b_ptrs, b_descriptor, bs_ptrs, bs_mask, up_s_ptr, row0, n_off, k_off, k, stride_bs_k,
     GATE: tl.constexpr, GROUPED: tl.constexpr, B_MEMORY_MODE: tl.constexpr, SWAP_AB: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, WEIGHT_VALUES_PER_BYTE: tl.constexpr = 1,
-    INTERLEAVED_GATE_UP: tl.constexpr = False,
+    GATE_UP_SCALES: tl.constexpr = False,
 ):
     """The static weight path: value tile + per-K-block scale broadcast to a per-N vector (the static
     act scale is a scalar folded post-loop)."""
     KB: tl.constexpr = BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE
     w = _weight_value(b_ptrs, b_descriptor, row0, n_off, k_off, GATE, GROUPED, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, KB)
     w_s = _weight_scale_static(
-        bs_ptrs, up_s_ptr, bs_mask, k, stride_bs_k, GROUPED, GATE, BLOCK_SIZE_N, INTERLEAVED_GATE_UP
+        bs_ptrs, up_s_ptr, bs_mask, k, stride_bs_k, GROUPED, GATE, BLOCK_SIZE_N, GATE_UP_SCALES
     )
     return w, w_s
 
