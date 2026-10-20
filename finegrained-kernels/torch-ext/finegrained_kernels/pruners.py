@@ -15,7 +15,7 @@
 import torch
 import triton
 
-from .compat import FP8_DTYPE, get_active_device_type, is_sm10x, is_sm90, sm_count, sm_shared_memory_limit
+from .compat import FP8_DTYPE, get_active_device_type, is_sm10x, is_sm90, sm_count, sm_shared_memory_limit, triton_version
 from .mma import MMA_N_ATOM_WIDTH
 
 # ── config pruners ────────────────────────────────────────────────────────────
@@ -265,7 +265,7 @@ def warp_spec_compile_guard_pruner():
         if not c.kwargs.get("WARP_SPEC"):
             return True
         # The tile-loop WS candidates require Triton 3.8's partitioning passes.
-        if c.kwargs.get("PIPELINE", "k_loop") != "k_loop" and tuple(int(n) for n in triton.__version__.split(".")[:2]) < (3, 8):
+        if c.kwargs.get("PIPELINE", "k_loop") != "k_loop" and triton_version() < (3, 8):
             return False
         # WS needs num_warps a multiple of 4 (its async producer/consumer partitions) and enough M
         # work — the MMA's M operand, which SWAP_AB moves to BLOCK_SIZE_N (so BM=1 decode can still
@@ -826,7 +826,7 @@ _WEIGHT_ONLY_POINTER_TRAPS = {
 
 def _warp_spec_needs_descriptor_tile() -> bool:
     """Triton >= 3.8, where a TMA-descriptor operand narrows WS to one tile (see the pruner)."""
-    return tuple(int(n) for n in triton.__version__.split(".")[:2]) >= (3, 8)
+    return triton_version() >= (3, 8)
 
 
 def warp_spec_memory_mode_pruner(weight_only: bool = False, gather_only: bool = False):
@@ -996,8 +996,8 @@ def single_row_tile_pruner():
 
 
 def swap_decode_scope_pruner(max_m: int = 16):
-    """``early_config_prune`` scoping a 2D plain-dot kernel's ``SWAP_AB`` rows (BM=1: the weight's
-    output rows in the MMA M dim, the token padded to the N=16 atom) to decode M, where they run
+    """``early_config_prune`` scoping a 2D plain-dot kernel's ``SWAP_AB`` rows (the weight's output
+    rows in the MMA M dim, the token tile padded to the N=16 atom) to decode M, where they run
     one program row per token, and to a pointer-mode activation (an A-side descriptor under
     ``SWAP_AB`` traps on Triton 3.8, see ``mx_2d_swap_scope_pruner``). Unswapped rows pass."""
 

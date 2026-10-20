@@ -472,8 +472,9 @@ def get_accelerator_autotuning_configs(
     # The coupled decode (BLOCK_SIZE_M, SWAP_AB) pairs — the single source of the swap/BM
     # coupling. At M=1 the MMA 16-atom is filled either by replicating the token (non-swap
     # BM=16, ~40% over the degenerate BM=1 on plain tl.dot) or by putting the weight's
-    # Swapped decode token tiles default to BM=1 for padded-token helpers. Plain GEMMs
-    # can opt into larger token tiles or the measured computed-lhs prefill candidates.
+    # output rows in M (swap). Swapped token tiles default to BM=1 for the padded-token
+    # helpers; plain GEMMs can opt into larger token tiles (``swap_block_sizes_m``) or the
+    # measured computed-lhs prefill candidates (``swap_ab_prefill``).
     if swap_ab and tune_block_m:
         # Keep the normal BM sweep and append the requested swapped token tiles.
         blocks = [{**b, "SWAP_AB": False} for b in blocks] + [
@@ -505,6 +506,9 @@ def get_accelerator_autotuning_configs(
         for s in num_stages
     ]
     if swap_ab_prefill:
+        # the prefill grid is all no-swap plus the appended computed-lhs rows; swapped decode rows
+        # would be reset below, so the two grids are exclusive
+        assert not swap_ab, "swap_ab_prefill and swap_ab build different swap grids; pass one"
         for config in configs:
             config.kwargs["SWAP_AB"] = False
         if is_sm10x():
@@ -599,6 +603,13 @@ def narrow_dot_autotuning_configs(
         for s in (2, 3, 4, 5, 6)
     ]
 
+
+
+@functools.cache
+def triton_version() -> tuple[int, int]:
+    """The installed Triton's ``(major, minor)``, for the pruners whose compiler-bug fences moved
+    between releases."""
+    return tuple(int(n) for n in triton.__version__.split(".")[:2])
 
 
 @functools.cache

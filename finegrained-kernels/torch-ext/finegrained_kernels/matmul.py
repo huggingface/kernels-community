@@ -26,11 +26,11 @@ from .bayesian_autotuner import bayesian_autotune
 from .bench import weight_input
 from .compat import add_op_namespace_prefix, FP8_DTYPE, is_sm10x, launches_skipped, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, pdl_launch_kwargs, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, narrow_dot_autotuning_configs, narrow_scalar_autotuning_configs, split_k_autotuning_configs, persistent_program_count
 from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_tiled_descriptors, rebind_weight_only_descriptors, int_weight_only_pre_hook
-from .formats import FP8_WEIGHT_ONLY_DEQUANT_MIN_M, block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, normalize_global_scale, e2m1_as_uint8, is_mx, is_rowwise, mx_scale_family, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_2d_operands, weight_format, validate_int_operands, validate_svdquant_operands, INT_WEIGHT_DTYPES
+from .formats import FP8_WEIGHT_ONLY_DEQUANT_MIN_M, INT_WEIGHT_ONLY_DEQUANT_MIN_DIM, INT_WEIGHT_ONLY_DEQUANT_MIN_M, block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, normalize_global_scale, e2m1_as_uint8, is_mx, is_rowwise, mx_scale_family, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_2d_operands, weight_format, validate_int_operands, validate_svdquant_operands, INT_WEIGHT_DTYPES
 from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, maybe_act_quant, mxfp8_act_quant, nvfp4_act_quant, quantize_rows_static, tensor_wide_act_operands, prepare_fp8_mx_inputs, dequantize_int_weight, permute_act_cols, svdquant_act_quant
 from .loading.scales import apply_row_scale, dequant_block_fp8_weight, mx_2d_scale_ptrs, weight_scale_rows
-from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, plain_dot, static_dot, int_weight_only_compute
+from .mma import SM10X, block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, plain_dot, static_dot, int_weight_only_compute
 from .loading.tiles import (
     advance_ptrs,
     load_act_block_dynamic,
@@ -1041,11 +1041,6 @@ def split_k_reduce(acc, Partials, TileCounters, tile, num_tiles, BM: tl.constexp
     return acc, last
 
 
-_SM10X = tl.constexpr(is_sm10x())
-
-# split-K over the decode band (M <= 16): a decode tile walks its whole K serially, latency-bound per step
-
-
 @bayesian_autotune(
     # the MX weight-only kernel's tuning space minus dot_scaled (the scaled MMA takes float formats only): tile + WS +
     # host-TMA memory modes on both operands, scales affine; plus the decode-sized scalar reduce's narrow tiles
@@ -1074,7 +1069,7 @@ _SM10X = tl.constexpr(is_sm10x())
         "early_config_prune": compose_pruners(
             block_within_dim_pruner("K"),
             int_scale_group_tile_pruner(),
-            # the CUDA-core reduce (int_words_dot_bf16) beats the BM=16 mma.sync tile up to M=4 (INT4, B200, 4096x4096:
+            # the CUDA-core reduce (int_words_dot) beats the BM=16 mma.sync tile up to M=4 (INT4, B200, 4096x4096:
             # M=2 7.7 vs 11.2us, M=4 9.9 vs 11.2us)
             scalar_max_m_pruner("M", max_m=4),
             scalar_block_m_pruner("M"),
@@ -1181,7 +1176,7 @@ def int_weight_only_matmul_2d_kernel(
         BYTE_ZERO: tl.constexpr = False
     else:
         BYTE_ZERO: tl.constexpr = Bz.dtype.element_ty == tl.uint8 or Bz.dtype.element_ty == tl.int8
-    WHOLE_WORD: tl.constexpr = _SM10X and SWAP_AB and INT_BITS == 4 and ROWS_MAJOR and BYTE_ZERO
+    WHOLE_WORD: tl.constexpr = SM10X and SWAP_AB and INT_BITS == 4 and ROWS_MAJOR and BYTE_ZERO
     # zero points run one K step ahead: their narrow per-row read is not one the pipeliner stages, so each step issues
     # the next step's and consumes the previous one's instead of stalling on its own
     k_last = k_first + k_per_split - 1
@@ -1712,7 +1707,8 @@ def w8a8_tensor_dynamic_fp8_matmul(
     ``[..., N]`` GLU intermediate. Returns a one-element list (mirrors the MX/grouped op).
     """
     validate_dense_2d_operands(A, B)
-    output_dtype = resolve_output_dtype(output_dtype, A, As)
+    # a calibrated scalar As on a raw A keeps A's dtype; only a pre-quantized FP8 A defaults to bf16
+    output_dtype = resolve_output_dtype(output_dtype, A, As if A.dtype == FP8_DTYPE else None)
 
     # cuBLAS per-tensor fast path, INSIDE the op for the same reasons as the MX one below:
     # every caller gets it, and a None falls through to the Triton launch unchanged.
@@ -2358,14 +2354,15 @@ def int_weight_only_matmul_2d(
     # Large prefill amortizes a per-call dequantization and reuses the unquantized Triton GEMM.
     # Smaller projections keep conversion inline to avoid the extra dispatch cost in eager mode.
     if (
-        a_scale is None and A.ndim == 2 and M >= 4096 and min(N, K) >= 2048
+        a_scale is None and A.ndim == 2 and M >= INT_WEIGHT_ONLY_DEQUANT_MIN_M
+        and min(N, K) >= INT_WEIGHT_ONLY_DEQUANT_MIN_DIM
         and not gate and bias is None and output_dtype in (None, A.dtype)
     ):
         return full_precision_matmul_2d(A, dequantize_int_weight(B, Bs, K, b_zero, dtype=A.dtype), output_dtype)
     C = A.new_empty(A.shape[:-1] + (gate_out_cols(N, gate, act_fn),), dtype=output_dtype)
     # placeholder boxes, rebound per tuned config by rebind_weight_only_descriptors
-    a_descriptor = TensorDescriptor.from_tensor(A.view(M, K), [1, 32])
-    b_descriptor = TensorDescriptor.from_tensor(B, [1, 32])
+    a_descriptor = maybe_descriptor(A.view(M, K), [1, 32])
+    b_descriptor = maybe_descriptor(B, [1, 32])
 
     def grid(META):
         return (triton.cdiv(M, META["BLOCK_SIZE_M"]), triton.cdiv(N, META["BLOCK_SIZE_N"]), META.get("SPLIT_K", 1))
@@ -2456,8 +2453,8 @@ def int_weight_only_matmul_2d(
 
 _SCALED_MM_MIN_M = int(os.environ.get("FINEGRAINED_SCALED_MM_MIN_M", "2"))
 # Row-wise FP8 keeps Triton decode; the public path wins through the measured M=8192.
-_SCALED_MM_ROWWISE_MIN_M = int(os.environ.get("FINEGRAINED_SCALED_MM_ROWWISE_MIN_M", "65"))
-_SCALED_MM_ROWWISE_MAX_M = int(os.environ.get("FINEGRAINED_SCALED_MM_ROWWISE_MAX_M", "8193"))
+_SCALED_MM_ROWWISE_MIN_M = 65
+_SCALED_MM_ROWWISE_MAX_M = 8193
 
 
 def _scaled_mm_2d(

@@ -952,8 +952,8 @@ def int_weight_only_matmul_batched_kernel(
 ):
     """Integer batched expert matmul: bf16/fp16 weight-only, calibrated INT4/FP8, or INT8 SmoothQuant.
     One routed row + one N-tile per
-    program (expert from ``ExpertIds``). ``SWAP_AB`` puts FP8 weights on the MMA lhs or selects the scalar
-    decode reduce. ``GATE`` fuses gate|up."""
+    program (expert from ``ExpertIds``). ``SWAP_AB`` puts the dequantized weight on the MMA lhs or selects
+    the scalar decode reduce. ``GATE`` fuses gate|up."""
     if PDL:
         gdc_wait()
     batch_id, pid_n, expert_id, A, B, C, Bs, in_row, out_row = expert_setup(

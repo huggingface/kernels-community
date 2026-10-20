@@ -1693,8 +1693,8 @@ def dequantize_int_weight(
     """An integer weight in the GEMMs' interleaved layout (``(..., N, K // VPW)`` uint32, ``interleave_int_words``)
     back to ``(..., N, K)`` the way the GEMMs dequantize it: ``(q - zero)`` in the scale dtype times the per-group
     scale, rounded once, then cast to ``dtype`` (``None``: the scale dtype). The width follows from ``K`` and the
-    word count; ``zeros`` ``None`` is the symmetric zero point ``2 ** (bits - 1)``. One fused launch; the integer
-    dgrad's operand."""
+    word count; ``zeros`` ``None`` is the symmetric zero point ``2 ** (bits - 1)``. One fused launch, used by the
+    large-prefill path that dequantizes once and runs the unquantized GEMM."""
     bits = int_weight_bits(K, words)
     k_words = words.shape[-1]
     group = K // scales.shape[-1]

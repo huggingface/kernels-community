@@ -54,8 +54,9 @@ __all__ = [
     "get_supported_norms",
     "rms_norm_rows",
     # load-time helpers: the swizzled scale layout the SM100 scaled-MMA reads, the row-wise
-    # quantizers a loader uses to quantize weights into the group formats, and the GPTQ / AWQ int4
-    # repacks into the int4 layout
+    # quantizers a loader uses to quantize weights into the group formats, and the integer helpers
+    # (GPTQ / AWQ / ModelOpt / GGML repacks into the kernels' word layout, act-order folding,
+    # dequantization)
     "swizzle_mx_scales",
     "unswizzle_mx_scales",
     "mxfp8_act_quant",

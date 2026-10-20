@@ -193,7 +193,7 @@ def mx_weight_only_scalar_swapped(
 # PTX inline asm (round_f32_to_bf16_f32, the packed zero-point subtract) on NVIDIA; elsewhere plain Triton
 _PTX = tl.constexpr(is_nvidia())
 # Keep architecture-specific integer fast paths on the measured sm_10x target.
-_SM10X = tl.constexpr(is_sm10x())
+SM10X = tl.constexpr(is_sm10x())
 
 
 @triton.jit
@@ -374,7 +374,7 @@ def int_dequant_tile(
         N: tl.constexpr = w.shape[0]
         BK: tl.constexpr = VPW * w.shape[1]
         NG: tl.constexpr = BK // SCALE_GROUP_K
-        if _SM10X and BITS == 8 and w_scale.dtype == tl.bfloat16:
+        if SM10X and BITS == 8 and w_scale.dtype == tl.bfloat16:
             q = int8_words_to_bf16(w, False).reshape(N, NG, SCALE_GROUP_K)
             center = 0 if w_zero is None else (w_zero.to(tl.bfloat16) - 128)[:, :, None]
             v = int_dequant(q, center, w_scale[:, :, None], OUT_DTYPE, divisor)
@@ -388,7 +388,7 @@ def int_dequant_tile(
         BK: tl.constexpr = VPW * w.shape[0]
         N: tl.constexpr = w.shape[1]
         NG: tl.constexpr = BK // SCALE_GROUP_K
-        if _SM10X and BITS == 8 and w_scale.dtype == tl.bfloat16:
+        if SM10X and BITS == 8 and w_scale.dtype == tl.bfloat16:
             q = int8_words_to_bf16(w, True).reshape(NG, SCALE_GROUP_K, N)
             center = 0 if w_zero is None else (tl.trans(w_zero).to(tl.bfloat16) - 128)[:, None, :]
             v = int_dequant(q, center, tl.trans(w_scale)[:, None, :], OUT_DTYPE, divisor)
@@ -534,7 +534,7 @@ def int8_words_dot(w, a):
     """Signed INT8 dot from offset-binary interleaved words, accumulating exactly in INT32."""
     BM: tl.constexpr = a.shape[0]
     KW: tl.constexpr = a.shape[1] // 4
-    if _SM10X:
+    if SM10X:
         # Weight bytes hold K offsets (0, 2, 1, 3); pack the activation bytes in the same order.
         even, odd = tl.split(a.to(tl.uint8, bitcast=True).to(tl.uint32).reshape(BM, KW, 2, 2))
         a0, a2 = tl.split(even)
@@ -572,7 +572,7 @@ def int_weight_only_scalar(
     KW: tl.constexpr = BLOCK_SIZE_K // VPW
     BM: tl.constexpr = a.shape[0]
     if (
-        _SM10X and (BITS == 2 or BITS == 4 or a.dtype == tl.float16) and (BM == 1 or BM == 2 or BM == 4)
+        SM10X and (BITS == 2 or BITS == 4 or a.dtype == tl.float16) and (BM == 1 or BM == 2 or BM == 4)
         and a.dtype == w_scale.dtype and (a.dtype == tl.bfloat16 or a.dtype == tl.float16)
     ):
         WPG: tl.constexpr = SCALE_GROUP_K // VPW  # words per scale group
@@ -632,7 +632,7 @@ def int_weight_only_compute(
         acc = int_weight_only_scalar(acc, a, w, w_scale, w_zero, N_WIDTH, BLOCK_SIZE_K, TILE_GROUP, BITS)
     else:
         # Keep a complete INT4 word with its owner through either orientation.
-        WHOLE_WORD: tl.constexpr = _SM10X and BITS == 4 and (
+        WHOLE_WORD: tl.constexpr = SM10X and BITS == 4 and (
             (SWAP_AB and ROWS_MAJOR) or (not ROWS_MAJOR and w_zero is None)
         )
         if a.dtype == tl.int8:

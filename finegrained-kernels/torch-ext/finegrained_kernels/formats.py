@@ -21,6 +21,10 @@ from .compat import MX_SCALE_GROUP_K, NIBBLES_PER_BYTE, NVFP4_SCALE_GROUP_K, UE8
 
 # Amortize weight conversion across this many activation rows per GEMM.
 FP8_WEIGHT_ONLY_DEQUANT_MIN_M = 1024
+# The integer 2D prefill dequantizes once only at this many rows and above this weight size.
+INT_WEIGHT_ONLY_DEQUANT_MIN_M = 4096
+INT_WEIGHT_ONLY_DEQUANT_MIN_DIM = 2048
+
 
 def ue8m0_as_uint8(scale: torch.Tensor | None) -> torch.Tensor | None:
     """View UE8M0 (``float8_e8m0fnu``) weight scales as ``uint8`` for the Triton
@@ -443,6 +447,8 @@ def validate_int_operands(A, B, Bs, b_zero, b_perm, a_scale, b_scale2) -> int:
 
 
 def validate_svdquant_operands(A, B, As, Bs, activation_format, output_dtype, lora_a, lora_b, pre_quant_scale):
+    """SVDQuant's low-rank correction ``lora_a`` / ``lora_b`` (both or neither) against the NVFP4 GEMM
+    it rides on; no factors, no checks."""
     if lora_a is None and lora_b is None:
         return
     assert lora_a is not None and lora_b is not None, "SVDQuant requires both low-rank factors"
