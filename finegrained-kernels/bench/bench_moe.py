@@ -54,8 +54,8 @@ Every (row, problem, regime, impl) cell runs in THREE modes:
 
 Regimes: decode T=1 and prefill T=8192 (routed through top_k experts; attn row: M=T).
 
---smoke: fast everything-compiles pass — 3-trial tunes (``n_trials`` in FINEGRAINED_AUTOTUNE_CONFIG, set
-before the package import) and a 256-token prefill.
+--smoke: fast everything-compiles pass — FINEGRAINED_AUTOTUNE_CONFIG's ``fast`` mode (merged into any
+config already set, before the package import) and a 256-token prefill.
 
 Baselines ("all kinds"): finegrained-fp8 (upstream), DeepGEMM (fp8/fp4/bf16), transformers
 grouped_mm/batched_mm (torch._grouped_mm / torch.bmm, the BF16 torch path), SonicMoE, OpenAI
@@ -97,7 +97,7 @@ _parser.add_argument("--devices", default="",
                      help="comma-separated physical GPUs for the shards (default 0..gpus-1); shard g "
                           "still owns tasks where i %% gpus == g, only the device it runs on changes")
 _parser.add_argument("--smoke", action="store_true",
-                     help="fast everything-compiles pass: 3-trial tunes and a 256-token prefill")
+                     help="fast everything-compiles pass: fast-mode tunes and a 256-token prefill")
 _parser.add_argument("--mock", action="store_true",
                      help="no GPU, no kernels: random-but-plausible latencies and parity so the figure "
                           "(layout, crash markers, hatching) can be validated in seconds")
@@ -126,7 +126,7 @@ if SMOKE:  # merged into any FINEGRAINED_AUTOTUNE_CONFIG already set (inline JSO
         _autotune_config = json.loads(open(_autotune_config).read())
     else:  # a mode name (``fast``)
         _autotune_config = {"mode": _autotune_config} if _autotune_config else {}
-    _autotune_config.setdefault("n_trials", 3)
+    _autotune_config.setdefault("mode", "fast")
     os.environ["FINEGRAINED_AUTOTUNE_CONFIG"] = json.dumps(_autotune_config)
 
 import torch  # noqa: E402
