@@ -181,7 +181,6 @@ def argsort(x: torch.Tensor, end_bit: int = 32) -> tuple[torch.Tensor, torch.Ten
 
 # Export public API
 __all__ = [
-    "MyReplacementLayer",
     # Direct kernel exports
     "exclusive_cumsum",
     "inclusive_cumsum",
