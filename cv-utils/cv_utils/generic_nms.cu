@@ -65,7 +65,7 @@ Tensor sort_indices(
 
 // aten::index_select(Tensor self, int dim, Tensor index) -> Tensor
 // The torch::stable wrapper requires Torch 2.14 headers, but this works on 2.10.
-Tensor index_select(const Tensor& self, int64_t dim, const Tensor& index) {
+Tensor index_select_compat(const Tensor& self, int64_t dim, const Tensor& index) {
   std::array<StableIValue, 3> stack{
       torch::stable::detail::from(self),
       torch::stable::detail::from(dim),
@@ -285,7 +285,7 @@ Tensor generic_nms(
         dets.size(0) == dets.size(1),
         "when use_iou_matrix=True, first argument must be [N,N]");
     auto sorted_iou = torch::stable::contiguous(
-        index_select(index_select(dets, 0, order_t), 1, order_t));
+        index_select_compat(index_select_compat(dets, 0, order_t), 1, order_t));
     DISPATCH_FLOATING_TYPES_AND_HALF(
         sorted_iou.scalar_type(), "nms_kernel_iou_ex", [&] {
           nms_kernel_iou_impl<scalar_t><<<blocks, threads, 0, stream>>>(
@@ -298,7 +298,7 @@ Tensor generic_nms(
     STD_TORCH_CHECK(
         dets.size(1) == 4, "when use_iou_matrix=False, boxes must be [N,4]");
     auto dets_sorted =
-        torch::stable::contiguous(index_select(dets, 0, order_t));
+        torch::stable::contiguous(index_select_compat(dets, 0, order_t));
     DISPATCH_FLOATING_TYPES_AND_HALF(
         dets_sorted.scalar_type(), "nms_kernel_ex", [&] {
           nms_kernel_impl<scalar_t><<<blocks, threads, 0, stream>>>(
