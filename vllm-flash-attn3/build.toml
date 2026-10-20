@@ -1,7 +1,7 @@
 [general]
 name = "vllm-flash-attn3"
 version = 1
-edition = 5
+edition = 6
 license = "Apache-2.0"
 backends = ["cuda"]
 
@@ -16,44 +16,8 @@ repo-id = "kernels-community/vllm-flash-attn3"
 src = ["flash-attn/flash_api_stable.cpp"]
 stable-abi = "2.9"
 
-[kernel.flash_attn]
-backend = "cuda"
-cuda-capabilities = [
-    "8.0",
-    "9.0a",
-]
-cuda-flags = [
-    "-O3",
-    "-std=c++17",
-    "--ftemplate-backtrace-limit=0",
-    "--use_fast_math",
-    "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
-    "-DCUTLASS_ENABLE_GDC_FOR_SM90",
-    "--expt-relaxed-constexpr",
-    "--expt-extended-lambda",
-    "--use_fast_math",
-    "-DNDEBUG",
-]
-depends = [
-    "torch",
-    "cutlass_3_9",
-]
-src = [
-    "flash-attn/cuda_check.h",
-    "flash-attn/flash_fwd_combine.cu",
-    "flash-attn/flash_fwd_combine_kernel.h",
-    "flash-attn/flash_fwd_combine_launch_template.h",
-    "flash-attn/flash.h",
-    "flash-attn/flash_prepare_scheduler.cu",
-    "flash-attn/heuristics.h",
-    "flash-attn/seqlen.h",
-    "flash-attn/static_switch.h",
-    "flash-attn/tile_size.h",
-    "flash-attn/utils.h",
-]
-
 [kernel.flash_attn_sm80]
-backend = "cuda"
+language = "cpp-cuda"
 cuda-capabilities = ["8.0"]
 cuda-flags = [
     "-O3",
@@ -203,7 +167,7 @@ src = [
 ]
 
 [kernel.flash_attn_sm90]
-backend = "cuda"
+language = "cpp-cuda"
 cuda-capabilities = ["9.0a"]
 cuda-flags = [
     "-O3",
@@ -550,4 +514,40 @@ src = [
     "flash-attn/instantiations/flash_fwd_hdimdiff_fp16_softcap_sm90.cu",
     "flash-attn/instantiations/flash_fwd_hdimdiff_fp16_split_sm90.cu",
     "flash-attn/instantiations/flash_fwd_hdimdiff_fp16_split_softcap_sm90.cu",
+]
+
+[kernel.flash_attn]
+language = "cpp-cuda"
+cuda-capabilities = [
+    "8.0",
+    "9.0a",
+]
+cuda-flags = [
+    "-O3",
+    "-std=c++17",
+    "--ftemplate-backtrace-limit=0",
+    "--use_fast_math",
+    "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
+    "-DCUTLASS_ENABLE_GDC_FOR_SM90",
+    "--expt-relaxed-constexpr",
+    "--expt-extended-lambda",
+    "--use_fast_math",
+    "-DNDEBUG",
+]
+depends = [
+    "torch",
+    "cutlass_3_9",
+]
+src = [
+    "flash-attn/cuda_check.h",
+    "flash-attn/flash_fwd_combine.cu",
+    "flash-attn/flash_fwd_combine_kernel.h",
+    "flash-attn/flash_fwd_combine_launch_template.h",
+    "flash-attn/flash.h",
+    "flash-attn/flash_prepare_scheduler.cu",
+    "flash-attn/heuristics.h",
+    "flash-attn/seqlen.h",
+    "flash-attn/static_switch.h",
+    "flash-attn/tile_size.h",
+    "flash-attn/utils.h",
 ]

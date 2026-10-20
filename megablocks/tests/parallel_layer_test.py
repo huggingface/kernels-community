@@ -1,3 +1,4 @@
+import kernels
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -5,13 +6,13 @@ import os
 
 
 def test_megablocks_moe_mlp_import():
-    from megablocks.layers import MegaBlocksMoeMLP
+    MegaBlocksMoeMLP = kernels.get_kernel("kernels-community/megablocks", version=1).layers.MegaBlocksMoeMLP
 
     assert MegaBlocksMoeMLP is not None, "MegaBlocksMoeMLP import failed."
 
 
 def run_distributed_test(rank, world_size):
-    from megablocks.layers import MegaBlocksMoeMLP
+    MegaBlocksMoeMLP = kernels.get_kernel("kernels-community/megablocks", version=1).layers.MegaBlocksMoeMLP
 
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12355"

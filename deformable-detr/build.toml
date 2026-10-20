@@ -1,7 +1,7 @@
 [general]
 name = "deformable-detr"
 version = 1
-edition = 5
+edition = 6
 license = "Apache-2.0"
 backends = ["cuda"]
 
@@ -18,7 +18,7 @@ src = [
 cuda = "2.10"
 
 [kernel.activation]
-backend = "cuda"
+language = "cpp-cuda"
 depends = ["torch"]
 include = ["."]
 src = [

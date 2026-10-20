@@ -39,6 +39,22 @@ def test_unknown_extensions_and_test_changes_are_build_relevant(tmp_path):
     ) == ["relu"]
 
 
+def test_detects_ported_kernel_source(tmp_path):
+    (tmp_path / "einops" / "src").mkdir(parents=True)
+    (tmp_path / "einops" / "src" / "build.toml").touch()
+    files = [{"filename": "einops/port/port.kdl", "status": "modified"}]
+
+    assert guidance.touched_source_kernels(
+        files, guidance.kernel_directories(tmp_path)
+    ) == ["einops"]
+
+
+def test_detects_new_ported_kernel_from_added_manifest():
+    files = [{"filename": "new-kernel/src/build.toml", "status": "added"}]
+
+    assert guidance.touched_source_kernels(files, set()) == ["new-kernel"]
+
+
 def test_detects_new_kernel_from_added_manifest():
     files = [
         {"filename": "new-kernel/build.toml", "status": "added"},

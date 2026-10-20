@@ -4,27 +4,49 @@
 #include "torch_binding.h"
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
-  // FP-quantized (MXFP4) operations
-  ops.def("mxfp4_qmm_n(Tensor x, Tensor w, Tensor scales, int output_features) -> Tensor");
-  ops.def("mxfp4_qmv(Tensor x, Tensor w, Tensor scales, int output_features) -> Tensor");
+  ops.def(
+      "quantized_matmul(Tensor x, Tensor w, Tensor scales, Tensor? biases, bool transpose, int? group_size, "
+      "int? bits, str mode) -> Tensor");
+  ops.impl("quantized_matmul", torch::kMPS, &quantized_matmul);
+  ops.def(
+      "gather_qmm(Tensor x, Tensor w, Tensor scales, Tensor? biases, Tensor? lhs_indices, Tensor? rhs_indices, "
+      "bool transpose, int? group_size, int? bits, str mode, Tensor? global_scale, bool sorted_indices) -> Tensor");
+  ops.impl("gather_qmm", torch::kMPS, &gather_qmm);
+  ops.def("quantize(Tensor w, int? group_size, int? bits, str mode, Tensor? global_scale) -> Tensor[]");
+  ops.impl("quantize", torch::kMPS, &quantize);
+  ops.def(
+      "dequantize(Tensor w, Tensor scales, Tensor? biases, int? group_size, int? bits, str mode, "
+      "Tensor? global_scale, ScalarType? dtype) -> Tensor");
+  ops.impl("dequantize", torch::kMPS, &dequantize);
+  ops.def(
+      "qqmm(Tensor x, Tensor w, Tensor? scales, int? group_size, int? bits, str mode, Tensor? global_scale_x, "
+      "Tensor? global_scale_w) -> Tensor");
+  ops.impl("qqmm", torch::kMPS, &qqmm);
+  ops.def(
+      "gather_qqmm(Tensor x, Tensor w, Tensor? scales, Tensor? lhs_indices, Tensor? rhs_indices, int? group_size, "
+      "int? bits, str mode, Tensor? global_scale_x, Tensor? global_scale_w, bool sorted_indices) -> Tensor");
+  ops.impl("gather_qqmm", torch::kMPS, &gather_qqmm);
 
-  // Affine quantized operations
-  ops.def("affine_qmv(Tensor x, Tensor w, Tensor scales, Tensor biases, int group_size, int bits, int output_features) -> Tensor");
-  ops.def("affine_qmm_t(Tensor x, Tensor w, Tensor scales, Tensor biases, int group_size, int bits) -> Tensor");
-  ops.def("affine_qmm_n(Tensor x, Tensor w, Tensor scales, Tensor biases, int group_size, int bits, int output_features) -> Tensor");
-
-}
-
-TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, MPS, ops) {
-  // FP-quantized (MXFP4)
-  ops.impl("mxfp4_qmm_n", mxfp4_qmm_n);
-  ops.impl("mxfp4_qmv", mxfp4_qmv);
-
-  // Affine quantized
-  ops.impl("affine_qmv", affine_qmv);
-  ops.impl("affine_qmm_t", affine_qmm_t);
-  ops.impl("affine_qmm_n", affine_qmm_n);
-
+  // Not part of the Python API: the tests use these (through `_ops`) to check which kernels the
+  // dispatch picks. Registered as catch-alls so they also take meta tensors.
+  ops.def(
+      "trace_quantized_matmul(Tensor x, Tensor w, Tensor scales, Tensor? biases, bool transpose, "
+      "int? group_size, int? bits, str mode) -> str[]");
+  ops.impl("trace_quantized_matmul", &trace_quantized_matmul);
+  ops.def(
+      "trace_gather_qmm(Tensor x, Tensor w, Tensor scales, Tensor? biases, Tensor? lhs_indices, "
+      "Tensor? rhs_indices, bool transpose, int? group_size, int? bits, str mode, Tensor? global_scale, "
+      "bool sorted_indices) -> str[]");
+  ops.impl("trace_gather_qmm", &trace_gather_qmm);
+  ops.def(
+      "trace_qqmm(Tensor x, Tensor w, Tensor? scales, int? group_size, int? bits, str mode, "
+      "Tensor? global_scale_x, Tensor? global_scale_w) -> str[]");
+  ops.impl("trace_qqmm", &trace_qqmm);
+  ops.def(
+      "trace_gather_qqmm(Tensor x, Tensor w, Tensor? scales, Tensor? lhs_indices, Tensor? rhs_indices, "
+      "int? group_size, int? bits, str mode, Tensor? global_scale_x, Tensor? global_scale_w, "
+      "bool sorted_indices) -> str[]");
+  ops.impl("trace_gather_qqmm", &trace_gather_qqmm);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

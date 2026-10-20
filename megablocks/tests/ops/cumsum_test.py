@@ -4,12 +4,15 @@
 import pytest
 import torch
 
-from megablocks import ops
+import kernels
+
+megablocks = kernels.get_kernel("kernels-community/megablocks", version=1)
+ops = megablocks.ops
 
 CUMSUM_TESTS = (
     (1, 32),
     (2, 32),
-    (2, 1024),
+    pytest.param(2, 1024, marks=pytest.mark.kernels_ci),
     (4, 1024),
     (8, 1024),
     (16, 1024),
@@ -27,6 +30,7 @@ CUMSUM_TESTS = (
 
 
 @pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(('n', 'm'), CUMSUM_TESTS)
 def test_exclusive_cumsum(n: int, m: int):
     x = torch.randint(0, 2, (n, m)).long().cuda()
@@ -36,6 +40,7 @@ def test_exclusive_cumsum(n: int, m: int):
 
 
 @pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(('n', 'm'), CUMSUM_TESTS)
 def test_inclusive_cumsum(n: int, m: int):
     x = torch.randint(0, 2, (n, m)).long().cuda()

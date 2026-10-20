@@ -1,7 +1,7 @@
 [general]
 name = "aiter-flash-attn-ck"
 version = 1
-edition = 5
+edition = 6
 license = "MIT"
 backends = ["rocm"]
 
@@ -15,7 +15,7 @@ src = [
 ]
 
 [kernel.aiter_flash_attn_ck]
-backend = "rocm"
+language = "cpp-rocm"
 cxx-flags = [
     "-DENABLE_CK=1",
     "-DFAV2_ON=1",

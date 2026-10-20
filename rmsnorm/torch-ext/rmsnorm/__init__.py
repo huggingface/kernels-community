@@ -23,5 +23,5 @@ def apply_rms_norm_backward(grad_output, input, weight, output, rstd, eps, input
             weight_requires_grad
     )
 
-__all__ = ["layers", "apply_rms_norm_forward", "apply_rms_norm_backward"]
+__all__ = ["layers", "apply_rms_norm", "apply_rms_norm_backward"]
 

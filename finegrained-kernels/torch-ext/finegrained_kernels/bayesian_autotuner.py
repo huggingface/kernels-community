@@ -493,7 +493,7 @@ class BayesianAutotuner(Autotuner):
         anchors = self._basin_anchor_indices(configs)
         order = list(range(len(configs)))
         random.Random(0).shuffle(order)
-        warm_idx = self._warm_start_index(configs)
+        warm_idx = self._warm_start_index(configs, key)
         head = anchors + ([warm_idx] if warm_idx is not None else [])
         order = list(dict.fromkeys(head + order))
         for idx in order[: max(n_startup, len(head))]:
@@ -707,15 +707,19 @@ class BayesianAutotuner(Autotuner):
                 anchors.append(ordered[-1])
         return anchors
 
-    def _warm_start_index(self, configs: List[Config]):
-        """Return the index in ``configs`` matching the most recently cached
-        key's best config (or ``None`` if no prior tune or no match in the
-        current pruned list)."""
+    def _warm_start_index(self, configs: List[Config], key=None):
+        """Return the index in ``configs`` matching the best config of the cached key closest to
+        ``key`` — the most equal positions, the most recent on a tie — or ``None`` if no prior tune
+        or no match in the current pruned list. A variant of a tuned call (the same GEMM without its
+        gather, say) then starts from that call's winner rather than whatever was tuned last."""
         if not self.cache:
             return None
-        # Python 3.7+ dicts preserve insertion order; last entry = most recent tune.
-        prev_best = next(reversed(self.cache.values()))
-        prev_kwargs = prev_best.all_kwargs()
+        cached = list(self.cache.items())  # insertion order: last entry = most recent tune
+
+        def closeness(i):
+            return (sum(a == b for a, b in zip(cached[i][0], key or ())), i)
+
+        prev_kwargs = cached[max(range(len(cached)), key=closeness)][1].all_kwargs()
         for i, c in enumerate(configs):
             if c.all_kwargs() == prev_kwargs:
                 return i

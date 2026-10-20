@@ -48,6 +48,7 @@ KERNEL_SOURCE_MAPPING = {
     "scattermoe": "https://github.com/shawntan/scattermoe",
     "sgl-flash-attn3": "https://github.com/sgl-project/sgl-flash-attn",
     "sonic-moe": "https://github.com/Dao-AILab/sonic-moe",
+    "tdt-loss": "",
     "tinygrad-rms": "https://github.com/tinygrad/tinygrad",
     "trimul-gpumode": "https://github.com/davidberard98/gpumode-trimul",
     "triton-kernels": "https://github.com/triton-lang/triton.git",
@@ -66,6 +67,7 @@ KERNEL_SOURCE_MAPPING = {
     "aiter-flash-attn": "https://github.com/ROCm/aiter",
     "aiter-flash-attn-ck": "https://github.com/ROCm/aiter",
     "aiter-kernels": "https://github.com/ROCm/aiter",
+    "aiter-sage-attention": "https://github.com/ROCm/aiter",
     # Too much stuff happening in vLLM, not worth reporting as MoE freshness.
     "vllm-moe": "",
     "fla": "github.com/fla-org/flash-linear-attention",
