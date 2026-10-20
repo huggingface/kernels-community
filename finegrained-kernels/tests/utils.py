@@ -507,18 +507,22 @@ def encode_csf_scales(scales):
     return fixed, streams
 
 
-def prepare_weight_scales(scales, csf_encoding, fn, compiled=False):
-    """Wrap a matrix Problem's existing op; compiled cases capture decode + GEMM together."""
-    if not csf_encoding:
-        return maybe_compile(fn, compiled)
+def prepare_csf(scales):
+    """Encode dense NVFP4 scales to prepared CSF buffers, plus a dense decode workspace
+    deliberately offset by one byte (a contiguous workspace need not be two-byte aligned)."""
     fixed, exceptions = encode_csf_scales(scales)
     buffers = prepare_nvfp4_csf_scales(
         fixed.to(scales.device), [stream.to(scales.device) for stream in exceptions]
     )
-
-    # A contiguous workspace need not start on a two-byte boundary.
     workspace = torch.empty(scales.numel() + 1, dtype=scales.dtype, device=scales.device)[1:]
-    workspace = workspace.reshape(-1, *scales.shape[-2:])
+    return buffers, workspace.reshape(-1, *scales.shape[-2:])
+
+
+def prepare_weight_scales(scales, csf_encoding, fn, compiled=False):
+    """Wrap a matrix Problem's existing op; compiled cases capture decode + GEMM together."""
+    if not csf_encoding:
+        return maybe_compile(fn, compiled)
+    buffers, workspace = prepare_csf(scales)
 
     def run(A, B, As, Bs, **kwargs):
         decoded = decompress_nvfp4_csf_scales(

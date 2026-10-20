@@ -340,12 +340,28 @@ def prepare_nvfp4_csf_scales(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Prepare one matrix or an expert stack without expanding or moving its scales.
 
-    `fixed` is uint8 `[rows/16, 16*(1+cols/2)]`, or the same shape with an
-    expert dimension. Exceptions are uint32 `[count]` for one matrix, or one
-    tensor per expert; low 24 bits locate a scale and high 8 bits replace it.
-    Returns (fixed, concatenated exceptions, expert offsets) on the input device.
-    Decode on the accelerator at load time for dense residency, or into shared
-    scratch immediately before GEMM.
+    CSF stores each row of E4M3 scale bytes as a base plus 4-bit deltas, which is
+    lossless whenever a row's bytes span at most 16 codes; the rest are exceptions.
+
+    - `fixed` is uint8 `[rows/16, 16*(1+cols/2)]`, or the same shape with a leading
+      expert dimension. Each 16-row slab holds 16 row bases (bytes 0..240), then those
+      rows' deltas, two per byte (even column in the low nibble). Scale `(r, c)` decodes
+      to byte `base[r] + delta[r, c]`.
+    - `exceptions` is one uint32 `[count]` tensor for a matrix, or one per expert, for
+      the scales outside their row's window. Each word is `position | byte << 24`:
+      the low 24 bits are the row-major index `r * cols + c` (sorted and unique), the
+      high 8 bits are the exact E4M3 byte, which overwrites the decoded value.
+
+    Returns, on the input device:
+
+    - `fixed`: contiguous `[experts, rows/16, 16*(1+cols/2)]` (a 2D input gains `experts=1`).
+    - `exceptions`: every expert's words concatenated into one uint32 vector.
+    - `expert_offsets`: uint32 `[experts + 1]` prefix sums; expert `e` owns
+      `exceptions[expert_offsets[e]:expert_offsets[e + 1]]`.
+
+    These are `decompress_nvfp4_csf_scales`' inputs. Decode on the accelerator at load time
+    for dense residency, or into shared scratch immediately before GEMM. The checks here
+    run once per checkpoint load, off the forward path, so the decoder does not repeat them.
     """
     if fixed.dtype != torch.uint8 or fixed.ndim not in (2, 3):
         raise ValueError("CSF fixed stream must be a 2D or 3D uint8 tensor")
@@ -498,6 +514,9 @@ def _decompress_into(
             4096,
             ALIGNED_OUTPUT=out.storage_offset() % 2 == 0,
         )
+        # The fixed stream decodes every scale branch-free as base + delta, including the
+        # few outside their row's 16-code window. This second, small pass overwrites those
+        # positions with their exact bytes (stream order runs after the first kernel).
         if exceptions.numel():
             compile_time_only_triton_wrap(_apply_exceptions_kernel)[(experts,)](
                 exceptions, expert_offsets, out, expert_start, rows * cols, 256
@@ -521,30 +540,14 @@ def decompress_nvfp4_csf_scales(
     A shared dense workspace saves memory across layers, not within one layer.
     Pass the grouped GEMM's cumulative `expert_start` to decode only experts with
     routed tokens. Inactive workspace planes stay untouched and must not be read.
+
+    The streams must come from `prepare_nvfp4_csf_scales`, which validates them; only
+    `out` and `expert_start`, which are new here, are checked.
     """
-    if fixed.dtype != torch.uint8 or fixed.ndim != 3 or not fixed.is_contiguous():
-        raise ValueError("CSF fixed stream must be contiguous 3D uint8")
     if fixed.device.type == "cpu":
         raise ValueError("CSF decompression requires an accelerator")
     experts, slabs, slab_bytes = fixed.shape
-    if experts == 0 or slabs == 0 or slab_bytes <= 16 or slab_bytes % 16:
-        raise ValueError("Invalid CSF slab shape")
-    if (
-        exceptions.dtype != torch.uint32
-        or exceptions.ndim != 1
-        or not exceptions.is_contiguous()
-        or expert_offsets.dtype != torch.uint32
-        or expert_offsets.shape != (experts + 1,)
-        or not expert_offsets.is_contiguous()
-    ):
-        raise ValueError(
-            "CSF exceptions and expert offsets must be contiguous uint32 vectors of prepared shape"
-        )
     rows, cols = slabs * 16, (slab_bytes // 16 - 1) * 2
-    if rows * cols > 1 << 24:
-        raise ValueError(
-            "CSF exception positions support at most 2**24 scales per matrix"
-        )
     shape = (experts, rows, cols)
     if out is None:
         out = torch.empty(shape, dtype=torch.float8_e4m3fn, device=fixed.device)
