@@ -534,11 +534,11 @@ def resolve_output_dtype(
     return activation.dtype if act_scale is None else torch.bfloat16
 
 
-def block_fp8_weight_scale_grid(B: torch.Tensor, Bs: torch.Tensor, interleaved_scales: bool = False):
+def block_fp8_weight_scale_grid(B: torch.Tensor, Bs: torch.Tensor, gate: bool = False):
     """Normalize scalar/block FP8 scales and infer their block size from the grid.
 
     A partial square block on N retains the size implied by K. Separately
-    calibrated gate/up scale rows alternate per block under interleaved_scales.
+    calibrated gate/up scale rows alternate per block under ``gate``.
     """
     assert B.dtype == torch.float8_e4m3fn and B.ndim in (2, 3)
     experts = B.shape[0] if B.ndim == 3 else 1
@@ -548,7 +548,7 @@ def block_fp8_weight_scale_grid(B: torch.Tensor, Bs: torch.Tensor, interleaved_s
     assert Bs.ndim == B.ndim and Bs.shape[:-2] == B.shape[:-2]
     assert K % Bs.shape[-1] == 0, "the weight scale grid must tile K evenly"
     block_k = K // Bs.shape[-1]
-    if interleaved_scales and Bs.shape[-2] > 1:
+    if gate and Bs.shape[-2] > 1:
         assert rows % 2 == 0 and Bs.shape[-2] % 2 == 0, "gate/up scale rows must occur in pairs"
         scale_rows, weight_rows = Bs.shape[-2] // 2, rows // 2
     else:

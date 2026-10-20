@@ -370,7 +370,7 @@ def dequant_block_fp8_weight_tile(
     Gate/up weight rows alternate per value; their scale rows alternate per block.
     ``offs_k`` is a contiguous K tile starting at a multiple of its width.
     """
-    scale_n = (offs_n // 2 // BLOCK_N) * 2 + offs_n % 2 if GATE_SCALES else offs_n // BLOCK_N
+    scale_n = weight_scale_rows(offs_n, BLOCK_N, GATE_SCALES)
     tile_k: tl.constexpr = offs_k.shape[0]
     first_k = tl.min(offs_k, 0)
     tl.device_assert(first_k % tile_k == 0, "weight K tiles must start on their tile grid")
@@ -416,7 +416,7 @@ def _dequant_block_fp8_weight_kernel(
         n, k = offsets // K, offsets % K
         # Full tiles avoid masked-load codegen; the final partial tile stays bounded.
         mask = offsets < N * K if (N * K) % BLOCK_SIZE else tl.full((BLOCK_SIZE,), True, tl.int1)
-        scale_n = (n // 2 // BLOCK_N) * 2 + n % 2 if GATE_SCALES else n // BLOCK_N
+        scale_n = weight_scale_rows(n, BLOCK_N, GATE_SCALES)
         weight = tl.load(B + expert * stride_b_e + n * stride_b_n + k * stride_b_k, mask, 0.0)
         scale = tl.load(
             Bs + expert * stride_bs_e + scale_n * stride_bs_n + (k // BLOCK_K) * stride_bs_k,

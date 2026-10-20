@@ -44,8 +44,8 @@ import triton
 import triton.language as tl
 from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
-from .grouped import block_fp8_weight_only_matmul_grouped, matmul_grouped
-from .batched import GATE_UNSTACK_MAX_S, block_fp8_weight_only_matmul_batched, matmul_batched
+from .grouped import matmul_grouped
+from .batched import GATE_UNSTACK_MAX_S, matmul_batched
 from .bayesian_autotuner import bayesian_autotune
 from .compat import (
     MX_SCALE_GROUP_K,
@@ -728,36 +728,25 @@ def moe_unfused_grouped(
         hidden_states, fmt, gate_up_proj_scale_inv, gate_up_proj_input_global_scale,
         gate_up_proj_activation_scale, scatter_idx, expert_start, gate_up_proj_pre_quant_scale,
     )
-    if (gate and fmt == "bf16" and gate_up_proj.dtype == torch.float8_e4m3fn
-            and not is_mx(gate_up_proj, gate_up_proj_scale_inv) and gate_up_proj_pre_quant_scale is None):
-        assert (gate_up_proj_activation_scale is None and gate_up_proj_input_global_scale is None
-                and gate_up_proj_weight_global_scale is None), "FP8 weight-only takes raw activations and block scales"
-        # Keep calibrated gate/up scale blocks interleaved while leaving the GLU unfused.
-        gate_up_out = block_fp8_weight_only_matmul_grouped(
-            gate_up_in, gate_up_proj, gate_up_proj_scale_inv, expert_start,
-            output_dtype=hidden_states.dtype, gather_idx=gather_idx,
-            bias=gate_up_proj_bias, interleaved_scales=True,
-        )[0]
-    else:
-        gate_up_out = matmul_grouped(
-            gate_up_in,
-            gate_up_proj,
-            As=gate_up_in_scale,
-            Bs=gate_up_proj_scale_inv,
-            a_global_scale=gate_up_proj_input_global_scale,
-            b_global_scale=gate_up_proj_weight_global_scale,
-            b_zero=gate_up_proj_weight_zero_point,
-            b_perm=gate_up_proj_weight_perm,
-            a_pre_quant_scale=gate_up_proj_pre_quant_scale,
-            expert_start=expert_start,
-            bias=gate_up_proj_bias,
-            gate=gate,
-            act_fn=None,  # raw gate|up output, the GLU runs on the host
-            activation_format=fmt,
-            activation_scale_ub=activation_scale_ub,
-            output_dtype=hidden_states.dtype,
-            gather_idx=gather_idx,
-        )
+    gate_up_out = matmul_grouped(
+        gate_up_in,
+        gate_up_proj,
+        As=gate_up_in_scale,
+        Bs=gate_up_proj_scale_inv,
+        a_global_scale=gate_up_proj_input_global_scale,
+        b_global_scale=gate_up_proj_weight_global_scale,
+        b_zero=gate_up_proj_weight_zero_point,
+        b_perm=gate_up_proj_weight_perm,
+        a_pre_quant_scale=gate_up_proj_pre_quant_scale,
+        expert_start=expert_start,
+        bias=gate_up_proj_bias,
+        gate=gate,
+        act_fn=None,  # raw gate|up output, the GLU runs on the host
+        activation_format=fmt,
+        activation_scale_ub=activation_scale_ub,
+        output_dtype=hidden_states.dtype,
+        gather_idx=gather_idx,
+    )
     inter = _host_glu(gate_up_out, act_fn, swiglu_alpha, swiglu_limit, gate)
     # down over the expert-ordered intermediate (quantized in the same format), scattering
     # to routed rows.
@@ -1027,36 +1016,25 @@ def moe_unfused_batched(
     gather_idx = _gather_idx(top_k_index)
 
     # gate_up as a plain GEMM (no gate epilogue) over gathered hidden -> (S, 2I).
-    if (gate and fmt == "bf16" and gate_up_proj.dtype == torch.float8_e4m3fn
-            and not is_mx(gate_up_proj, gate_up_proj_scale_inv) and gate_up_proj_pre_quant_scale is None):
-        assert (gate_up_proj_activation_scale is None and gate_up_proj_input_global_scale is None
-                and gate_up_proj_weight_global_scale is None), "FP8 weight-only takes raw activations and block scales"
-        # Keep calibrated gate/up scale blocks interleaved while leaving the GLU unfused.
-        gate_up_out = block_fp8_weight_only_matmul_batched(
-            hidden_states, gate_up_proj, gate_up_proj_scale_inv, expert_ids,
-            output_dtype=hidden_states.dtype, gather_idx=gather_idx,
-            bias=gate_up_proj_bias, interleaved_scales=True,
-        )[0]
-    else:
-        gate_up_out = matmul_batched(
-            hidden_states,
-            gate_up_proj,
-            As=gate_up_proj_activation_scale,
-            Bs=gate_up_proj_scale_inv,
-            a_global_scale=gate_up_proj_input_global_scale,
-            b_global_scale=gate_up_proj_weight_global_scale,
-            b_zero=gate_up_proj_weight_zero_point,
-            b_perm=gate_up_proj_weight_perm,
-            a_pre_quant_scale=gate_up_proj_pre_quant_scale,
-            expert_ids=expert_ids,
-            bias=gate_up_proj_bias,
-            gate=gate,
-            act_fn=None,  # raw gate|up output, the GLU runs on the host
-            activation_format=fmt,
-            activation_scale_ub=activation_scale_ub,
-            output_dtype=hidden_states.dtype,
-            gather_idx=gather_idx,
-        )
+    gate_up_out = matmul_batched(
+        hidden_states,
+        gate_up_proj,
+        As=gate_up_proj_activation_scale,
+        Bs=gate_up_proj_scale_inv,
+        a_global_scale=gate_up_proj_input_global_scale,
+        b_global_scale=gate_up_proj_weight_global_scale,
+        b_zero=gate_up_proj_weight_zero_point,
+        b_perm=gate_up_proj_weight_perm,
+        a_pre_quant_scale=gate_up_proj_pre_quant_scale,
+        expert_ids=expert_ids,
+        bias=gate_up_proj_bias,
+        gate=gate,
+        act_fn=None,  # raw gate|up output, the GLU runs on the host
+        activation_format=fmt,
+        activation_scale_ub=activation_scale_ub,
+        output_dtype=hidden_states.dtype,
+        gather_idx=gather_idx,
+    )
     inter = _host_glu(gate_up_out, act_fn, swiglu_alpha, swiglu_limit, gate)
     # down over the intermediate (quantized in the same format), routed-order output.
     down_out = matmul_batched(

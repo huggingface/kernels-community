@@ -2649,8 +2649,6 @@ def block_fp8_weight_only_matmul_grouped(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
-    *,
-    interleaved_scales: bool = False,
 ) -> List[torch.Tensor]:
     """FP8 W8A16 grouped GEMM; stage weights only when routed reuse amortizes conversion."""
     validate_dense_operands(A, B)
@@ -2665,14 +2663,14 @@ def block_fp8_weight_only_matmul_grouped(
     S = routed_rows(A, gather_idx, scatter_idx, expert_start, num_experts)
     if S >= FP8_WEIGHT_ONLY_DEQUANT_MIN_M * num_experts:
         weights = dequant_block_fp8_weight(
-            B, Bs, A.dtype, gate=gate or interleaved_scales, expert_start=expert_start,
+            B, Bs, A.dtype, gate=gate, expert_start=expert_start,
         )
         return full_precision_matmul_grouped(
             A, weights, expert_start, gate, act_fn, swiglu_alpha, swiglu_limit,
             simulate_unfused, activation_format, quantize_output, output_dtype,
             gather_idx, scatter_idx, bias=bias,
         )
-    Bs, scale_block_n, scale_block_k = block_fp8_weight_scale_grid(B, Bs, gate or interleaved_scales)
+    Bs, scale_block_n, scale_block_k = block_fp8_weight_scale_grid(B, Bs, gate)
     Bs = ue8m0_as_uint8(Bs)
 
     output_dtype = resolve_output_dtype(output_dtype, A, None)
@@ -2719,7 +2717,7 @@ def block_fp8_weight_only_matmul_grouped(
             BLOCK_N=scale_block_n,
             BLOCK_K=scale_block_k,
             GATE=gate,
-            GATE_SCALES=(gate or interleaved_scales) and Bs.shape[1] > 1,
+            GATE_SCALES=gate and Bs.shape[1] > 1,
             ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha,
             SWIGLU_LIMIT=swiglu_limit,

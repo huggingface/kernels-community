@@ -1993,13 +1993,11 @@ def block_fp8_weight_only_matmul_batched(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
-    *,
-    interleaved_scales: bool = False,
 ) -> List[torch.Tensor]:
     """FP8 W8A16 expert GEMM with in-tile weight rescaling."""
     validate_dense_operands(A, B)
     assert A.dtype in (torch.bfloat16, torch.float16), "FP8 weight-only takes raw BF16/FP16 activations"
-    Bs, scale_block_n, scale_block_k = block_fp8_weight_scale_grid(B, Bs, gate or interleaved_scales)
+    Bs, scale_block_n, scale_block_k = block_fp8_weight_scale_grid(B, Bs, gate)
     Bs = ue8m0_as_uint8(Bs)
     assert activation_format in (None, "bf16") and not quantize_output, (
         "FP8 weight-only requires unquantized activations and output"
@@ -2045,7 +2043,7 @@ def block_fp8_weight_only_matmul_batched(
             BLOCK_N=scale_block_n,
             BLOCK_K=scale_block_k,
             GATE=gate,
-            GATE_SCALES=(gate or interleaved_scales) and Bs.shape[1] > 1,
+            GATE_SCALES=gate and Bs.shape[1] > 1,
             ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha,
             SWIGLU_LIMIT=swiglu_limit,
