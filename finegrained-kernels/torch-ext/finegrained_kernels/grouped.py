@@ -30,7 +30,7 @@ from .descriptors import build_grouped_operand_descriptors, rebind_grouped_descr
 from .formats import FP8_WEIGHT_ONLY_DEQUANT_MIN_M, block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, row_scale_stride, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, validate_int_operands, INT_WEIGHT_DTYPES
 from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, mx_act_quant_grouped, mx_act_quant_routed_rows, quantize_routed_rows_per_expert, static_expert_act_operands, swizzle_grouped_mx_scales, tensor_wide_act_operands, prepare_fp8_mx_inputs, permute_routed_rows
 from .swizzle import swizzled_scale_descriptor
-from .loading.scales import apply_row_scale, dequant_block_fp8_weight
+from .loading.scales import apply_row_scale, dequant_block_fp8_weight, csf_weight_scales
 from .mma import block_dynamic_dot, fp8_dot, plain_dot, mx_compute, mx_weight_only_compute, static_dot, int_weight_only_compute
 from .scheduling import build_tile_layout, expand_gather_below_parity, expand_regime, load_packed_schedule, grouped_tile_order, prefetch_packed_entry, resolve_grouped_tile, resolve_grouped_tile_packed, fill_packed_schedule, packed_schedule_buffer
 from .loading.tiles import (
@@ -3009,6 +3009,8 @@ def matmul_grouped(
     scatter_idx: torch.Tensor | None = None,
     a_global_scale: torch.Tensor | None = None,
     b_global_scale: torch.Tensor | None = None,
+    b_scale_exceptions: torch.Tensor | None = None,
+    b_scale_exception_offsets: torch.Tensor | None = None,
     output_global_scale: torch.Tensor | None = None,
     b_zero: torch.Tensor | None = None,
     b_perm: torch.Tensor | None = None,
@@ -3053,12 +3055,16 @@ def matmul_grouped(
     - one scale per expert (``Bs`` ``(E,)``/``(E, 1, 1)``) or per output row (``(E, N, 1)``) →
       ``w8a8_tensor_dynamic_fp8_matmul_grouped``.
     - block scales (``Bs`` ``(E, N/bn, K/bk)``) → ``w8a8_block_dynamic_fp8_matmul_grouped``.
+    - uint32 integer weights → ``int_weight_only_matmul_grouped`` (weight-only), ``b_zero`` their zero points
+      (``None``: symmetric), ``b_perm`` ``(E, K)`` their act-order K orders (``None``: natural).
+    - CSF-compressed NVFP4 weight scales (``prepare_nvfp4_csf_scales``): ``Bs`` is the fixed
+      stream, ``b_scale_exceptions``/``b_scale_exception_offsets`` its exceptions and expert
+      offsets; the op decodes them before the GEMM (only the routed experts when routing allows).
 
     ``activation_scale_ub`` caps the dynamic per-token amax for row-wise FP8;
     it requires raw activations and applies before conversion to E4M3.
-    - uint32 integer weights → ``int_weight_only_matmul_grouped`` (weight-only), ``b_zero`` their zero points
-      (``None``: symmetric), ``b_perm`` ``(E, K)`` their act-order K orders (``None``: natural).
     """
+    Bs = csf_weight_scales(Bs, b_scale_exceptions, b_scale_exception_offsets, expert_start)
     _validate_quantization_args(
         A, As, B, Bs, a_global_scale, b_global_scale, output_global_scale,
         b_zero, b_perm, a_pre_quant_scale, activation_format, quantize_output, activation_scale_ub,

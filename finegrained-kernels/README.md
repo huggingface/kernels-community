@@ -381,6 +381,14 @@ Work done without an extra pass or launch.
 | grouped | INT2/4/8 (GPTQ, AWQ, SmoothQuant) | 🟢* | 🟢 | ⚪ | 🟢 | ⚪ |
 | grouped | BF16 / FP16 | ⚪ | 🟢 | ⚪ | 🟢 | ⚪ |
 
+CSF-compressed NVFP4 weight scales (a checkpoint's losslessly compressed E4M3 scale bytes) are
+prepared once at load: `prepare_nvfp4_csf_scales(fixed, exceptions)` validates the streams and
+returns `(fixed, exceptions, expert_offsets)`. Pass them to the ops as `Bs=fixed` with
+`b_scale_exceptions` / `b_scale_exception_offsets` (the MoE forwards take
+`*_proj_scale_exceptions` / `*_proj_scale_exception_offsets` beside `*_proj_scale_inv`), and each
+op decodes them before its GEMM, only the experts with routed rows. To keep dense scales instead,
+decode once with `decompress_nvfp4_csf_scales`.
+
 ## Autotuning
 
 Every kernel is tuned by a Tree-structured Parzen Estimator (TPE, the Bayesian search Optuna

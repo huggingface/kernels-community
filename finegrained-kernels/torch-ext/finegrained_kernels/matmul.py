@@ -31,7 +31,7 @@ from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_desc
 from .formats import FP8_WEIGHT_ONLY_DEQUANT_MIN_M, INT_WEIGHT_ONLY_DEQUANT_MIN_DIM, INT_WEIGHT_ONLY_DEQUANT_MIN_M, block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, normalize_global_scale, e2m1_as_uint8, is_mx, is_rowwise, mx_scale_family, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_2d_operands, weight_format, validate_int_operands, validate_svdquant_operands, INT_WEIGHT_DTYPES
 from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, maybe_act_quant, mxfp8_act_quant, nvfp4_act_quant, quantize_rows_static, tensor_wide_act_operands, prepare_fp8_mx_inputs, dequantize_int_weight, permute_act_cols, svdquant_act_quant
-from .loading.scales import apply_row_scale, dequant_block_fp8_weight, mx_2d_scale_ptrs, weight_scale_rows
+from .loading.scales import apply_row_scale, dequant_block_fp8_weight, mx_2d_scale_ptrs, weight_scale_rows, csf_weight_scales
 from .mma import SM10X, block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, plain_dot, static_dot, int_weight_only_compute
 from .loading.tiles import (
     advance_ptrs,
@@ -2701,6 +2701,8 @@ def matmul_2d(
     output_dtype: torch.dtype | None = None,
     a_global_scale: torch.Tensor | None = None,
     b_global_scale: torch.Tensor | None = None,
+    b_scale_exceptions: torch.Tensor | None = None,
+    b_scale_exception_offsets: torch.Tensor | None = None,
     output_global_scale: torch.Tensor | None = None,
     b_zero: torch.Tensor | None = None,
     b_perm: torch.Tensor | None = None,
@@ -2739,14 +2741,22 @@ def matmul_2d(
     BF16 linear outputs and addition; otherwise the final sum stays FP32 until the output cast.
     This recipe currently supports inference only.
 
-    Routes by weight dtype + inferred block: ``Bs`` None → full-precision; uint32 words → integer GEMM; MX/NVFP4 (int8/E4M3 weights
-    with UE8M0 group-32 or E4M3 group-16 ``Bs``) → ``mx_dynamic_matmul``; tensor-wide or row-wise FP8
-    (scalar or ``(N, 1)`` ``Bs``) → ``w8a8_tensor_dynamic_fp8_matmul``; block FP8 → the static variant
-    when ``As`` is a per-tensor scalar, else dynamic.
+    Routes by weight dtype + inferred block:
+    - ``Bs`` None → full-precision.
+    - uint32 words → integer GEMM.
+    - MX/NVFP4 (int8/E4M3 weights with UE8M0 group-32 or E4M3 group-16 ``Bs``) →
+      ``mx_dynamic_matmul``.
+    - tensor-wide or row-wise FP8 (scalar or ``(N, 1)`` ``Bs``) → ``w8a8_tensor_dynamic_fp8_matmul``.
+    - block FP8 → the static variant when ``As`` is a per-tensor scalar, else dynamic.
+    - CSF-compressed NVFP4 weight scales (``prepare_nvfp4_csf_scales``): ``Bs`` is the fixed
+      stream, ``b_scale_exceptions``/``b_scale_exception_offsets`` its exceptions and expert
+      offsets; the op decodes them before the GEMM.
 
     ``activation_scale_ub`` caps the dynamic per-token amax for row-wise FP8;
     it requires raw activations and applies before conversion to E4M3.
     """
+    if b_scale_exceptions is not None:  # one prepared matrix decodes as a 1-expert stack
+        Bs = csf_weight_scales(Bs, b_scale_exceptions, b_scale_exception_offsets)[0]
     _validate_quantization_args(
         A, As, B, Bs, a_global_scale, b_global_scale, output_global_scale,
         b_zero, b_perm, a_pre_quant_scale, activation_format, quantize_output, activation_scale_ub,

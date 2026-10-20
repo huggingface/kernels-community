@@ -41,6 +41,7 @@ from utils import (  # type: ignore
     dq_int,
     dequant_gate_up,
     make_gate_up,
+    prepare_csf,
 )
 
 from finegrained_kernels import fold_act_order_into_gate_up, moe, scheduling, swizzle_mx_scales  # type: ignore
@@ -72,6 +73,7 @@ class MoEProblem:
     swiglu_limit: Optional[float] = None
     act_fn: Union[str, Callable] = "silu"  # a callable runs on the host between the GEMMs
     swizzled: bool = False  # pre-swizzled (5D SWIZZLE_32_4_4) weight scales — the deployment layout
+    csf_encoding: bool = False  # NVFP4 weight scales handed to the fused block as CSF streams
     input_globals: bool = False  # calibrated NVFP4 activation input_scale per projection
     expert_globals: bool = False  # the down's calibrated input_scale differs per expert
     static: bool = False  # calibrated (static) activation scale, one per expert
@@ -99,6 +101,7 @@ class MoEProblem:
             f"_I{self.intermediate_dim}_top{self.num_top_k}_{DTYPE_TAG[self.dtype]}"
             f"{'_capped' if self.activation_scale_ub is not None else ''}{'_compile' if self.compile else ''}"
             f"{act}{fmt}{'_swizzled' if self.swizzled else ''}"
+            f"{'_csf' if self.csf_encoding else ''}"
             f"{'_inputglobals' if self.input_globals else ''}"
             f"{'_expertglobals' if self.expert_globals else ''}"
             f"{'_static' if self.static else ''}"
@@ -171,6 +174,8 @@ MOE_PROBLEMS = [
     MoEProblem(weights="mxfp4", num_tokens=1, swizzled=True),
     MoEProblem(weights="nvfp4", swizzled=True),
     MoEProblem(weights="nvfp4", num_tokens=1, swizzled=True),
+    MoEProblem(weights="nvfp4", csf_encoding=True),
+    MoEProblem(weights="nvfp4", num_tokens=1, csf_encoding=True),
     # the full deployment stack for a calibrated NVFP4 checkpoint: pre-swizzled artifact +
     # per-projection input globals, at decode batch (the bench's GLM-NVFP4 decode cell)
     MoEProblem(weights="nvfp4", num_tokens=1, swizzled=True, input_globals=True),
@@ -301,6 +306,10 @@ def _make_moe_weights(problem: MoEProblem):
             pytest.skip("the SWIZZLE_32_4_4 scale layout is the tcgen05 fast path (CUDA-only)")
         gate_up_s = swizzle_mx_scales(gate_up_s)
         down_s = swizzle_mx_scales(down_s)
+    if problem.csf_encoding:
+        # E4M3 codes 24 apart (more than the 15 a CSF offset holds): an exception in every expert, of both projections
+        gate_up_s[..., 0, :2] = gate_up_s.new_tensor([0.125, 1.0])
+        down_s[..., 0, :2] = down_s.new_tensor([0.125, 1.0])
     return gate_up, gate_up_s, gate_up_g, down, down_s, down_g
 
 
@@ -455,6 +464,22 @@ def _assert_fused_correctness(out, ref, problem: MoEProblem):
     torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
 
 
+def _fused_scales(problem: MoEProblem, gate_up_s, down_s):
+    """The fused block's ``(gate_up_proj_scale_inv, down_proj_scale_inv, kwargs)``: the dense
+    scales, or under ``csf_encoding`` their CSF fixed streams with the exceptions as kwargs (the
+    block decodes them itself; the unfused reference keeps the dense scales)."""
+    if not problem.csf_encoding:
+        return gate_up_s, down_s, {}
+    gate_up_fixed, gate_up_exceptions, gate_up_offsets = prepare_csf(gate_up_s)
+    down_fixed, down_exceptions, down_offsets = prepare_csf(down_s)
+    return gate_up_fixed, down_fixed, dict(
+        gate_up_proj_scale_exceptions=gate_up_exceptions,
+        gate_up_proj_scale_exception_offsets=gate_up_offsets,
+        down_proj_scale_exceptions=down_exceptions,
+        down_proj_scale_exception_offsets=down_offsets,
+    )
+
+
 def _run_pair(problem: MoEProblem, fused_fn, unfused_fn):
     torch.manual_seed(0)
     gate_up, gate_up_s, gate_up_g, down, down_s, down_g = _make_moe_weights(problem)
@@ -465,16 +490,18 @@ def _run_pair(problem: MoEProblem, fused_fn, unfused_fn):
     ref = unfused_fn(
         hidden, top_k_index, top_k_weights, gate_up, down, gate_up_s, down_s, **common
     )
+    fused_gate_up_s, fused_down_s, csf = _fused_scales(problem, gate_up_s, down_s)
     out = maybe_compile(fused_fn, problem.compile)(
         hidden,
         top_k_index,
         top_k_weights,
         gate_up,
         down,
-        gate_up_s,
-        down_s,
+        fused_gate_up_s,
+        fused_down_s,
         simulate_unfused=True,
         **common,
+         **csf,
     )
     _assert_fused_correctness(out, ref, problem)
     if problem.activation_scale_ub is not None:

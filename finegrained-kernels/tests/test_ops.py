@@ -56,6 +56,7 @@ from utils import (  # type: ignore
     make_gptq_act_order,
     maybe_compile,
     quant_dequant_a,
+    prepare_weight_scales,
 )
 
 import finegrained_kernels  # type: ignore
@@ -109,6 +110,7 @@ class Problem:
     per_expert_globals: bool = False  # activation (and requant output) globals calibrated per expert
     prequant: bool = False  # pass As explicitly (must be bit-identical to raw A)
     static: bool = False  # calibrated (static) activation scale instead of a runtime one
+    csf_encoding: bool = False  # lossless CSF compression of NVFP4 scales
     swizzled: bool = False  # pass MX weight scales pre-swizzled (5D SWIZZLE_32_4_4 fast path)
     sentinel_fraction: float = 0.0
     noncontiguous: bool = False
@@ -146,6 +148,8 @@ class Problem:
             tag += "_prequant"
         if self.static:
             tag += "_static"
+        if self.csf_encoding:
+            tag += "_csf"
         if self.swizzled:
             tag += "_swizzled"
         if self.sentinel_fraction:
@@ -279,6 +283,10 @@ def scenarios() -> list[Problem]:
         # per-projection input_scale), which the act quant applies by the row's expert
         Problem(weights="nvfp4", per_expert_globals=True),
         Problem(weights="nvfp4", gate=True, activation_format="nvfp4", quantize_output=True, per_expert_globals=True),
+        Problem(weights="nvfp4", csf_encoding=True, S=8),
+        Problem(weights="nvfp4", csf_encoding=True, empty_expert=True, sentinel_fraction=0.25, compile=True),
+        Problem(weights="nvfp4", csf_encoding=True, activation_format="bf16"),
+        Problem(weights="nvfp4", csf_encoding=True, gate=True, activation_format="nvfp4", quantize_output=True, compile=True),
         # swizzled decode (S=8) — the bench's pre-swizzled batched decode arm per fp4 family
         Problem(weights="mxfp4", swizzled=True, S=8),
         Problem(weights="nvfp4", swizzled=True, S=8),
@@ -699,15 +707,15 @@ def _op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_globa
     bs = swizzle_mx_scales(Bs) if problem.swizzled and Bs is not None else Bs
     globals_kw = dict(a_global_scale=As_global, b_global_scale=Bs_global)
     if op == "matmul":
-        fn = maybe_compile(finegrained_kernels.matmul_2d, problem.compile)
+        fn = prepare_weight_scales(bs, problem.csf_encoding, finegrained_kernels.matmul_2d, problem.compile)
         return fn(A, B, As, bs, **globals_kw, **kw)
     if op == "batched":
-        fn = maybe_compile(finegrained_kernels.matmul_batched, problem.compile)
+        fn = prepare_weight_scales(bs, problem.csf_encoding, finegrained_kernels.matmul_batched, problem.compile)
         return fn(A, B, As, bs, expert_ids=expert_ids, **globals_kw, **kw)
     expert_start, gather_idx, scatter_idx = finegrained_kernels.scheduling.compute_grouped_scheduling(
         expert_ids, problem.E, 1
     )
-    fn = maybe_compile(finegrained_kernels.matmul_grouped, problem.compile)
+    fn = prepare_weight_scales(bs, problem.csf_encoding, finegrained_kernels.matmul_grouped, problem.compile)
     raw = fn(
         A,
         B,
@@ -816,6 +824,9 @@ def _make_weights(problem: Problem, row, E):
         Bs_global = dq_int(B, Bs, group=problem.int_group or problem.K).abs().amax(dim=(-2, -1)).div(448).clamp(min=1e-12)
     elif problem.weights in INT_BITS and problem.activation_format == "int8":
         Bs = Bs.float()
+    if problem.csf_encoding:
+        # E4M3 codes 24 apart (more than the 15 a CSF offset holds): an exception in every expert
+        Bs[..., 0, :2] = Bs.new_tensor([0.125, 1.0])
     return B, Bs, Bs_global
 
 

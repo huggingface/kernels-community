@@ -32,9 +32,9 @@ from .formats import block_fp8_weight_scale_grid, _validate_quantization_args, g
 from .epilogue import fused_glu
 from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, prepare_fp8_mx_inputs, permute_routed_rows, static_expert_act_operands, tensor_wide_act_operands
 from .swizzle import swizzled_scale_descriptor
-from .scheduling import is_off_rank
+from .scheduling import is_off_rank, routed_expert_start
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, plain_dot, static_dot, MMA_N_ATOM, int_weight_only_compute
-from .loading.scales import apply_row_scale, weight_scale_rows
+from .loading.scales import apply_row_scale, weight_scale_rows, csf_weight_scales
 from .loading.tiles import (
     advance_ptrs,
     load_act_block_dynamic,
@@ -2298,6 +2298,8 @@ def matmul_batched(
     scatter_idx: torch.Tensor | None = None,
     a_global_scale: torch.Tensor | None = None,
     b_global_scale: torch.Tensor | None = None,
+    b_scale_exceptions: torch.Tensor | None = None,
+    b_scale_exception_offsets: torch.Tensor | None = None,
     output_global_scale: torch.Tensor | None = None,
     b_zero: torch.Tensor | None = None,
     b_perm: torch.Tensor | None = None,
@@ -2338,12 +2340,20 @@ def matmul_batched(
     - one scale per expert (``Bs`` ``(E,)``/``(E, 1, 1)``) or per output row (``(E, N, 1)``) →
       ``w8a8_tensor_dynamic_fp8_matmul_batched``.
     - block scales (``Bs`` ``(E, N/bn, K/bk)``) → ``w8a8_block_dynamic_fp8_matmul_batched``.
+    - uint32 integer weights → ``int_weight_only_matmul_batched`` (weight-only), ``b_zero`` their zero points
+      (``None``: symmetric), ``b_perm`` ``(E, K)`` their act-order K orders (``None``: natural).
+    - CSF-compressed NVFP4 weight scales (``prepare_nvfp4_csf_scales``): ``Bs`` is the fixed
+      stream, ``b_scale_exceptions``/``b_scale_exception_offsets`` its exceptions and expert
+      offsets; the op decodes them before the GEMM (only the routed experts when routing allows).
 
     ``activation_scale_ub`` caps the dynamic per-token amax for row-wise FP8;
     it requires raw activations and applies before conversion to E4M3.
-    - uint32 integer weights → ``int_weight_only_matmul_batched`` (weight-only), ``b_zero`` their zero points
-      (``None``: symmetric), ``b_perm`` ``(E, K)`` their act-order K orders (``None``: natural).
     """
+    if b_scale_exceptions is not None:
+        Bs = csf_weight_scales(
+            Bs, b_scale_exceptions, b_scale_exception_offsets,
+            routed_expert_start(expert_ids, B.shape[0]),
+        )
     _validate_quantization_args(
         A, As, B, Bs, a_global_scale, b_global_scale, output_global_scale,
         b_zero, b_perm, a_pre_quant_scale, activation_format, quantize_output, activation_scale_ub,
