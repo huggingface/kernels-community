@@ -450,6 +450,11 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None, block_within_k: bool 
             and getattr(args.get("B"), "dtype", None) == torch.uint8
         ):
             return False
+        # A gate|up tile overhanging N (the 2D kernel's non-aligned N: N=320 at BN=128) returns a
+        # wrong GLU / requant on every M, warp, stage, memory-mode and WS variant (all 157 such
+        # admitted configs, W4A4 gate requant N=K=320, B200 2026-10-20); a BN dividing N is correct.
+        if args.get("GATE") and args["N"] % config_dim(c, args, "BLOCK_SIZE_N"):
+            return False
         # no-swap width cap: Triton miscompiles a scaled MMA wider than 256 into a sticky
         # illegal-address device trap; the stacked 2*BN extent under GATE counts in full
         rows = (2 if args.get("GATE") else 1) * config_dim(c, args, "BLOCK_SIZE_N")
