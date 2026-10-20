@@ -29,7 +29,7 @@ ENV_VAR = "FINEGRAINED_AUTOTUNE_CONFIG"
 # Tuner kwargs by name, plus the debugging outputs (``key_log_path``, ``call_count_path``,
 # ``tracebacks``) and the cross-rank tune lock wait.
 KEYS = {
-    "n_trials": int, "max_failures": int, "runoff": bool, "basin_probes": bool,
+    "n_trials": int, "strict": bool, "runoff": bool, "basin_probes": bool,
     "max_refine_iters": int, "log_path": str,
     "key_log_path": str, "call_count_path": str, "tracebacks": bool, "lock_timeout": float,
 }

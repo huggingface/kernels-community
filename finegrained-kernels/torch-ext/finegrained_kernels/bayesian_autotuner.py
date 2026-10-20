@@ -111,8 +111,8 @@ class BayesianAutotuner(Autotuner):
         # that many rejects has a pruner gap, and the fix is to fence the dead region rather than
         # to tolerate the compiles. Its own axis so a kernel can raise it deliberately.
         # an explicit argument wins over the config override, which wins over the default
-        if max_failures is None:
-            max_failures = overrides.get("max_failures", self.n_trials)
+        if max_failures is None:  # ``strict`` aborts on the first failure
+            max_failures = 0 if overrides.get("strict") else self.n_trials
         self.max_failures = int(max_failures)
         self.n_startup_trials = n_startup_trials
         # top fraction of measured configs the TPE treats as "good"
@@ -957,7 +957,7 @@ def bayesian_autotune(
                               refinement, including Config fields such as num_stages
     max_failures:             abort the tune once this many configs fail to compile/run before
                               the measured budget is met (default n_trials; runtime override
-                              ``max_failures`` in FINEGRAINED_AUTOTUNE_CONFIG). Without it a broadly broken
+                              ``strict`` in FINEGRAINED_AUTOTUNE_CONFIG sets 0). Without it a broadly broken
                               grid spins: failures don't consume the trial budget, so the search
                               keeps picking and each pick costs an O(configs) rescan.
     log_path:                 JSONL of benched configs (or ``log_path`` in FINEGRAINED_AUTOTUNE_CONFIG)

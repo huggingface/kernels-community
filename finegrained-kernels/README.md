@@ -164,7 +164,8 @@ JSON or a path to a JSON file; `"mode": "fast"` there composes with explicit key
 Unknown modes or keys raise. Keys are the tuner's options:
 
 - `n_trials`: configs measured per shape (trial budget).
-- `max_failures`: failed compiles/runs before a tune aborts (default `n_trials`).
+- `strict`: abort a tune on the first config that fails to compile or run, as the tests do
+  (by default up to `n_trials` failures are tolerated).
 - `runoff`: remeasure the finalists before crowning one (default `true`).
 - `basin_probes`: measure one anchor per categorical basin before the TPE (default `true`).
 - `max_refine_iters`: coordinate-refinement iterations (default `5`; `0` disables it).
