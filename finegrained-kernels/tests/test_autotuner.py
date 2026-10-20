@@ -16,6 +16,7 @@ crash-config pruner guards, autotuner resilience and reporting for failing confi
 activation-quant arm equivalence, and cross-process determinism; each docstring
 carries its incident."""
 
+import itertools
 import logging
 import subprocess
 import sys
@@ -350,14 +351,15 @@ def test_basin_anchors_cover_interior_and_wide_output_tiles():
     """Each swap basin gets an interior anchor and a wide output tile, both with
     middle K, warp, and stage settings rather than lexicographic extremes.
     """
+    grid = itertools.product(
+        (False, True), (16, 64, 128), (64, 128, 256), (64, 128, 256), (4, 8, 16), (2, 4, 6)
+    )
     configs = [
         triton.Config(
             {"BLOCK_SIZE_M": bm, "BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk, "SWAP_AB": swap},
             num_warps=warps, num_stages=stages,
         )
-        for swap in (False, True)
-        for bm in (16, 64, 128) for bn in (64, 128, 256) for bk in (64, 128, 256)
-        for warps in (4, 8, 16) for stages in (2, 4, 6)
+        for swap, bm, bn, bk, warps, stages in grid
     ]
     @bayesian_autotune(configs, [], path_anchor_axes=("SWAP_AB",))
     @triton.jit

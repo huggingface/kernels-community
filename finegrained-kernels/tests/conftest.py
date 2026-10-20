@@ -33,10 +33,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "torch-ext"))
 # lets a crowned config survive one unrelated bad neighbour.
 # Merged into any FINEGRAINED_AUTOTUNE_CONFIG already set (inline JSON or a file), before the
 # package is imported, since the tuner reads it when each kernel is decorated.
+# A mode name (``fast``) becomes ``{"mode": ...}`` so explicit keys still compose with it.
 _autotune_config = os.environ.get("FINEGRAINED_AUTOTUNE_CONFIG", "")
-_autotune_config = json.loads(
-    _autotune_config if _autotune_config.lstrip().startswith("{") else Path(_autotune_config).read_text()
-) if _autotune_config else {}
+if _autotune_config.lstrip().startswith("{"):
+    _autotune_config = json.loads(_autotune_config)
+elif os.path.isfile(_autotune_config):
+    _autotune_config = json.loads(Path(_autotune_config).read_text())
+else:
+    _autotune_config = {"mode": _autotune_config} if _autotune_config else {}
 _autotune_config.setdefault("max_failures", 0)
 os.environ["FINEGRAINED_AUTOTUNE_CONFIG"] = json.dumps(_autotune_config)
 

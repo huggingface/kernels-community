@@ -120,9 +120,12 @@ REPLOT = ARGS.replot
 _SHARD = os.environ.get("BENCH_SHARD")
 if SMOKE:  # merged into any FINEGRAINED_AUTOTUNE_CONFIG already set (inline JSON or a file)
     _autotune_config = os.environ.get("FINEGRAINED_AUTOTUNE_CONFIG", "")
-    _autotune_config = json.loads(
-        _autotune_config if _autotune_config.lstrip().startswith("{") else open(_autotune_config).read()
-    ) if _autotune_config else {}
+    if _autotune_config.lstrip().startswith("{"):
+        _autotune_config = json.loads(_autotune_config)
+    elif os.path.isfile(_autotune_config):
+        _autotune_config = json.loads(open(_autotune_config).read())
+    else:  # a mode name (``fast``)
+        _autotune_config = {"mode": _autotune_config} if _autotune_config else {}
     _autotune_config.setdefault("n_trials", 3)
     os.environ["FINEGRAINED_AUTOTUNE_CONFIG"] = json.dumps(_autotune_config)
 

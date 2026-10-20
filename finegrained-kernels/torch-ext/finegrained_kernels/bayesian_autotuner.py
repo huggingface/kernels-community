@@ -66,22 +66,41 @@ _TUNER_OVERRIDES = {
     "max_refine_iters": int, "log_path": str,
     "key_log_path": str, "call_count_path": str, "tracebacks": bool, "lock_timeout": float,
 }
+# Named presets: ``FINEGRAINED_AUTOTUNE_CONFIG=fast``, or ``"mode"`` inside a JSON config, whose
+# explicit keys then win over the preset's.
+_TUNER_MODES = {
+    # one measured config, no search phases: correctness runs, not performance
+    "fast": {"n_trials": 1, "runoff": False, "basin_probes": False, "max_refine_iters": 0},
+}
 
 
 def _tuner_overrides() -> dict:
-    """Tuner overrides from ``FINEGRAINED_AUTOTUNE_CONFIG``: inline JSON or a path to a JSON file,
-    e.g. ``{"n_trials": 1, "runoff": false, "basin_probes": false, "max_refine_iters": 0}``. Tuner
-    kwargs are fixed where each kernel is decorated, so this is the one runtime control, meant
-    for fast correctness runs, search studies and debugging."""
+    """Tuner overrides from ``FINEGRAINED_AUTOTUNE_CONFIG``: a mode name (``fast``), inline JSON,
+    or a path to a JSON file, e.g. ``{"mode": "fast", "log_path": "tune.jsonl"}``. Tuner kwargs are
+    fixed where each kernel is decorated, so this is the one runtime control, meant for fast
+    correctness runs, search studies and debugging."""
     value = os.environ.get("FINEGRAINED_AUTOTUNE_CONFIG")
     if not value:
         return {}
-    overrides = json.loads(value if value.lstrip().startswith("{") else Path(value).read_text())
+    if value.lstrip().startswith("{"):
+        overrides = json.loads(value)
+    elif os.path.isfile(value):
+        overrides = json.loads(Path(value).read_text())
+    else:
+        overrides = {"mode": value}
+    mode = overrides.pop("mode", None)
+    if mode is not None:
+        if mode not in _TUNER_MODES:
+            raise ValueError(
+                f"FINEGRAINED_AUTOTUNE_CONFIG mode {mode!r} is not one of {sorted(_TUNER_MODES)} "
+                "(or a JSON object / JSON file path)"
+            )
+        overrides = {**_TUNER_MODES[mode], **overrides}
     unknown = set(overrides) - set(_TUNER_OVERRIDES)
     if unknown:
         raise ValueError(
             f"FINEGRAINED_AUTOTUNE_CONFIG has unknown keys {sorted(unknown)}; "
-            f"expected a subset of {sorted(_TUNER_OVERRIDES)}"
+            f"expected a subset of {sorted(_TUNER_OVERRIDES)} or \"mode\""
         )
     return {k: _TUNER_OVERRIDES[k](v) for k, v in overrides.items()}
 
@@ -965,12 +984,15 @@ def bayesian_autotune(
     """Decorator mirroring ``@triton.autotune``. Extra kwargs:
     n_trials:                 successfully measured configs per key (TPE budget; configs
                               that fail to compile/run are skipped without consuming it)
+                              (runtime override: ``n_trials`` in FINEGRAINED_AUTOTUNE_CONFIG)
     n_startup_trials:         random seed configs before the TPE model kicks in
     gamma:                    top fraction of measured configs treated as "good"
     runoff:                   remeasure the top candidates before choosing the winner
+                              (runtime override: ``runoff``)
     basin_probes:             measure categorical basin anchors before the TPE
+                              (runtime override: ``basin_probes``)
     max_refine_iters:         coordinate-descent iterations after the TPE (0 disables)
-                              (all three overridable at runtime through FINEGRAINED_AUTOTUNE_CONFIG)
+                              (runtime override: ``max_refine_iters``)
     path_anchor_axes:         branch axes (kwarg names) whose values relocate the tile
                               optimum — one guaranteed max-tile anchor per value combo
                               (see _basin_anchor_indices); the kernel declares them, the
