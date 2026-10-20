@@ -856,9 +856,11 @@ def warp_spec_memory_mode_pruner(weight_only: bool = False, gather_only: bool = 
 
     Weight-only dot prefill additionally supports the measured w8 128x128x128 tile at
     stages 2/3 with both host descriptors, inline scheduling and an already expert-sorted A. Both original
-    and swapped operand orientations lower; descriptor gather is outside this exception.
+    and swapped operand orientations lower, except the swapped MXFP8 down K loop; descriptor gather is
+    outside this exception.
     Integer outer pipelines also support eight warps for the 128x64x256 gate tile and
-    the packed, flattened 128x128x256 down tile at stage 2.
+    the packed, flattened 128x128x256 down tile at stage 2; MX outer pipelines support the
+    swapped 128x128x128 down tile at stage 2 (its gate|up tile fails to lower).
 
     ``weight_only`` adds the rows that kernel charted for itself and the sweep did not re-probe:
     ``BN == 32`` with WS, which failed 9/9 cells there, and (below 3.8) its trapping
@@ -885,6 +887,11 @@ def warp_spec_memory_mode_pruner(weight_only: bool = False, gather_only: bool = 
                 weight_only and c.kwargs.get("COMPUTE_MODE") == "dot"
                 and a == b == "host_descriptor" and args.get("GatherIdx") is None
                 and not c.kwargs.get("PACKED_SCHEDULE")
+                and c.kwargs.get("PIPELINE", "k_loop") == "k_loop"
+                and not (
+                    c.kwargs.get("SWAP_AB") and args.get("WEIGHT_VALUES_PER_BYTE") == 1
+                    and not args.get("GATE", False)
+                )
                 and config_dim(c, args, "BLOCK_SIZE_N") == 128
                 and config_dim(c, args, "BLOCK_SIZE_K") == 128
                 and c.num_stages in (2, 3)
@@ -893,13 +900,20 @@ def warp_spec_memory_mode_pruner(weight_only: bool = False, gather_only: bool = 
                 weight_only and c.kwargs.get("PIPELINE") in ("tile_loop", "flattened")
                 and c.kwargs.get("SWAP_AB")
                 and a == b == "host_descriptor" and args.get("GatherIdx") is None
-                and config_dim(c, args, "BLOCK_SIZE_K") == 256 and c.num_stages == 2
+                and c.num_stages == 2
                 and (
-                    args.get("GATE", False) and config_dim(c, args, "BLOCK_SIZE_N") == 64
+                    config_dim(c, args, "BLOCK_SIZE_K") == 256 and (
+                        args.get("GATE", False) and config_dim(c, args, "BLOCK_SIZE_N") == 64
+                        or (
+                            args.get("INT_BITS") in (2, 4, 8) and not args.get("GATE", False)
+                            and config_dim(c, args, "BLOCK_SIZE_N") == 128
+                            and c.kwargs.get("PACKED_SCHEDULE") and c.kwargs.get("PIPELINE") == "flattened"
+                        )
+                    )
                     or (
-                        args.get("INT_BITS") in (2, 4, 8) and not args.get("GATE", False)
+                        "WEIGHT_VALUES_PER_BYTE" in args and not args.get("GATE", False)
                         and config_dim(c, args, "BLOCK_SIZE_N") == 128
-                        and c.kwargs.get("PACKED_SCHEDULE") and c.kwargs.get("PIPELINE") == "flattened"
+                        and config_dim(c, args, "BLOCK_SIZE_K") == 128
                     )
                 )
             )

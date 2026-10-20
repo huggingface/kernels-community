@@ -936,15 +936,8 @@ def mx_dynamic_matmul_grouped_kernel(
         )
 
 
-@bayesian_autotune(
-    # weight-only is a plain bf16 dot (fp4/fp8 weight upcast per-group in-loop). Host-TMA memory-mode axis
-    # on both operands + WS. weight-only uses NO swizzled scales (those are a tcgen05 dot_scaled layout;
-    # this kernel decodes the group scale in registers) — the grouped weight-scale affine load is
-    # UNMASKED, so it never blocks WS. The one WS blocker is the masked gathered/padded ACTIVATION
-    # value load (`other=0.0`); the descriptor arm's tma gather4 has no such constant, so WS pairs
-    # with A_MEMORY_MODE=descriptor. warp_spec_compile_guard_pruner owns the num_warps%4 / BM>=64
-    # WS-compile region; WS+pointer-A (masked load) is scored out.
-    get_accelerator_autotuning_configs(
+def _mx_weight_only_grouped_configs():
+    configs = get_accelerator_autotuning_configs(
         packed_schedule=True,
         swap_ab_prefill=True,
         tune_block_nk=True,
@@ -954,7 +947,29 @@ def mx_dynamic_matmul_grouped_kernel(
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
         pre_hook=grouped_pre_hook,
-    ),
+    )
+    for config in configs:
+        config.kwargs["PIPELINE"] = "k_loop"
+    # Overlap consecutive output tiles behind the computed-lhs prefill seeds.
+    for config in [c for c in configs if c.kwargs["SWAP_AB"] and c.num_stages == 2]:
+        for packed in (False, True):
+            seed = triton.Config(
+                dict(config.kwargs, PACKED_SCHEDULE=packed), num_warps=config.num_warps,
+                num_stages=config.num_stages, pre_hook=config.pre_hook,
+            )
+            configs.extend(pipeline_autotuning_configs([seed], ("tile_loop", "flattened")))
+    return configs
+
+
+@bayesian_autotune(
+    # weight-only is a plain bf16 dot (fp4/fp8 weight upcast per-group in-loop). Host-TMA memory-mode axis
+    # on both operands + WS. weight-only uses NO swizzled scales (those are a tcgen05 dot_scaled layout;
+    # this kernel decodes the group scale in registers) — the grouped weight-scale affine load is
+    # UNMASKED, so it never blocks WS. The one WS blocker is the masked gathered/padded ACTIVATION
+    # value load (`other=0.0`); the descriptor arm's tma gather4 has no such constant, so WS pairs
+    # with A_MEMORY_MODE=descriptor. warp_spec_compile_guard_pruner owns the num_warps%4 / BM>=64
+    # WS-compile region; WS+pointer-A (masked load) is scored out.
+    _mx_weight_only_grouped_configs(),
     ["N", "K", "tokens_per_expert_bit_length", "GATE"],
     n_trials=100,
     benchmark_input=weight_input,
@@ -1031,6 +1046,7 @@ def mx_weight_only_matmul_grouped_kernel(
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+    PIPELINE: tl.constexpr = "k_loop",
     SWAP_AB: tl.constexpr = False,
 ):
     """weight-only grouped expert matmul: raw bf16 activations against MXFP4/MXFP8 weights upcast to bf16
@@ -1042,9 +1058,10 @@ def mx_weight_only_matmul_grouped_kernel(
     start_pid = tl.program_id(axis=0)
     if PACKED_SCHEDULE:
         total_m_tiles = load_packed_schedule(Schedule, BLOCK_SIZE_M)
-        prefetched = prefetch_packed_entry(
-            Schedule, start_pid // tl.cdiv(N, BLOCK_SIZE_N), total_m_tiles
-        )
+        if PIPELINE == "k_loop":
+            prefetched = prefetch_packed_entry(
+                Schedule, start_pid // tl.cdiv(N, BLOCK_SIZE_N), total_m_tiles
+            )
     else:
         exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = build_tile_layout(
             ExpertStart, NUM_EXPERTS_POW2, BLOCK_SIZE_M
@@ -1052,7 +1069,12 @@ def mx_weight_only_matmul_grouped_kernel(
     num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     offs_kb = tl.arange(0, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE)
-    for tile_id in tl.range(start_pid, total_m_tiles * num_n_tiles, NUM_PROGRAMS):
+    for tile_id in tl.range(
+        start_pid, total_m_tiles * num_n_tiles, NUM_PROGRAMS,
+        flatten=PIPELINE == "flattened", warp_specialize=WARP_SPEC and PIPELINE != "k_loop",
+    ):
+        if PACKED_SCHEDULE and PIPELINE != "k_loop":
+            prefetched = prefetch_packed_entry(Schedule, tile_id // num_n_tiles, total_m_tiles)
         pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start = (
             resolve_grouped_tile_packed(
                 tile_id, num_n_tiles, prefetched,
@@ -1062,7 +1084,7 @@ def mx_weight_only_matmul_grouped_kernel(
                 GatherIdx, ScatterIdx, BLOCK_SIZE_N, BLOCK_SIZE_M, GATE,
             )
         )
-        if PACKED_SCHEDULE:
+        if PACKED_SCHEDULE and PIPELINE == "k_loop":
             prefetched = prefetch_packed_entry(
                 Schedule, (tile_id + NUM_PROGRAMS) // num_n_tiles, total_m_tiles
             )
@@ -1077,7 +1099,7 @@ def mx_weight_only_matmul_grouped_kernel(
         # The tail K-tile slides back to end at K instead of running past the row, so BK need
         # only FIT K (see the batched sibling): the overlapped lanes are re-read and cancelled
         # by zeroing their activation. BK | K leaves every offset untouched.
-        for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
+        for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC and PIPELINE == "k_loop"):
             k_start = tl.minimum(k * BLOCK_SIZE_K, K - BLOCK_SIZE_K)
             overlap = k * BLOCK_SIZE_K - k_start
             a, _as = load_act_plain(
