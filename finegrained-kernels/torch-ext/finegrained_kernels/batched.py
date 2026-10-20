@@ -27,7 +27,7 @@ from .bayesian_autotuner import bayesian_autotune
 
 from .compat import add_op_namespace_prefix, FP8_DTYPE, MX_SCALE_GROUP_K, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype, pdl_launch_kwargs
 from .descriptors import rebind_batched_mx_bs_descriptor
-from .formats import check_activation_format, global_scale_stride, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, is_per_expert_global, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_gate, resolve_output_dtype, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
+from .formats import check_activation_format, global_scale_stride, gate_out_cols, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, is_per_expert_global, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
 from .epilogue import fused_glu
 from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, static_expert_act_operands, tensor_wide_act_operands
 from .swizzle import swizzled_scale_descriptor
@@ -160,9 +160,6 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     SWAP_AB: tl.constexpr = False,
     # Gate|up fusion epilogue (GATE=False -> plain batched GEMM, every arm below folds out)
     GATE: tl.constexpr = False,
-    # B's block scales are per projection over interleaved gate|up rows (set whenever B is a gate|up
-    # weight, with or without the GATE epilogue)
-    GATE_UP_SCALES: tl.constexpr = False,
     ACT_FN: tl.constexpr = "silu",
     SWIGLU_ALPHA: tl.constexpr = None,
     SWIGLU_LIMIT: tl.constexpr = None,
@@ -219,7 +216,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     # span shares a tile + a single dot, each row's scale block following from its global row.
     b_ptrs = weight_tile_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB)
     bs_ptr = Bs
-    bs_off = weight_scale_rows(offs_bn, BLOCK_N, GATE_UP_SCALES) * stride_bs_n
+    bs_off = weight_scale_rows(offs_bn, BLOCK_N, GATE) * stride_bs_n
     acc = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
 
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -305,9 +302,6 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
     SWAP_AB: tl.constexpr = False,
     # Gate|up fusion epilogue (GATE=False -> plain batched GEMM, every arm below folds out)
     GATE: tl.constexpr = False,
-    # B's block scales are per projection over interleaved gate|up rows (set whenever B is a gate|up
-    # weight, with or without the GATE epilogue)
-    GATE_UP_SCALES: tl.constexpr = False,
     ACT_FN: tl.constexpr = "silu",
     SWIGLU_ALPHA: tl.constexpr = None,
     SWIGLU_LIMIT: tl.constexpr = None,
@@ -355,7 +349,7 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
     # each weight row's scale block follows from its global row.
     b_ptrs = weight_tile_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB)
     bs_ptr = Bs
-    bs_off = weight_scale_rows(offs_bn, BLOCK_N, GATE_UP_SCALES) * stride_bs_n
+    bs_off = weight_scale_rows(offs_bn, BLOCK_N, GATE) * stride_bs_n
     acc = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
 
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -1015,7 +1009,7 @@ def w8a8_block_dynamic_fp8_matmul_batched(
     expert_ids: torch.Tensor,
     block_size: List[int],
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
@@ -1025,7 +1019,6 @@ def w8a8_block_dynamic_fp8_matmul_batched(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
-    raw_gate_up: bool = False,
 ) -> List[torch.Tensor]:
     """Block-scale batched FP8 matmul: C[s] = A[s] @ B[expert_ids[s]].T; activations
     quantized offline in one pass. The ``gate``/``act_fn``/``swiglu_*``/``requant``/``output_dtype``
@@ -1037,10 +1030,6 @@ def w8a8_block_dynamic_fp8_matmul_batched(
     A:  (rows, K) raw bf16/fp16 activations — rows addressed via ``gather_idx``
     B:  (num_experts, N, K) FP8 weights; under ``gate`` the (num_experts, 2N, K) gate|up stack
     Bs: (num_experts, N // block_n, K // block_k) per-block weight scales (2N under gate)
-
-    ``raw_gate_up``: ``B`` is the interleaved gate|up weight but the GLU is left to the caller
-    (``gate=True, act_fn=None`` at the dispatcher, or the unstacked ``gate`` band). Under either,
-    gate and up carry their own block scales, so row ``r`` reads its projection's block.
     """
     validate_dense_operands(A, B)
 
@@ -1076,18 +1065,18 @@ def w8a8_block_dynamic_fp8_matmul_batched(
         f"the fused 'fp8' requant needs square quant blocks, got {block_size}"
     )
     # The decode band runs the ``gate`` contract UNSTACKED (``unstacked_gate``): this same op
-    # without the gate, then the one-kernel ``fused_glu``. Holding the gate AND up tiles per CTA
+    # with ``act_fn=None`` (the raw gate|up output), then the one-kernel ``fused_glu``. Holding the gate AND up tiles per CTA
     # doubles the smem footprint and halves occupancy precisely where the launch is
     # weight-bandwidth-bound, and the fp8 ``tl.dot`` — unlike the MX/NVFP4 scaled MMA, whose
     # wide M operand earns the native instruction — gains nothing back: DSV3 shape, same 235MB
     # weight read, stacked 69.8µs vs unstacked 49.8µs at S=8, a wash by S=32. A requant is the
     # same offline quant the raw activation gets below, applied to the GLU output.
-    if gate and S <= GATE_UNSTACK_MAX_S:
+    if gate and act_fn is not None and S <= GATE_UNSTACK_MAX_S:
         return unstacked_gate(
             lambda intermediate_dtype: w8a8_block_dynamic_fp8_matmul_batched(
-                A, B, As, Bs, expert_ids, block_size,
+                A, B, As, Bs, expert_ids, block_size, gate=True, act_fn=None,
                 activation_format=activation_format, output_dtype=intermediate_dtype,
-                gather_idx=gather_idx, scatter_idx=scatter_idx, bias=bias, raw_gate_up=True,
+                gather_idx=gather_idx, scatter_idx=scatter_idx, bias=bias,
             ),
             output_dtype, simulate_unfused, act_fn, swiglu_alpha, swiglu_limit,
             quant_group=block_n if requant else None, use_ue8m0=bs_u8.dtype == torch.uint8,
@@ -1107,7 +1096,7 @@ def w8a8_block_dynamic_fp8_matmul_batched(
         cs_dtype = bs_u8.dtype  # uint8 (UE8M0) or float32 — the whole-model scale format
         Cs = torch.empty(S, N // block_n, device=A.device, dtype=cs_dtype)
     else:
-        C = A.new_empty(S, N, dtype=output_dtype)
+        C = A.new_empty(S, gate_out_cols(N, gate, act_fn), dtype=output_dtype)
         Cs = None  # unread without an OUTPUT_FORMAT; strides literal below
 
     # the N tile is tuned (it may subdivide the block scale — see scale_subblock_pruner)
@@ -1152,7 +1141,6 @@ def w8a8_block_dynamic_fp8_matmul_batched(
             BLOCK_K=block_k,
             num_experts=num_experts,
             GATE=gate,
-            GATE_UP_SCALES=gate or raw_gate_up,
             ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha,
             SWIGLU_LIMIT=swiglu_limit,
@@ -1178,7 +1166,7 @@ def w8a8_block_static_fp8_matmul_batched(
     expert_ids: torch.Tensor,
     block_size: List[int],
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
@@ -1188,7 +1176,6 @@ def w8a8_block_static_fp8_matmul_batched(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
-    raw_gate_up: bool = False,
 ) -> List[torch.Tensor]:
     """Block-scale batched FP8 matmul with a static (per-tensor calibrated) activation scale — the
     block-dynamic batched sibling with the 2D ``block_static`` format. ``A`` is raw here: the op
@@ -1201,10 +1188,6 @@ def w8a8_block_static_fp8_matmul_batched(
     As: scalar / (1,) for one calibrated scale, or (num_experts,) for a MoE that
         calibrates each expert separately
     Bs: (num_experts, N // block_n, K // block_k) per-block weight scales (2N under gate)
-
-    ``raw_gate_up``: ``B`` is the interleaved gate|up weight but the GLU is left to the caller
-    (``gate=True, act_fn=None`` at the dispatcher, or the unstacked ``gate`` band). Under either,
-    gate and up carry their own block scales, so row ``r`` reads its projection's block.
     """
     validate_dense_operands(A, B)
 
@@ -1236,7 +1219,7 @@ def w8a8_block_static_fp8_matmul_batched(
         C = A.new_empty(S, N, dtype=FP8_DTYPE)
         Cs = torch.empty(S, N // block_n, device=A.device, dtype=bs_u8.dtype)
     else:
-        C = A.new_empty(S, N, dtype=output_dtype)
+        C = A.new_empty(S, gate_out_cols(N, gate, act_fn), dtype=output_dtype)
         Cs = None  # unread without an OUTPUT_FORMAT; strides literal below
 
     # the N tile is tuned (it may subdivide the block scale — see scale_subblock_pruner)
@@ -1281,7 +1264,6 @@ def w8a8_block_static_fp8_matmul_batched(
             BLOCK_N=block_n,
             BLOCK_K=block_k,
             GATE=gate,
-            GATE_UP_SCALES=gate or raw_gate_up,
             ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha,
             SWIGLU_LIMIT=swiglu_limit,
@@ -1306,7 +1288,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
     Bs: torch.Tensor,
     expert_ids: torch.Tensor,
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
@@ -1340,7 +1322,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
 
     bs_u8 = ue8m0_as_uint8(Bs)
     qA, As, as_stride_m, as_stride_e = tensor_wide_act_operands(A, As, num_experts)
-    C = A.new_empty(S, N, dtype=output_dtype)
+    C = A.new_empty(S, gate_out_cols(N, gate, act_fn), dtype=output_dtype)
 
     def grid(META):
         return (S, triton.cdiv(N, META["BLOCK_SIZE_N"]))
@@ -1397,7 +1379,7 @@ def mx_dynamic_matmul_batched(
     Bs: torch.Tensor,
     expert_ids: torch.Tensor,
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
@@ -1531,7 +1513,7 @@ def mx_dynamic_matmul_batched(
         C = a_u8.new_empty((S, N), dtype=FP8_DTYPE)
         Cs = torch.empty(S, N // MX_SCALE_GROUP_K, device=a_u8.device, dtype=torch.uint8)
     else:
-        C = a_u8.new_empty((S, N), dtype=output_dtype)
+        C = a_u8.new_empty((S, gate_out_cols(N, gate, act_fn)), dtype=output_dtype)
         Cs = None  # unread without an OUTPUT_FORMAT; strides literal below
 
     def grid(META):
@@ -1608,7 +1590,7 @@ def full_precision_matmul_batched(
     B: torch.Tensor,
     expert_ids: torch.Tensor,
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
@@ -1640,7 +1622,7 @@ def full_precision_matmul_batched(
     K = A.shape[1]
     S = expert_ids.shape[0]
     num_experts, _, N = expert_weight_shape(B, gate)
-    C = A.new_empty(S, N, dtype=output_dtype)
+    C = A.new_empty(S, gate_out_cols(N, gate, act_fn), dtype=output_dtype)
 
     def grid(META):
         return (S, triton.cdiv(N, META["BLOCK_SIZE_N"]))
@@ -1692,7 +1674,7 @@ def mx_weight_only_matmul_batched(
     Bs: torch.Tensor,
     expert_ids: torch.Tensor,
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
@@ -1717,7 +1699,7 @@ def mx_weight_only_matmul_batched(
     # loop; unlike the block-FP8 band this never inverts (GPT-OSS shape: 48.0->39.7µs at S=4,
     # still ahead at S=512; 2026-08-06).
     output_dtype = resolve_output_dtype(output_dtype, A, None)
-    if gate:
+    if gate and act_fn is not None:
         return unstacked_gate(
             lambda intermediate_dtype: mx_weight_only_matmul_batched(
                 A, B, Bs, expert_ids, output_dtype=intermediate_dtype,
@@ -1735,7 +1717,7 @@ def mx_weight_only_matmul_batched(
     N = rows // 2 if gate else rows
     scale_group = mx_scale_family(Bs, K)
     b_global_scale = normalize_global_scale(b_global_scale, num_experts)
-    C = A.new_empty(S, N, dtype=output_dtype)
+    C = A.new_empty(S, gate_out_cols(N, gate, act_fn), dtype=output_dtype)
     b_u8 = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)
 
@@ -1844,8 +1826,8 @@ def matmul_batched(
       ``w8a8_tensor_dynamic_fp8_matmul_batched``.
     - block scales (``Bs`` ``(E, N/bn, K/bk)``) → ``w8a8_block_dynamic_fp8_matmul_batched``.
     """
-    gate, act_fn, raw_gate_up = resolve_gate(gate, act_fn)
     check_activation_format(activation_format, quantize_output)
+    assert act_fn is not None or not quantize_output, "the raw gate|up output (act_fn=None) is not requantized"
     assert (a_global_scale is None and b_global_scale is None) or (
         Bs is not None and weight_format(B, Bs) == "nvfp4"
     ), "two-level globals (a_global_scale / b_global_scale) are NVFP4-only"
@@ -1882,7 +1864,6 @@ def matmul_batched(
             gather_idx,
             scatter_idx,
             bias=bias,
-            raw_gate_up=raw_gate_up,
         )
         return out[0] if len(out) == 1 else tuple(out)
 
@@ -1978,7 +1959,6 @@ def matmul_batched(
             gather_idx,
             scatter_idx,
             bias=bias,
-            raw_gate_up=raw_gate_up,
         )
     # bd/mx/full-precision ops return a list ([C] or [C, Cs]); the tensor op returns a bare tensor.
     if isinstance(out, (list, tuple)):

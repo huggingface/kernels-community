@@ -170,6 +170,12 @@ def validate_dense_2d_operands(A: torch.Tensor, B: torch.Tensor) -> None:
         f"{tuple(B.stride())} for shape {tuple(B.shape)}"
     )
 
+def gate_out_cols(N: int, gate: bool, act_fn: str | None) -> int:
+    """Output width of a GEMM over ``N``-wide projections: the GLU's ``N``, or under ``act_fn=None``
+    the raw interleaved ``2N`` gate|up columns (the caller applies the activation)."""
+    return 2 * N if gate and act_fn is None else N
+
+
 def expert_weight_shape(B: torch.Tensor, gate: bool) -> tuple[int, int, int]:
     """(num_experts, n_rows, N) of an expert weight stack — under a gate epilogue B is
     the (E, 2N, K) gate|up stack, so the per-projection width N is half the stored rows."""
@@ -355,12 +361,3 @@ def resolve_output_dtype(
     if output_dtype is not None:
         return output_dtype
     return activation.dtype if act_scale is None else torch.bfloat16
-
-
-def resolve_gate(gate: bool, act_fn: str | None) -> tuple[bool, str, bool]:
-    """``(gate, act_fn, raw_gate_up)`` for an op launch. ``act_fn=None`` skips the GLU: the GEMM runs
-    ungated and returns the raw output, and on a gate|up weight (``gate``) its block scales stay per
-    projection (``raw_gate_up``) for the caller's host-side activation."""
-    if act_fn is None:
-        return False, "silu", gate
-    return gate, act_fn, False
