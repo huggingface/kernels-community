@@ -253,133 +253,54 @@ row-wise formats, the optional bound capping each row's amax.
 
 ## Optimization coverage
 
-Which optimizations each kernel can use, grouped by what they improve. Rows are the kernels per family (the recipes they serve are in the format matrix above); a cell is what the kernel's tuning grid, constexprs and pruners allow. Where a cell is 🟠, the fencing pruner's docstring says where and why.
+Which optimizations each quant recipe gets, by regime. Decode (small M) runs the batched kernels for MoE and the 2D kernel for a dense linear; prefill runs the grouped kernels for MoE and the same 2D kernel. A cell is what the kernel's tuning grid, constexprs and pruners allow; where it is 🟠, the fencing pruner's docstring says where and why.
 
 🟢 available (a tuner axis or config; 🟢* always on) · 🟠 fenced or partial: pruned in some regime · 🔴 not implemented where it would plausibly apply · ⚪ not applicable (⚪† deliberately absent, measured not to win)
 
-#### Scheduling and launch
+#### Decode
 
-How work is spread over the GPU and how launches overlap.
+Small M: MoE decode runs the batched kernels, a dense linear the 2D kernel; cells are 2D / batched.
 
-| Family | Kernel | warp spec. | persistent | small-tile grid | tile order | packed schedule | PDL |
+| Recipe | swap-AB | scalar GEMV | split-K | PDL | row padding | unstacked gate | act quant |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 2D | block FP8 (dynamic) | 🟠 | ⚪† | ⚪ | 🟢* | ⚪ | 🟢* |
-| 2D | block FP8 (static act) | 🟠 | ⚪† | ⚪ | 🟢* | ⚪ | 🔴 |
-| 2D | tensor / row-wise FP8 | 🟠 | ⚪† | ⚪ | 🟢* | ⚪ | 🟢* |
-| 2D | MXFP8 / MXFP4 / NVFP4 | 🟢 | 🟠 | ⚪ | 🟢* | ⚪ | 🟢* |
-| 2D | MX weight-only | 🟢 | ⚪† | ⚪ | 🟢* | ⚪ | 🔴 |
-| 2D | FP8 weight-only | 🟢 | ⚪† | ⚪ | 🟢* | ⚪ | 🔴 |
-| 2D | INT2/4/8 weight-only | 🟠 | ⚪† | ⚪ | 🟢* | ⚪ | 🔴 |
-| 2D | BF16 / FP16 | 🟢 | ⚪† | ⚪ | 🟢* | ⚪ | 🔴 |
-| batched | block FP8 (dynamic) | ⚪† | ⚪ | ⚪ | ⚪ | ⚪ | 🟢* |
-| batched | block FP8 (static act) | ⚪† | ⚪ | ⚪ | ⚪ | ⚪ | 🟢* |
-| batched | tensor / row-wise FP8 | ⚪† | ⚪ | ⚪ | ⚪ | ⚪ | 🟢* |
-| batched | MXFP8 / MXFP4 / NVFP4 | ⚪† | ⚪ | ⚪ | ⚪ | ⚪ | 🟢* |
-| batched | MX weight-only | ⚪† | ⚪ | ⚪ | ⚪ | ⚪ | 🟢* |
-| batched | INT2/4/8 weight-only | ⚪† | ⚪ | ⚪ | ⚪ | ⚪ | 🟢* |
-| batched | BF16 / FP16 | ⚪† | ⚪ | ⚪ | ⚪ | ⚪ | 🟢* |
-| batched | FP8 weight-only | ⚪† | ⚪ | ⚪ | ⚪ | ⚪ | 🟢* |
-| grouped | block FP8 (dynamic) | 🟠 | 🟢* | 🔴 | 🔴 | 🟠 | ⚪ |
-| grouped | block FP8 (static act) | 🟠 | 🟢* | 🔴 | 🔴 | 🟠 | ⚪ |
-| grouped | tensor / row-wise FP8 | 🟠 | 🟢* | 🟢* | 🟢* | 🟠 | ⚪ |
-| grouped | MXFP8 / MXFP4 / NVFP4 | 🟠 | 🟢* | 🔴 | 🔴 | 🟠 | ⚪ |
-| grouped | MX weight-only | 🟠 | 🟢* | 🟢* | 🔴 | 🟠 | ⚪ |
-| grouped | INT2/4/8 weight-only | 🟠 | 🟢* | 🟢 | 🔴 | 🟠 | ⚪ |
-| grouped | BF16 / FP16 | 🟢 | 🟢* | 🟢* | 🔴 | 🟠 | ⚪ |
-| grouped | FP8 weight-only | 🟠 | 🟢* | 🔴 | 🔴 | 🟠 | ⚪ |
+| block FP8 (dynamic act) | 🔴 / 🟠 | 🔴 / 🔴 | ⚪† / ⚪† | 🟢* / 🟢* | 🟢* / ⚪ | ⚪ / 🟢 | 🟢* / 🟢* |
+| block FP8 (static act) | 🔴 / 🟠 | 🔴 / 🔴 | ⚪† / ⚪† | 🔴 / 🟢* | 🔴 / ⚪ | ⚪ / 🔴 | 🟢 / 🟢 |
+| tensor / row-wise FP8 | 🟠 / 🟠 | 🔴 / 🔴 | ⚪† / ⚪† | 🟢* / 🟢* | 🟢* / ⚪ | ⚪ / 🔴 | 🟢* / 🟢 |
+| MXFP8 / MXFP4 / NVFP4 | 🟠 / 🟠 | 🟠 / 🟢 | 🟠 / ⚪ | 🟢* / 🟢* | 🟢* / ⚪ | ⚪ / ⚪ | 🟢 / 🟢 |
+| MX weight-only (W4A16 / W8A16) | 🔴 / 🟠 | 🔴 / 🟢 | 🔴 / 🔴 | 🔴 / 🟢* | ⚪ / ⚪ | ⚪ / 🟢* | ⚪ / ⚪ |
+| FP8 weight-only | 🟠 / 🟢 | 🔴 / 🔴 | 🔴 / ⚪ | 🔴 / 🟢* | ⚪ / ⚪ | ⚪ / 🔴 | ⚪ / ⚪ |
+| INT2/4/8 (GPTQ, AWQ, SmoothQuant) | 🟠 / 🟠 | 🟠 / 🟢 | 🟠 / 🔴 | 🔴 / 🟢* | ⚪ / ⚪ | ⚪ / 🟢* | 🟢* / 🟢* |
+| BF16 / FP16 | 🟠 / 🟢 | ⚪ / ⚪ | ⚪ / ⚪ | 🔴 / 🟢* | ⚪ / ⚪ | ⚪ / 🔴 | ⚪ / ⚪ |
 
-#### Memory and data movement
+#### Prefill
 
-How operands and scales are read.
+Large M: MoE prefill runs the grouped kernels, a dense linear the 2D kernel; cells are 2D / grouped.
 
-| Family | Kernel | TMA A | TMA B | TMA gather | row padding | swizzled scales | prefill dequant |
+| Recipe | warp spec. | persistent | small-tile grid | tile order | packed schedule | tile pipeline | weight on MMA lhs | TMA gather | prefill dequant | cuBLAS route |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| block FP8 (dynamic act) | 🟠 / 🟠 | ⚪† / 🟢* | ⚪ / 🟢* | 🟢* / ⚪† | ⚪ / 🟠 | ⚪ / 🔴 | ⚪ / ⚪ | ⚪ / 🟠 | ⚪ / ⚪ | 🔴 / ⚪ |
+| block FP8 (static act) | 🟠 / 🟠 | ⚪† / 🟢* | ⚪ / 🟢* | 🟢* / ⚪† | ⚪ / 🟠 | ⚪ / 🔴 | ⚪ / ⚪ | ⚪ / 🟠 | ⚪ / ⚪ | 🔴 / ⚪ |
+| tensor / row-wise FP8 | 🟠 / 🟠 | ⚪† / 🟢* | ⚪ / 🟢* | 🟢* / 🟢* | ⚪ / 🟠 | ⚪ / 🔴 | ⚪ / ⚪ | ⚪ / 🟠 | ⚪ / ⚪ | 🟠 / ⚪ |
+| MXFP8 / MXFP4 / NVFP4 | 🟢 / 🟠 | 🟠 / 🟢* | ⚪ / 🟢* | 🟢* / ⚪† | ⚪ / 🟠 | ⚪ / 🔴 | ⚪ / ⚪ | ⚪ / 🟠 | ⚪ / ⚪ | 🟠 / 🔴 |
+| MX weight-only (W4A16 / W8A16) | 🟢 / 🟠 | ⚪† / 🟢* | ⚪ / 🟢* | 🟢* / ⚪† | ⚪ / 🟠 | ⚪ / 🟢 | 🟢 / 🟢 | ⚪ / 🟠 | 🔴 / 🔴 | 🔴 / ⚪ |
+| FP8 weight-only | 🟢 / 🟠 | ⚪† / 🟢* | ⚪ / 🟢* | 🟢* / ⚪† | ⚪ / 🟠 | ⚪ / 🟢 | 🔴 / 🟢 | ⚪ / 🟠 | 🟢 / 🟢 | 🟠 / ⚪ |
+| INT2/4/8 (GPTQ, AWQ, SmoothQuant) | 🟠 / 🟠 | ⚪† / 🟢* | ⚪ / 🟢 | 🟢* / ⚪† | ⚪ / 🟠 | ⚪ / 🟢 | 🔴 / 🟢 | ⚪ / 🟠 | 🟠 / 🔴 | 🔴 / ⚪ |
+| BF16 / FP16 | 🟢 / 🟢 | ⚪† / 🟢* | ⚪ / 🟢* | 🟢* / ⚪† | ⚪ / 🟠 | ⚪ / 🟢 | ⚪ / ⚪ | ⚪ / 🟠 | ⚪ / ⚪ | 🔴 / ⚪ |
+
+#### Both regimes
+
+Cells are 2D / batched / grouped.
+
+| Recipe | native scaled MMA | TMA A | TMA B | fused GLU | raw gate\|up | fused requant | swizzled scales |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 2D | block FP8 (dynamic) | 🟠 | 🟠 | ⚪ | 🟢* | ⚪ | ⚪ |
-| 2D | block FP8 (static act) | 🟠 | 🟠 | ⚪ | 🔴 | ⚪ | ⚪ |
-| 2D | tensor / row-wise FP8 | 🟠 | 🟠 | ⚪ | 🟢* | ⚪ | ⚪ |
-| 2D | MXFP8 / MXFP4 / NVFP4 | 🟢 | 🟢 | ⚪ | 🟢* | 🟠 | ⚪ |
-| 2D | MX weight-only | 🟢 | 🟢 | ⚪ | ⚪ | ⚪ | 🔴 |
-| 2D | FP8 weight-only | 🟢 | 🟢 | ⚪ | ⚪ | ⚪ | 🟢 |
-| 2D | INT2/4/8 weight-only | 🟠 | 🟢 | ⚪ | ⚪ | ⚪ | 🟠 |
-| 2D | BF16 / FP16 | 🟠 | 🟠 | ⚪ | ⚪ | ⚪ | ⚪ |
-| batched | block FP8 (dynamic) | ⚪ | 🔴 | ⚪ | ⚪ | ⚪ | ⚪ |
-| batched | block FP8 (static act) | ⚪ | 🔴 | ⚪ | ⚪ | ⚪ | ⚪ |
-| batched | tensor / row-wise FP8 | ⚪ | 🔴 | ⚪ | ⚪ | ⚪ | ⚪ |
-| batched | MXFP8 / MXFP4 / NVFP4 | ⚪ | 🔴 | ⚪ | ⚪ | 🟠 | ⚪ |
-| batched | MX weight-only | ⚪ | 🔴 | ⚪ | ⚪ | ⚪ | ⚪ |
-| batched | INT2/4/8 weight-only | ⚪ | 🔴 | ⚪ | ⚪ | ⚪ | ⚪ |
-| batched | BF16 / FP16 | ⚪ | 🔴 | ⚪ | ⚪ | ⚪ | ⚪ |
-| batched | FP8 weight-only | ⚪ | 🔴 | ⚪ | ⚪ | ⚪ | ⚪ |
-| grouped | block FP8 (dynamic) | 🟢 | 🟢 | 🟠 | ⚪ | ⚪ | ⚪ |
-| grouped | block FP8 (static act) | 🟢 | 🟢 | 🟠 | ⚪ | ⚪ | ⚪ |
-| grouped | tensor / row-wise FP8 | 🟢 | 🟢 | 🟠 | ⚪ | ⚪ | ⚪ |
-| grouped | MXFP8 / MXFP4 / NVFP4 | 🟢 | 🟢 | 🟠 | ⚪ | 🟠 | ⚪ |
-| grouped | MX weight-only | 🟢 | 🟢 | 🟠 | ⚪ | ⚪ | 🔴 |
-| grouped | INT2/4/8 weight-only | 🟢 | 🟢 | 🟠 | ⚪ | ⚪ | 🔴 |
-| grouped | BF16 / FP16 | 🟢 | 🟢 | 🟠 | ⚪ | ⚪ | ⚪ |
-| grouped | FP8 weight-only | 🟢 | 🟢 | 🟠 | ⚪ | ⚪ | 🟢 |
-
-#### Compute
-
-How much of the MMA each tile uses.
-
-| Family | Kernel | native scaled MMA | swap-AB decode | scalar GEMV | split-K | tile pipeline | weight on MMA lhs | cuBLAS route |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 2D | block FP8 (dynamic) | 🟠 | 🔴 | 🔴 | ⚪† | ⚪ | ⚪ | 🔴 |
-| 2D | block FP8 (static act) | ⚪ | 🔴 | 🔴 | ⚪† | ⚪ | ⚪ | 🔴 |
-| 2D | tensor / row-wise FP8 | ⚪ | 🟠 | 🔴 | ⚪† | ⚪ | ⚪ | 🟠 |
-| 2D | MXFP8 / MXFP4 / NVFP4 | 🟠 | 🟠 | 🟠 | 🟠 | ⚪ | ⚪ | 🟠 |
-| 2D | MX weight-only | 🟠 | 🔴 | 🔴 | 🔴 | ⚪ | 🟢 | 🔴 |
-| 2D | FP8 weight-only | ⚪ | 🟠 | 🔴 | 🔴 | ⚪ | 🔴 | 🟠 |
-| 2D | INT2/4/8 weight-only | ⚪ | 🟠 | 🟠 | 🟠 | ⚪ | 🔴 | 🔴 |
-| 2D | BF16 / FP16 | ⚪ | 🟠 | ⚪ | ⚪ | ⚪ | ⚪ | 🔴 |
-| batched | block FP8 (dynamic) | 🔴 | 🟠 | 🔴 | ⚪† | ⚪ | ⚪ | ⚪ |
-| batched | block FP8 (static act) | ⚪ | 🟠 | 🔴 | ⚪† | ⚪ | ⚪ | ⚪ |
-| batched | tensor / row-wise FP8 | ⚪ | 🟠 | 🔴 | ⚪† | ⚪ | ⚪ | ⚪ |
-| batched | MXFP8 / MXFP4 / NVFP4 | 🟠 | 🟠 | 🟢 | ⚪ | ⚪ | ⚪ | ⚪ |
-| batched | MX weight-only | 🟠 | 🟠 | 🟢 | 🔴 | ⚪ | ⚪ | ⚪ |
-| batched | INT2/4/8 weight-only | ⚪ | 🟠 | 🟢 | 🔴 | ⚪ | ⚪ | ⚪ |
-| batched | BF16 / FP16 | ⚪ | 🟢 | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| batched | FP8 weight-only | ⚪ | 🟢 | 🔴 | ⚪ | ⚪ | ⚪ | ⚪ |
-| grouped | block FP8 (dynamic) | 🟠 | ⚪ | ⚪ | ⚪ | 🔴 | ⚪ | ⚪ |
-| grouped | block FP8 (static act) | ⚪ | ⚪ | ⚪ | ⚪ | 🔴 | ⚪ | ⚪ |
-| grouped | tensor / row-wise FP8 | ⚪ | ⚪ | ⚪ | ⚪ | 🔴 | ⚪ | ⚪ |
-| grouped | MXFP8 / MXFP4 / NVFP4 | 🟠 | ⚪ | ⚪ | ⚪ | 🔴 | ⚪ | 🔴 |
-| grouped | MX weight-only | 🟠 | ⚪ | ⚪ | ⚪ | 🟢 | 🟢 | ⚪ |
-| grouped | INT2/4/8 weight-only | ⚪ | ⚪ | ⚪ | ⚪ | 🟢 | 🟢 | ⚪ |
-| grouped | BF16 / FP16 | ⚪ | ⚪ | ⚪ | ⚪ | 🟢 | ⚪ | ⚪ |
-| grouped | FP8 weight-only | ⚪ | ⚪ | ⚪ | ⚪ | 🟢 | 🟢 | ⚪ |
-
-#### Fusion
-
-Work done without an extra pass or launch.
-
-| Family | Kernel | act quant | fused GLU | unstacked gate | raw gate\|up | fused requant |
-| --- | --- | --- | --- | --- | --- | --- |
-| 2D | block FP8 (dynamic) | 🟢* | 🟢 | ⚪ | 🟢 | 🔴 |
-| 2D | block FP8 (static act) | 🟢 | 🟢 | ⚪ | 🟢 | 🔴 |
-| 2D | tensor / row-wise FP8 | 🟢* | 🟢 | ⚪ | 🟢 | ⚪ |
-| 2D | MXFP8 / MXFP4 / NVFP4 | 🟢 | 🟢 | ⚪ | 🟢 | 🟠 |
-| 2D | MX weight-only | ⚪ | 🟢 | ⚪ | 🟢 | ⚪ |
-| 2D | FP8 weight-only | ⚪ | 🟢 | ⚪ | 🟢 | ⚪ |
-| 2D | INT2/4/8 weight-only | 🟢* | 🟢 | ⚪ | 🟢 | ⚪ |
-| 2D | BF16 / FP16 | ⚪ | 🟢 | ⚪ | 🟢 | ⚪ |
-| batched | block FP8 (dynamic) | 🟢* | 🟢 | 🟢 | 🟢 | 🟢 |
-| batched | block FP8 (static act) | 🟢 | 🟢 | 🔴 | 🟢 | 🟢 |
-| batched | tensor / row-wise FP8 | 🟢 | 🟢 | 🔴 | 🟢 | ⚪ |
-| batched | MXFP8 / MXFP4 / NVFP4 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 |
-| batched | MX weight-only | ⚪ | 🟢 | 🟢* | 🟢 | ⚪ |
-| batched | INT2/4/8 weight-only | 🟢* | 🟢 | 🟢* | 🟢 | ⚪ |
-| batched | BF16 / FP16 | ⚪ | 🟢 | 🔴 | 🟢 | ⚪ |
-| batched | FP8 weight-only | ⚪ | 🟢 | 🔴 | 🟢 | ⚪ |
-| grouped | block FP8 (dynamic) | 🟢* | 🟢 | ⚪ | 🟢 | 🟢 |
-| grouped | block FP8 (static act) | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 |
-| grouped | tensor / row-wise FP8 | 🟢 | 🟢 | ⚪ | 🟢 | ⚪ |
-| grouped | MXFP8 / MXFP4 / NVFP4 | 🟢* | 🟢 | ⚪ | 🟢 | 🟢 |
-| grouped | MX weight-only | ⚪ | 🟢 | ⚪ | 🟢 | ⚪ |
-| grouped | INT2/4/8 weight-only | 🟢* | 🟢 | ⚪ | 🟢 | ⚪ |
-| grouped | BF16 / FP16 | ⚪ | 🟢 | ⚪ | 🟢 | ⚪ |
-| grouped | FP8 weight-only | ⚪ | 🟢 | ⚪ | 🟢 | ⚪ |
+| block FP8 (dynamic act) | 🟠 / 🔴 / 🟠 | 🟠 / ⚪ / 🟢 | 🟠 / 🔴 / 🟢 | 🟢 / 🟢 / 🟢 | 🟢 / 🟢 / 🟢 | 🔴 / 🟢 / 🟢 | ⚪ / ⚪ / ⚪ |
+| block FP8 (static act) | ⚪ / ⚪ / ⚪ | 🟠 / ⚪ / 🟢 | 🟠 / 🔴 / 🟢 | 🟢 / 🟢 / 🟢 | 🟢 / 🟢 / 🟢 | 🔴 / 🟢 / 🟢 | ⚪ / ⚪ / ⚪ |
+| tensor / row-wise FP8 | ⚪ / ⚪ / ⚪ | 🟠 / ⚪ / 🟢 | 🟠 / 🔴 / 🟢 | 🟢 / 🟢 / 🟢 | 🟢 / 🟢 / 🟢 | ⚪ / ⚪ / ⚪ | ⚪ / ⚪ / ⚪ |
+| MXFP8 / MXFP4 / NVFP4 | 🟠 / 🟠 / 🟠 | 🟢 / ⚪ / 🟢 | 🟢 / 🔴 / 🟢 | 🟢 / 🟢 / 🟢 | 🟢 / 🟢 / 🟢 | 🟠 / 🟢 / 🟢 | 🟠 / 🟠 / 🟠 |
+| MX weight-only (W4A16 / W8A16) | 🟠 / 🟠 / 🟠 | 🟢 / ⚪ / 🟢 | 🟢 / 🔴 / 🟢 | 🟢 / 🟢 / 🟢 | 🟢 / 🟢 / 🟢 | ⚪ / ⚪ / ⚪ | ⚪ / ⚪ / ⚪ |
+| FP8 weight-only | ⚪ / ⚪ / ⚪ | 🟢 / ⚪ / 🟢 | 🟢 / 🔴 / 🟢 | 🟢 / 🟢 / 🟢 | 🟢 / 🟢 / 🟢 | ⚪ / ⚪ / ⚪ | ⚪ / ⚪ / ⚪ |
+| INT2/4/8 (GPTQ, AWQ, SmoothQuant) | ⚪ / ⚪ / ⚪ | 🟠 / ⚪ / 🟢 | 🟢 / 🔴 / 🟢 | 🟢 / 🟢 / 🟢 | 🟢 / 🟢 / 🟢 | ⚪ / ⚪ / ⚪ | ⚪ / ⚪ / ⚪ |
+| BF16 / FP16 | ⚪ / ⚪ / ⚪ | 🟠 / ⚪ / 🟢 | 🟠 / 🔴 / 🟢 | 🟢 / 🟢 / 🟢 | 🟢 / 🟢 / 🟢 | ⚪ / ⚪ / ⚪ | ⚪ / ⚪ / ⚪ |
 
 ## Autotuning
 
