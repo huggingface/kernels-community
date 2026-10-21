@@ -99,6 +99,7 @@ import csv
 import os
 import random
 import subprocess
+import threading
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -265,6 +266,7 @@ import transformers.integrations.mxfp4 as _tfmx  # noqa: E402
 # no B200 bf16 JSONs for them and would silently fall back to heuristic defaults (measured
 # 12-23% slow at prefill).
 os.environ.setdefault("VLLM_TUNED_CONFIG_FOLDER", os.path.join(_HERE, "vllm_configs"))
+sys.path.insert(0, os.path.expanduser("~/vllm"))
 try:
     from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts as vllm_fused_experts  # noqa: E402
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation as _VllmAct  # noqa: E402
@@ -2518,12 +2520,23 @@ elif _SHARD is None and not MOCK:
     if ARGS.suffix is not None:
         worker_flags += ["--suffix", ARGS.suffix]
 
+    # one shared queue: a device takes the next case when it frees up, so a slow case (a cold
+    # 100-trial tune) holds one GPU instead of the fixed i % GPUS list queued behind it
+    pending = iter(range(len(TASKS)))
+    pending_lock = threading.Lock()
+
     def _run_device(g):
         device = devices[g] if devices else (os.environ.get(DEVICE_MASK_ENV, "0") if GPUS == 1 else str(g))
-        return sum(subprocess.run(
-            [sys.executable, os.path.abspath(__file__), "--gpus", "1", *worker_flags, *FILTERS],
-            env={**os.environ, DEVICE_MASK_ENV: device, "BENCH_SHARD": f"{i}/{len(TASKS)}"},
-        ).returncode != 0 for i in range(g, len(TASKS), GPUS))
+        failed = 0
+        while True:
+            with pending_lock:
+                i = next(pending, None)
+            if i is None:
+                return failed
+            failed += subprocess.run(
+                [sys.executable, os.path.abspath(__file__), "--gpus", "1", *worker_flags, *FILTERS],
+                env={**os.environ, DEVICE_MASK_ENV: device, "BENCH_SHARD": f"{i}/{len(TASKS)}"},
+            ).returncode != 0
 
     with ThreadPoolExecutor(max_workers=GPUS) as pool:
         nfail = sum(pool.map(_run_device, range(GPUS)))
