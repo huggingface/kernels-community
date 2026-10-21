@@ -26,7 +26,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .bayesian_autotuner import bayesian_autotune
 from .bench import weight_input
-from .compat import add_op_namespace_prefix, FP8_DTYPE, is_sm10x, launches_skipped, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, pdl_launch_kwargs, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, narrow_dot_autotuning_configs, narrow_scalar_autotuning_configs, split_k_autotuning_configs, persistent_program_count
+from .compat import add_op_namespace_prefix, FP8_DTYPE, is_sm10x, launches_skipped, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, pdl_launch_kwargs, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, narrow_dot_autotuning_configs, narrow_scalar_autotuning_configs, split_k_autotuning_configs, persistent_program_count, pipeline_autotuning_configs
 from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_tiled_descriptors, rebind_weight_only_descriptors
 from .formats import FP8_WEIGHT_ONLY_DEQUANT_MIN_M, INT_WEIGHT_ONLY_DEQUANT_MIN_DIM, INT_WEIGHT_ONLY_DEQUANT_MIN_M, block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, normalize_global_scale, e2m1_as_uint8, is_mx, is_rowwise, mx_scale_family, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_2d_operands, weight_format, validate_int_operands, validate_svdquant_operands, INT_WEIGHT_DTYPES
 from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
@@ -35,6 +35,7 @@ from .loading.scales import apply_row_scale, dequant_block_fp8_weight, mx_2d_sca
 from .mma import SM10X, block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, plain_dot, static_dot, int_weight_only_compute
 from .loading.tiles import (
     advance_ptrs,
+    output_tile_range,
     load_act_block_dynamic,
     load_act_mx,
     load_act_plain,
@@ -88,6 +89,22 @@ def _holds_rows(t: torch.Tensor, rows: int) -> bool:
 # unconditionally; only the two gates above have a real M=1 inline win.
 
 
+def _block_dynamic_2d_configs():
+    """The k_loop grid, plus its warp-specialized host-TMA prefill tiles over the output-tile
+    pipelines (persistent, WS across tiles: one tile's epilogue overlaps the next tile's MMA)."""
+    configs = get_accelerator_autotuning_configs(
+        warp_spec=True,
+        tune_block_m=True,
+        tune_block_n=True,
+        a_memory_modes=("descriptor", "pointer"),
+        b_memory_modes=("descriptor", "pointer"),
+        pre_hook=rebind_bd_descriptors,
+    )
+    seeds = [c for c in configs if c.kwargs.get("WARP_SPEC") and c.kwargs.get("BLOCK_SIZE_M", 0) >= 64
+             and c.kwargs.get("A_MEMORY_MODE") == c.kwargs.get("B_MEMORY_MODE") == "host_descriptor"]
+    return configs + pipeline_autotuning_configs(seeds, ("tile_loop", "flattened"))
+
+
 @bayesian_autotune(
     # tune_block_m: BLOCK_SIZE_M is a config axis. tune_block_n: the N tile is DECOUPLED
     # from the caller's scale granularity (block_n) — a BN=256 tile over 128-wide scale
@@ -102,14 +119,7 @@ def _holds_rows(t: torch.Tensor, rows: int) -> bool:
     #    pointer arm's K-major rhs): wins wide-N compute prefill, feeding the big tiles the pointer
     #    arm cannot. WS is load-bearing here: the per-iteration transpose races without it.
     # Emitting both axes lets the tuner route per regime. Verdicts B200 (sm_100) — re-chart on H100.
-    get_accelerator_autotuning_configs(
-        warp_spec=True,
-        tune_block_m=True,
-        tune_block_n=True,
-        a_memory_modes=("descriptor", "pointer"),
-        b_memory_modes=("descriptor", "pointer"),
-        pre_hook=rebind_bd_descriptors,
-    ),
+    _block_dynamic_2d_configs(),
     # m_bit_length (log2 M bucket) keys the M tile, mirroring mx_dynamic_matmul_kernel; GATE keys the
     # gate|up arm separately (its stacked dot is 2*BN wide, a distinct config space). block_n/block_k
     # (the launch-pinned quant block) gate descriptor-box legality and the K tile — two checkpoints
@@ -188,6 +198,10 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
     PDL: tl.constexpr = False,
+    # output-tile pipeline: "k_loop" = one tile per program, WS on the K loop; "tile_loop" /
+    # "flattened" = a persistent loop over output tiles, warp-specialized across tiles so one
+    # tile's epilogue overlaps the next tile's MMA (the grouped kernels' PIPELINE axis)
+    PIPELINE: tl.constexpr = "k_loop",
 ):
     """Block-scale FP8 GEMM kernel.
 
@@ -213,94 +227,101 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     USE_DOT_SCALED: tl.constexpr = (As.dtype.element_ty == tl.uint8) and (
         (BLOCK_SIZE_N if SWAP_AB else BLOCK_SIZE_M) >= 128
     )
-    pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
-        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, block_k, GATE=GATE
-    )
-    # Scale pointers index off AFFINE row/col offsets + a bounds mask; the %-wrapped forms
-    # (offs_am/offs_bn from swizzle_offsets) drive ONLY the pointer arm's operand tiles
-    # (token replication at decode). Keeping scales affine avoids the non-affine gather
-    # the wrap induces (~460us / 18pp at prefill).
-    n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
-    n_rows = 2 * N if GATE else N
-    offs_am_lin = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_bn_lin = pid_n * n_width + tl.arange(0, n_width)
-    as_ptrs = As + offs_am_lin * stride_as_m
-    as_mask = offs_am_lin < M
-    bs_mask = offs_bn_lin < n_rows
-    a_descriptor = operand_tile_descriptor(
-        ADescriptor, A, M, K, stride_a_m, stride_a_k, BLOCK_SIZE_M, block_k, A_MEMORY_MODE
-    )
-    b_descriptor = operand_tile_descriptor(
-        BDescriptor,
-        B,
-        N,
-        K,
-        stride_b_n,
-        stride_b_k,
-        BLOCK_SIZE_N,
-        block_k,
-        B_MEMORY_MODE, GATE,
-    )
-    # Explicit operand-tile pointers on the pointer arm; a scalar placeholder on a descriptor
-    # arm (which reads its box via the descriptor — the [BM,BK]/[BK,BN] index tensor would stay
-    # live across the K-loop for nothing and spill registers, ~460us / 20pp MFU at wide-N prefill).
-    # Under GATE the weight is the interleaved (2N, K) gate|up tile (matmul_weight_ptrs), and its
-    # per-weight-row block scale is a 2*BN gather (``weight_scale_rows``) — the block_dynamic_dot
-    # broadcast then folds it per row exactly as in the dense case.
-    a_ptrs = operand_tile_ptrs(A, offs_am, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, not SWAP_AB)
-    b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, B_MEMORY_MODE, SWAP_AB)
-    # the scale-index gather decouples the tile from the scale grid: a wide tile spans several
-    # scale columns, a narrow one shares a column
-    bs_ptrs = Bs + weight_scale_rows(offs_bn_lin, block_n, GATE) * stride_bs_n
-    accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
-
-    for k in tl.range(0, tl.cdiv(K, block_k), warp_specialize=WARP_SPEC):
-        a, a_s = load_act_block_dynamic(
-            a_ptrs, as_ptrs, None, as_mask, a_descriptor, pid_m * BLOCK_SIZE_M, k * block_k,
-            0, 0, A_MEMORY_MODE, False, False, SWAP_AB,
+    tile_start, tile_end, tile_step = output_tile_range(M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, PIPELINE != "k_loop")
+    for tile_id in tl.range(
+        tile_start, tile_end, tile_step,
+        flatten=PIPELINE == "flattened", warp_specialize=WARP_SPEC and PIPELINE != "k_loop",
+    ):
+        pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
+            M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, block_k, GATE=GATE, tile_id=tile_id
         )
-        b, b_s = load_weight_block_dynamic(
-            b_ptrs, b_descriptor, bs_ptrs, bs_mask, 0, 0, pid_n * n_width, k * block_k, 0, 0,
-            GATE, False, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, block_k,
+        # Scale pointers index off AFFINE row/col offsets + a bounds mask; the %-wrapped forms
+        # (offs_am/offs_bn from swizzle_offsets) drive ONLY the pointer arm's operand tiles
+        # (token replication at decode). Keeping scales affine avoids the non-affine gather
+        # the wrap induces (~460us / 18pp at prefill).
+        n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
+        n_rows = 2 * N if GATE else N
+        offs_am_lin = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_bn_lin = pid_n * n_width + tl.arange(0, n_width)
+        as_ptrs = As + offs_am_lin * stride_as_m
+        as_mask = offs_am_lin < M
+        bs_mask = offs_bn_lin < n_rows
+        a_descriptor = operand_tile_descriptor(
+            ADescriptor, A, M, K, stride_a_m, stride_a_k, BLOCK_SIZE_M, block_k, A_MEMORY_MODE
         )
-        accumulator = block_dynamic_dot(
-            accumulator, a, a_s, b, b_s, block_k, SWAP_AB, USE_DOT_SCALED, False
-        )
-        a_ptrs, as_ptrs, b_ptrs, bs_ptrs, _, _ = advance_ptrs(
-            a_ptrs, as_ptrs, b_ptrs, bs_ptrs, b_ptrs, bs_ptrs,
-            block_k * stride_a_k, stride_as_k, block_k * stride_b_k, stride_bs_k,
-            A_MEMORY_MODE, B_MEMORY_MODE, True, True, False,
-        )
-
-    if PDL:
-        gdc_launch_dependents()
-    if GATE:
-        gemm_epilogue(
-            C, None, accumulator, offs_am_lin, pid_n, pid_m, as_mask,
-            stride_c_m, stride_c_n, 0, 0,
-            BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, block_k,
-            ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
-            COMPUTE_MODE="dot", SWAP_AB=SWAP_AB, N_COLS=N,
-            Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
-        )
-    else:
-        accumulator = add_bias(
-            accumulator, Bias, stride_bias_e, stride_bias_n, 0, pid_n,
-            BLOCK_SIZE_N, N, SWAP_AB,
-        )
-        store_masked_oriented(
-            C,
-            accumulator,
-            pid_m,
-            pid_n,
-            M,
+        b_descriptor = operand_tile_descriptor(
+            BDescriptor,
+            B,
             N,
-            stride_c_m,
-            stride_c_n,
-            BLOCK_SIZE_M,
+            K,
+            stride_b_n,
+            stride_b_k,
             BLOCK_SIZE_N,
-            SWAP_AB,
+            block_k,
+            B_MEMORY_MODE, GATE,
         )
+        # Explicit operand-tile pointers on the pointer arm; a scalar placeholder on a descriptor
+        # arm (which reads its box via the descriptor — the [BM,BK]/[BK,BN] index tensor would stay
+        # live across the K-loop for nothing and spill registers, ~460us / 20pp MFU at wide-N prefill).
+        # Under GATE the weight is the interleaved (2N, K) gate|up tile (matmul_weight_ptrs), and its
+        # per-weight-row block scale is a 2*BN gather (``weight_scale_rows``) — the block_dynamic_dot
+        # broadcast then folds it per row exactly as in the dense case.
+        a_ptrs = operand_tile_ptrs(A, offs_am, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, not SWAP_AB)
+        b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, B_MEMORY_MODE, SWAP_AB)
+        # the scale-index gather decouples the tile from the scale grid: a wide tile spans several
+        # scale columns, a narrow one shares a column
+        bs_ptrs = Bs + weight_scale_rows(offs_bn_lin, block_n, GATE) * stride_bs_n
+        accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
+
+        for k in tl.range(0, tl.cdiv(K, block_k), warp_specialize=WARP_SPEC and PIPELINE == "k_loop"):
+            a, a_s = load_act_block_dynamic(
+                a_ptrs, as_ptrs, None, as_mask, a_descriptor, pid_m * BLOCK_SIZE_M, k * block_k,
+                0, 0, A_MEMORY_MODE, False, False, SWAP_AB,
+            )
+            b, b_s = load_weight_block_dynamic(
+                b_ptrs, b_descriptor, bs_ptrs, bs_mask, 0, 0, pid_n * n_width, k * block_k, 0, 0,
+                GATE, False, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, block_k,
+            )
+            accumulator = block_dynamic_dot(
+                accumulator, a, a_s, b, b_s, block_k, SWAP_AB, USE_DOT_SCALED, False
+            )
+            a_ptrs, as_ptrs, b_ptrs, bs_ptrs, _, _ = advance_ptrs(
+                a_ptrs, as_ptrs, b_ptrs, bs_ptrs, b_ptrs, bs_ptrs,
+                block_k * stride_a_k, stride_as_k, block_k * stride_b_k, stride_bs_k,
+                A_MEMORY_MODE, B_MEMORY_MODE, True, True, False,
+            )
+
+        if PDL and PIPELINE == "k_loop":
+            gdc_launch_dependents()
+        if GATE:
+            gemm_epilogue(
+                C, None, accumulator, offs_am_lin, pid_n, pid_m, as_mask,
+                stride_c_m, stride_c_n, 0, 0,
+                BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, block_k,
+                ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
+                COMPUTE_MODE="dot", SWAP_AB=SWAP_AB, N_COLS=N,
+                Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
+            )
+        else:
+            accumulator = add_bias(
+                accumulator, Bias, stride_bias_e, stride_bias_n, 0, pid_n,
+                BLOCK_SIZE_N, N, SWAP_AB,
+            )
+            store_masked_oriented(
+                C,
+                accumulator,
+                pid_m,
+                pid_n,
+                M,
+                N,
+                stride_c_m,
+                stride_c_n,
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_N,
+                SWAP_AB,
+            )
+    if PDL and PIPELINE != "k_loop":
+        gdc_launch_dependents()
 
 
 @bayesian_autotune(
@@ -829,12 +850,7 @@ def mx_dynamic_matmul_kernel(
     """
     if PDL:
         gdc_wait()
-    num_m_tiles = tl.cdiv(M, BLOCK_SIZE_M)
-    if PERSISTENT:
-        tile_start, tile_end, tile_step = tl.program_id(0), num_m_tiles * tl.cdiv(N, BLOCK_SIZE_N), tl.num_programs(0)
-    else:
-        tile_start = tl.program_id(1) * num_m_tiles + tl.program_id(0)
-        tile_end, tile_step = tile_start + 1, 1
+    tile_start, tile_end, tile_step = output_tile_range(M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, PERSISTENT)
     for tile_id in range(tile_start, tile_end, tile_step):
         # uint8 A = packed-E2M1 activations (W4A4 — the dtype IS the activation format)
         ACT_VALUES_PER_BYTE: tl.constexpr = 2 if A.dtype.element_ty == tl.uint8 else 1
@@ -1586,6 +1602,9 @@ def w8a8_block_dynamic_fp8_matmul(
     b_descriptor = maybe_descriptor(B, [1, block_k])
 
     def grid(META):
+        if META.get("PIPELINE", "k_loop") != "k_loop":
+            tiles = triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"])
+            return (min(tiles, persistent_program_count(A.device.index or 0, META["BLOCK_SIZE_M"])),)
         return (
             triton.cdiv(M, META["BLOCK_SIZE_M"]),
             triton.cdiv(N, META["BLOCK_SIZE_N"]),
@@ -2435,14 +2454,17 @@ def int_weight_only_matmul_2d(
     if b_perm is not None or a_pre_quant_scale is not None or a_scale is not None:
         A = permute_act_cols(A, b_perm, a_pre_quant_scale, a_scale, torch.int8 if smoothquant else FP8_DTYPE)
     assert A.is_contiguous(), "A must be contiguous (the host-TMA descriptor arm reads its box)"
-    # Large prefill amortizes a per-call dequantization and reuses the unquantized Triton GEMM.
-    # Smaller projections keep conversion inline to avoid the extra dispatch cost in eager mode.
+    # Large prefill amortizes a per-call dequantization into cuBLAS, as the FP8 weight-only route does
+    # (Qwen2.5-7B qkv GPTQ M=8192, B200: INT4 216.6 -> 201.1 us, INT8 249.6 -> 206.3 us, bitwise; the Triton BF16
+    # GEMM it replaces ran 233 us against cuBLAS's 194). Smaller projections keep conversion inline to avoid the
+    # extra dispatch cost in eager mode.
     if (
         a_scale is None and A.ndim == 2 and M >= INT_WEIGHT_ONLY_DEQUANT_MIN_M
         and min(N, K) >= INT_WEIGHT_ONLY_DEQUANT_MIN_DIM
         and not gate and bias is None and output_dtype in (None, A.dtype)
     ):
-        return full_precision_matmul_2d(A, dequantize_int_weight(B, Bs, K, b_zero, dtype=A.dtype), output_dtype)
+        with torch.autocast(A.device.type, enabled=False):
+            return [torch.nn.functional.linear(A, dequantize_int_weight(B, Bs, K, b_zero, dtype=A.dtype))]
     C = A.new_empty(A.shape[:-1] + (gate_out_cols(N, gate, act_fn),), dtype=output_dtype)
     # placeholder boxes, rebound per tuned config by rebind_weight_only_descriptors
     a_descriptor = maybe_descriptor(A.view(M, K), [1, 32])

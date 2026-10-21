@@ -26,6 +26,17 @@ SWIZZLE_GROUP_A_BYTES = tl.constexpr(524288)
 
 
 @triton.jit
+def output_tile_range(M, N, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, PERSISTENT: tl.constexpr):
+    """The ``(start, end, step)`` output-tile ids this program covers, for ``swizzle_offsets(tile_id=)``:
+    its own tile on the ``(cdiv(M, BM), cdiv(N, BN))`` grid, or, persistent, a grid-stride over every tile."""
+    num_m_tiles = tl.cdiv(M, BLOCK_SIZE_M)
+    if PERSISTENT:
+        return tl.program_id(0), num_m_tiles * tl.cdiv(N, BLOCK_SIZE_N), tl.num_programs(0)
+    tile = tl.program_id(1) * num_m_tiles + tl.program_id(0)
+    return tile, tile + 1, 1
+
+
+@triton.jit
 def swizzle_offsets(
     M,
     N,

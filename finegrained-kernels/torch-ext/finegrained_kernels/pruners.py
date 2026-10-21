@@ -647,7 +647,12 @@ def block_dynamic_2d_warp_spec_pruner():
       - the implicit ``dot_scaled`` arm (``USE_DOT_SCALED``: UE8M0/uint8 ``As`` on a
         native-M tile — (BN if SWAP_AB else BM) >= 128) + WS fails at every warps/stages/
         memory-mode cell; BM=64 and non-WS all compile. fp32-scale launches never emit the
-        scaled MMA and keep the (w<=8) WS grid.
+        scaled MMA and keep the (w<=8) WS grid. On Triton 3.8 these compile (124/180, bitwise) but
+        never win: best 555 us vs the 518 us non-WS crown (DeepSeek-V4 attn, M=8192, B200), so the
+        fence stays as TPE hygiene.
+    The output-tile pipeline (``PIPELINE`` != k_loop) is fp32-scale only: with UE8M0 scales it never wins (DeepSeek-V4
+    attn M=8192, B200: best forced pipeline 637 us vs the 510 us k_loop crown; tuned A/B 1.00-1.02x), while fp32
+    scales gain 0.82-0.95x (DeepSeek-V3 attn, M=512-8192, bitwise).
     Mostly 2D-only: the grouped bd loop WS-compiles from its descriptor arm and its own
     race guard REQUIRES WS at BM >= 64, but it shares the dot_scaled+WS failure on the
     POINTER arm (see block_dynamic_grouped_matmul_pruner). Compile soundness is
@@ -659,6 +664,8 @@ def block_dynamic_2d_warp_spec_pruner():
         if c.num_warps > 8:
             return False
         if getattr(args.get("As"), "dtype", None) == torch.uint8:
+            if c.kwargs.get("PIPELINE", "k_loop") != "k_loop":
+                return False
             native_m = "BLOCK_SIZE_N" if c.kwargs.get("SWAP_AB") else "BLOCK_SIZE_M"
             return config_dim(c, args, native_m) < 128
         return True
@@ -1520,7 +1527,10 @@ def smem_pruner(
         tiles = 2 if args.get("GATE") else 1
         bk = config_dim(c, args, k_dim)
         unquantized = a.element_size() >= 2 and b.element_size() >= 2
-        stages = c.num_stages if unquantized or full_stages else c.num_stages - 1
+        # an output-tile pipeline keeps every stage live (no K-loop pipeliner clamp): 2D block-FP8
+        # BM64xBN256 s6 needs 254084 B and BM128xBN256 s5 262276 B, both above that full-stage floor
+        pipelined = c.kwargs.get("PIPELINE", "k_loop") != "k_loop"
+        stages = c.num_stages if unquantized or full_stages or pipelined else c.num_stages - 1
         if pointer_ws_extra_stage and c.kwargs.get("WARP_SPEC") and (
             c.kwargs.get("A_MEMORY_MODE", "pointer") == c.kwargs.get("B_MEMORY_MODE", "pointer") == "pointer"
         ):
