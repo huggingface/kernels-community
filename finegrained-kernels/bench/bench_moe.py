@@ -11,38 +11,29 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""finegrained-kernels bench — local build vs upstream finegrained-fp8 (rev v4) + reference impls.
+"""finegrained-kernels bench — the local build against every third-party kernel that runs each
+checkpoint format, and against transformers main (the integration finegrained-kernels replaces).
 
-The **finegrained-kernels** arm is the local kernel; **finegrained-fp8** is the upstream hub
-build (``kernels-community/finegrained-fp8`` @ ``v4``, which has the fused MoE + MX paths).
 By default the finegrained-kernels arm feeds PRE-SWIZZLED (SWIZZLE_32_4_4) MX weight scales, so
 its numbers reflect the tcgen05 fast path (pass ``--no-preswizzle`` for the affine path). Writes
 ``bench/bench_moe.csv`` (all 3 modes) + ``bench/bench_moe.png`` beside this file.
 
-Rows (each row = decode | prefill subplot pair in the figure):
-  quantized           moe_fused_*    finegrained-kernels vs finegrained-fp8 vs transformers@main vs DeepGEMM
-                                     — every impl at its best: fused where it has one, and
-                                     transformers@main contributes its two-GEMM experts dispatch
-  unquantized (BF16)  finegrained-kernels fused vs transformers grouped_mm/batched_mm vs SonicMoE
-                      vs DeepGEMM grouped BF16
-  linear quantized      matmul_2d, one qkv-proj-shaped linear per model in
-                      its deployment format — FP8 128x128 (finegrained-kernels/finegrained-fp8/DeepGEMM), MXFP4
-                      W4A4 (finegrained-kernels W4A4, finegrained-fp8 W4A8, DeepGEMM FP4), NVFP4 (finegrained-kernels only),
-                      MXFP8 (finegrained-kernels/finegrained-fp8)
+Rows, each a decode and a prefill panel in the figure (activation-quantized and weight-only
+recipes get separate panels):
+  quantized           moe_fused_*: MoE experts per checkpoint format, every arm at its best (fused
+                      where it has a fused path; transformers@main runs its experts dispatch)
+  unquantized (BF16)  the same roster in BF16
+  linear quantized    matmul_2d: one qkv-proj-shaped linear per model in its deployment format
 
-MoE problems (real model shapes; one base model per format, same roster BF16'd for
-the unquantized row; baselines per problem):
-  deepseek-ai/DeepSeek-V4  MXFP4 W4A8         finegrained-fp8, DeepGEMM FP4, TRT-LLM (MxFP4xMxFP8)
-  openai/GPT-OSS-120B      full MXFP4 (W4A4)  OpenAI triton_kernels, TRT-LLM (MxFP4xBf16) —
-                                              finegrained-fp8 lacks W4A4 AND its kernels
-                                              can't run K=2880 (no BK-divides-K guard)
-  nvidia/GLM-5.2-NVFP4     NVFP4 (W4A4)       TRT-LLM (NvFP4xNvFP4), torch.scaled_grouped_mm
-  deepseek-ai/DeepSeek-V3  FP8 W8A8 (128x128) finegrained-fp8, DeepGEMM FP8, vLLM, TRT-LLM — UE8M0
-                                              block scales (the B200 deployment format;
-                                              DeepGEMM SM100 rejects fp32 scales by design)
-  MiniMaxAI/MiniMax-M3     MXFP8 W8A8         finegrained-fp8 (no TRT-LLM: clamped SwiGLU)
-  meta-llama/Llama-4-Scout rowwise FP8 W8A8  torch, FBGEMM, vLLM (TRT-LLM rowwise unavailable on B200)
-  unknown model          FP8 W8A16          E128 H6144 I6144 top4, tensor/block scales
+Rivals per format (each quantizes/prepares with its own stack; parity is checked against ours):
+  block / per-tensor / rowwise FP8   DeepGEMM, vLLM (fused_moe, CUTLASS GEMMs), FlashInfer TRT-LLM,
+                                     FBGEMM, torch.nn.functional.scaled_(grouped_)mm, transformers@main
+  MXFP4 / MXFP8                      FlashInfer TRT-LLM and mm_mxfp8, DeepGEMM FP4, OpenAI
+                                     triton_kernels, vLLM Marlin (MXFP4 W4A16)
+  NVFP4                              FlashInfer TRT-LLM / CUTLASS / mm_fp4, vLLM CUTLASS FP4, nvfp4-gemm
+  INT4/INT8 weight-only              vLLM Marlin / ExLlama, FlashInfer TRT-LLM MXINT4
+  BF16                               vLLM fused_moe, SonicMoE, DeepGEMM, megablocks, torch grouped_mm/bmm
+Every rival is import-guarded: a missing package skips its arm.
 
 The FP8/FP4 TRT-LLM arms are FlashInfer's ``trtllm_*_routed_moe`` kernels — the backends vLLM's
 serving path dispatches to on Blackwell for these quant modes (its own triton fused-MoE
@@ -77,11 +68,6 @@ Regimes: decode T=1 and prefill T=8192 (routed through top_k experts; attn row: 
 --smoke: fast everything-compiles pass — FINEGRAINED_AUTOTUNE_CONFIG=fast (unless one is already set)
 and a 256-token prefill.
 
-Baselines ("all kinds"): finegrained-fp8 (upstream), DeepGEMM (fp8/fp4/bf16), transformers
-grouped_mm/batched_mm (torch.nn.functional.grouped_mm / torch.bmm, the BF16 torch path), SonicMoE, OpenAI
-triton_kernels (MXFP4), and torch.scaled_grouped_mm (the cuBLAS quantized-prefill path). Each
-is import-guarded; a missing dependency skips that baseline.
-
 Run: python bench/bench_moe.py                         (all rows, single GPU)
      python bench/bench_moe.py --gpus 8                (shard problems across 8 GPUs, one process per GPU)
      python bench/bench_moe.py --gpus 5 --devices 3,4,5,6,7  (pin those shards to GPUs 3-7)
@@ -110,7 +96,7 @@ from textwrap import fill
 import argparse
 
 _parser = argparse.ArgumentParser(
-    description="MoE bench: finegrained-kernels vs finegrained-fp8 + references, on real model shapes.",
+    description="MoE + linear bench: finegrained-kernels vs third-party kernels and transformers main, on real model shapes.",
     epilog="Outputs land beside the script: bench_moe.csv + bench_moe.png (a filtered run writes "
            "bench_moe_partial.*; --mock writes bench_moe_mock.*).",
 )
@@ -440,16 +426,6 @@ try:
 except (ImportError, OSError):
     flashinfer_svdquant_linear = None
 
-UPSTREAM_FP8_LABEL = "v4"  # the legend suffix: the hub tag the pinned snapshot was published under
-# The `v4` tag was rebuilt on 2026-09-13 with a new op-namespace id (same kernel source). That
-# re-keys the upstream tuner's caches, and its cold search on the MX grouped rows (DeepSeek-V4
-# W4A8, MiniMax-M3 MXFP8) hits a config that traps with a misaligned address on this stack; the
-# upstream tuner has no trap fences, so the fault poisons the shard's CUDA context and blanks every
-# later cell. Pin the snapshot the committed figure measured (identical source, warm crowns).
-UPSTREAM_FP8_REV = "29083040812e244b390757d6198e2889fe551d13"
-# Load Hub dependencies only when a selected task needs them. Integer-only runs do not
-# download unrelated FP8/GPT-OSS kernels or depend on their availability.
-upstream_fp8 = None
 triton_kernels_hub = None
 
 DEVICE = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
@@ -491,12 +467,12 @@ FULL_MOE_PROBLEMS = {
         # deepgemm baseline. (Router is sqrtsoftplus upstream; the bench's shared softmax
         # top-k feeds every arm the same weights, so it does not affect the comparison.)
         E=256, H=4096, I=2048, top_k=6, weights="fp8_128x128_ue8m0", activation_format=None,
-        baselines=("finegrained-fp8", "deepgemm", "vllm", "trtllm"), fp8_block=[128, 128], block_size=(128, 128),
+        baselines=("transformers@main", "deepgemm", "vllm", "trtllm"), fp8_block=[128, 128], block_size=(128, 128),
         act="silu", swiglu_alpha=None, swiglu_limit=None,
     ),
     "deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6)": dict(
         E=256, H=4096, I=2048, top_k=6, weights="mxfp4", activation_format="mxfp8",
-        baselines=("finegrained-fp8", "deepgemm", "trtllm"), fp8_block=None, block_size=None,
+        baselines=("transformers@main", "deepgemm", "trtllm"), fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=None, swiglu_limit=None,
     ),
     "openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4)": dict(
@@ -504,8 +480,6 @@ FULL_MOE_PROBLEMS = {
         # a bf16-act x mxfp4-weight matmul (fp4 weight upcast in-MMA). fgm runs the SAME format via the
         # dedicated weight-only kernels (activation_format="bf16": raw bf16 acts, mxfp4 weight upcast to bf16
         # per-group in-loop, plain bf16 dot). The triton_kernels baseline is the reference W4A16.
-        # (finegrained-fp8 lacks W4A16 AND its MX kernels have no BK-divides-K guard — BK {128,256}
-        # doesn't divide 2880 -> NaN.)
         E=128, H=2880, I=2880, top_k=4, weights="mxfp4", activation_format="bf16",
         baselines=("trtllm", "vllm_marlin"), fused_extra=("triton_kernels",), fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
@@ -519,15 +493,14 @@ FULL_MOE_PROBLEMS = {
         # DeepSeek-V3 experts deploy fp32 block scales (software rescale). DeepGEMM's SM100
         # experts kernel requires UE8M0 and fails loud on fp32, so no deepgemm baseline here.
         E=256, H=7168, I=2048, top_k=8, weights="fp8_128x128", activation_format=None,
-        baselines=("finegrained-fp8", "vllm", "trtllm"), fp8_block=[128, 128], block_size=(128, 128),
+        baselines=("transformers@main", "vllm", "trtllm"), fp8_block=[128, 128], block_size=(128, 128),
         act="silu", swiglu_alpha=None, swiglu_limit=None,
     ),
     "mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4)": dict(
         # The only shipped STATIC scheme: its conversion script asserts qscheme_act == "TENSOR"
         # and writes weight_block_size None, so both levels are per tensor — per-expert weight
         # scales and a calibrated activation scale per expert in place of the runtime one.
-        # finegrained-fp8 has no static path and the rest take block scales, so vLLM is the one
-        # comparable arm (parity 4e-3 against us).
+        # vLLM and TRT-LLM's per-tensor entry point are the comparable arms (vLLM parity 4e-3).
         E=128, H=4096, I=2048, top_k=4, weights="fp8_tensor", activation_format=None, static=True,
         # trtllm rides their per_tensor entry point (`trtllm_fp8_per_tensor_scale_moe`), which
         # routes internally — it rejects the packed precomputed routing the block-scale arms
@@ -542,7 +515,7 @@ FULL_MOE_PROBLEMS = {
         # (see the gate in _run_task) — their fp4 kernel implements them, so GPT-OSS keeps its arm.
         # Re-checked on FlashInfer 0.6.18: its MXFP8 setup also rejects this shape.
         E=128, H=6144, I=3072, top_k=4, weights="mxfp8", activation_format=None,
-        baselines=("finegrained-fp8",), fp8_block=None, block_size=None,
+        baselines=("transformers@main",), fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
     ),
     "meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1)": dict(
@@ -622,12 +595,12 @@ FULL_BF16_PROBLEMS = {
 SMALL_MOE_PROBLEMS = {
     "deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E32 H2048 I1024 top6)": dict(
         E=32, H=2048, I=1024, top_k=6, weights="fp8_128x128_ue8m0", activation_format=None,
-        baselines=("finegrained-fp8", "deepgemm", "vllm", "trtllm"), fp8_block=[128, 128], block_size=(128, 128),
+        baselines=("transformers@main", "deepgemm", "vllm", "trtllm"), fp8_block=[128, 128], block_size=(128, 128),
         act="silu", swiglu_alpha=None, swiglu_limit=None,
     ),
     "deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E32 H2048 I1024 top6)": dict(
         E=32, H=2048, I=1024, top_k=6, weights="mxfp4", activation_format="mxfp8",
-        baselines=("finegrained-fp8", "deepgemm", "trtllm"), fp8_block=None, block_size=None,
+        baselines=("transformers@main", "deepgemm", "trtllm"), fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=None, swiglu_limit=None,
     ),
     # H/I stay at full size: 2880/2 = 1440 is not a multiple of any BLOCK_SIZE_K in the BF16
@@ -643,12 +616,12 @@ SMALL_MOE_PROBLEMS = {
     # covered here through its BF16 row.
     "deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E32 H3584 I1024 top8)": dict(
         E=32, H=3584, I=1024, top_k=8, weights="fp8_128x128", activation_format=None,
-        baselines=("finegrained-fp8", "vllm", "trtllm"), fp8_block=[128, 128], block_size=(128, 128),
+        baselines=("transformers@main", "vllm", "trtllm"), fp8_block=[128, 128], block_size=(128, 128),
         act="silu", swiglu_alpha=None, swiglu_limit=None,
     ),
     "MiniMaxAI/MiniMax-M3 MXFP8 (E16 H3072 I1536 top4)": dict(
         E=16, H=3072, I=1536, top_k=4, weights="mxfp8", activation_format=None,
-        baselines=("finegrained-fp8",), fp8_block=None, block_size=None,
+        baselines=("transformers@main",), fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
     ),
 }
@@ -700,9 +673,9 @@ ATTN_PROBLEMS = {
     "deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096)": dict(
         # DeepSeek-V4's attention deploys block-FP8 W8A8 with UE8M0 (power-of-two) scales
         # (only the EXPERTS are mixed W4A8) — routes through the tcgen05 dot_scaled arm.
-        # K=4096 is on the 128 grid, so finegrained-fp8 (block-dyn) and DeepGEMM FP8 both run it.
+        # K=4096 is on the 128 grid, so DeepGEMM FP8 runs it.
         N=12288, K=4096, weights="fp8_128x128_ue8m0", activation_format=None,
-        block=[128, 128], baselines=("finegrained-fp8", "deepgemm", "vllm_mm"),
+        block=[128, 128], baselines=("deepgemm", "vllm_mm"),
     ),
     # GPT-OSS deploys MXFP4 in experts; dense GPTQ/AWQ examples follow below.
     "nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144)": dict(
@@ -720,13 +693,12 @@ ATTN_PROBLEMS = {
         # UE8M0 deepgemm comparison is the DeepSeek-V4 attn row.
         N=21504, K=7168, weights="fp8_128x128", activation_format=None,
         # vLLM's CUTLASS block-FP8 GEMM reads the fp32 block scales as they are
-        block=[128, 128], baselines=("finegrained-fp8", "vllm_mm"),
+        block=[128, 128], baselines=("vllm_mm",),
     ),
     # the dense half of the same per-tensor STATIC export as the Mistral-4 MoE row: its attn
     # linears carry per-tensor weights and a calibrated activation scale, on the 2D op. N is the
     # fused qkv width from the model config (32 q heads + 32 kv heads, all 128-wide, hidden 4096).
-    # finegrained-fp8 has no static path and DeepGEMM's fp8 arms here are block-scaled, but
-    # torch's TensorWise scaled_mm is exactly this quantization granularity, so `torch_mm` bars
+    # DeepGEMM's fp8 arms are block-scaled, but torch's TensorWise scaled_mm is exactly this quantization granularity, so `torch_mm` bars
     # it. The local arm ROUTES to that same cuBLAS call, so the two are expected to coincide —
     # their diverging is the regression signal.
     "mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096)": dict(
@@ -736,7 +708,7 @@ ATTN_PROBLEMS = {
     "MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144)": dict(
         N=18432, K=6144, weights="mxfp8", activation_format=None,
         # DeepGEMM FP8 is 128-block, not group-32 MX; FlashInfer's mm_mxfp8 (CUTLASS) is
-        block=None, baselines=("finegrained-fp8", "flashinfer_mm"),
+        block=None, baselines=("flashinfer_mm",),
     ),
     "meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120)": dict(
         # Scout uses GQA: (40 query heads + 2 * 8 KV heads) * head_dim 128.
@@ -802,7 +774,6 @@ IMPL_COLORS = {
     "trtllm": "#dd0000",
     "trtllm_per_tensor": "#dd0000",
     "transformers@main": "#dd8800",
-    "finegrained-fp8": "#ffaaff",
     "torch": "#aa88ff",
     "torch_rowwise": "#aaddaa",
     "flashinfer_cutlass_moe": "#aa0066",
@@ -829,7 +800,7 @@ def _impl_label(impl, regime=None):
     """Legend name. The reference forwards ARE plain torch ops — name them by the op:
     transformers batched_mm -> torch.bmm (decode) / grouped_mm -> torch.nn.functional.grouped_mm (bf16);
     ``torch`` -> torch.nn.functional.scaled_grouped_mm (the quantized cuBLAS path). Every other impl
-    (finegrained-kernels, finegrained-fp8, deepgemm, ...) is its own label."""
+    (finegrained-kernels, deepgemm, ...) is its own label."""
     if impl == "finegrained-kernels-unfused":
         return "finegrained-kernels unfused"
     if impl == "torch_weight_only":
@@ -866,8 +837,6 @@ def _impl_label(impl, regime=None):
         return "FlashInfer CUTLASS"
     if impl == "flashinfer_svdquant":
         return "FlashInfer SVDQuant"
-    if impl == "finegrained-fp8":
-        return f"finegrained-fp8@{UPSTREAM_FP8_LABEL}"
     return impl
 
 
@@ -942,7 +911,7 @@ def _marlin_type(cfg):
 
 def build(cfg):
     """Quantized weights for one MoE problem, shared by every impl and row. The GLM-FP8
-    problem uses UE8M0 block scales (finegrained-fp8/finegrained-kernels decode them natively; DeepGEMM SM100
+    problem uses UE8M0 block scales (finegrained-kernels decodes them natively; DeepGEMM SM100
     requires them)."""
     torch.manual_seed(0)
     E, H, inter = cfg["E"], cfg["H"], cfg["I"]
@@ -1142,76 +1111,12 @@ def torch_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_):
     return lambda: fgm.moe.moe_torch_grouped(hidden, idx, w, gu, dn, gus_b, dns_b, **kw)
 
 
-def _fp8_scales(t, block):
-    """finegrained-fp8's BLOCK-FP8 path predates UE8M0 scales (KeyError on e8m0) — hand it the
-    exact fp32 values instead (UE8M0 holds pure exponents: lossless, same math).
-    Its MX path reads UE8M0 natively, so MX scales (block None) pass through."""
-    if block is not None and t is not None and t.dtype == torch.float8_e8m0fnu:
-        t = t.float()
-        _mark_static(t)
-    return t
-
-
 def _check_upstream_fp8_offsets(cfg, grouped, gu, dn, *, fused=False):
     # Pinned MX grouped readers use int32 expert offsets; the fused path also faults at the boundary.
     if grouped and cfg["weights"] in _MX_WEIGHTS:
         size = max(t.numel() * t.element_size() for t in (gu, dn))
         if size > 2**31 or (fused and size == 2**31):
-            raise RuntimeError("pinned finegrained-fp8 MX prefill has unsafe 32-bit expert offsets for this weight stack")
-
-
-def fp8_fused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
-    """Hub finegrained-fp8 fused forward (block_size positional; None = MX, [128,128] = block FP8)."""
-    _check_upstream_fp8_offsets(cfg, grouped, gu, dn, fused=True)
-    fn = upstream_fp8.moe_fused_grouped if grouped else upstream_fp8.moe_fused_batched
-    gus = _fp8_scales(gus, cfg["fp8_block"])
-    dns = _fp8_scales(dns, cfg["fp8_block"])
-    kw = dict(act_fn=cfg["act"], swiglu_alpha=cfg["swiglu_alpha"],
-              swiglu_limit=cfg["swiglu_limit"])
-    return lambda: fn(hidden, idx, w, gu, dn, gus, dns, cfg["fp8_block"], **kw)
-
-
-def fp8_unfused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
-    """finegrained-fp8 unfused: two plain finegrained-fp8 GEMMs + host GLU + weighted reduce. finegrained-fp8's grouped op
-    wants A expert-sorted with per-expert cumulative row-ends (``offsets``) and counts;
-    its batched op wants pre-expanded A + flat expert ids."""
-    _check_upstream_fp8_offsets(cfg, grouped, gu, dn)
-    E, top_k, T = cfg["E"], cfg["top_k"], hidden.shape[0]
-    gus = _fp8_scales(gus, cfg["fp8_block"])
-    dns = _fp8_scales(dns, cfg["fp8_block"])
-    flat = idx.reshape(-1).long()
-    if grouped:
-        order = torch.argsort(flat, stable=True)
-        src = order // top_k
-        counts = torch.histc(flat.float(), bins=E, min=0, max=E - 1).to(torch.int32)
-        offsets = torch.cumsum(counts, 0).to(torch.int32)
-
-        def run():
-            a_sorted = hidden[src]
-            gu_out = upstream_fp8.matmul_grouped(a_sorted, gu, gus, offsets, counts,
-                                           cfg["fp8_block"], torch.bfloat16)
-            gate, up = gu_out.chunk(2, dim=-1)
-            inter = _glu(gate, up, cfg).to(torch.bfloat16)
-            down = upstream_fp8.matmul_grouped(inter, dn, dns, offsets, counts,
-                                         cfg["fp8_block"], torch.bfloat16)
-            routed = torch.empty_like(down)
-            routed[order] = down
-            return (routed.view(T, top_k, -1) * w[..., None]).sum(1)
-    else:
-        src = torch.arange(T, device=hidden.device).repeat_interleave(top_k)
-        flat_i32 = flat.to(torch.int32)
-
-        def run():
-            a = hidden[src]
-            gu_out = upstream_fp8.matmul_batched(a, gu, gus, flat_i32, cfg["fp8_block"],
-                                           torch.bfloat16)
-            gate, up = gu_out.chunk(2, dim=-1)
-            inter = _glu(gate, up, cfg).to(torch.bfloat16)
-            down = upstream_fp8.matmul_batched(inter, dn, dns, flat_i32, cfg["fp8_block"],
-                                         torch.bfloat16)
-            return (down.view(T, top_k, -1) * w[..., None]).sum(1)
-
-    return run
+            raise RuntimeError("finegrained-fp8 hub kernel: MX prefill has unsafe 32-bit expert offsets for this weight stack")
 
 
 def transformers_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
@@ -1269,8 +1174,7 @@ def transformers_main_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
     """``transformers`` main on a quantized checkpoint — its ``finegrained_fp8`` integration
     (fp8_grouped_mm / fp8_batched_mm experts dispatch), which loads the finegrained-fp8 hub kernel
     behind a Python wrapper. This is the status quo an fgm integration would replace, so it is the
-    reference for what integrating fgm buys end-to-end; the bare ``finegrained-fp8`` arm is the
-    same kernel WITHOUT the wrapper, which separates integration overhead from kernel speed."""
+    reference for what integrating fgm buys end-to-end."""
     _check_upstream_fp8_offsets(cfg, grouped, gu, dn)
     mod = _Experts(cfg, gu, dn, gus, dns)
     fwd = fp8_grouped_mm_experts_forward if grouped else fp8_batched_mm_experts_forward
@@ -1866,8 +1770,6 @@ ARMS = {
     "finegrained-kernels-unfused": moe_unfused_arm,
     "torch_weight_only": torch_weight_only_arm,
     "marlin": marlin_weight_only_arm,
-    "finegrained-fp8": fp8_fused_arm,
-    "finegrained-fp8_unfused": fp8_unfused_arm,
     "transformers": transformers_arm,
     "transformers@main": transformers_main_arm,
     "sonicmoe": sonicmoe_arm,
@@ -2021,8 +1923,6 @@ def _mock_rows(row, pname, arms, rows_out):
     for regime, scale in (("decode", 100.0), ("prefill", 2000.0)):
         for i, name in enumerate(arms):
             res = {m: scale * rng.uniform(0.5, 3.0) for m in MODES}
-            if "finegrained-fp8" in name and regime == "prefill":
-                res["compile"] = None  # finegrained-fp8's sm_count fullgraph skip
             parity = None if i == 0 else rng.choice([1e-3, 3e-2, 0.12, float("nan")])
             rows_out.append((row, pname, regime, _impl(name), res, parity))
 
@@ -2182,7 +2082,6 @@ def _attn_arms(cfg, x, weights):
             exllama = _exllama_weight(cfg, W, Ws)
             exllama_bits = INT_BITS[cfg["weights"]]
             _mark_static(*exllama)
-    Ws_fp8 = _fp8_scales(Ws, block)
     dg_block = tuple(block) if block else None
     # deployment layout for the LOCAL arm only (every baseline reads the raw row-major scale):
     # dense attn weights ship pre-swizzled like the MoE arms, so the 2D op benches the tcgen05
@@ -2332,9 +2231,6 @@ def _attn_arms(cfg, x, weights):
             attn_arms["fbgemm"] = lambda: fbgemm_mm(x)
         if "vllm_mm" in cfg["baselines"] and vllm_fused_experts is not None:
             attn_arms["vllm_mm"] = lambda: vllm_mm(x)
-    if "finegrained-fp8" in cfg["baselines"]:
-        attn_arms["finegrained-fp8"] = lambda: upstream_fp8.matmul_2d(x, W, Ws_fp8, block,
-                                                   torch.bfloat16)
     if "deepgemm" in cfg["baselines"]:
         attn_arms["deepgemm"] = lambda: deepgemm_fp8_fp4_linear(
             x, W, Ws, block_size=dg_block, output_dtype=torch.bfloat16)
@@ -2508,7 +2404,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
 device_name = "MOCK (random values)" if MOCK else ACCELERATOR.get_device_name(0)
 print(f"device: {device_name}  torch {torch.__version__}  cache={CACHE_POLICY}"
       f"{'  [SMOKE]' if SMOKE else ''}")
-print("finegrained-kernels = local build; baselines: finegrained-fp8 (upstream), DeepGEMM, "
+print("finegrained-kernels = local build; baselines: transformers@main, DeepGEMM, "
       "vLLM fused MoE/Marlin/ExLlama, FlashInfer's TRT-LLM routed MoE/MXINT4, transformers grouped_mm/batched_mm, "
       "SonicMoE, OpenAI triton_kernels, torch.scaled_grouped_mm, "
       "nvfp4-gemm (transformers' NVFP4Linear kernel), megablocks (bf16 dMoE)"
@@ -2579,11 +2475,8 @@ def _load_rows_csv(path):
 
 def _run_task(kind, pname, cfg, rows_out):
     """Run one problem's row(s) into rows_out (build its weights once, bench its arms)."""
-    global upstream_fp8, triton_kernels_hub, _megablocks, _nvfp4_gemm
+    global triton_kernels_hub, _megablocks, _nvfp4_gemm
     if not (MOCK or REPLOT):
-        if "finegrained-fp8" in cfg["baselines"] and upstream_fp8 is None:
-            upstream_fp8 = get_kernel("kernels-community/finegrained-fp8", revision=UPSTREAM_FP8_REV,
-                                      trust_remote_code=TRUSTED)
         if "triton_kernels" in cfg.get("fused_extra", ()) + cfg["baselines"] and triton_kernels_hub is None:
             triton_kernels_hub = get_kernel("kernels-community/gpt-oss-triton-kernels", version=1,
                                            trust_remote_code=TRUSTED)
@@ -2630,15 +2523,13 @@ def _run_task(kind, pname, cfg, rows_out):
         # quantized: its forward hands `block_size` straight to grouped_matmul (None = MX), so
         # MXFP4/MXFP8 checkpoints work, not just block-scale FP8. It cannot express bf16
         # activations (W4A16) — it always quantizes — and feeding it those faults the CUDA context.
-        tfm_arm_t = (("transformers@main",)
-                     if "finegrained-fp8" in cfg["baselines"] and _quantized_acts(cfg) else ())
         # nvfp4-gemm is NOT enlisted on the MoE rows. That integration has no MoE kernel, so the
         # only way to run it here is a dense GEMM per expert — 8.8ms against our 47us, which is a
         # statement about the missing kernel rather than a comparison of kernels, and one bar that
         # tall flattens every other bar in the panel. It stays on the attn row, where the two are
         # doing the same job.
         quant_arms = (("finegrained-kernels",) + cfg["baselines"] + cfg.get("fused_extra", ())
-                      + tfm_arm_t + torch_arm_t)
+                      + torch_arm_t)
         # soft-imported arms drop out where their package is absent; the TRT-LLM fp8-block
         # kernel additionally drops on clamped/scaled SwiGLU rows — passing its gemm1_alpha/
         # beta/clamp_limit there still answers a different function (measured rel 4.4e-1 vs
@@ -2660,8 +2551,9 @@ def _run_task(kind, pname, cfg, rows_out):
                 print(f"      [{name} unavailable on this installation]", flush=True)
         quant_arms = tuple(a for a in quant_arms if a not in unavailable
                            and (a != "marlin" or fused_marlin_moe is not None and apply_fp8_marlin_linear is not None))
-        # Keep the legacy Hub arm last so an unexpected CUDA fault preserves other timings.
-        _TRAP_RISK = ("finegrained-fp8",)
+        # transformers@main runs the legacy finegrained-fp8 hub kernel: keep it last so an
+        # unexpected CUDA fault there preserves the other timings
+        _TRAP_RISK = ("transformers@main",)
         quant_arms = (tuple(a for a in quant_arms if a not in _TRAP_RISK)
                       + tuple(a for a in quant_arms if a in _TRAP_RISK))
         if wanted("quantized", pname):
