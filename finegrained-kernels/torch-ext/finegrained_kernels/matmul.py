@@ -1583,6 +1583,11 @@ def w8a8_block_dynamic_fp8_matmul(
     assert Bs.shape == (triton.cdiv(rows, block_n), K // block_k), (
         f"Bs shape {tuple(Bs.shape)} != expected ({triton.cdiv(rows, block_n)}, {K // block_k})"
     )
+    # cuBLAS MXFP8 fast path for power-of-two block scales, inside the op as the MX route
+    if not gate and bias is None and not simulate_unfused:
+        _smm = _torch_scaled_mm_2d_block_ue8m0(A, B, Bs, block_size, resolve_output_dtype(output_dtype, A, None))
+        if _smm is not None:
+            return [_smm]
 
     bs_u8 = ue8m0_as_uint8(Bs)
     # UE8M0 weight scales are the DeepGEMM-Blackwell format — quantize activations to UE8M0
@@ -2557,6 +2562,9 @@ _SCALED_MM_MIN_M = int(os.environ.get("FINEGRAINED_SCALED_MM_MIN_M", "2"))
 # Row-wise FP8 keeps Triton decode; the public path wins through the measured M=8192.
 _SCALED_MM_ROWWISE_MIN_M = 65
 _SCALED_MM_ROWWISE_MAX_M = 8193
+# UE8M0 block FP8 keeps Triton through M=256 (B200, N=12288 K=4096, cudagraph): M=128 16.0 vs 19.1us,
+# M=256 23.3 vs 23.6, then M=320 40.8 vs 27.2, M=2048 138.5 vs 91.2, M=8192 510.2 vs 330.0.
+_SCALED_MM_BLOCK_MIN_M = 257
 
 
 def _scaled_mm_2d(
@@ -2657,6 +2665,39 @@ def _torch_scaled_mm_2d_tensor_wise(A, B, As, Bs, activation_format, out_dtype, 
         return _smm_reject("activation-alignment")
     out = _scaled_mm_2d(Aq, As.contiguous(), B, Bs.contiguous(), None, None, "fp8")
     return out.reshape(*A.shape[:-1], B.shape[0])
+
+
+def _torch_scaled_mm_2d_block_ue8m0(A, B, Bs, block_size, out_dtype):
+    """The scaled_mm route for 128x128 UE8M0 block FP8 (the DeepGEMM-Blackwell checkpoints), or
+    ``None`` to take the Triton kernel. A power-of-two block scale is an MX group-32 scale repeated
+    over its block, so the same operands run as cuBLAS's MXFP8 GEMM: the activation quant writes each
+    ``1 x 128`` scale into its four swizzled group-32 slots, and the weight's ``128 x 128`` grid
+    expands to one row per weight row. Bit-identical to the Triton kernel (same quant, fp32
+    accumulate); DeepSeek-V4 qkv prefill (B200, M=8192 N=12288 K=4096) GEMM 489 -> 288 us."""
+    if os.environ.get("FINEGRAINED_DISABLE_SCALED_MM"):
+        return _smm_reject("env-disabled")
+    if not is_sm10x():
+        return _smm_reject("not-sm10x")
+    if not (hasattr(torch.nn.functional, "scaled_mm") and hasattr(torch.nn.functional, "ScalingType")):
+        return _smm_reject("no-F.scaled_mm")
+    bs_u8 = ue8m0_as_uint8(Bs)
+    if bs_u8.dtype != torch.uint8:
+        return _smm_reject("fp32 block scale")  # not a power of two: no MX form
+    if list(block_size) != [128, 128]:
+        return _smm_reject("block")
+    if out_dtype is not torch.bfloat16:
+        return _smm_reject("out-dtype")
+    N, K = B.shape
+    M = A.numel() // K
+    if M < _SCALED_MM_BLOCK_MIN_M or K % 128 or N % 128:
+        return _smm_reject("shape/minM")
+    if B.stride(-1) != 1:
+        return _smm_reject("weight-layout")
+    Aq, As = fp8_act_quant_block_dynamic(A.reshape(M, K), 128, use_ue8m0=True, swizzled=True)
+    weight_rows = torch.arange(N, device=B.device, dtype=torch.int32) // 128
+    Bs_mx = swizzle_mx_scales(bs_u8.repeat_interleave(4, dim=1), gather_idx=weight_rows)
+    out = _scaled_mm_2d(Aq, As, B, Bs_mx, None, None, "mxfp8")
+    return out.reshape(*A.shape[:-1], N)
 
 
 def _torch_scaled_mm_2d(A, B, As, Bs, activation_format, a_global_scale, b_global_scale, out_dtype):

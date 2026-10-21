@@ -300,6 +300,8 @@ def scenarios() -> list[Problem]:
         # launch-scale smoke (the matrix rides small shapes; this catches scale-dependent
         # scheduling/tiling regressions)
         Problem(weights="mxfp8", S=2048, E=16, N=512, K=1024),
+        # UE8M0 block FP8 above M=256: the 2D op runs it as cuBLAS's MXFP8 GEMM
+        Problem(weights="fp8_128x128_ue8m0", S=2048, E=16, N=512, K=1024),
         Problem(weights="fp8_128x128", compile=True),
         Problem(weights="mxfp4", compile=True),
         Problem(weights="bf16", compile=True),  # the fp kernel's pre_hook under compile

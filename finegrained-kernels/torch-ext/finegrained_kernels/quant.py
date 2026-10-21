@@ -1149,7 +1149,7 @@ def _launch_act_quant(
         for bt in (16, 32, 64, 128)
         for w in (1, 2, 4, 8)
     ],
-    ["K", "BLOCK_K", "t_bucket"],
+    ["K", "BLOCK_K", "t_bucket", "SWIZZLED"],
     n_trials=100,
 )
 @triton.jit
@@ -1165,6 +1165,7 @@ def _fp8_act_quant_block_dynamic_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_T: tl.constexpr,
     UE8M0: tl.constexpr = False,
+    SWIZZLED: tl.constexpr = False,
     PDL: tl.constexpr = False,
 ):
     """One-pass block-FP8 activation quant: rows → E4M3 + one ``amax/448`` scale per
@@ -1174,7 +1175,11 @@ def _fp8_act_quant_block_dynamic_kernel(
     form starved memory (128-byte transactions across ~T*K/BK tiny programs); the row tile
     gives the loads something to coalesce. The span equals the consumer's ``BLOCK_SIZE_K``,
     so results are bit-exact with the inline quant. Arbitrary input strides (no host-side
-    copy); ``BLOCK_K`` is fixed by the scale layout, ``BLOCK_T`` and warps are tuned."""
+    copy); ``BLOCK_K`` is fixed by the scale layout, ``BLOCK_T`` and warps are tuned.
+
+    ``SWIZZLED`` (UE8M0 only) stores each ``1 x BLOCK_K`` scale into its ``BLOCK_K // 32`` group-32
+    slots of the SWIZZLE_32_4_4 layout: the same power-of-two scale repeated, so an MXFP8 GEMM
+    reads exactly the block-FP8 operand."""
     if PDL:
         gdc_wait()
     pid_t = tl.program_id(0)
@@ -1191,22 +1196,35 @@ def _fp8_act_quant_block_dynamic_kernel(
     tl.store(Y + rows[:, None] * K + offs[None, :], y, mask=row_mask[:, None])
     if PDL:
         gdc_launch_dependents()
-    tl.store(S + rows * (K // BLOCK_K) + kb, s, mask=row_mask)
+    if SWIZZLED:
+        store_mx_act_scales(
+            None, S, rows, tl.broadcast_to(s[:, None], (BLOCK_T, BLOCK_K // 32)), row_mask, kb, T, K,
+            32, BLOCK_K, True, "blocks",
+        )
+    else:
+        tl.store(S + rows * (K // BLOCK_K) + kb, s, mask=row_mask)
 
 
 def fp8_act_quant_block_dynamic(
-    x: torch.Tensor, block_k: int, use_ue8m0: bool = False, row_multiple: int = 1
+    x: torch.Tensor, block_k: int, use_ue8m0: bool = False, row_multiple: int = 1, swizzled: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``(T, K)`` activations to block-FP8 once (E4M3 + per-``block_k`` scales)
     instead of inline per weight-tile — same rationale and layout as ``mxfp8_act_quant`` (a
     GEMM re-reads its activation once per N-tile). Bit-exact with the inline form. Scales are
     fp32 (``amax/448``) or, under ``use_ue8m0``, UE8M0 exponent bytes (power-of-two scales)
     for the tcgen05 ``dot_scaled`` path — the DeepGEMM-Blackwell format. ``row_multiple`` backs
-    the E4M3 rows with storage rounded up to that many rows, as ``fp8_act_quant_tensor_wide``."""
+    the E4M3 rows with storage rounded up to that many rows, as ``fp8_act_quant_tensor_wide``.
+    ``swizzled`` (UE8M0 only) emits the scales as the group-32 SWIZZLE_32_4_4 operand of an MXFP8
+    GEMM instead, each block scale repeated over its ``block_k // 32`` groups."""
     T, K = x.shape
+    assert use_ue8m0 or not swizzled, "only power-of-two (UE8M0) block scales are MX group scales"
     y = row_padded_empty(T, K, row_multiple, FP8_DTYPE, x.device)
     s_dtype = torch.uint8 if use_ue8m0 else torch.float32
-    s = torch.empty(T, K // block_k, device=x.device, dtype=s_dtype)
+    if swizzled:
+        cb = triton.cdiv(K // MX_SCALE_GROUP_K, 4)
+        s = torch.empty(1, triton.cdiv(T, 128), cb, 2, 256, device=x.device, dtype=s_dtype)
+    else:
+        s = torch.empty(T, K // block_k, device=x.device, dtype=s_dtype)
 
     def grid(META):
         return (triton.cdiv(T, META["BLOCK_T"]), K // block_k)
@@ -1214,7 +1232,7 @@ def fp8_act_quant_block_dynamic(
     with device_context(x.device):
         compile_time_only_triton_wrap(_fp8_act_quant_block_dynamic_kernel)[grid](
             x, y, s, x.stride(0), x.stride(1), T, T.bit_length(),
-            K=K, BLOCK_K=block_k, UE8M0=use_ue8m0,
+            K=K, BLOCK_K=block_k, UE8M0=use_ue8m0, SWIZZLED=swizzled,
             **pdl_launch_kwargs(),
         )
     return y, s
