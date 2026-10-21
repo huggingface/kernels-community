@@ -78,7 +78,7 @@ Regimes: decode T=1 and prefill T=8192 (routed through top_k experts; attn row: 
 and a 256-token prefill.
 
 Baselines ("all kinds"): finegrained-fp8 (upstream), DeepGEMM (fp8/fp4/bf16), transformers
-grouped_mm/batched_mm (torch._grouped_mm / torch.bmm, the BF16 torch path), SonicMoE, OpenAI
+grouped_mm/batched_mm (torch.nn.functional.grouped_mm / torch.bmm, the BF16 torch path), SonicMoE, OpenAI
 triton_kernels (MXFP4), and torch.scaled_grouped_mm (the cuBLAS quantized-prefill path). Each
 is import-guarded; a missing dependency skips that baseline.
 
@@ -98,6 +98,7 @@ Run: python bench/bench_moe.py                         (all rows, single GPU)
 import csv
 import os
 import random
+import re
 import subprocess
 import threading
 import sys
@@ -274,13 +275,36 @@ try:
     from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8 as _vllm_group_quant  # noqa: E402
     from vllm._custom_ops import scaled_fp8_quant as _vllm_tensor_quant  # noqa: E402
     from vllm._custom_ops import cutlass_scaled_mm as _vllm_scaled_mm  # noqa: E402
+    from vllm._custom_ops import cutlass_scaled_fp4_mm as _vllm_fp4_mm  # noqa: E402
+    from vllm._custom_ops import scaled_fp4_quant as _vllm_fp4_quant  # noqa: E402
 except ImportError:
     vllm_fused_experts = None
+# FlashInfer's CUTLASS fused MoE (the kernel vLLM's FlashInferExperts wraps)
+try:
+    from flashinfer.fused_moe import cutlass_fused_moe as _fi_cutlass_moe  # noqa: E402
+    from flashinfer.fp4_quantization import block_scale_interleave as _fi_sf_interleave_moe  # noqa: E402
+except (ImportError, OSError):
+    _fi_cutlass_moe = None
+# FlashInfer's dense FP4/MXFP8 GEMMs (the linear rows' FlashInfer arm), CUTLASS backend
+try:
+    from flashinfer import fp4_quantize as _fi_fp4_quant  # noqa: E402
+    from flashinfer import mm_fp4 as _fi_mm_fp4  # noqa: E402
+    from flashinfer import mm_mxfp8 as _fi_mm_mxfp8  # noqa: E402
+    from flashinfer import mxfp8_quantize as _fi_mxfp8_quant  # noqa: E402
+except (ImportError, OSError):
+    _fi_mm_fp4 = None
 try:
     from vllm.model_executor.layers.fused_moe.experts.marlin_moe import fused_marlin_moe  # noqa: E402
     from vllm.scalar_type import scalar_types  # noqa: E402
 except ImportError:
     fused_marlin_moe = None
+
+try:
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (  # noqa: E402
+        prepare_moe_mxfp4_layer_for_marlin,
+    )
+except ImportError:
+    prepare_moe_mxfp4_layer_for_marlin = None
 
 try:
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (  # noqa: E402
@@ -483,12 +507,12 @@ FULL_MOE_PROBLEMS = {
         # (finegrained-fp8 lacks W4A16 AND its MX kernels have no BK-divides-K guard — BK {128,256}
         # doesn't divide 2880 -> NaN.)
         E=128, H=2880, I=2880, top_k=4, weights="mxfp4", activation_format="bf16",
-        baselines=("trtllm",), fused_extra=("triton_kernels",), fp8_block=None, block_size=None,
+        baselines=("trtllm", "vllm_marlin"), fused_extra=("triton_kernels",), fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
     ),
     "nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8)": dict(
         E=256, H=6144, I=2048, top_k=8, weights="nvfp4", activation_format=None,
-        baselines=("trtllm",), fp8_block=None, block_size=None,
+        baselines=("trtllm", "flashinfer_cutlass_moe"), fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=None, swiglu_limit=None,
     ),
     "deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8)": dict(
@@ -516,6 +540,7 @@ FULL_MOE_PROBLEMS = {
         # No TRT-LLM arm: this row's activation is the clamped/scaled SwiGLU (alpha 1.702,
         # limit 7.0) and their fp8-block kernel answers a different function with those scalars
         # (see the gate in _run_task) — their fp4 kernel implements them, so GPT-OSS keeps its arm.
+        # Re-checked on FlashInfer 0.6.18: its MXFP8 setup also rejects this shape.
         E=128, H=6144, I=3072, top_k=4, weights="mxfp8", activation_format=None,
         baselines=("finegrained-fp8",), fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
@@ -677,12 +702,14 @@ ATTN_PROBLEMS = {
         # (only the EXPERTS are mixed W4A8) — routes through the tcgen05 dot_scaled arm.
         # K=4096 is on the 128 grid, so finegrained-fp8 (block-dyn) and DeepGEMM FP8 both run it.
         N=12288, K=4096, weights="fp8_128x128_ue8m0", activation_format=None,
-        block=[128, 128], baselines=("finegrained-fp8", "deepgemm"),
+        block=[128, 128], baselines=("finegrained-fp8", "deepgemm", "vllm_mm"),
     ),
     # GPT-OSS deploys MXFP4 in experts; dense GPTQ/AWQ examples follow below.
     "nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144)": dict(
         N=18432, K=6144, weights="nvfp4", activation_format=None,
-        block=None, baselines=(),  # no baseline supports NVFP4
+        # vLLM's CUTLASS FP4 GEMM and FlashInfer's mm_fp4 (CUTLASS backend), each quantizing the
+        # BF16 weight with its own NVFP4 quantizer (FlashInfer's trtllm backend wants pre-shuffled weights)
+        block=None, baselines=("vllm_mm", "flashinfer_mm"),
     ),
     "deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168)": dict(
         # DeepSeek-V3 deploys fp32 block scales everywhere (software rescale, not dot_scaled).
@@ -692,7 +719,8 @@ ATTN_PROBLEMS = {
         # That is a different computation, so timing it here would compare unlike work; the honest
         # UE8M0 deepgemm comparison is the DeepSeek-V4 attn row.
         N=21504, K=7168, weights="fp8_128x128", activation_format=None,
-        block=[128, 128], baselines=("finegrained-fp8",),
+        # vLLM's CUTLASS block-FP8 GEMM reads the fp32 block scales as they are
+        block=[128, 128], baselines=("finegrained-fp8", "vllm_mm"),
     ),
     # the dense half of the same per-tensor STATIC export as the Mistral-4 MoE row: its attn
     # linears carry per-tensor weights and a calibrated activation scale, on the 2D op. N is the
@@ -703,11 +731,12 @@ ATTN_PROBLEMS = {
     # their diverging is the regression signal.
     "mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096)": dict(
         N=12288, K=4096, weights="fp8_tensor", activation_format=None,
-        block=None, baselines=(), static=True,
+        block=None, baselines=("vllm_mm",), static=True,  # vLLM: cutlass_scaled_mm, per-tensor scales
     ),
     "MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144)": dict(
         N=18432, K=6144, weights="mxfp8", activation_format=None,
-        block=None, baselines=("finegrained-fp8",),  # DeepGEMM FP8 is 128-block, not group-32 MX
+        # DeepGEMM FP8 is 128-block, not group-32 MX; FlashInfer's mm_mxfp8 (CUTLASS) is
+        block=None, baselines=("finegrained-fp8", "flashinfer_mm"),
     ),
     "meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120)": dict(
         # Scout uses GQA: (40 query heads + 2 * 8 KV heads) * head_dim 128.
@@ -760,41 +789,46 @@ ATTN_PROBLEMS = {
 MODES = ["eager", "cudagraph", "compile"]
 CACHE_POLICY = "rotating_gt_2l2" if DEVICE == "cuda" else "backend_default"
 
-# One hue family per project, a distinct shade per arm, so color alone names the arm within any
-# panel (vLLM teals, FlashInfer/TRT-LLM greens, torch pinks). Arms that never share a row (the two
-# torch and torch_mm) may share a shade.
+# Picked for separation, not by vendor: a 10-color palette (greedy max-min OKLab distance) assigned so
+# that arms sharing a panel never share a color (every panel's all-pairs dE >= 15.6, colorblind dE
+# >= 11.4). finegrained-kernels is the fixed blue and the most distinct color in every panel: every
+# other color stays >= 22 dE from it. A color may name different arms in different panels, so each
+# panel carries its own legend.
 IMPL_COLORS = {
-    "finegrained-kernels": "#1f77b4",
-    "finegrained-kernels-unfused": "#9ecae1",
-    "finegrained-fp8": "#bdbdbd",
-    "transformers@main": "#636363",  # transformers main on a quantized checkpoint (status quo)
-    "transformers": "#9467bd",
-    "deepgemm": "#d4a017",
-    "deepgemm_bf16": "#d4a017",
-    "sonicmoe": "#ff7f0e",
-    "megablocks": "#8c6d31",  # databricks dropless-MoE (bf16 reference)
-    "triton_kernels": "#8c564b",  # OpenAI mxfp4 (GPT-OSS) reference
-    "nvfp4_gemm": "#d62728",  # transformers NVFP4Linear kernel (dense 2D row only)
-    "vllm": "#17becf",  # vLLM triton fused-MoE (its bf16 serving kernel)
-    "vllm_marlin": "#0e7c86",
-    "marlin": "#01665e",
-    "vllm_mm": "#9edae5",
-    "vllm_exllama": "#5ab4ac",
-    "trtllm": "#76b900",  # FlashInfer TRT-LLM fused MoE (NVIDIA Blackwell serving kernels)
-    "flashinfer_mxint4": "#b8e186",
-    "flashinfer_svdquant": "#4d7c0f",
-    "torch": "#e377c2",  # torch/cuBLAS F.scaled_grouped_mm (quantized prefill reference)
-    "torch_mm": "#e377c2",  # torch/cuBLAS F.scaled_mm (the attn-row sibling)
-    "torch_rowwise": "#c51b7d",
-    "torch_weight_only": "#ae017e",
-    "fbgemm": "#bcbd22",
+    "finegrained-kernels": "#1f63c6",
+    "deepgemm": "#77ee00",
+    "deepgemm_bf16": "#77ee00",
+    "vllm": "#00aa99",
+    "trtllm": "#dd0000",
+    "trtllm_per_tensor": "#dd0000",
+    "transformers@main": "#dd8800",
+    "finegrained-fp8": "#ffaaff",
+    "torch": "#aa88ff",
+    "torch_rowwise": "#aaddaa",
+    "flashinfer_cutlass_moe": "#aa0066",
+    "fbgemm": "#660044",
+    "finegrained-kernels-unfused": "#00aa99",
+    "marlin": "#77ee00",
+    "vllm_marlin": "#ffaaff",
+    "flashinfer_mxint4": "#dd8800",
+    "torch_weight_only": "#660044",
+    "triton_kernels": "#aa88ff",
+    "torch_mm": "#dd0000",
+    "nvfp4_gemm": "#00aa99",
+    "vllm_mm": "#dd8800",
+    "flashinfer_mm": "#aa88ff",
+    "flashinfer_svdquant": "#aaddaa",
+    "vllm_exllama": "#dd0000",
+    "sonicmoe": "#dd0000",
+    "transformers": "#ffaaff",
+    "megablocks": "#660044",
 }
 
 
-def _impl_label(impl):
+def _impl_label(impl, regime=None):
     """Legend name. The reference forwards ARE plain torch ops — name them by the op:
-    transformers batched_mm -> torch.bmm (decode) / grouped_mm -> torch._grouped_mm (bf16);
-    ``torch`` -> torch.scaled_grouped_mm (the quantized cuBLAS path). Every other impl
+    transformers batched_mm -> torch.bmm (decode) / grouped_mm -> torch.nn.functional.grouped_mm (bf16);
+    ``torch`` -> torch.nn.functional.scaled_grouped_mm (the quantized cuBLAS path). Every other impl
     (finegrained-kernels, finegrained-fp8, deepgemm, ...) is its own label."""
     if impl == "finegrained-kernels-unfused":
         return "finegrained-kernels unfused"
@@ -802,16 +836,16 @@ def _impl_label(impl):
         return "torch runtime dequant + BF16 GEMM"
     if impl == "marlin":
         return "vLLM Marlin FP8 W8A16"
-    if impl == "transformers":
-        return "torch.bmm / torch._grouped_mm"
+    if impl == "transformers":  # batched_mm at decode, grouped_mm at prefill
+        return {"decode": "torch.bmm", "prefill": "torch.nn.functional.grouped_mm"}.get(regime, "torch.bmm / torch.nn.functional.grouped_mm")
     if impl == "torch":
-        return "torch.scaled_grouped_mm"
+        return "torch.nn.functional.scaled_grouped_mm"
     if impl == "torch_rowwise":
-        return "torch.scaled_mm (per expert)"
+        return "torch.nn.functional.scaled_mm (per expert)"
     if impl == "fbgemm":
         return "FBGEMM / MSLK"
     if impl == "torch_mm":
-        return "torch.scaled_mm"
+        return "torch.nn.functional.scaled_mm"
     if impl == "nvfp4_gemm":
         return "nvfp4-gemm"
     if impl == "vllm_exllama":
@@ -826,6 +860,10 @@ def _impl_label(impl):
         return "vLLM CUTLASS"
     if impl == "trtllm":
         return "FlashInfer TRT-LLM"
+    if impl == "flashinfer_mm":
+        return "FlashInfer"
+    if impl == "flashinfer_cutlass_moe":
+        return "FlashInfer CUTLASS"
     if impl == "flashinfer_svdquant":
         return "FlashInfer SVDQuant"
     if impl == "finegrained-fp8":
@@ -1545,6 +1583,13 @@ def vllm_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
     backends, each with its own weight interleaving."""
     tki = idx.to(torch.int32)
     tkw = w.to(torch.float32)
+    act = _VllmAct.SILU
+    if _vllm_swigluoai(cfg):
+        # GPT-OSS's clamped SwiGLU is vLLM's swigluoai (alpha 1.702, limit 7 fixed), which reads
+        # gate|up interleaved; bf16 rows only (no scale grid to reorder)
+        assert cfg["weights"] == "bf16"
+        act, gu = _VllmAct.SWIGLUOAI, _interleave_rows(gu)
+        _mark_static(gu)
     qc = None
     if cfg["weights"] == "fp8_rowwise":
         qc = _vllm_fp8_qc(w1_scale=gus, w2_scale=dns,
@@ -1567,10 +1612,17 @@ def vllm_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
     if qc is not None:
         _mark_static(qc.w1_scale, qc.w2_scale, qc.a1_scale, qc.a2_scale)
     return lambda: vllm_fused_experts(hidden, gu, dn, tkw, tki,
-                                      activation=_VllmAct.SILU, quant_config=qc)
+                                      activation=act, quant_config=qc)
+
+
+def _vllm_swigluoai(cfg):
+    """The row's activation is GPT-OSS's clamped SwiGLU, which vLLM implements as swigluoai."""
+    return (cfg["swiglu_alpha"], cfg["swiglu_limit"]) == (1.702, 7.0)
 
 
 def marlin_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, logits, guz, dnz):
+    if cfg["weights"] == "mxfp4":
+        return _marlin_mxfp4_moe_arm(cfg, hidden, idx, w, gu, gus, dn, dns)
     def pack(weight, scales, zeros):
         triples = [_marlin_weight(cfg, weight[e], scales[e], None if zeros is None else zeros[e])
                    for e in range(cfg["E"])]
@@ -1583,6 +1635,66 @@ def marlin_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, l
     return lambda: fused_marlin_moe(
         hidden, g, d, None, None, gs, ds, w, idx, kind,
         w1_zeros=gz, w2_zeros=dz, workspace=workspace)
+
+
+def _marlin_mxfp4_moe_arm(cfg, hidden, idx, w, gu, gus, dn, dns):
+    """vLLM's MXFP4 Marlin MoE (its GPT-OSS backend on GPUs without the TRT-LLM kernels), prepared
+    by vLLM's own prepare_moe_mxfp4_layer_for_marlin from the checkpoint's interleaved gate|up, with
+    the GPT-OSS clamped SwiGLU as vLLM's swigluoai. Padded the way vLLM pads it for this backend
+    (intermediate to 128, hidden to 256: mxfp4_round_up_hidden_size_and_intermediate_size); zero
+    fp4 bytes and zero scale bytes decode to 0, so the padded lanes contribute nothing."""
+    assert _vllm_swigluoai(cfg)
+    H, inter = cfg["H"], cfg["I"]
+    Hp, Ip = -(-H // 256) * 256, -(-inter // 128) * 128
+    w13 = _interleave_rows(_trtllm_fp4_pad(gu.view(torch.uint8), 2 * Ip, Hp // 2, True))
+    w13s = _interleave_rows(_trtllm_fp4_pad(gus.view(torch.uint8), 2 * Ip, Hp // 32, True))
+    w2 = _trtllm_fp4_pad(dn.view(torch.uint8), Hp, Ip // 2, False)
+    w2s = _trtllm_fp4_pad(dns.view(torch.uint8), Hp, Ip // 32, False)
+    layer = torch.nn.Module()
+    layer.params_dtype = hidden.dtype
+    w13, w2, s13, s2, _, _ = prepare_moe_mxfp4_layer_for_marlin(layer, w13, w2, w13s, w2s, None, None)
+    workspace = marlin_make_workspace_new(hidden.device, 4)
+    _mark_static(w13, w2, s13, s2, workspace)
+
+    def run():
+        x = torch.nn.functional.pad(hidden, (0, Hp - H)) if Hp != H else hidden
+        out = fused_marlin_moe(x, w13, w2, None, None, s13, s2, w, idx, scalar_types.float4_e2m1f.id,
+                               activation=_VllmAct.SWIGLUOAI, workspace=workspace)
+        return out[:, :H] if Hp != H else out
+    return run
+
+
+def flashinfer_cutlass_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_):
+    """FlashInfer's CUTLASS NVFP4 fused MoE (W4A4), on the row's own packed weights and calibrated
+    globals: gate|up swapped to their [up; gate], block scales in their interleaved layout, globals
+    inverted to their scale-into-fp4 convention (alpha = act global * weight global per expert). The
+    activation and intermediate quant run inside the kernel. Checked against an NVFP4 fake-quant
+    reference: 0.232 vs BF16 on random data, the format's own error (6e-2 from the exact emulation)."""
+    inter = cfg["I"]
+
+    def swap(t):
+        return torch.cat([t[:, inter:], t[:, :inter]], dim=1).contiguous()
+
+    w1 = swap(gu.view(torch.uint8)).view(torch.long)
+    w2 = dn.view(torch.uint8).contiguous().view(torch.long)
+    def interleave(t):  # their 128x4 scale tiles, returned flat: (E, rows padded to 128, cols to 4)
+        rows, cols = -(-t.shape[1] // 128) * 128, -(-t.shape[2] // 4) * 4
+        return _fi_sf_interleave_moe(t).reshape(t.shape[0], rows, cols).view(torch.int32)
+
+    w1s = interleave(swap(gus.view(torch.uint8)))
+    w2s = interleave(dns.view(torch.uint8).contiguous())
+    act_g, inter_g = _nvfp4_input_globals(cfg, hidden, gu, gus, gu_g)
+    scales = [(1.0 / act_g).reshape(()).float(), w1s, (act_g * gu_g.float()).reshape(-1),
+              (1.0 / inter_g).reshape(()).float(), w2s, (inter_g * dn_g.float()).reshape(-1)]
+    tki, tkw = idx.to(torch.int32), w.to(torch.float32)
+    _mark_static(w1, w2, *scales)
+
+    def run():
+        out = _fi_cutlass_moe(input=hidden, token_selected_experts=tki, token_final_scales=tkw,
+                              fc1_expert_weights=w1, fc2_expert_weights=w2,
+                              output_dtype=hidden.dtype, quant_scales=scales)
+        return out[0] if isinstance(out, (list, tuple)) else out
+    return run
 
 
 def flashinfer_int4_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, logits, guz, dnz):
@@ -1763,6 +1875,7 @@ ARMS = {
     "vllm": vllm_moe_arm,
     "vllm_marlin": marlin_moe_arm,
     "flashinfer_mxint4": flashinfer_int4_arm,
+    "flashinfer_cutlass_moe": flashinfer_cutlass_moe_arm,
     "trtllm": trtllm_moe_arm,
     "deepgemm": deepgemm_arm,
     "deepgemm_bf16": deepgemm_bf16_arm,
@@ -2243,7 +2356,76 @@ def _attn_arms(cfg, x, weights):
         _pw = _nvfp4_gemm.pack(_w_bf16, device=x.device)
         _mark_static(_pw.qweight, _pw.sf, _pw.global_scale, _pw.sf_rowmajor)
         attn_arms["nvfp4_gemm"] = lambda: _nvfp4_gemm.gemm(_pw, x)
+    if "vllm_mm" in cfg["baselines"] and vllm_fused_experts is not None and cfg["weights"] != "fp8_rowwise":
+        attn_arms["vllm_mm"] = _vllm_linear_arm(cfg, x, W, Ws, W_g, attn_act_scale)
+    if "flashinfer_mm" in cfg["baselines"] and _fi_mm_fp4 is not None:
+        attn_arms["flashinfer_mm"] = _flashinfer_linear_arm(cfg, x, W, Ws, W_g)
     return attn_arms
+
+
+_FP4_RANGE = 448.0 * 6.0  # NVFP4 global: e4m3 block-scale max * e2m1 max
+
+
+def _bf16_weight(cfg, W, Ws, W_g):
+    """The row's weight in BF16, for a rival stack that quantizes it with its own quantizer."""
+    g = W_g if W_g is not None else torch.ones(1, device=W.device)
+    return WEIGHTS[cfg["weights"]]["dequant"](W[None], Ws[None], g)[0].to(torch.bfloat16)
+
+
+def _vllm_linear_arm(cfg, x, W, Ws, W_g, act_scale):
+    """vLLM's dense CUTLASS GEMMs, as its linear methods call them: block FP8 (per-token-group act
+    quant, column-major scales; fp32 block scales read as stored), per-tensor static FP8 against the
+    calibrated scale, and NVFP4 W4A4 (its own quantizer and swizzled scales, alpha = 1 / globals)."""
+    if cfg["weights"] == "nvfp4":
+        w_gs = (_FP4_RANGE / _bf16_weight(cfg, W, Ws, W_g).float().abs().amax()).reshape(1)
+        wq, wsf = _vllm_fp4_quant(_bf16_weight(cfg, W, Ws, W_g), w_gs)
+        _mark_static(wq, wsf, w_gs)
+
+        def run():
+            a_gs = (_FP4_RANGE / x.float().abs().amax()).reshape(1)
+            aq, asf = _vllm_fp4_quant(x, a_gs)
+            return _vllm_fp4_mm(aq, wq, asf, wsf, 1.0 / (a_gs * w_gs), x.dtype)
+        return run
+    if cfg.get("static"):
+        w_t, w_s = W.t(), Ws.reshape(1).float()
+        _mark_static(w_t, w_s)
+
+        def run():
+            aq, a_s = _vllm_tensor_quant(x, act_scale)
+            return _vllm_scaled_mm(aq, w_t, a_s, w_s, x.dtype)
+        return run
+    w_t, w_s = W.t(), Ws.float().t()
+    _mark_static(w_t, w_s)
+
+    def run():
+        aq, a_s = _vllm_group_quant(x, cfg["block"][1], column_major_scales=True)
+        return _vllm_scaled_mm(aq, w_t, a_s, w_s, x.dtype)
+    return run
+
+
+def _flashinfer_linear_arm(cfg, x, W, Ws, W_g):
+    """FlashInfer's mm_fp4 (NVFP4) / mm_mxfp8 on the CUTLASS backend, each quantizing the BF16 weight
+    with FlashInfer's own quantizer (its trtllm backend wants a pre-shuffled weight)."""
+    w_bf16 = _bf16_weight(cfg, W, Ws, W_g)
+    if cfg["weights"] == "nvfp4":
+        w_gs = (_FP4_RANGE / w_bf16.float().abs().amax()).reshape(1)
+        wq, wsf = _fi_fp4_quant(w_bf16, w_gs)
+        wq, wsf = wq.t(), wsf.t()
+        _mark_static(wq, wsf, w_gs)
+
+        def run():
+            a_gs = (_FP4_RANGE / x.float().abs().amax()).reshape(1)
+            aq, asf = _fi_fp4_quant(x, a_gs)
+            return _fi_mm_fp4(aq, wq, asf, wsf, 1.0 / (a_gs * w_gs), x.dtype, backend="cutlass")
+        return run
+    wq, wsf = _fi_mxfp8_quant(w_bf16, True)
+    wq, wsf = wq.t(), wsf.t()
+    _mark_static(wq, wsf)
+
+    def run():
+        aq, asf = _fi_mxfp8_quant(x, True)
+        return _fi_mm_mxfp8(aq, wq, asf, wsf, out_dtype=x.dtype, backend="cutlass")
+    return run
 
 
 def bench_attn_row(row, pname, cfg, rows_out):
@@ -2469,6 +2651,7 @@ def _run_task(kind, pname, cfg, rows_out):
             ("fbgemm",) if _fbgemm_rowwise_grouped is None else ()) + (
             ("torch_rowwise",) if scaled_mm is None else ())
         unavailable += (("vllm_marlin",) if fused_marlin_moe is None or apply_gptq_marlin_linear is None else ())
+        unavailable += (("flashinfer_cutlass_moe",) if _fi_cutlass_moe is None else ())
         unavailable += (("flashinfer_mxint4",) if (
             trtllm_mxint4_block_scale_routed_moe is None or DEVICE != "cuda"
             or ACCELERATOR.get_device_capability()[0] != 10) else ())
@@ -2489,7 +2672,7 @@ def _run_task(kind, pname, cfg, rows_out):
         # sonic bug rather than an unsupported activation
         plain_glu = cfg["swiglu_alpha"] is None and cfg["swiglu_limit"] is None
         arms = tuple(a for a in cfg["baselines"]
-                     if (a not in ("sonicmoe", "vllm") or plain_glu)
+                     if (a != "sonicmoe" or plain_glu) and (a != "vllm" or plain_glu or _vllm_swigluoai(cfg))
                      and (a != "vllm" or vllm_fused_experts is not None))
         # megablocks is bf16-only (no quantized path), so it belongs on this row and nowhere else
         if _megablocks is not None and plain_glu:
@@ -2579,13 +2762,26 @@ import matplotlib  # noqa: E402
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.ticker  # noqa: E402
 
 # ONE quantized row. Impls with a fused path are benched fused (their best); transformers@main
 # has only the two-GEMM shape, so that is what it contributes. No fused/unfused split in the
 # figure — it is an internal distinction of ours that most baselines do not have.
-ROW_ORDER = ["quantized", "linear quantized", "unquantized"]
-ROW_LABELS = {"quantized": "MoE quantized", "linear quantized": "Linear quantized",
+# Weight-only recipes (W*A16) and activation-quantized ones meet almost disjoint rival sets, so they
+# get their own panels: no panel carries more arms than a palette can keep apart.
+ROW_ORDER = ["quantized", "quantized weight-only", "linear quantized", "linear weight-only", "unquantized"]
+ROW_LABELS = {"quantized": "MoE quantized activations", "quantized weight-only": "MoE weight-only",
+              "linear quantized": "Linear quantized activations", "linear weight-only": "Linear weight-only",
               "unquantized": "MoE unquantized (BF16)"}
+
+
+def _panel_row(category, problem):
+    if category in ("quantized", "linear quantized") and re.search(r"\bW\d+A16\b", problem):
+        return "quantized weight-only" if category == "quantized" else "linear weight-only"
+    return category
+
+
+rows = [(_panel_row(rr, p), p, *rest) for rr, p, *rest in rows]
 present_rows = [r for r in ROW_ORDER if any(rr == r for rr, *_ in rows)]
 
 
@@ -2632,6 +2828,7 @@ for (row, regime), (ax,) in zip(panels, axes):
                  if rr == row and reg == regime]
         floor = min((v for _, _, res, _ in cells for v in res.values() if v is not None and v > 0), default=1) / 2
         ax.set_yscale("log")
+        ax.yaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())  # decade labels only
         ax.grid(axis="y", alpha=0.2, zorder=0)
         problems = list(dict.fromkeys(p for p, *_ in cells))
         # ONE fixed model order across every row (was per-panel support-sort, which
@@ -2715,7 +2912,7 @@ for (row, regime), (ax,) in zip(panels, axes):
                      else solid_mode)
         ax.set_title(f"{ROW_LABELS[row]} — {regime} (T={tok}; {mode_note})", loc="left")
         # this panel's arms only, in one fixed order across panels (colors follow the arm)
-        handles = [mpatches.Patch(color=IMPL_COLORS[i], label=_impl_label(i))
+        handles = [mpatches.Patch(color=IMPL_COLORS[i], label=_impl_label(i, regime))
                    for i in legend_order if i in panel_impls]
         if overlay_drawn:
             handles.append(mpatches.Patch(facecolor="none", edgecolor="black", hatch="////", label="compile (faster)"))
