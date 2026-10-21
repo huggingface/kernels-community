@@ -499,8 +499,24 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
         )
 
 
+def _tensor_grouped_configs():
+    """The shared grouped dot grid, plus warp-specialized host-TMA tiles over the output-tile pipelines (sm10x)."""
+    configs = _grouped_dot_configs()
+    for config in configs:
+        config.kwargs["PIPELINE"] = "k_loop"
+    if is_sm10x():
+        seeds = [
+            c for c in configs
+            if c.kwargs["WARP_SPEC"] and c.kwargs["A_MEMORY_MODE"] == c.kwargs["B_MEMORY_MODE"] == "host_descriptor"
+            and c.kwargs["BLOCK_SIZE_M"] == 128 and c.kwargs["BLOCK_SIZE_K"] == 128 and c.num_stages in (3, 4)
+            and (c.kwargs["BLOCK_SIZE_N"], c.num_warps) in ((128, 8), (256, 4))
+        ]
+        configs.extend(pipeline_autotuning_configs(seeds, ("tile_loop", "flattened")))
+    return configs
+
+
 @bayesian_autotune(
-    _grouped_dot_configs(),
+    _tensor_grouped_configs(),
     # GATE keys the gate|up arm separately (its dot is 2*BN wide, a different tile optimum).
     ["N", "K", "tokens_per_expert_bit_length", "GATE"],
     n_trials=100,
@@ -520,7 +536,7 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
             warp_spec_compile_guard_pruner(),
             warp_spec_memory_mode_pruner(),
             descriptor_box_pruner(),
-            smem_pruner(),
+            smem_pruner(ws_full_stages=True),
             raw_activation_pointer_pruner(),
         )
     },
@@ -572,6 +588,9 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     # E-wide register-resident layout — register relief, bit-identical tiles; scope pruner
     # admits it at BM>=128 only (see packed_schedule_scope_pruner)
     PACKED_SCHEDULE: tl.constexpr = False,
+    # output-tile pipeline (the full-precision kernel's axis): "k_loop" WS on the K loop, "tile_loop" /
+    # "flattened" WS across output tiles so one tile's epilogue overlaps the next tile's MMA
+    PIPELINE: tl.constexpr = "k_loop",
     A_MEMORY_MODE: tl.constexpr = "pointer",
     B_MEMORY_MODE: tl.constexpr = "pointer",
     # Gate|up fusion epilogue (GATE=False -> plain grouped GEMM). No fused requant here
@@ -596,17 +615,23 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
     if PACKED_SCHEDULE:
         total_m_tiles = load_packed_schedule(Schedule, BLOCK_SIZE_M)
-        prefetched = prefetch_packed_entry(
-            Schedule, grouped_tile_order(start_pid, total_m_tiles, num_n_tiles) // num_n_tiles, total_m_tiles
-        )
+        if PIPELINE == "k_loop":
+            prefetched = prefetch_packed_entry(
+                Schedule, grouped_tile_order(start_pid, total_m_tiles, num_n_tiles) // num_n_tiles, total_m_tiles
+            )
     else:
         exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = build_tile_layout(
             ExpertStart, NUM_EXPERTS_POW2, BLOCK_SIZE_M
         )
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
-    for logical_tile_id in tl.range(start_pid, total_m_tiles * num_n_tiles, NUM_PROGRAMS):
+    for logical_tile_id in tl.range(
+        start_pid, total_m_tiles * num_n_tiles, NUM_PROGRAMS,
+        flatten=PIPELINE == "flattened", warp_specialize=WARP_SPEC and PIPELINE != "k_loop",
+    ):
         tile_id = grouped_tile_order(logical_tile_id, total_m_tiles, num_n_tiles)
+        if PACKED_SCHEDULE and PIPELINE != "k_loop":
+            prefetched = prefetch_packed_entry(Schedule, tile_id // num_n_tiles, total_m_tiles)
         pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start = (
             resolve_grouped_tile_packed(
                 tile_id, num_n_tiles, prefetched,
@@ -625,7 +650,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
                 GATE,
             )
         )
-        if PACKED_SCHEDULE:
+        if PACKED_SCHEDULE and PIPELINE == "k_loop":
             prefetched = prefetch_packed_entry(
                 Schedule, grouped_tile_order(logical_tile_id + NUM_PROGRAMS, total_m_tiles, num_n_tiles) // num_n_tiles, total_m_tiles
             )
@@ -647,7 +672,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
         )
 
         acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
-        for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
+        for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC and PIPELINE == "k_loop"):
             a, _as = load_act_static(
                 a_ptrs, ADescriptor, m_start, k * BLOCK_SIZE_K, row_mask, in_row, a_s[:, None],
                 A_MEMORY_MODE, GatherIdx is not None,
@@ -703,6 +728,10 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
         pre_hook=grouped_mx_pre_hook,
         warp_spec=True,  # dot_scaled+WS+TMA compiles+wins on a clean context (was a num_warps=2 misread)
     ),  # prefill: no scalar branch; TMA descriptor vs pointer loads on both operands
+    # No output-tile PIPELINE axis (the tensor/weight-only kernels' one): it double-buffers the
+    # accumulator in tensor memory, so a 256-column dot_scaled accumulator (GATE, or BN=256) needs
+    # 576 of 512 columns, and the BN=128 down tiles that fit never beat the tuned BN=256 k_loop
+    # crown (B200, DeepSeek-V4 MXFP4 / GLM NVFP4 / MiniMax MXFP8 at T=2048/8192: 0.98-1.01x).
     # the MXFP4/MXFP8 (and packed-activation) splits key themselves — the tuner appends
     # every tensor arg's dtype to its cache key (memory and disk);
     # GATE keys the gate|up arm separately (its stacked dot is 2*BN wide, a different tile optimum).

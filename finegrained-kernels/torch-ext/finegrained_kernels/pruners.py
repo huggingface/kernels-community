@@ -944,9 +944,15 @@ def warp_spec_memory_mode_pruner(weight_only: bool = False, gather_only: bool = 
                     )
                 )
             )
+            # FP8-activation dot loops pipelined across output tiles lower at w8 too (tensor-wide grouped
+            # gate|up, Mistral-4: BM128 BN128 BK128 tile_loop w8 s4 runs, 0.85x the k_loop crown)
+            fp8_pipeline_tile = (
+                not weight_only and getattr(args.get("A"), "dtype", None) == FP8_DTYPE
+                and c.kwargs.get("PIPELINE", "k_loop") != "k_loop" and a == b == "host_descriptor"
+            )
             return not descriptor or (
                 config_dim(c, args, "BLOCK_SIZE_M") == 128
-                and (c.num_warps == 4 or ((prefill_tile or pipeline_tile) and c.num_warps == 8))
+                and (c.num_warps == 4 or ((prefill_tile or pipeline_tile or fp8_pipeline_tile) and c.num_warps == 8))
             )
         if descriptor:
             return True
@@ -1475,6 +1481,7 @@ def gate_stacked_tmem_trap_pruner():
 
 def smem_pruner(
     k_dim="BLOCK_SIZE_K", min_sets: float = 0.5, full_stages: bool = False, pointer_ws_extra_stage: bool = False,
+    ws_full_stages: bool = False,
 ):
     """``early_config_prune`` dropping configs whose shared memory certainly cannot fit,
     with bounds derived from TTGIR allocations and checked against ``metadata.shared``:
@@ -1515,6 +1522,9 @@ def smem_pruner(
     block-dynamic kernel: BM=128 s4 gate|up 245784 B = 5 sets); with it the dynamic floor drops all
     155 logged failures and none of 3302 compiling configs. The static kernel does not (its
     pointer/pointer WS s4 tiles compile), so it is off there.
+    ``ws_full_stages``: ``full_stages`` for warp-specialized configs only (the K-loop pipeliner still
+    clamps the others): the tensor-wide grouped gate|up tune at Mistral-4 drops all 32 WS
+    shared-memory failures and none of 105 compiling configs.
 
     These are lower bounds on the observed IR allocations, not a complete allocator
     model: omitted storage keeps borderline configs for the compiler to check. Samples
@@ -1530,7 +1540,8 @@ def smem_pruner(
         # an output-tile pipeline keeps every stage live (no K-loop pipeliner clamp): 2D block-FP8
         # BM64xBN256 s6 needs 254084 B and BM128xBN256 s5 262276 B, both above that full-stage floor
         pipelined = c.kwargs.get("PIPELINE", "k_loop") != "k_loop"
-        stages = c.num_stages if unquantized or full_stages or pipelined else c.num_stages - 1
+        all_live = full_stages or pipelined or (ws_full_stages and c.kwargs.get("WARP_SPEC"))
+        stages = c.num_stages if unquantized or all_live else c.num_stages - 1
         if pointer_ws_extra_stage and c.kwargs.get("WARP_SPEC") and (
             c.kwargs.get("A_MEMORY_MODE", "pointer") == c.kwargs.get("B_MEMORY_MODE", "pointer") == "pointer"
         ):
