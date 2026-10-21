@@ -47,6 +47,8 @@ def _vertical_patchify_kernel(
     PATCH_BLOCK: tl.constexpr,
     TEMPORAL: tl.constexpr,
 ):
+    """Second pass of `resize_normalize_patchify`: like `_vertical_kernel`, but writes each value at its place in
+    the patch layout. The last frame of an input is repeated to fill its last temporal patch."""
     frame = tl.program_id(0)
     out_height = tl.load(out_heights + frame).to(tl.int32)
     out_width = tl.load(out_widths + frame).to(tl.int32)

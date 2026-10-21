@@ -18,6 +18,7 @@ MAX_PLANS = 1024
 
 @triton.jit
 def _tap_count(scale, CUBIC: tl.constexpr, ANTIALIAS: tl.constexpr):
+    """Number of filter taps per output pixel for a resize by `scale`, the input size over the output size."""
     filter_scale = tl.maximum(scale, 1.0) if ANTIALIAS else 1.0
     return (tl.ceil((2.0 if CUBIC else 1.0) * filter_scale) * 2 + 1).to(tl.int32)
 
@@ -35,6 +36,8 @@ def _filter_table_kernel(
     CUBIC: tl.constexpr,
     ANTIALIAS: tl.constexpr,
 ):
+    """Writes the normalized filter weights and the first input index of every output position, one table per row
+    of programs."""
     table = tl.program_id(0)
     out_size = tl.load(out_sizes + table)
     if tl.program_id(1) * BLOCK >= out_size:
@@ -73,6 +76,7 @@ def _filter_table_kernel(
 
 @triton.jit
 def _round(values, ROUND_TO_UINT8: tl.constexpr):
+    """Rounds to the nearest integer and clamps to [0, 255] when `ROUND_TO_UINT8`, like torchvision on uint8 images."""
     if ROUND_TO_UINT8:
         values = tl.minimum(tl.maximum(tl.floor(values + 0.5), 0.0), 255.0)
     return values
@@ -98,6 +102,7 @@ def _horizontal_kernel(
     ROUND_TO_UINT8: tl.constexpr,
     FRAME_POINTERS: tl.constexpr,
 ):
+    """First pass: resizes the width of every frame into `intermediate`, one tile of channel rows per program."""
     frame = tl.program_id(0)
     plane_rows = CHANNELS * tl.load(heights + frame).to(tl.int32)
     out_width = tl.load(out_widths + frame).to(tl.int32)
@@ -154,6 +159,7 @@ def _vertical_kernel(
     OUTPUT_ALIGNED: tl.constexpr,
     ALIGNMENT: tl.constexpr,
 ):
+    """Second pass: resizes the height of `intermediate`, then rescales, normalizes and writes `(C, H, W)` outputs."""
     frame = tl.program_id(0)
     out_height = tl.load(out_heights + frame)
     out_width = tl.load(out_widths + frame)

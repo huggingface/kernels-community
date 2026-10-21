@@ -47,6 +47,9 @@ patches, and returns `grid_thw` as an int64 tensor.
 
 ## Limitations
 
+- `upsample_argmax` runs on tensor cores in float16 when both sides are upsampled at least 2x. Then a few pixels
+  at near-ties between two classes can get another class than in float32 (about 1e-4 of pixels on ADE20K, with no
+  change in mIoU). Smaller upsampling factors run in float32.
 - Inputs are uint8 `(C, H, W)` tensors on one CUDA device, with the same channel count.
 - Bilinear and bicubic only. The output is float32.
 - `resize_normalize` takes the resized size of each image from the caller, and an optional crop no larger than
