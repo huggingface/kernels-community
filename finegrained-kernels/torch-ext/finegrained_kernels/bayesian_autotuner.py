@@ -27,6 +27,7 @@ exhaustive bench-all.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import logging
 import json
@@ -36,6 +37,7 @@ import traceback
 import random
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from functools import cached_property, partial
 from pathlib import Path
@@ -44,6 +46,8 @@ import torch
 
 from typing import Dict, List
 
+from triton.runtime._async_compile import AsyncCompileMode
+from triton.tools.tensor_descriptor import TensorDescriptor
 from triton.runtime.autotuner import (
     Autotuner,
     Config,
@@ -153,12 +157,54 @@ class BayesianAutotuner(Autotuner):
         self.log_path = log_path or overrides.get("log_path")
         self.key_log_path = overrides.get("key_log_path")
         self.tracebacks = overrides.get("tracebacks", False)
+        # Threads compiling a tune's configs ahead of timing when it times every pruned config
+        # (no search trajectory to wait on); timing stays serial. 0 = compile on first launch.
+        self.compile_workers = overrides.get("compile_workers", 0)
+        self._precompile_pending = None
         # steady-state launch support: key extraction without dict builds (eager decode
         # is host-bound; the cache-hit path of run() is on the per-token critical path)
         self._arg_position = {name: i for i, name in enumerate(self.arg_names)}
         self._arg_name_set = frozenset(self.arg_names)
         self._dtype_tag_cache: Dict[tuple, str] = {}
         self._dtype_str_cache: Dict[torch.dtype, str] = {}
+
+    def prune_configs(self, kwargs):
+        pruned = super().prune_configs(kwargs)
+        if self.compile_workers > 1 and len(pruned) <= self.n_trials:
+            # deferred to the first bench, so a disk-cached crown compiles nothing
+            self._precompile_pending = (pruned, self.launch_snapshot({**self.nargs, **kwargs}))
+        return pruned
+
+    @staticmethod
+    def launch_snapshot(nargs: dict) -> dict:
+        """``nargs`` with private copies of its host-TMA descriptors: a config's ``pre_hook``
+        rebinds a box in place, and a pointer config leaves the (unused) box as found, yet the box
+        is part of the compile key, so each precompiled config must start from the launch's own."""
+        return {k: copy.copy(v) if isinstance(v, TensorDescriptor) else v for k, v in nargs.items()}
+
+    def precompile(self, configs: List[Config], nargs: dict, workers: int | None = None):
+        """Compile ``configs`` for the launch ``nargs`` on a thread pool (Triton's
+        ``AsyncCompileMode``) so the serial timing loop then hits the compile cache. Each
+        config's ``pre_hook`` runs first, as at launch: descriptor boxes are part of the
+        specialization. Failures are left for the bench to record. B200, Triton 3.8, 96
+        full-precision grouped configs from a cold cache: 25.9 s serial, 11.5 s on 16 threads
+        (part of the compile holds the GIL, so more threads stop helping)."""
+        workers = workers or self.compile_workers
+        if workers <= 1 or len(configs) <= 1:
+            return
+        nargs = {k: v for k, v in nargs.items() if k not in ("grid", "warmup")}
+        memo = self._failed_compile_memo()
+        with AsyncCompileMode(ThreadPoolExecutor(workers), ignore_errors=True):
+            for config in configs:
+                if self._compile_signature(config, nargs) in memo:
+                    continue  # a known compile failure the bench skips too
+                full = {**self.launch_snapshot(nargs), **config.all_kwargs()}
+                try:
+                    if config.pre_hook:
+                        config.pre_hook(full)
+                    self.fn.run(**full, grid=(1,), warmup=True)
+                except Exception:  # the bench records it
+                    pass
 
     def _owns_timing(self) -> bool:
         """Whether this tuner picks the timer: on CUDA, with no user ``do_bench`` or hooks (those
@@ -210,6 +256,9 @@ class BayesianAutotuner(Autotuner):
         invalidating env), so the next fresh tune of ANY shape skips the doomed compile
         outright (~40-66 wasted compiles per nvfp4 tune before this). The memo dies with
         the kernel source (``fn.cache_key``); bench-stage errors are never persisted."""
+        if self._precompile_pending is not None:
+            pending, self._precompile_pending = self._precompile_pending, None
+            self.precompile(*pending)
         sig = self._compile_signature(config, meta)
         memo = self._failed_compile_memo()
         if sig is not None and sig in memo:
@@ -451,7 +500,7 @@ class BayesianAutotuner(Autotuner):
             try:
                 ret = super().run(*args, **kwargs)
             finally:
-                self._benchmark_banks = None
+                self._benchmark_banks = self._precompile_pending = None
             self._report_bench_failures()
             return ret
 
@@ -522,7 +571,7 @@ class BayesianAutotuner(Autotuner):
                 else:
                     benchmark()
             finally:
-                self._benchmark_banks = None
+                self._benchmark_banks = self._precompile_pending = None
 
         config = self.cache[key]
         self.best_config = config

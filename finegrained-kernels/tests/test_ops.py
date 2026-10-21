@@ -1022,6 +1022,7 @@ def test_every_admitted_config_is_correct(problem: Problem, op, tuner):
     def spy(configs, named_args, **kwargs):
         kept = orig_prune(configs, named_args, **kwargs) if orig_prune else configs
         admitted["configs"] = list(kept)
+        admitted.setdefault("launches", []).append(tuner.launch_snapshot({**named_args, **kwargs}))  # gate cases launch twice
         return kept
 
     tuner.early_config_prune = spy
@@ -1030,6 +1031,8 @@ def test_every_admitted_config_is_correct(problem: Problem, op, tuner):
         tuner.cache.clear()
         _run_ref_vs_op(problem, op, A, expert_ids, B, Bs, Bs_global, shared=shared)
         assert admitted.get("configs"), "the spy never saw a prune pass"
+        for nargs in admitted["launches"]:  # every config runs below, in each launch's specialization
+            tuner.precompile(admitted["configs"], nargs, workers=16)
         forgiven = []
         for cfg in admitted["configs"]:
             tuner.configs = [cfg]
