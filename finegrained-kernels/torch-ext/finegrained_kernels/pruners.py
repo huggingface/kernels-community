@@ -1196,6 +1196,23 @@ def swizzled_scale_config_pruner(allow_gate_subblock=False):
     )
 
 
+def block_static_grouped_matmul_pruner():
+    """``early_config_prune`` for the static block-FP8 grouped kernel's own dead cell, on top of the
+    inherited block-dynamic map: a warp-specialized ``BLOCK_SIZE_M = 128`` gate|up tile with a
+    pointer A and a descriptor B overflows tensor memory (576 > 512 columns) at every stage count,
+    while pointer/pointer at the same tile compiles (B200, Triton 3.8, BN = 128 stacked)."""
+
+    def ok(c, args):
+        return not (
+            args.get("GATE") and c.kwargs.get("WARP_SPEC")
+            and config_dim(c, args, "BLOCK_SIZE_M") == 128
+            and c.kwargs.get("A_MEMORY_MODE", "pointer") == "pointer"
+            and c.kwargs.get("B_MEMORY_MODE", "pointer") != "pointer"
+        )
+
+    return config_filter(ok, when=lambda args: get_active_device_type() == "cuda")
+
+
 def block_dynamic_grouped_matmul_pruner():
     """``early_config_prune`` for the block-dynamic grouped kernel: the Triton 3.7.1
     pipeliner-race guard, sized to its four-load-stream single-dot K-loop. The GATE arm
@@ -1449,7 +1466,9 @@ def gate_stacked_tmem_trap_pruner():
     return config_filter(ok, on_empty=raise_all_trap)
 
 
-def smem_pruner(k_dim="BLOCK_SIZE_K", min_sets: float = 0.5):
+def smem_pruner(
+    k_dim="BLOCK_SIZE_K", min_sets: float = 0.5, full_stages: bool = False, pointer_ws_extra_stage: bool = False,
+):
     """``early_config_prune`` dropping configs whose shared memory certainly cannot fit,
     with bounds derived from TTGIR allocations and checked against ``metadata.shared``:
 
@@ -1480,6 +1499,16 @@ def smem_pruner(k_dim="BLOCK_SIZE_K", min_sets: float = 0.5):
     120 of 162 dead ones did (every BK=512 request, 59/59), so ``min_sets=2`` there halves the
     dead compiles a 100-trial tune pays without dropping a single compiling config.
 
+    ``full_stages``: the loop stages every one of ``num_stages`` raw-operand buffers (no
+    pipeliner clamp), so the raw floor counts them all. Measured on the static block-FP8 grouped
+    gate|up loop (B200, BN=128 stacked, BK=128): BM=128 s5 262152 B and s6 327688 B, BM=64 s6
+    245768 B, each above ``num_stages * BK * (BM + 2*BN)``; over the block-dynamic grouped tune
+    logs (DSV3/E16 keys, ~4k trials) that floor drops 109 failed configs and no compiling one.
+    ``pointer_ws_extra_stage``: a warp-specialized pointer/pointer loop holds one more set (the
+    block-dynamic kernel: BM=128 s4 gate|up 245784 B = 5 sets); with it the dynamic floor drops all
+    155 logged failures and none of 3302 compiling configs. The static kernel does not (its
+    pointer/pointer WS s4 tiles compile), so it is off there.
+
     These are lower bounds on the observed IR allocations, not a complete allocator
     model: omitted storage keeps borderline configs for the compiler to check. Samples
     were taken on B200 (sm_100); the FP8 weight-only extension is scoped to that arch —
@@ -1491,7 +1520,11 @@ def smem_pruner(k_dim="BLOCK_SIZE_K", min_sets: float = 0.5):
         tiles = 2 if args.get("GATE") else 1
         bk = config_dim(c, args, k_dim)
         unquantized = a.element_size() >= 2 and b.element_size() >= 2
-        stages = c.num_stages if unquantized else c.num_stages - 1
+        stages = c.num_stages if unquantized or full_stages else c.num_stages - 1
+        if pointer_ws_extra_stage and c.kwargs.get("WARP_SPEC") and (
+            c.kwargs.get("A_MEMORY_MODE", "pointer") == c.kwargs.get("B_MEMORY_MODE", "pointer") == "pointer"
+        ):
+            stages += 1
         packed = 2 if b.dtype == torch.uint8 else 1
         bm = config_dim(c, args, "BLOCK_SIZE_M")
         bn = config_dim(c, args, "BLOCK_SIZE_N")

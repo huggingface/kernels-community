@@ -74,6 +74,7 @@ from finegrained_kernels.grouped import (  # type: ignore
     full_precision_matmul_grouped_kernel,
     int_weight_only_matmul_grouped_kernel,
     mx_dynamic_matmul_grouped_kernel,
+    w8a8_block_static_fp8_matmul_grouped_kernel,
     w8a8_tensor_dynamic_fp8_matmul_grouped_kernel,
 )
 from finegrained_kernels.loading.scales import decode_group_scale
@@ -598,7 +599,9 @@ def _fp32_intermediate(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As
         W = dequant_gate_up(row, B, Bs, Bs_global)
     else:
         W = row["dequant"](B, Bs, Bs_global)
-    if problem.activation_format == "bf16":
+    if problem.activation_format == "bf16" and problem.weights != "nvfp4":
+        # the dequantized weight in the activation dtype, as the GEMM does; NVFP4 applies its
+        # second-level global after the dot, so its W * global never rounds
         W = W.to(A.dtype).float()
     bias = _bias(problem, op)
     if op == "matmul":
@@ -964,6 +967,11 @@ _SWEEP_CELLS = [
     (Problem(weights="mxfp4", gate=True, activation_format="mxfp4", quantize_output=True, N=320, K=320), "matmul", mx_dynamic_matmul_kernel),
     (Problem(weights="nvfp4", gate=True, activation_format="nvfp4", quantize_output=True, swizzled=True, S=8), "batched", mx_dynamic_matmul_batched_kernel),
     (Problem(weights="fp8_128x128", activation_format="bf16"), "grouped", block_fp8_weight_only_matmul_grouped_kernel),
+    # gathered gate|up rows on the raw-activation dot arms: a TMA-gathered descriptor A under WS
+    # is the lowering failure warp_spec_memory_mode_pruner(gather_only=True) fences
+    (Problem(weights="bf16", gate=True), "grouped", full_precision_matmul_grouped_kernel),
+    # the static block-scale kernel: its own three-stream K-loop under the block-dynamic fences
+    (Problem(weights="fp8_128x128", gate=True, static=True), "grouped", w8a8_block_static_fp8_matmul_grouped_kernel),
     # the calibrated (static) arm on per-tensor weights: it hands the kernel a RAW A to quantize
     # per tile, the one activation form that cannot ride the TMA gather, so its admitted set is
     # the one a memory-mode fence gets wrong (silently — the tuner forgives what will not lower)
