@@ -64,6 +64,36 @@ def test_resize_normalize_matches_interpolate(antialias, resample, shortest_edge
         )
 
 
+@pytest.mark.parametrize(
+    "input_sizes, size",
+    [([(480, 640)] * 3, (256, 256)), ([(224, 224)] * 2, (224, 224)), ([(300, 224)] * 2, (224, 224))],
+)
+def test_resize_normalize_same_shape_batch(input_sizes, size):
+    images = random_images(input_sizes)
+    output = cv_utils.resize_normalize(
+        images, [size] * len(images), MEAN, STD, 1 / 255, "bicubic", round_to_uint8=False
+    )
+    for image, result in zip(images, output):
+        torch.testing.assert_close(result, reference(image, size, "bicubic"), atol=2e-3, rtol=0)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two CUDA devices")
+def test_resize_normalize_other_device():
+    images = [image.to("cuda:1") for image in random_images([(480, 640), (300, 300)])]
+    with torch.cuda.device(0):
+        output = cv_utils.resize_normalize(
+            images, [(256, 256)] * 2, MEAN, STD, 1 / 255, "bicubic", round_to_uint8=False
+        )
+        pixel_values, grid_thw = cv_utils.resize_normalize_patchify(
+            [image[None] for image in images], [(252, 336), (280, 280)], MEAN, STD, 1 / 255, "bicubic", 14, 2, 2
+        )
+    assert pixel_values.device == torch.device("cuda:1")
+    assert grid_thw.tolist() == [[1, 18, 24], [1, 20, 20]]
+    for image, result in zip(images, output):
+        assert result.device == torch.device("cuda:1")
+        torch.testing.assert_close(result, reference(image, (256, 256), "bicubic"), atol=2e-3, rtol=0)
+
+
 def test_resize_normalize_patchify_matches_reference():
     frames = random_images([(280, 420), (140, 140), (140, 140), (140, 140)])
     inputs = [frames[0][None], torch.stack(frames[1:])]
@@ -87,25 +117,38 @@ def test_resize_normalize_patchify_matches_reference():
     torch.testing.assert_close(pixel_values, torch.cat(expected), atol=2e-3, rtol=0)
 
 
+@pytest.mark.parametrize("crop_size", [None, (200, 200)])
 @pytest.mark.parametrize("resample", ["bilinear", "bicubic"])
-def test_resize_normalize_rounds_like_two_uint8_passes(resample):
+def test_resize_normalize_rounds_like_two_uint8_passes(resample, crop_size):
     images = random_images([(480, 640), (1024, 768)])
-    output = cv_utils.resize_normalize(images, [(224, 224)] * len(images), MEAN, STD, 1 / 255, resample)
-    for image, result in zip(images, output):
+    sizes = [(224, 224)] * len(images)
+    output = cv_utils.resize_normalize(images, sizes, MEAN, STD, 1 / 255, resample, crop_size=crop_size)
+    unrounded = cv_utils.resize_normalize(
+        images, sizes, MEAN, STD, 1 / 255, resample, crop_size=crop_size, round_to_uint8=False
+    )
+    mean = torch.tensor(MEAN, device=images[0].device)[:, None, None]
+    std = torch.tensor(STD, device=images[0].device)[:, None, None]
+    for image, result, unrounded_result in zip(images, output, unrounded):
         wide = F.interpolate(image[None].float(), size=(image.shape[1], 224), mode=resample, antialias=True)
         wide = wide.round().clamp(0, 255)
         resized = F.interpolate(wide, size=(224, 224), mode=resample, antialias=True).round().clamp(0, 255)[0]
-        mean = torch.tensor(MEAN, device=image.device)[:, None, None]
-        std = torch.tensor(STD, device=image.device)[:, None, None]
-        levels = ((result * std + mean) * 255 - resized).abs()
+        if crop_size is not None:
+            resized = resized[:, 12:212, 12:212]
+        rounded_levels = (result * std + mean) * 255
+        levels = (rounded_levels - resized).abs()
         assert levels.max().item() <= 1.01
         assert (levels > 0.5).float().mean().item() < 0.05
+        # The rounded output sits on uint8 levels, the unrounded one does not.
+        torch.testing.assert_close(rounded_levels, rounded_levels.round(), atol=1e-3, rtol=0)
+        assert not torch.equal(result, unrounded_result)
 
 
 def test_invalid_inputs_raise():
     image = random_images([(64, 64)])[0]
     with pytest.raises(ValueError, match="uint8"):
         cv_utils.resize_normalize([image.float()], [(32, 32)], MEAN, STD, 1 / 255, "bilinear")
+    with pytest.raises(ValueError, match="at least one"):
+        cv_utils.resize_normalize([], [], MEAN, STD, 1 / 255, "bilinear")
     with pytest.raises(ValueError, match="crop_size"):
         cv_utils.resize_normalize([image], [(32, 32)], MEAN, STD, 1 / 255, "bilinear", crop_size=(48, 48))
     with pytest.raises(ValueError, match="one size per image"):

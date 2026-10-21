@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from functools import lru_cache
 from itertools import accumulate
 
@@ -7,6 +8,7 @@ import triton.language as tl
 
 from .resize import (
     MAX_PLANS,
+    ROW_ALIGNMENT,
     _check_frames,
     _horizontal_pass,
     _normalization,
@@ -40,6 +42,7 @@ def _vertical_patchify_kernel(
     ANTIALIAS: tl.constexpr,
     ROUND_TO_UINT8: tl.constexpr,
     ALIGNED: tl.constexpr,
+    ALIGNMENT: tl.constexpr,
     PATCH: tl.constexpr,
     PATCH_BLOCK: tl.constexpr,
     TEMPORAL: tl.constexpr,
@@ -55,8 +58,8 @@ def _vertical_patchify_kernel(
     row_stride = tl.load(row_strides + frame)
     intermediate_offset = tl.load(intermediate_offsets + frame)
     if ALIGNED:
-        row_stride = tl.multiple_of(row_stride, 16)
-        intermediate_offset = tl.multiple_of(intermediate_offset, 16)
+        row_stride = tl.multiple_of(row_stride, ALIGNMENT)
+        intermediate_offset = tl.multiple_of(intermediate_offset, ALIGNMENT)
     frame_in_input = tl.load(frames_in_input + frame).to(tl.int32)
     frame_count = tl.load(frame_counts + frame).to(tl.int32)
     group = frame_in_input // TEMPORAL
@@ -133,18 +136,18 @@ def _patchify_plan(device, channels, input_shapes, target_sizes, patch_size, tem
 
 
 def resize_normalize_patchify(
-    inputs,
-    target_sizes,
-    image_mean,
-    image_std,
-    rescale_factor,
-    resample,
-    patch_size,
-    block_size,
-    temporal_patch_size,
-    antialias=True,
-    round_to_uint8=True,
-):
+    inputs: Sequence[torch.Tensor],
+    target_sizes: Sequence[tuple[int, int]],
+    image_mean: float | Sequence[float],
+    image_std: float | Sequence[float],
+    rescale_factor: float,
+    resample: str,
+    patch_size: int,
+    block_size: int,
+    temporal_patch_size: int,
+    antialias: bool = True,
+    round_to_uint8: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Resize, normalize and patchify uint8 `(T, C, H, W)` inputs into Qwen2-VL `pixel_values` and an int64 `grid_thw`.
 
     `target_sizes[i]` is the frame size of `inputs[i]`, with `T=1` for an image. A missing frame of the last
@@ -174,22 +177,24 @@ def resize_normalize_patchify(
     intermediate = _horizontal_pass(sources, plan, channels, cubic, antialias, round_to_uint8)
     output = torch.empty(plan["patches"], device=device, dtype=torch.float32)
     block_rows, block_columns = plan["vertical_tile"]
-    _vertical_patchify_kernel[plan["vertical_grid"]](
-        intermediate,
-        output,
-        *plan["vertical"],
-        means,
-        stds,
-        *plan["vertical_lists"],
-        CHANNELS=channels,
-        BLOCK_ROWS=block_rows,
-        BLOCK_COLUMNS=block_columns,
-        CUBIC=cubic,
-        ANTIALIAS=antialias,
-        ROUND_TO_UINT8=round_to_uint8,
-        ALIGNED=plan["aligned"],
-        PATCH=patch_size,
-        PATCH_BLOCK=block_size,
-        TEMPORAL=temporal_patch_size,
-    )
+    with torch.cuda.device(device):
+        _vertical_patchify_kernel[plan["vertical_grid"]](
+            intermediate,
+            output,
+            *plan["vertical"],
+            means,
+            stds,
+            *plan["vertical_lists"],
+            CHANNELS=channels,
+            BLOCK_ROWS=block_rows,
+            BLOCK_COLUMNS=block_columns,
+            CUBIC=cubic,
+            ANTIALIAS=antialias,
+            ROUND_TO_UINT8=round_to_uint8,
+            ALIGNED=plan["aligned"],
+            ALIGNMENT=ROW_ALIGNMENT,
+            PATCH=patch_size,
+            PATCH_BLOCK=block_size,
+            TEMPORAL=temporal_patch_size,
+        )
     return output, torch.tensor(plan["grid_thw"], dtype=torch.int64)

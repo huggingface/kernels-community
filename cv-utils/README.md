@@ -15,6 +15,7 @@ Kernels for computer vision pre- and post-processing.
 | `generic_nms` | non-maximum suppression of boxes | CUDA |
 | `resize_normalize` | antialiased resize to one size per image, center crop, rescale and normalize of uint8 images | Triton |
 | `resize_normalize_patchify` | the same, written in the Qwen2-VL `pixel_values` patch layout, for images and videos | Triton |
+| `upsample_argmax` | the class of every pixel of bilinearly upsampled segmentation logits, without storing the upsampled logits | Triton |
 
 ## Usage
 
@@ -53,3 +54,5 @@ patches, and returns `grid_thw` as an int64 tensor.
 - `resize_normalize_patchify` needs target sizes that are multiples of `patch_size * block_size`.
 - With `round_to_uint8=True`, results can differ from torch by one uint8 level where a value falls on a rounding
   boundary.
+- The metadata of a batch layout (input sizes, target sizes, crop) is cached, up to 1024 layouts. A new layout costs
+  one extra copy and one extra launch, so batches of photos that all have different sizes pay that cost on every call.

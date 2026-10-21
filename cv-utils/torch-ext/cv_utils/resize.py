@@ -1,4 +1,5 @@
 import math
+from collections.abc import Sequence
 from functools import lru_cache
 from itertools import accumulate
 
@@ -151,6 +152,7 @@ def _vertical_kernel(
     ROUND_TO_UINT8: tl.constexpr,
     ALIGNED: tl.constexpr,
     OUTPUT_ALIGNED: tl.constexpr,
+    ALIGNMENT: tl.constexpr,
 ):
     frame = tl.program_id(0)
     out_height = tl.load(out_heights + frame)
@@ -163,12 +165,12 @@ def _vertical_kernel(
     row_stride = tl.load(row_strides + frame)
     intermediate_offset = tl.load(intermediate_offsets + frame)
     if ALIGNED:
-        row_stride = tl.multiple_of(row_stride, 16)
-        intermediate_offset = tl.multiple_of(intermediate_offset, 16)
+        row_stride = tl.multiple_of(row_stride, ALIGNMENT)
+        intermediate_offset = tl.multiple_of(intermediate_offset, ALIGNMENT)
     output_offset = tl.load(output_offsets + frame)
     if OUTPUT_ALIGNED:
-        out_width = tl.multiple_of(out_width, 16)
-        output_offset = tl.multiple_of(output_offset, 16)
+        out_width = tl.multiple_of(out_width, ALIGNMENT)
+        output_offset = tl.multiple_of(output_offset, ALIGNMENT)
     rows = first_row + tl.arange(0, BLOCK_ROWS)
     columns = first_column + tl.arange(0, BLOCK_COLUMNS)
     row_active = rows < out_height
@@ -199,7 +201,6 @@ def _as_tensors(device, dtype, *lists):
     return packed.split([len(values) for values in lists])
 
 
-@lru_cache
 def _tile(tile, out_width):
     """`tile` with its columns capped at the power of two above `out_width`, and the rows grown to keep its size."""
     rows, columns = tile
@@ -223,13 +224,17 @@ def _rescaled_normalization(mean, std, rescale, device):
 
 
 def _check_frames(frames, ndim):
+    if not frames:
+        raise ValueError("Pass at least one input.")
     device = frames[0].device
     channels = frames[0].shape[-3]
     if any(
         frame.dtype != torch.uint8 or frame.ndim != ndim or frame.device != device or frame.shape[-3] != channels
         for frame in frames
     ):
-        raise ValueError("Frames must be uint8 tensors on one device with the same number of channels.")
+        raise ValueError(
+            f"Inputs must be {ndim}-dimensional uint8 tensors on one device with the same number of channels."
+        )
 
 
 def _plan_passes(
@@ -312,13 +317,18 @@ def _plan_passes(
         *zip(*tables),
         *vertical_lists,
     )
-    _filter_table_kernel[(len(tables), triton.cdiv(max(out_size for *_, out_size in tables), TABLE_BLOCK))](
-        *table_tensors[:6],
-        -0.5 if antialias else -0.75,
-        BLOCK=TABLE_BLOCK,
-        CUBIC=cubic,
-        ANTIALIAS=antialias,
+    table_arguments, vertical_list_tensors = (
+        table_tensors[: -len(vertical_lists)],
+        table_tensors[-len(vertical_lists) :],
     )
+    with torch.cuda.device(device):
+        _filter_table_kernel[(len(tables), triton.cdiv(max(out_size for *_, out_size in tables), TABLE_BLOCK))](
+            *table_arguments,
+            -0.5 if antialias else -0.75,
+            BLOCK=TABLE_BLOCK,
+            CUBIC=cubic,
+            ANTIALIAS=antialias,
+        )
     horizontal = None
     if not skip_horizontal:
         block_rows, block_columns = _tile(HORIZONTAL_TILE, max(out_widths))
@@ -359,7 +369,7 @@ def _plan_passes(
             vertical_weights,
             vertical_first_taps,
         ),
-        "vertical_lists": table_tensors[6:],
+        "vertical_lists": vertical_list_tensors,
         "aligned": all(value % ROW_ALIGNMENT == 0 for value in row_strides + intermediate_offsets),
         "uniform_output": len(set(out_sizes)) == 1,
     }
@@ -385,24 +395,26 @@ def _horizontal_pass(sources, plan, channels, cubic, antialias, round_to_uint8):
     intermediate = torch.empty(
         plan["intermediate_length"], device=frames.device, dtype=torch.uint8 if round_to_uint8 else torch.float32
     )
-    _horizontal_kernel[grid](
-        frames,
-        intermediate,
-        *metadata,
-        CHANNELS=channels,
-        BLOCK_ROWS=block_rows,
-        BLOCK_COLUMNS=block_columns,
-        CUBIC=cubic,
-        ANTIALIAS=antialias,
-        ROUND_TO_UINT8=round_to_uint8,
-        FRAME_POINTERS=len(sources) > 1,
-        num_warps=HORIZONTAL_WARPS,
-    )
+    with torch.cuda.device(frames.device):
+        _horizontal_kernel[grid](
+            frames,
+            intermediate,
+            *metadata,
+            CHANNELS=channels,
+            BLOCK_ROWS=block_rows,
+            BLOCK_COLUMNS=block_columns,
+            CUBIC=cubic,
+            ANTIALIAS=antialias,
+            ROUND_TO_UINT8=round_to_uint8,
+            FRAME_POINTERS=len(sources) > 1,
+            num_warps=HORIZONTAL_WARPS,
+        )
     return intermediate
 
 
 @lru_cache(maxsize=MAX_PLANS)
 def _resize_plan(device, channels, image_sizes, sizes, crop_size, cubic, antialias):
+    """Metadata of one batch layout. Its tensors are written on the stream that is current when it is built."""
     out_sizes = list(sizes) if crop_size is None else [crop_size] * len(sizes)
     output_lengths = [channels * height * width for height, width in out_sizes]
     plan = _plan_passes(
@@ -430,16 +442,16 @@ def _resize_plan(device, channels, image_sizes, sizes, crop_size, cubic, antiali
 
 
 def resize_normalize(
-    images,
-    sizes,
-    image_mean,
-    image_std,
-    rescale_factor,
-    resample,
-    crop_size=None,
-    antialias=True,
-    round_to_uint8=True,
-):
+    images: Sequence[torch.Tensor],
+    sizes: Sequence[tuple[int, int]],
+    image_mean: float | Sequence[float],
+    image_std: float | Sequence[float],
+    rescale_factor: float,
+    resample: str,
+    crop_size: tuple[int, int] | None = None,
+    antialias: bool = True,
+    round_to_uint8: bool = True,
+) -> list[torch.Tensor]:
     """Resize uint8 CHW images, center crop them to `crop_size`, rescale and normalize them.
 
     `sizes[i]` is the `(height, width)` that `images[i]` is resized to. Returns one float32 `(C, H, W)` tensor per
@@ -475,22 +487,24 @@ def resize_normalize(
     else:
         output = torch.empty(sum(plan["output_lengths"]), device=device, dtype=torch.float32)
     block_rows, block_columns = plan["vertical_tile"]
-    _vertical_kernel[plan["vertical_grid"]](
-        intermediate,
-        output,
-        *plan["vertical"],
-        means,
-        stds,
-        *plan["vertical_lists"],
-        CHANNELS=channels,
-        BLOCK_ROWS=block_rows,
-        BLOCK_COLUMNS=block_columns,
-        CUBIC=cubic,
-        ANTIALIAS=antialias,
-        ROUND_TO_UINT8=round_to_uint8,
-        ALIGNED=plan["aligned"],
-        OUTPUT_ALIGNED=plan["output_aligned"],
-    )
+    with torch.cuda.device(device):
+        _vertical_kernel[plan["vertical_grid"]](
+            intermediate,
+            output,
+            *plan["vertical"],
+            means,
+            stds,
+            *plan["vertical_lists"],
+            CHANNELS=channels,
+            BLOCK_ROWS=block_rows,
+            BLOCK_COLUMNS=block_columns,
+            CUBIC=cubic,
+            ANTIALIAS=antialias,
+            ROUND_TO_UINT8=round_to_uint8,
+            ALIGNED=plan["aligned"],
+            OUTPUT_ALIGNED=plan["output_aligned"],
+            ALIGNMENT=ROW_ALIGNMENT,
+        )
     if plan["uniform_output"]:
         return list(output.unbind(0))
     return [
