@@ -760,31 +760,34 @@ ATTN_PROBLEMS = {
 MODES = ["eager", "cudagraph", "compile"]
 CACHE_POLICY = "rotating_gt_2l2" if DEVICE == "cuda" else "backend_default"
 
+# One hue family per project, a distinct shade per arm, so color alone names the arm within any
+# panel (vLLM teals, FlashInfer/TRT-LLM greens, torch pinks). Arms that never share a row (the two
+# torch and torch_mm) may share a shade.
 IMPL_COLORS = {
     "finegrained-kernels": "#1f77b4",
-    "finegrained-fp8": "#bbbbbb",
-    "deepgemm": "#2ca02c",
-    "deepgemm_bf16": "#2ca02c",
+    "finegrained-kernels-unfused": "#9ecae1",
+    "finegrained-fp8": "#bdbdbd",
+    "transformers@main": "#636363",  # transformers main on a quantized checkpoint (status quo)
     "transformers": "#9467bd",
-    "transformers@main": "#7f7f7f",  # transformers main on a quantized checkpoint (status quo)
+    "deepgemm": "#d4a017",
+    "deepgemm_bf16": "#d4a017",
     "sonicmoe": "#ff7f0e",
-    "vllm": "#17becf",  # vLLM triton fused-MoE (its bf16 serving kernel)
-    "vllm_marlin": "#bcbd22",
-    "vllm_exllama": "#8c564b",
-    "trtllm": "#76b900",  # FlashInfer TRT-LLM fused MoE (NVIDIA Blackwell serving kernels)
-    "flashinfer_mxint4": "#76b900",
-    "flashinfer_svdquant": "#76b900",
+    "megablocks": "#8c6d31",  # databricks dropless-MoE (bf16 reference)
     "triton_kernels": "#8c564b",  # OpenAI mxfp4 (GPT-OSS) reference
     "nvfp4_gemm": "#d62728",  # transformers NVFP4Linear kernel (dense 2D row only)
-    "megablocks": "#7f7f7f",  # databricks dropless-MoE (bf16 reference)
+    "vllm": "#17becf",  # vLLM triton fused-MoE (its bf16 serving kernel)
+    "vllm_marlin": "#0e7c86",
+    "marlin": "#01665e",
+    "vllm_mm": "#9edae5",
+    "vllm_exllama": "#5ab4ac",
+    "trtllm": "#76b900",  # FlashInfer TRT-LLM fused MoE (NVIDIA Blackwell serving kernels)
+    "flashinfer_mxint4": "#b8e186",
+    "flashinfer_svdquant": "#4d7c0f",
     "torch": "#e377c2",  # torch/cuBLAS F.scaled_grouped_mm (quantized prefill reference)
-    "finegrained-kernels-unfused": "#6baed6",
-    "torch_weight_only": "#e377c2",
-    "marlin": "#17becf",
-    "torch_rowwise": "#e377c2",
-    "fbgemm": "#bcbd22",
     "torch_mm": "#e377c2",  # torch/cuBLAS F.scaled_mm (the attn-row sibling)
-    "vllm_mm": "#17becf",
+    "torch_rowwise": "#c51b7d",
+    "torch_weight_only": "#ae017e",
+    "fbgemm": "#bcbd22",
 }
 
 
@@ -822,7 +825,9 @@ def _impl_label(impl):
     if impl == "vllm_mm":
         return "vLLM CUTLASS"
     if impl == "trtllm":
-        return "FlashInfer"
+        return "FlashInfer TRT-LLM"
+    if impl == "flashinfer_svdquant":
+        return "FlashInfer SVDQuant"
     if impl == "finegrained-fp8":
         return f"finegrained-fp8@{UPSTREAM_FP8_LABEL}"
     return impl
@@ -2583,19 +2588,6 @@ ROW_LABELS = {"quantized": "MoE quantized", "linear quantized": "Linear quantize
               "unquantized": "MoE unquantized (BF16)"}
 present_rows = [r for r in ROW_ORDER if any(rr == r for rr, *_ in rows)]
 
-# bars must be PHYSICALLY identical across every subplot of every figure: one slot
-# width (sized by the fullest impl set) and one x data-range on every axis (sparse
-# rows centered) — a data-unit width on a stretched sparse axis renders fat bars
-GLOBAL_WIDTH = 0.9 / max(
-    (len({i for rr, _, reg, i, *_ in rows if rr == r and reg == reg2})
-     for r in present_rows for reg2 in ("decode", "prefill")),
-    default=1,
-)
-GLOBAL_SPAN = max(
-    (len({p for rr, p, reg, *_ in rows if rr == r and reg == reg2})
-     for r in present_rows for reg2 in ("decode", "prefill")),
-    default=1,
-) - 1
 
 # Measured runs already merged their per-case CSVs; replot only reads them.
 # Mock timings still need their CSV written here.
@@ -2610,13 +2602,31 @@ import matplotlib.patches as mpatches  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
 
 REGIME_MODES = {"decode": ("cudagraph", "compile"), "prefill": ("eager", "compile")}
-fig, axes = plt.subplots(max(len(present_rows), 1), 2,
-                         figsize=(max(18, 2.2 * (GLOBAL_SPAN + 1)), 4.6 * max(len(present_rows), 1)),
+# One full-width panel per (category, regime), stacked, each with its own legend of the arms it
+# draws: side-by-side decode/prefill squeezed ~14 model groups into half the width, and a single
+# legend over ~30 arms made every panel a lookup.
+panels = [(row, regime) for row in present_rows for regime in ("decode", "prefill")]
+fig, axes = plt.subplots(max(len(panels), 1), 1,
+                         figsize=(18, 3.9 * max(len(panels), 1)),
                          squeeze=False)
-any_overlay = any_eager_fallback = any_missing = False
-for ri, row in enumerate(present_rows):
-    for ci, regime in enumerate(("decode", "prefill")):
-        ax = axes[ri][ci]
+legend_order = list(dict.fromkeys(impl for _, _, _, impl, *_ in rows))
+
+
+def _panel_shape(row, regime):
+    """(model groups, arms in the most crowded group) of one panel."""
+    groups = {}
+    for rr, p, reg, *_ in rows:
+        if rr == row and reg == regime:
+            groups[p] = groups.get(p, 0) + 1
+    return len(groups), max(groups.values(), default=1)
+
+
+# One PHYSICAL bar width in every panel, the widest the most crowded panel fits: an axis spanning
+# n groups draws a data unit at width / (n + 1.1), so a panel's bars are sized in its own units.
+bar_phys = min((0.88 / m) / (n + 1.1) for n, m in map(lambda pr: _panel_shape(*pr), panels) if n)
+for (row, regime), (ax,) in zip(panels, axes):
+        panel_impls = set()
+        missing_drawn = False
         solid_mode, overlay_mode = REGIME_MODES[regime]
         cells = [(p, i, r, par) for (rr, p, reg, i, r, par) in rows
                  if rr == row and reg == regime]
@@ -2635,6 +2645,9 @@ for ri, row in enumerate(present_rows):
                     return i
             return len(CANONICAL_MODEL_ORDER)
         problems.sort(key=_model_rank)
+        # each panel spans only its own models; a slot is sized by its most crowded group, so a
+        # sparse panel gets wide bars instead of a fullest-panel width stranded mid-axis
+        width = bar_phys * (len(problems) + 1.1)
         overlay_drawn = False
         eager_only_drawn = False  # any bar shown as eager because cudagraph is unsupported?
         ticks, ticklabels = [], []
@@ -2643,11 +2656,11 @@ for ri, row in enumerate(present_rows):
             # Wrap model and recipe names; full ids remain in the CSV.
             short = pname.split(" (")[0]
             model, _, rest = short.partition(" ")
-            if short.startswith("unknown model "):
-                model, rest = "unknown model", short.removeprefix("unknown model ")
+            if short.startswith("unknown model "):  # a synthetic shape, no published checkpoint
+                model, rest = "synthetic", short.removeprefix("unknown model ")
             model = model.split("/")[-1]
             rest = rest.removeprefix("attn ").removesuffix(" qkv-shaped")
-            ticklabels.append(fill(model, 18) + (f"\n{fill(rest, 18)}" if rest else ""))
+            ticklabels.append(fill(model, 16) + (f"\n{fill(rest, 16)}" if rest else ""))
             # bars speed-ranked within the group (fastest leftmost, crashed last),
             # centered on the group's own arm count — colors identify the impls
             group = [(i, r) for p, i, r, _par in cells if p == pname]
@@ -2660,29 +2673,30 @@ for ri, row in enumerate(present_rows):
 
             group.sort(key=lambda t: (_drawn(t[1]) is None, _drawn(t[1]) or 0.0))
             for slot, (impl, res) in enumerate(group):
-                off = (slot - (len(group) - 1) / 2) * GLOBAL_WIDTH
+                off = (slot - (len(group) - 1) / 2) * width
                 sval = res.get(solid_mode)
                 eager_fb = (res.get("eager") if sval is None and regime == "decode" else None)
+                panel_impls.add(impl)
                 if sval is not None:
-                    ax.bar(gi + off, sval, GLOBAL_WIDTH, color=IMPL_COLORS[impl],
+                    ax.bar(gi + off, sval, width, color=IMPL_COLORS[impl],
                            zorder=2)
                 elif eager_fb is not None:
                     # Cannot be graph-captured (megablocks' routing does a device->host copy;
                     # nvfp4_gemm's per-expert loop has data-dependent shapes) but DOES run. Show
                     # the eager cost, dot-hatched so it is never read as a cudagraph number —
                     # a red X here would say "broken" about something merely 5x slower.
-                    ax.bar(gi + off, eager_fb, GLOBAL_WIDTH, color=IMPL_COLORS[impl],
+                    ax.bar(gi + off, eager_fb, width, color=IMPL_COLORS[impl],
                            alpha=0.55, edgecolor="black", hatch="..", linewidth=0.7, zorder=2)
                     eager_only_drawn = True
                 else:
                     # Deployment mode unavailable: keep its marker above the log-axis floor.
                     ax.plot(gi + off, floor * 1.25, "x", color="red", markersize=9,
                             clip_on=False, zorder=4)
-                    any_missing = True
+                    missing_drawn = True
                 # Overlay compile wins on the same implementation's eager/graph bar.
                 oval = res.get(overlay_mode)
                 if oval is not None and sval is not None and oval < sval:
-                    ax.bar(gi + off, oval, GLOBAL_WIDTH, facecolor="none",
+                    ax.bar(gi + off, oval, width, facecolor="none",
                            edgecolor="black", hatch="////", linewidth=0.8, zorder=3)
                     overlay_drawn = True
         # dotted separators between model groups (so adjacent models' edge bars
@@ -2691,35 +2705,31 @@ for ri, row in enumerate(present_rows):
             ax.axvline(sep + 0.5, color="0.7", linestyle=":", linewidth=0.8, zorder=0)
         # same x data-range on every axis; sparse rows sit centered
         extent = max(ticks) if ticks else 0
-        margin = (GLOBAL_SPAN - extent) / 2
-        ax.set_xlim(-0.6 - margin, extent + 0.6 + margin)
+        ax.set_xlim(-0.55, extent + 0.55)
         ax.set_xticks(ticks)
-        ax.set_xticklabels(ticklabels, fontsize=7)
+        ax.set_xticklabels(ticklabels, fontsize=8)
         ax.set_ylim(bottom=floor)
         ax.set_ylabel("latency (us, log scale)")
         tok = DECODE_TOKENS if regime == "decode" else PREFILL_TOKENS
         mode_note = (f"solid={solid_mode}, hatch=compile-if-faster" if overlay_drawn
                      else solid_mode)
-        ax.set_title(f"{ROW_LABELS[row]} — {regime} (T={tok}; {mode_note})")
-        any_overlay |= overlay_drawn
-        any_eager_fallback |= eager_only_drawn
-
-# One legend serves all panels; none of the model groups are hidden behind it.
-impls = list(dict.fromkeys(impl for _, _, _, impl, *_ in rows))
-handles = [mpatches.Patch(color=IMPL_COLORS[i], label=_impl_label(i)) for i in impls]
-if any_overlay:
-    handles.append(mpatches.Patch(facecolor="none", edgecolor="black", hatch="////", label="compile (faster)"))
-if any_eager_fallback:
-    handles.append(mpatches.Patch(facecolor="none", edgecolor="black", hatch="..", label="eager (no cudagraph)"))
-if any_missing:
-    handles.append(Line2D([], [], color="red", marker="x", linestyle="none", label="unavailable"))
-fig.legend(handles=handles, loc="lower center", ncol=4, fontsize=8, frameon=False)
-legend_height = 0.25 * ((len(handles) + 3) // 4) / fig.get_figheight()
+        ax.set_title(f"{ROW_LABELS[row]} — {regime} (T={tok}; {mode_note})", loc="left")
+        # this panel's arms only, in one fixed order across panels (colors follow the arm)
+        handles = [mpatches.Patch(color=IMPL_COLORS[i], label=_impl_label(i))
+                   for i in legend_order if i in panel_impls]
+        if overlay_drawn:
+            handles.append(mpatches.Patch(facecolor="none", edgecolor="black", hatch="////", label="compile (faster)"))
+        if eager_only_drawn:
+            handles.append(mpatches.Patch(facecolor="none", edgecolor="black", hatch="..", label="eager (no cudagraph)"))
+        if missing_drawn:
+            handles.append(Line2D([], [], color="red", marker="x", linestyle="none", label="unavailable"))
+        ax.legend(handles=handles, loc="upper left", bbox_to_anchor=(1.005, 1.0), fontsize=8,
+                  frameon=False, borderaxespad=0.0)
 cache_note = "cold weights (>2xL2)" if DEVICE == "cuda" else "backend cache defaults"
 fig.suptitle(f"GEMM + MoE quantization — finegrained-kernels vs references  "
              f"({device_name}, real model shapes; decode=cudagraph, prefill=eager; "
              f"hatch=compile-if-faster; {cache_note})", y=0.9995)
-fig.tight_layout(rect=(0, legend_height + 0.02, 1, 0.98))
+fig.tight_layout(rect=(0, 0, 1, 0.985))
 out_png = os.path.join(_HERE, f"bench_moe{suffix}.png")
 fig.savefig(out_png, dpi=120)
 print(f"wrote {out_png}" + ("" if REPLOT else f" + bench_moe{suffix}.csv"))
