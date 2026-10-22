@@ -36,24 +36,19 @@ def do_bench(fn, quantiles=None, *, cudagraph=False, **kwargs):
     return do_bench_cudagraph(fn, quantiles=quantiles, **kwargs)
 
 
-def gemm_weight(nargs):
-    """``cold_weight`` for the GEMMs: their weight ``B`` and the bytes one call reads from it (only
-    the routed experts' planes of an expert stack)."""
-    weight = nargs["B"]
-    active_bytes = weight.numel() * weight.element_size()
-    expert_ids = nargs.get("ExpertIds")
-    expert_start = nargs.get("ExpertStart")
+def _active_bytes(nargs, weight):
+    """The bytes one call reads from ``weight``: only the routed experts' planes of an expert stack."""
+    nbytes = weight.numel() * weight.element_size()
+    expert_ids, expert_start = nargs.get("ExpertIds"), nargs.get("ExpertStart")
     if expert_ids is not None:
         experts = weight.shape[0]
-        active = expert_ids[(expert_ids >= 0) & (expert_ids < experts)].unique().numel()
-        active_bytes = active_bytes * active // experts
-    elif expert_start is not None:
+        return nbytes * expert_ids[(expert_ids >= 0) & (expert_ids < experts)].unique().numel() // experts
+    if expert_start is not None:
         experts = weight.shape[0]
         if expert_start.numel() < experts + 1:
-            return weight, 0
-        active = (expert_start[1:experts + 1] > expert_start[:experts]).sum().item()
-        active_bytes = active_bytes * active // experts
-    return weight, active_bytes
+            return 0
+        return nbytes * (expert_start[1:experts + 1] > expert_start[:experts]).sum().item() // experts
+    return nbytes
 
 
 def rotation_count(active_bytes, device):
@@ -106,21 +101,10 @@ def routed_banks(nargs, experts, count):
     return banks
 
 
-def weight_banks(nargs, weight, active_bytes):
-    """Rotate the forward GEMMs' readonly B and its full-weight host descriptor.
-
-    A routed call rotates which experts it reads (``routed_banks``); a dense one, or an expert stack
-    too small for disjoint blocks, rotates copies of B. Other operands stay shared. The opted-in
-    GEMMs pass B independently of outputs and scales; BSDescriptor may be an unread alias of BDescriptor.
-    """
-    if not weight.is_cuda or torch._debug_has_internal_overlap(weight) != 0:
-        return None
+def _copied_banks(nargs, weight, count):
+    """Banks over copies of ``B`` and its full-weight host descriptor (BSDescriptor may be an unread
+    alias of BDescriptor). None when B's descriptor covers a different span or memory is short."""
     span_bytes = weight.numel() * weight.element_size()
-    count = rotation_count(active_bytes, weight.device)
-    if count is None:
-        return None
-    if weight.ndim == 3 and (banks := routed_banks(nargs, weight.shape[0], count)) is not None:
-        return banks
     descriptor = nargs.get("BDescriptor")
     if isinstance(descriptor, TensorDescriptor):
         base = descriptor.base
@@ -148,3 +132,19 @@ def weight_banks(nargs, weight, active_bytes):
     except torch.OutOfMemoryError:
         return None
     return banks
+
+
+def gemm_cold_banks(nargs):
+    """``cold_banks`` for the GEMMs: launch-argument sets that together read more than twice L2 of
+    distinct weight ``B``. A routed call reroutes to other experts of the one stack (``routed_banks``);
+    a dense call, or a stack too small for disjoint expert sets, cycles copies of B. Other operands
+    stay shared. None (cold event timing) when B cannot be rotated."""
+    weight = nargs["B"]
+    if not weight.is_cuda or torch._debug_has_internal_overlap(weight) != 0:
+        return None
+    count = rotation_count(_active_bytes(nargs, weight), weight.device)
+    if count is None:
+        return None
+    if weight.ndim == 3 and (banks := routed_banks(nargs, weight.shape[0], count)) is not None:
+        return banks
+    return _copied_banks(nargs, weight, count)

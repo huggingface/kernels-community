@@ -32,7 +32,7 @@ from utils import TEST_DEVICE, make_weights
 import finegrained_kernels  # type: ignore
 import finegrained_kernels.matmul  # type: ignore
 from finegrained_kernels.bayesian_autotuner import bayesian_autotune  # type: ignore
-from finegrained_kernels.bench import gemm_weight, routed_banks  # type: ignore
+from finegrained_kernels.bench import gemm_cold_banks, routed_banks  # type: ignore
 from finegrained_kernels.compat import is_sm10x  # type: ignore
 from finegrained_kernels.pruners import block_within_dim_pruner, mx_config_pruner  # type: ignore
 
@@ -295,7 +295,7 @@ def test_rotating_weights_are_reused_and_released(monkeypatch, n_trials):
         [triton.Config({"BLOCK": block}, pre_hook=observe) for block in (32, 64, 128)],
         ["N"],
         n_trials=n_trials,
-        cold_weight=gemm_weight,
+        cold_banks=gemm_cold_banks,
         cache_results=False,
     )
     @triton.jit

@@ -186,14 +186,15 @@ decode once with `decompress_nvfp4_csf_scales`.
 Every kernel is tuned by a Tree-structured Parzen Estimator (TPE, the Bayesian search Optuna
 uses) autotuner with per-shape disk caching, config pruners
 that fence compiler bugs and can't-win regions per (arch, format), and failed-compile memoization.
-Forward GEMMs tune with CUDA graph replay over banks whose active weight values exceed
-twice L2. A routed kernel's banks reroute the same rows to other experts of the one stack
+The tuner times a kernel cold when it declares `cold_banks`: a function returning launch-argument
+sets to cycle through, timed as one CUDA graph. Forward GEMMs declare `bench.gemm_cold_banks`,
+whose banks' active weight values exceed twice L2. A routed kernel's banks reroute the same rows to other experts of the one stack
 (only selected expert planes count), so they copy nothing; a dense weight, or an expert stack
 too small for disjoint expert sets, rotates copies, which stay near twice L2 in total. Weight
 strides and host TMA bindings are preserved; activations, scales and outputs stay shared.
 Banks are reused across candidates and released after the search. Unsupported layouts,
 excessive bank counts or insufficient memory use cold event timing, with cache clearing
-outside the measured interval. Kernels without a declared weight input also use cold events.
+outside the measured interval. Kernels without `cold_banks` also use cold events.
 Explicit benchmark callbacks, legacy timing options and user hooks retain their existing behavior.
 
 `FINEGRAINED_AUTOTUNE_CONFIG` overrides the tuner for every kernel, read when the kernels are
