@@ -25,7 +25,7 @@ cuda-flags = [
     "-D__CUDA_NO_HALF_CONVERSIONS__",
     "-D__CUDA_NO_HALF2_OPERATORS__",
 ]
-depends = ["torch"]
+depends = ["torch", "torch-stable-abi-shim"]
 src = [
     "cv_utils/connected_components.cu",
     "cv_utils/generic_nms.cu",
