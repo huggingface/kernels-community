@@ -27,7 +27,7 @@ from .bayesian_autotuner import bayesian_autotune
 from .bench import weight_input
 
 from .compat import add_op_namespace_prefix, FP8_DTYPE, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, narrow_scalar_autotuning_configs, tl_dtype, pdl_launch_kwargs
-from .descriptors import rebind_batched_mx_bs_descriptor
+from .descriptors import batched_weight_descriptor, rebind_batched_mx_bs_descriptor, rebind_batched_weight_descriptor
 from .formats import block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, is_per_expert_global, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_operands, weight_block_size, validate_int_operands, INT_WEIGHT_DTYPES
 from .epilogue import fused_glu
 from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, prepare_fp8_mx_inputs, permute_routed_rows, static_expert_act_operands, tensor_wide_act_operands
@@ -55,7 +55,7 @@ from .loading.tiles import (
     weight_tile_ptrs,
 )
 from .epilogue import acc_init, bias_strides, gemm_epilogue
-from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, dot_scaled_staging_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, gate_tile_cap_pruner, mx_config_pruner, require_moe_dims_aligned, scale_subblock_pruner, single_row_tile_pruner, smem_pruner, swizzled_scale_config_pruner, weight_only_swap_scope_pruner, int_scale_group_tile_pruner
+from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, dot_scaled_staging_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gate_tile_cap_pruner, mx_config_pruner, require_moe_dims_aligned, scale_subblock_pruner, single_row_tile_pruner, smem_pruner, swizzled_scale_config_pruner, weight_only_swap_scope_pruner, int_scale_group_tile_pruner
 
 
 @triton.jit
@@ -104,8 +104,33 @@ def expert_setup(
     return batch_id, pid_n, expert_id, A, B, C, Bs, in_row, out_row
 
 
+def with_weight_stream(configs):
+    """Cross the weight-stream axis into a batched kernel's configs: ``B_MEMORY_MODE`` pointer or a
+    host TMA descriptor over the expert stack (``batched_weight_descriptor``), the box re-bound per
+    config after the config's own pre_hook."""
+    def stream(config, mode):
+        def pre_hook(nargs, own=config.pre_hook):
+            if own is not None:
+                own(nargs)
+            rebind_batched_weight_descriptor(nargs)
+        return triton.Config(
+            dict(config.kwargs, B_MEMORY_MODE=mode), num_warps=config.num_warps, num_stages=config.num_stages,
+            num_ctas=config.num_ctas, maxnreg=config.maxnreg, pre_hook=pre_hook,
+        )
+    return [stream(config, mode) for config in configs for mode in ("pointer", "host_descriptor")]
+
+
+@triton.jit
+def batched_weight_row(expert_id, pid_n, N, n_width: tl.constexpr, GATE: tl.constexpr):
+    """The weight tile's first row in the expert stack viewed as one matrix — the TMA coordinate of
+    ``batched_weight_descriptor`` (an expert spans ``2N`` rows under GATE). The weight stream is
+    asynchronous and staged over ``num_stages`` buffers there; the pointer loads of a reduce that
+    feeds no dot are never pipelined (one K tile in flight per program)."""
+    return (expert_id * (2 * N if GATE else N) + pid_n * n_width).to(tl.int32)
+
+
 @bayesian_autotune(
-    get_accelerator_autotuning_configs(swap_ab=True, tune_block_n=True),
+    with_weight_stream(get_accelerator_autotuning_configs(swap_ab=True, tune_block_n=True)),
     # one winner per (shape, requant): requant narrows the legal tiles to the quant block, so a
     # shared entry could replay a sub-block winner on a launch whose output scale needs the block.
     # GATE stacks a 2*BN-wide dot — a distinct config space that must not share a winner.
@@ -119,6 +144,7 @@ def expert_setup(
         "early_config_prune": compose_pruners(
             scale_subblock_pruner(),
             fp8_dot_warp_pruner(),
+            descriptor_box_pruner(),
         )
     },
 )
@@ -127,6 +153,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     A,  # (S, K) E4M3 activations (pre-quantized once by the wrapper)
     As,  # (S, K // BLOCK_SIZE_K) fp32 per-row, per-K-block activation scales
     B,  # (num_experts, N, K) FP8 weights; under GATE the (num_experts, 2N, K) gate|up stack
+    BDescriptor,  # host TMA descriptor over B viewed (E * rows, K_stored); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (num_experts, N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales (2N under GATE)
     C,  # (S, N) output; under an OUTPUT_FORMAT the FP8-requantized intermediate
     Cs,  # (S, N // BLOCK_SIZE_N) per-(row, block) output scale; written iff OUTPUT_FORMAT
@@ -174,6 +201,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     OUTPUT_FORMAT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+    B_MEMORY_MODE: tl.constexpr = "pointer",
     PDL: tl.constexpr = False,
 ):
     """Block-scale batched FP8 expert matmul kernel.
@@ -231,8 +259,9 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
             a_ptrs, as_ptrs, None, None, 0, 0, 0, 0, 0, "pointer", False, False, False
         )
         w, b_s = load_weight_block_dynamic(
-            b_ptrs, b_ptrs, bs_ptr + bs_off, None, 0, 0, 0, 0, 0, 0,
-            GATE, False, "pointer", SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
+            b_ptrs, BDescriptor, bs_ptr + bs_off, None, 0, 0,
+            batched_weight_row(expert_id, pid_n, N, n_width, GATE), k * BLOCK_SIZE_K, 0, 0,
+            GATE, False, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
         )
         acc = block_dynamic_dot(acc, a, a_s, w, b_s, BLOCK_SIZE_K, SWAP_AB, False, True)
         a_ptrs, as_ptrs, b_ptrs, bs_ptr, _, _ = advance_ptrs(
@@ -254,7 +283,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
 
 
 @bayesian_autotune(
-    get_accelerator_autotuning_configs(swap_ab=True, tune_block_n=True),
+    with_weight_stream(get_accelerator_autotuning_configs(swap_ab=True, tune_block_n=True)),
     # keyed like the block-dynamic sibling: requant narrows the legal tiles to the quant block
     ["N", "K", "S", "OUTPUT_FORMAT", "GATE", "BLOCK_N", "BLOCK_K"],
     n_trials=100,
@@ -264,6 +293,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
         "early_config_prune": compose_pruners(
             scale_subblock_pruner(),
             fp8_dot_warp_pruner(),
+            descriptor_box_pruner(),
         )
     },
 )
@@ -272,6 +302,7 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
     A,  # (S, K) E4M3 activations (pre-quantized against the static scale by the wrapper)
     As,  # calibrated (static) activation scale: one value, or one per expert
     B,  # (num_experts, N, K) FP8 weights; under GATE the (num_experts, 2N, K) gate|up stack
+    BDescriptor,  # host TMA descriptor over B viewed (E * rows, K_stored); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (num_experts, N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales (2N under GATE)
     C,  # (S, N) output; under an OUTPUT_FORMAT the FP8-requantized intermediate
     Cs,  # (S, N // BLOCK_SIZE_N) per-(row, block) output scale; written iff OUTPUT_FORMAT
@@ -316,6 +347,7 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
     OUTPUT_FORMAT: tl.constexpr = None,  # None | "fp8" (per-(row, block) requant of the intermediate)
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+    B_MEMORY_MODE: tl.constexpr = "pointer",
     PDL: tl.constexpr = False,
 ):
     """Block-scale batched FP8 expert matmul with a static (per-tensor) activation scale — the
@@ -365,8 +397,9 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
         # (fake-batch replicated) takes the other arm and ignores it
         a, _ = load_act_static(a_ptrs, 0, 0, 0, None, 0, a_s_static, "pointer", False)
         w, b_s = load_weight_static(
-            b_ptrs, b_ptrs, bs_ptr + bs_off, None, 0, 0, 0, 0, 0, 0,
-            GATE, False, "pointer", SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
+            b_ptrs, BDescriptor, bs_ptr + bs_off, None, 0, 0,
+            batched_weight_row(expert_id, pid_n, N, n_width, GATE), k * BLOCK_SIZE_K, 0, 0,
+            GATE, False, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
         )
         acc = static_dot(acc, a, w, b_s, SWAP_AB, BLOCK_SIZE_K, True)
         a_ptrs, _, b_ptrs, bs_ptr, _, _ = advance_ptrs(
@@ -390,7 +423,7 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
 
 @bayesian_autotune(
     # S (routed rows) keyed like the block-dynamic/mx batched siblings — decode re-tunes per batch.
-    get_accelerator_autotuning_configs(tune_block_nk=True, swap_ab=True),
+    with_weight_stream(get_accelerator_autotuning_configs(tune_block_nk=True, swap_ab=True)),
     # GATE keys the gate|up arm separately: its 2*BN tile is a different config space, and an
     # ungated crown replayed under GATE can overflow shared memory
     ["N", "K", "S", "GATE"],
@@ -405,6 +438,7 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
             block_within_dim_pruner("K"),
             block_within_dim_pruner("N", "BLOCK_SIZE_N"),
             single_row_tile_pruner(),
+            descriptor_box_pruner(),
         )
     },
 )
@@ -413,6 +447,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     A,  # (S, K) pre-quantized FP8 activations
     As,  # per-token activation scales (S,), or a calibrated (static) one: shared, or per expert
     B,  # (num_experts, N, K) FP8 weights; under GATE the (num_experts, 2N, K) gate|up stack
+    BDescriptor,  # host TMA descriptor over B viewed (E * rows, K_stored); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (num_experts, N, 1) row-wise weight scales, or (num_experts, 1, 1) per tensor (stride_bs_n 0)
     C,  # (S, N) output; under GATE the bf16 GLU intermediate
     Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
@@ -451,6 +486,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+    B_MEMORY_MODE: tl.constexpr = "pointer",
     PDL: tl.constexpr = False,
 ):
     """Tensor-scale / row-wise batched FP8 expert matmul kernel.
@@ -493,10 +529,11 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     a_s = tl.load(As + in_row * stride_as_m + expert_id * stride_as_e)
 
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
-    for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a, _ = load_act_static(a_ptrs, 0, 0, 0, None, 0, a_s, "pointer", False)
-        b, _ = load_weight_plain(
-            b_ptrs, b_ptrs, 0, 0, 0, GATE, False, "pointer", SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a, unused_act_scale = load_act_static(a_ptrs, 0, 0, 0, None, 0, a_s, "pointer", False)
+        b, unused_weight_scale = load_weight_plain(
+            b_ptrs, BDescriptor, 0, batched_weight_row(expert_id, pid_n, N, n_width, GATE), k * BLOCK_SIZE_K,
+            GATE, False, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K
         )
         accumulator = accumulator + fp8_dot(a, b, SWAP_AB, BLOCK_SIZE_K)
         a_ptrs, _, b_ptrs, _, _, _ = advance_ptrs(
@@ -528,13 +565,13 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
 # implemented for future shapes but is not fielded. Swap verdicts are B200 (sm_100) — re-measure
 # on H100 or the target device before inheriting.
 @bayesian_autotune(
-    get_accelerator_autotuning_configs(
+    with_weight_stream(get_accelerator_autotuning_configs(
         mx=True,
         tune_block_nk=True,
         compute_modes=("dot_scaled", "scalar"),
         swap_ab=True,
         pre_hook=rebind_batched_mx_bs_descriptor,
-    ),
+    )),
     # ACTIVATION_FORMAT keys the inline act-quant grid: A stays raw bf16 under every
     # format, so the tuner's dtype-appended key can't split W4A8 from W4A4 itself.
     # SWIZZLED_SCALES keys the weight-scale load: it constrains the config space (BK % 128 == 0)
@@ -553,9 +590,10 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     # native scaled-MMA; smaller-BN swap configs never win and mislead the TPE).
     prune_configs_by={
         "early_config_prune": compose_pruners(
-            mx_config_pruner("K", "N"), swizzled_scale_config_pruner(allow_gate_subblock=True), smem_pruner(),
+            mx_config_pruner("K", "N"), swizzled_scale_config_pruner(allow_gate_subblock=True), smem_pruner(staged_weights=True),
             gate_tile_cap_pruner(),
             dot_scaled_staging_pruner(),
+            descriptor_box_pruner(),
         )
     },
 )
@@ -564,6 +602,7 @@ def mx_dynamic_matmul_batched_kernel(
     A,  # (S, K) activations: raw BF16/FP16 (inline-quant) or E4M3 (pre-quantized, As set)
     As,  # (S, K // SCALE_GROUP_K) UE8M0 act scales; None ⇒ inline-quant, read iff not None
     B,  # (num_experts, N, K[/2]); under GATE the (num_experts, 2N, K[/2]) gate|up stack
+    BDescriptor,  # host TMA descriptor over B viewed (num_experts * (2N|N), K_bytes); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (num_experts, N, K // SCALE_GROUP_K) UE8M0 weight scales (2N under GATE)
     BSDescriptor,  # host TMA descriptor over Bs when SWIZZLED (BN=128 bulk load); dummy otherwise
     C,  # (S, N[/2]) output; under an OUTPUT_FORMAT the MX-requantized intermediate
@@ -622,6 +661,7 @@ def mx_dynamic_matmul_batched_kernel(
     # single Bs pointer (+ BSDescriptor for the BN=128 bulk load); un-swizzled Bs takes the affine
     # arm in the same leaf. The op never swizzles — a 3D caller runs un-swizzled at no penalty.
     SWIZZLED_SCALES: tl.constexpr = False,
+    B_MEMORY_MODE: tl.constexpr = "pointer",
     PDL: tl.constexpr = False,
 ):
     """Unified batched microscaled expert matmul (MXFP8/MXFP4/NVFP4, W4A8/W4A4) with
@@ -696,9 +736,11 @@ def mx_dynamic_matmul_batched_kernel(
             BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K, ACTIVATION_FORMAT,
         )
         b, b_s = load_weight_mx(
-            b_ptrs, b_ptrs, Bs, None, BSDescriptor, Bs, 0, 0, 0, 0, expert_id, pid_n, k, N, K,
+            b_ptrs, BDescriptor, Bs, None, BSDescriptor, Bs, 0,
+            batched_weight_row(expert_id, pid_n, N, n_width, GATE), k * (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE),
+            0, expert_id, pid_n, k, N, K,
             stride_bs_e, stride_bs_n, stride_bs_k,
-            GATE, False, True, "pointer", SWAP_AB, SWIZZLED_SCALES,
+            GATE, False, True, B_MEMORY_MODE, SWAP_AB, SWIZZLED_SCALES,
             BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, WEIGHT_VALUES_PER_BYTE,
         )
         accumulator = mx_compute(
@@ -738,9 +780,9 @@ def mx_dynamic_matmul_batched_kernel(
 @bayesian_autotune(
     # weight-only plain bf16 dot (fp4/fp8 weight upcast per-group in-loop), plus the swapped
     # decode reduce (weight output rows lead the tile, no MMA — see the scope pruner).
-    get_accelerator_autotuning_configs(
+    with_weight_stream(get_accelerator_autotuning_configs(
         tune_block_nk=True, compute_modes=("dot", "dot_scaled", "scalar"), swap_ab=True
-    ),
+    )),
     ["N", "K", "S", "GATE"],
     n_trials=100,
     benchmark_input=weight_input,
@@ -754,6 +796,7 @@ def mx_dynamic_matmul_batched_kernel(
             block_within_dim_pruner("N", "BLOCK_SIZE_N"),
             mx_config_pruner("K", "N", block_within_k=False),  # dot_scaled shape gates
             weight_only_swap_scope_pruner(),
+            descriptor_box_pruner(),
         )
     },
 )
@@ -761,6 +804,7 @@ def mx_dynamic_matmul_batched_kernel(
 def mx_weight_only_matmul_batched_kernel(
     A,  # (rows, K) raw BF16/FP16 activations — NOT quantized
     B,  # (num_experts, N, K[/2]) MXFP4/NVFP4/MXFP8 weights; 2N under GATE
+    BDescriptor,  # host TMA descriptor over B viewed (E * rows, K_stored); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (num_experts, N, K // SCALE_GROUP_K) group scales — UE8M0 (MX) or E4M3 (NVFP4)
     BsGlobal,  # (num_experts,) fp32 NVFP4 per-expert global — recovers on the accumulator; read iff not None
     C,
@@ -799,6 +843,7 @@ def mx_weight_only_matmul_batched_kernel(
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+    B_MEMORY_MODE: tl.constexpr = "pointer",
     PDL: tl.constexpr = False,
 ):
     """weight-only batched (decode) expert matmul: raw bf16 activations against MXFP4/MXFP8 weights upcast
@@ -851,9 +896,11 @@ def mx_weight_only_matmul_batched_kernel(
             a = tl.where(tl.arange(0, BLOCK_SIZE_K)[None, :] >= overlap, a, 0.0)
         b_k = b_ptrs + (k_start // WEIGHT_VALUES_PER_BYTE) * stride_b_k
         w, w_s = load_weight_mx(
-            b_k, b_k, Bs, None, None, Bs, 0, 0, 0, 0, expert_id, pid_n, k, N, K,
+            b_k, BDescriptor, Bs, None, None, Bs, 0,
+            batched_weight_row(expert_id, pid_n, N, n_width, GATE), k_start // WEIGHT_VALUES_PER_BYTE,
+            0, expert_id, pid_n, k, N, K,
             stride_bs_e, stride_bs_n, stride_bs_k,
-            GATE, False, True, "pointer", SWAP_AB, False,
+            GATE, False, True, B_MEMORY_MODE, SWAP_AB, False,
             BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, WEIGHT_VALUES_PER_BYTE,
             k_col_off=-(overlap // SCALE_GROUP_K),
         )
@@ -881,8 +928,10 @@ def mx_weight_only_matmul_batched_kernel(
 @bayesian_autotune(
     # the MX weight-only batched kernel's space minus dot_scaled: the upcast dot, plus the swapped decode reduce at
     # the MMA tiles and at narrow ones (8 / 16 rows: a decode grid of N / 8 programs, the measured winner)
-    get_accelerator_autotuning_configs(tune_block_nk=True, compute_modes=("dot", "scalar"), swap_ab=True)
-    + narrow_scalar_autotuning_configs(block_ns=(8, 16), SWAP_AB=True),
+    with_weight_stream(
+        get_accelerator_autotuning_configs(tune_block_nk=True, compute_modes=("dot", "scalar"), swap_ab=True)
+        + narrow_scalar_autotuning_configs(block_ns=(8, 16), SWAP_AB=True)
+    ),
     # the width and the scale group decide which tiles fit and compile: part of the key
     ["N", "K", "S", "GATE", "INT_BITS", "SCALE_GROUP_K"],
     n_trials=100,
@@ -895,6 +944,7 @@ def mx_weight_only_matmul_batched_kernel(
             block_within_dim_pruner("N", "BLOCK_SIZE_N"),
             weight_only_swap_scope_pruner(),
             int_scale_group_tile_pruner(divides_k=False),
+            descriptor_box_pruner(),
         )
     },
 )
@@ -903,6 +953,7 @@ def int_weight_only_matmul_batched_kernel(
     A,  # (rows, K) prepared bf16/fp16, FP8 (W4A8), or INT8 (SmoothQuant) activations
     AsGlobal,  # fp32 calibrated input scale; None for weight-only
     B,  # (num_experts, N, K // VPW) interleaved uint32 words of VPW = 32 // INT_BITS values; 2N under GATE
+    BDescriptor,  # host TMA descriptor over B viewed (E * rows, K_stored); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (num_experts, N, K // SCALE_GROUP_K) float group scales
     Bz,  # (num_experts, N, K // SCALE_GROUP_K) integer zero points; None for a symmetric weight
     BsGlobal,  # fp32 W4A8 second-level weight scale; None otherwise
@@ -947,6 +998,7 @@ def int_weight_only_matmul_batched_kernel(
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+    B_MEMORY_MODE: tl.constexpr = "pointer",
     PDL: tl.constexpr = False,
     INT_BITS: tl.constexpr = 4,
 ):
@@ -996,8 +1048,9 @@ def int_weight_only_matmul_batched_kernel(
             a = tl.where(tl.arange(0, BLOCK_SIZE_K)[None, :] >= overlap, a, 0)
         b_k = b_ptrs + (k_start // VPW) * stride_b_k
         w, w_s = load_weight_int(
-            b_k, b_k, Bs, Bs, 0, 0, 0, expert_id, pid_n, k, N, K, stride_bs_e, stride_bs_n, stride_bs_k,
-            GATE, True, "pointer", True, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K,
+            b_k, BDescriptor, Bs, Bs, 0, batched_weight_row(expert_id, pid_n, N, n_width, GATE), k_start // VPW,
+            expert_id, pid_n, k, N, K, stride_bs_e, stride_bs_n, stride_bs_k,
+            GATE, True, B_MEMORY_MODE, True, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K,
             k_col_off=-(overlap // SCALE_GROUP_K), BITS=INT_BITS,
         )
         w_z = None
@@ -1030,7 +1083,7 @@ def int_weight_only_matmul_batched_kernel(
 
 
 @bayesian_autotune(
-    get_accelerator_autotuning_configs(tune_block_nk=True, swap_ab=True, swap_block_sizes_m=(1, 2)),
+    with_weight_stream(get_accelerator_autotuning_configs(tune_block_nk=True, swap_ab=True, swap_block_sizes_m=(1, 2))),
     # S (routed rows) keyed like the fp8/mx batched siblings — decode re-tunes per batch;
     # GATE keys the gate|up arm separately (its stacked dot is 2*BN wide).
     ["N", "K", "S", "GATE"],
@@ -1043,6 +1096,7 @@ def int_weight_only_matmul_batched_kernel(
         "early_config_prune": compose_pruners(
             block_within_dim_pruner("K"),
             block_within_dim_pruner("N", "BLOCK_SIZE_N"),
+            descriptor_box_pruner(),
             smem_pruner(),
         )
     },
@@ -1051,6 +1105,7 @@ def int_weight_only_matmul_batched_kernel(
 def full_precision_matmul_batched_kernel(
     A,  # (rows, K) BF16/FP16 activations
     B,  # (num_experts, N, K) weights in A's dtype; under GATE the (num_experts, 2N, K) gate|up stack
+    BDescriptor,  # host TMA descriptor over B viewed (E * rows, K_stored); read iff B_MEMORY_MODE != "pointer"
     C,  # (S, N) output; under GATE the GLU intermediate
     Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     ExpertIds,  # (S,) — which expert each batch element routes to
@@ -1085,6 +1140,7 @@ def full_precision_matmul_batched_kernel(
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+    B_MEMORY_MODE: tl.constexpr = "pointer",
     PDL: tl.constexpr = False,
 ):
     """Full-precision batched expert matmul kernel: plain ``tl.dot`` over unquantized
@@ -1094,7 +1150,7 @@ def full_precision_matmul_batched_kernel(
     output rows in the MMA M dim, the logical ``[BM, N]`` accumulator kept (``plain_dot``)."""
     if PDL:
         gdc_wait()
-    batch_id, pid_n, expert_id, A, B, C, _, in_row, out_row = expert_setup(
+    batch_id, pid_n, expert_id, A, B, C, unused_scale_base, in_row, out_row = expert_setup(
         A,
         B,
         C,
@@ -1124,10 +1180,11 @@ def full_precision_matmul_batched_kernel(
     )
 
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False)
-    for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a, _ = load_act_plain(a_ptrs, 0, 0, 0, None, 0, "pointer", False)
-        w, _ = load_weight_plain(
-            b_ptrs, b_ptrs, 0, 0, 0, GATE, False, "pointer", SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a, unused_act_scale = load_act_plain(a_ptrs, 0, 0, 0, None, 0, "pointer", False)
+        w, unused_weight_scale = load_weight_plain(
+            b_ptrs, BDescriptor, 0, batched_weight_row(expert_id, pid_n, N, n_width, GATE), k * BLOCK_SIZE_K,
+            GATE, False, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K
         )
         accumulator = plain_dot(accumulator, a, w, SWAP_AB)
         a_ptrs, _, b_ptrs, _, _, _ = advance_ptrs(
@@ -1149,7 +1206,7 @@ def full_precision_matmul_batched_kernel(
 
 
 @bayesian_autotune(
-    get_accelerator_autotuning_configs(tune_block_nk=True, swap_ab=True, swap_block_sizes_m=(1, 2)),
+    with_weight_stream(get_accelerator_autotuning_configs(tune_block_nk=True, swap_ab=True, swap_block_sizes_m=(1, 2))),
     # S (routed rows) keyed like the fp8/mx batched siblings — decode re-tunes per batch;
     # GATE keys the gate|up arm separately (its stacked dot is 2*BN wide).
     ["N", "K", "S", "GATE", "BLOCK_N", "BLOCK_K", "GATE_SCALES"],
@@ -1162,6 +1219,7 @@ def full_precision_matmul_batched_kernel(
         "early_config_prune": compose_pruners(
             block_within_dim_pruner("K"),
             block_within_dim_pruner("N", "BLOCK_SIZE_N"),
+            descriptor_box_pruner(),
             smem_pruner(),
         )
     },
@@ -1170,6 +1228,7 @@ def full_precision_matmul_batched_kernel(
 def block_fp8_weight_only_matmul_batched_kernel(
     A,  # (rows, K) BF16/FP16 activations
     B,  # (num_experts, N, K) FP8 weights; under GATE the (num_experts, 2N, K) gate|up stack
+    BDescriptor,  # host TMA descriptor over B viewed (E * rows, K_stored); read iff B_MEMORY_MODE != "pointer"
     Bs,  # coarse FP8 weight scales
     C,  # (S, N) output; under GATE the GLU intermediate
     Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
@@ -1209,6 +1268,7 @@ def block_fp8_weight_only_matmul_batched_kernel(
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+    B_MEMORY_MODE: tl.constexpr = "pointer",
     PDL: tl.constexpr = False,
 ):
     """Batched FP8 W8A16 expert GEMM with optional fused gate/up activation."""
@@ -1245,10 +1305,10 @@ def block_fp8_weight_only_matmul_batched_kernel(
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a, unused_activation = load_act_plain(a_ptrs, 0, 0, 0, None, 0, "pointer", False)
         w = load_weight_block_fp8(
-            b_ptrs, b_ptrs, Bs, 0, 0, 0,
+            b_ptrs, BDescriptor, Bs, 0, batched_weight_row(expert_id, pid_n, N, n_width, GATE), k * BLOCK_SIZE_K,
             expert_id, offs_bn, k * BLOCK_SIZE_K + offs_k,
             stride_bs_e, stride_bs_n, stride_bs_k,
-            GATE, False, "pointer", SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
+            GATE, False, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
             BLOCK_N, BLOCK_K, GATE_SCALES, a.dtype,
         )
         accumulator = plain_dot(accumulator, a, w, SWAP_AB)
@@ -1399,6 +1459,7 @@ def w8a8_block_dynamic_fp8_matmul_batched(
             A_q,
             A_s,
             B,
+            batched_weight_descriptor(B),
             bs_u8,
             C,
             Cs,
@@ -1522,6 +1583,7 @@ def w8a8_block_static_fp8_matmul_batched(
             A_q,
             As,
             B,
+            batched_weight_descriptor(B),
             bs_u8,
             C,
             Cs,
@@ -1627,6 +1689,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
             qA,
             As,
             B,
+            batched_weight_descriptor(B),
             bs_u8,
             C,
             bias,
@@ -1841,6 +1904,7 @@ def mx_dynamic_matmul_batched(
             a_u8,
             as_u8,  # None when raw (A quantized inline)
             b_u8,
+            batched_weight_descriptor(b_u8),
             bs_u8,
             bs_descriptor,
             C,
@@ -1942,6 +2006,7 @@ def full_precision_matmul_batched(
         compile_time_only_triton_wrap(full_precision_matmul_batched_kernel)[grid](
             A,
             B,
+            batched_weight_descriptor(B),
             C,
             bias,
             expert_ids,
@@ -2018,6 +2083,7 @@ def block_fp8_weight_only_matmul_batched(
         compile_time_only_triton_wrap(block_fp8_weight_only_matmul_batched_kernel)[grid](
             A,
             B,
+            batched_weight_descriptor(B),
             Bs,
             C,
             bias,
@@ -2123,6 +2189,7 @@ def mx_weight_only_matmul_batched(
         compile_time_only_triton_wrap(mx_weight_only_matmul_batched_kernel)[grid](
             A,
             b_u8,
+            batched_weight_descriptor(b_u8),
             bs_u8,
             b_global_scale,
             C,
@@ -2233,6 +2300,7 @@ def int_weight_only_matmul_batched(
             A,
             a_scale,
             B,
+            batched_weight_descriptor(B),
             Bs,
             b_zero,
             b_scale2,

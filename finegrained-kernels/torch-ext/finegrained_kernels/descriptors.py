@@ -112,6 +112,24 @@ def rebind_batched_mx_bs_descriptor(nargs):
     nargs["BSDescriptor"].block_shape = [1, rep, rep_k, 2, 256]
 
 
+def batched_weight_descriptor(b: torch.Tensor) -> TensorDescriptor | None:
+    """Host TMA descriptor over a batched kernel's ``(E, rows, K_stored)`` weight stack viewed as one
+    ``(E * rows, K_stored)`` matrix, so an expert is a row offset (``batched_weight_row``). Placeholder
+    box, re-bound per config by ``rebind_batched_weight_descriptor``; None where the stack cannot be
+    viewed without a copy (``descriptor_box_pruner`` then keeps the pointer configs)."""
+    return maybe_descriptor(b.view(-1, b.shape[-1]), [128, 64]) if b.is_contiguous() else None
+
+
+def rebind_batched_weight_descriptor(nargs):
+    """Per-config pre_hook: the batched weight box ``[(2 if GATE else 1) * BLOCK_SIZE_N, BLOCK_SIZE_K //
+    values_per_element]`` — packed fp4 bytes hold 2 values, integer words ``K // K_stored``."""
+    values_per_element = {torch.uint8: 2, torch.uint32: nargs["K"] // nargs["B"].shape[-1]}.get(nargs["B"].dtype, 1)
+    rebind_operand_box(
+        nargs, "B_MEMORY_MODE", "BDescriptor",
+        (2 if nargs.get("GATE") else 1) * nargs["BLOCK_SIZE_N"], nargs["BLOCK_SIZE_K"] // values_per_element,
+    )
+
+
 def rebind_grouped_weight_descriptor(nargs):
     """Per-config pre_hook: set the MX weight descriptor box to the tuned
     ``[1, (2 if GATE else 1) * BLOCK_SIZE_N, BLOCK_SIZE_K // values_per_byte]`` over the

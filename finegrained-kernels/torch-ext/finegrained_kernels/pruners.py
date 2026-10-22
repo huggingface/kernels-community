@@ -1481,7 +1481,7 @@ def gate_stacked_tmem_trap_pruner():
 
 def smem_pruner(
     k_dim="BLOCK_SIZE_K", min_sets: float = 0.5, full_stages: bool = False, pointer_ws_extra_stage: bool = False,
-    ws_full_stages: bool = False,
+    ws_full_stages: bool = False, staged_weights: bool = False,
 ):
     """``early_config_prune`` dropping configs whose shared memory certainly cannot fit,
     with bounds derived from TTGIR allocations and checked against ``metadata.shared``:
@@ -1522,6 +1522,13 @@ def smem_pruner(
     block-dynamic kernel: BM=128 s4 gate|up 245784 B = 5 sets); with it the dynamic floor drops all
     155 logged failures and none of 3302 compiling configs. The static kernel does not (its
     pointer/pointer WS s4 tiles compile), so it is off there.
+    ``staged_weights``: the batched MX decode loop, from its TTGIR (B200, Triton 3.8; pointer and TMA
+    weights allocate alike). ``dot_scaled`` keeps ``num_stages - 1`` copies of the weight tile (fp4
+    packed; the swapped W4A8 MMA holds a second same-size copy per stage), its scale tile, and the raw
+    bf16 row(s) the inline quant reads (16 MMA rows, 1 swapped); scalar + TMA holds one unstaged weight
+    tile; a pointer reduce stages no weights. Over 96 compiled samples (MXFP4 W4A8, NVFP4, MXFP8; gate and
+    down; s2-s4) the bound never exceeds ``metadata.shared`` (min slack 8 B) and drops all 42 above the
+    limit.
     ``ws_full_stages``: ``full_stages`` for warp-specialized configs only (the K-loop pipeliner still
     clamps the others): the tensor-wide grouped gate|up tune at Mistral-4 drops all 32 WS
     shared-memory failures and none of 105 compiling configs.
@@ -1607,6 +1614,16 @@ def smem_pruner(
         else:
             # Other dot/scalar pipelines retain their raw-operand lower bound.
             need = stages * (bk * bm + (bk // packed) * tiles * bn)
+        if staged_weights:
+            rows = tiles * bn
+            if c.kwargs.get("COMPUTE_MODE") == "dot_scaled":
+                fp4_acts = a.dtype in (torch.int8, torch.uint8) or args.get("ACTIVATION_FORMAT") in ("mxfp4", "nvfp4")
+                w4a8_swap = packed == 2 and not fp4_acts and c.kwargs.get("SWAP_AB")
+                group = 16 if getattr(args.get("Bs"), "dtype", None) == torch.float8_e4m3fn else 32
+                raw_act = (1 if c.kwargs.get("SWAP_AB") else 16) * bk * a.element_size() if a.element_size() >= 2 else 0
+                need = max(need, (c.num_stages - 1) * (rows * ((bk if w4a8_swap else bk // packed) + bk // group) + raw_act))
+            elif c.kwargs.get("B_MEMORY_MODE", "pointer") != "pointer":
+                need = max(need, rows * (bk // packed))
         return need <= sm_shared_memory_limit()
 
     return config_filter(ok, when=lambda args: get_active_device_type() == "cuda")
