@@ -22,7 +22,8 @@ if TYPE_CHECKING:
     from ....ops.cp import FLACPContext
 
 
-@register(chunk_kda)
+# We do not register as we cannot rely on the backend to work for compile
+# @register(chunk_kda)
 class FlashKDABackend(BaseBackend):
     """Copyright (c) 2026 Moonshot AI
 

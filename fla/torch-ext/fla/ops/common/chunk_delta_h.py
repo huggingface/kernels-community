@@ -396,6 +396,9 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
     STATE_V_FIRST: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
+    # Keep in fp32 (some pass it as fp64) which causes issues under compile
+    scale = scale.to(tl.float32)
+
     pid = tl.program_id(0).to(tl.int64)
     NV = tl.cdiv(V, BV)
     i_v, i_nh = pid % NV, (pid // NV).to(tl.int64)
@@ -684,7 +687,8 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             tl.store(p_dh3, b_dh4.to(p_dh3.dtype.element_ty), mask=m_dh3)
 
 
-@dispatch('common')
+# Use triton only, other backends (cutlass, cute, etc.) need additional torch.compile support
+# @dispatch('common')
 def chunk_gated_delta_rule_fwd_h(
     k: torch.Tensor,
     w: torch.Tensor,

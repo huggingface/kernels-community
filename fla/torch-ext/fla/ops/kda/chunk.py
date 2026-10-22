@@ -211,8 +211,8 @@ class ChunkKDAFunction(torch.autograd.Function):
                 None, None)
 
 
-@torch.compiler.disable
-@dispatch
+# Use triton only, other backends (cutlass, cute, etc.) need additional torch.compile support
+# @dispatch
 def chunk_kda(
     q: torch.Tensor,
     k: torch.Tensor,

@@ -27,7 +27,7 @@ def _cpu_device_warning():
 
 
 @cache
-def get_multiprocessor_count(tensor_idx: int = 0, *, use_aicore: bool = False) -> int:
+def _get_multiprocessor_count(tensor_idx: int = 0, *, use_aicore: bool = False) -> int:
     try:
         return triton.runtime.driver.active.utils.get_device_properties(tensor_idx)['multiprocessor_count']
     except Exception:
@@ -39,6 +39,11 @@ def get_multiprocessor_count(tensor_idx: int = 0, *, use_aicore: bool = False) -
         except Exception:
             logger.debug('Failed to get NPU multiprocessor count, falling back to 1.', exc_info=True)
         return 1
+
+
+@torch.compiler.assume_constant_result
+def get_multiprocessor_count(tensor_idx: int = 0, *, use_aicore: bool = False) -> int:
+    return _get_multiprocessor_count(tensor_idx, use_aicore=use_aicore)
 
 
 @cache
@@ -172,13 +177,18 @@ class Backend(Enum):
 
 
 @cache
-def check_shared_mem(arch: str = "none", tensor_idx: int = 0) -> bool:
+def _check_shared_mem(arch: str = "none", tensor_idx: int = 0) -> bool:
     try:
         device_shared_mem_list = get_all_max_shared_mem()
         max_shared_memory = device_shared_mem_list[tensor_idx]
         return max_shared_memory >= Backend.get_shared_memory(arch)
     except Exception:
         return False
+
+
+@torch.compiler.assume_constant_result
+def check_shared_mem(arch: str = "none", tensor_idx: int = 0) -> bool:
+    return _check_shared_mem(arch, tensor_idx)
 
 
 if check_pytorch_version('2.4'):

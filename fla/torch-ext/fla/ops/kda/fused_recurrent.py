@@ -233,7 +233,8 @@ def fused_recurrent_kda_fwd_kernel(
             tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
 
-@dispatch('kda')
+# Use triton only, other backends (cutlass, cute, etc.) need additional torch.compile support
+# @dispatch('kda')
 def fused_recurrent_kda_fwd(
     q: torch.Tensor,
     k: torch.Tensor,

@@ -29,7 +29,8 @@ def _needs_backward(*tensors: torch.Tensor | None) -> bool:
     return any(isinstance(t, torch.Tensor) and t.requires_grad for t in tensors)
 
 
-@register('gated_delta_rule')
+# We do not register as we cannot rely on the backend to work for compile
+# @register('gated_delta_rule')
 class FlashQLABackend(BaseBackend):
     """Copyright (c) 2026 Qwen Team, Alibaba Cloud
 

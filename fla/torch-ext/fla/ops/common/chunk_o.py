@@ -515,6 +515,8 @@ def chunk_bwd_kernel_dv_local(
             b_gamma = tl.load(g_gamma + i_h)
             b_g = b_gamma * (tl.arange(0, BT) + 1)
 
+        # Keep in fp32 (some pass it as fp64) which causes issues under compile
+        scale = scale.to(tl.float32)
         b_A = tl.zeros([BT, BT], dtype=tl.float32)
         for i_k in range(tl.cdiv(K, BK)):
             o_k = i_k * BK + tl.arange(0, BK)
@@ -706,7 +708,8 @@ def chunk_bwd_dv_local(
     return dv
 
 
-@dispatch('common')
+# Use triton only, other backends (cutlass, cute, etc.) need additional torch.compile support
+# @dispatch('common')
 def chunk_bwd_dqkwg(
     q: torch.Tensor,
     k: torch.Tensor,
