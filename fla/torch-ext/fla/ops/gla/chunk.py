@@ -986,7 +986,8 @@ def chunk_gla_fwd_intra_gk(
     return A
 
 
-@dispatch('gla')
+# Use triton only, other backends (cutlass, cute, etc.) need additional torch.compile support
+# @dispatch('gla')
 def chunk_gla_fwd_o_gk(
     q: torch.Tensor,
     v: torch.Tensor,

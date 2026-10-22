@@ -798,7 +798,8 @@ def chunk_kda_fwd_kernel_intra_sub_chunk(
     tl.store(p_Akk, b_Ai.to(Akk.dtype.element_ty), mask=m_Akk_st)
 
 
-@dispatch('kda')
+# Use triton only, other backends (cutlass, cute, etc.) need additional torch.compile support
+# @dispatch('kda')
 def chunk_kda_fwd_intra(
     q: torch.Tensor,
     k: torch.Tensor,

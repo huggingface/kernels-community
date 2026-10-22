@@ -268,7 +268,8 @@ def prepare_wy_repr_bwd_kda_kernel(
     tl.store(p_db, b_db.to(p_db.dtype.element_ty), mask=m_t)
 
 
-@dispatch('kda')
+# Use triton only, other backends (cutlass, cute, etc.) need additional torch.compile support
+# @dispatch('kda')
 def recompute_w_u_fwd(
     k: torch.Tensor,
     v: torch.Tensor,

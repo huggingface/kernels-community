@@ -127,7 +127,8 @@ def chunk_kda_fwd_kernel_intra_token_parallel(
         tl.store(Akk + i_t * HV * BC + o_hv * BC + j - i_ts, b_Akk.to(Akk.dtype.element_ty), mask=m_hv)
 
 
-@dispatch('kda')
+# Use triton only, other backends (cutlass, cute, etc.) need additional torch.compile support
+# @dispatch('kda')
 def chunk_kda_fwd_intra_token_parallel(
     q: torch.Tensor,
     k: torch.Tensor,
