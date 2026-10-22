@@ -89,9 +89,7 @@ def device():
 
 @pytest.fixture(scope="module")
 def fla(device):
-    # return get_kernel("kernels-community/fla", version=2)
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "torch-ext"))
-    return importlib.import_module("fla")
+    return get_kernel("kernels-community/fla", version=2)
 
 
 @pytest.fixture(autouse=True)
