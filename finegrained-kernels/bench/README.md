@@ -30,11 +30,13 @@ Every cell runs in three modes: `eager`, `cudagraph` (decode's deployment mode),
 `compile` (`torch.compile(max-autotune, fullgraph)`). A cell that raises is a red ✕ marker;
 the others still run.
 
-On CUDA, every mode cycles through identical weight banks whose **active** weights exceed
-**twice the device's L2 cache**. For MoE, active bytes count only the experts selected by the
-unchanged routing, including weight scales. Dense layers count the whole matrix. Each bank
-has independent copies of the same inputs and routes, so compilation cannot share activation
-quantization or routing across invocations. The timed callback returns every bank's output;
+On CUDA, every mode cycles through banks whose **active** weights exceed **twice the device's
+L2 cache**. For MoE, active bytes count only the routed experts, including weight scales, and
+a bank swaps the routed experts with unrouted ones of the same stack (routing logits permuted
+alike), so every arm keeps one checkpoint; a stack too small for disjoint expert sets rotates
+copies instead. Dense layers count the whole matrix and rotate copies. Each bank has
+independent copies of the inputs, so compilation cannot share activation quantization or
+routing across invocations. The timed callback returns every bank's output;
 reported latency is its elapsed time divided by the bank count. Reuse inside one forward is
 preserved. Prepared weight views and scales keep static addresses so compiled replay does not
 warm them with staging copies. No cache-flush kernel or profiler time is included in graph latency.

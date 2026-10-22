@@ -32,7 +32,7 @@ from utils import TEST_DEVICE, make_weights
 import finegrained_kernels  # type: ignore
 import finegrained_kernels.matmul  # type: ignore
 from finegrained_kernels.bayesian_autotuner import bayesian_autotune  # type: ignore
-from finegrained_kernels.bench import weight_input  # type: ignore
+from finegrained_kernels.bench import gemm_weight, routed_banks  # type: ignore
 from finegrained_kernels.compat import is_sm10x  # type: ignore
 from finegrained_kernels.pruners import block_within_dim_pruner, mx_config_pruner  # type: ignore
 
@@ -248,6 +248,35 @@ def test_failed_configs_do_not_consume_trial_budget():
 
 
 @pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
+def test_routed_banks_read_disjoint_experts():
+    """Cold routed tuning shares one expert stack: each bank sends the same rows to its own experts."""
+    experts = 16
+    ids = torch.tensor([3, 7, 3, -1, 9], device=TEST_DEVICE, dtype=torch.int32)
+    banks = routed_banks({"ExpertIds": ids}, experts, 4)
+    seen = set()
+    for bank in banks:
+        bank_ids = bank["ExpertIds"]
+        assert bank_ids[3] == -1  # an off-rank sentinel stays one
+        routed = set(bank_ids[bank_ids >= 0].tolist())
+        assert len(routed) == 3 and not routed & seen
+        assert bank_ids[0] == bank_ids[2]  # rows sharing an expert still share one
+        seen |= routed
+    assert routed_banks({"ExpertIds": ids}, experts, 6) is None  # 6 blocks of 3 exceed 16 experts
+
+    start = torch.tensor([0, 0, 4, 4, 9, 9, 9, 9, 10] + [10] * 8, device=TEST_DEVICE, dtype=torch.int32)
+    counts = (start[1:] - start[:-1]).tolist()
+    seen = set()
+    for bank in routed_banks({"ExpertStart": start}, experts, 5):
+        bank_counts = (bank["ExpertStart"][1:] - bank["ExpertStart"][:-1]).tolist()
+        assert sorted(c for c in bank_counts if c) == sorted(c for c in counts if c)
+        assert bank["ExpertStart"][-1] == start[-1]
+        owners = {e for e, c in enumerate(bank_counts) if c}
+        assert not owners & seen
+        seen |= owners
+
+
+@pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA graph timing required")
 @pytest.mark.parametrize("n_trials", [2, 3])
 def test_rotating_weights_are_reused_and_released(monkeypatch, n_trials):
@@ -266,7 +295,7 @@ def test_rotating_weights_are_reused_and_released(monkeypatch, n_trials):
         [triton.Config({"BLOCK": block}, pre_hook=observe) for block in (32, 64, 128)],
         ["N"],
         n_trials=n_trials,
-        benchmark_input=weight_input,
+        cold_weight=gemm_weight,
         cache_results=False,
     )
     @triton.jit
