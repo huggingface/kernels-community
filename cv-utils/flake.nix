@@ -2,7 +2,7 @@
   description = "Flake for Torch kernel extension";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/add-torch-stable-abi-shim";
+    kernel-builder.url = "github:huggingface/kernels";
   };
 
   outputs =
