@@ -5,6 +5,7 @@ edition = 6
 license = "MIT"
 backends = [
     "cuda",
+    "rocm",
     "xpu",
 ]
 python-depends = ["einops"]
