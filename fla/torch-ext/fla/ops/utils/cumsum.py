@@ -393,8 +393,9 @@ def chunk_global_cumsum_vector(
     return z
 
 
+# Use triton only, other backends (cutlass, cute, etc.) need additional torch.compile support
+# @dispatch('utils')
 @input_guard
-@dispatch('utils')
 def chunk_global_cumsum(
     s: torch.Tensor,
     reverse: bool = False,
@@ -431,8 +432,9 @@ def chunk_global_cumsum(
         )
 
 
+# Use triton only, other backends (cutlass, cute, etc.) need additional torch.compile support
+# @dispatch('utils')
 @input_guard
-@dispatch('utils')
 def chunk_local_cumsum(
     g: torch.Tensor,
     chunk_size: int,
