@@ -36,8 +36,9 @@ def do_bench(fn, quantiles=None, *, cudagraph=False, **kwargs):
     return do_bench_cudagraph(fn, quantiles=quantiles, **kwargs)
 
 
-def weight_input(nargs):
-    """Main GEMM weight and its logical read bytes, excluding inactive expert planes."""
+def gemm_weight(nargs):
+    """``cold_weight`` for the GEMMs: their weight ``B`` and the bytes one call reads from it (only
+    the routed experts' planes of an expert stack)."""
     weight = nargs["B"]
     active_bytes = weight.numel() * weight.element_size()
     expert_ids = nargs.get("ExpertIds")
@@ -69,11 +70,48 @@ def free_device_bytes(device):
     return free + torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
 
 
+def routed_banks(nargs, experts, count):
+    """Banks over the one expert stack: bank 0 is the call, bank ``k`` relabels its ``n`` active
+    experts to the ``k``-th block of ``n`` experts it does not route to, so every bank reads other
+    experts' weights and no weight is copied. None when there is no routing or the ``count``
+    blocks do not fit the stack."""
+    ids, start = nargs.get("ExpertIds"), nargs.get("ExpertStart")
+    if ids is not None:
+        active = ids[(ids >= 0) & (ids < experts)].unique()
+    elif start is not None and start.numel() >= experts + 1:
+        counts = start[1:experts + 1] - start[:experts]
+        active = (counts > 0).nonzero().flatten()
+    else:
+        return None
+    n = active.numel()
+    if n == 0 or count * n > experts:
+        return None
+    idle = torch.arange(experts, device=active.device)
+    idle = idle[~torch.isin(idle, active)]
+    banks = [nargs]
+    for k in range(1, count):
+        block = idle[(k - 1) * n:k * n]
+        if ids is not None:
+            relabel = torch.arange(experts, device=ids.device, dtype=ids.dtype)
+            relabel[active] = block.to(ids.dtype)
+            routed = (ids >= 0) & (ids < experts)
+            banks.append(dict(nargs, ExpertIds=torch.where(routed, relabel[ids.clamp(0, experts - 1)], ids)))
+        else:
+            # same rows, now owned by the block's experts in the same order
+            moved = torch.zeros_like(counts)
+            moved[block] = counts[active]
+            bank_start = start.clone()
+            bank_start[1:experts + 1] = (start[0] + moved.cumsum(0)).to(start.dtype)
+            banks.append(dict(nargs, ExpertStart=bank_start))
+    return banks
+
+
 def weight_banks(nargs, weight, active_bytes):
     """Rotate the forward GEMMs' readonly B and its full-weight host descriptor.
 
-    Other operands stay shared. The opted-in GEMMs pass B independently of outputs
-    and scales; BSDescriptor may be an unread alias of BDescriptor.
+    A routed call rotates which experts it reads (``routed_banks``); a dense one, or an expert stack
+    too small for disjoint blocks, rotates copies of B. Other operands stay shared. The opted-in
+    GEMMs pass B independently of outputs and scales; BSDescriptor may be an unread alias of BDescriptor.
     """
     if not weight.is_cuda or torch._debug_has_internal_overlap(weight) != 0:
         return None
@@ -81,6 +119,8 @@ def weight_banks(nargs, weight, active_bytes):
     count = rotation_count(active_bytes, weight.device)
     if count is None:
         return None
+    if weight.ndim == 3 and (banks := routed_banks(nargs, weight.shape[0], count)) is not None:
+        return banks
     descriptor = nargs.get("BDescriptor")
     if isinstance(descriptor, TensorDescriptor):
         base = descriptor.base

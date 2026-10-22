@@ -25,7 +25,7 @@ from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .bayesian_autotuner import bayesian_autotune
-from .bench import weight_input
+from .bench import gemm_weight
 from .compat import add_op_namespace_prefix, FP8_DTYPE, is_sm10x, launches_skipped, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, pdl_launch_kwargs, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, narrow_dot_autotuning_configs, narrow_scalar_autotuning_configs, split_k_autotuning_configs, persistent_program_count, pipeline_autotuning_configs
 from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_tiled_descriptors, rebind_weight_only_descriptors
 from .formats import FP8_WEIGHT_ONLY_DEQUANT_MIN_M, INT_WEIGHT_ONLY_DEQUANT_MIN_DIM, INT_WEIGHT_ONLY_DEQUANT_MIN_M, block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, normalize_global_scale, e2m1_as_uint8, is_mx, is_rowwise, mx_scale_family, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_2d_operands, weight_format, validate_int_operands, validate_svdquant_operands, INT_WEIGHT_DTYPES
@@ -126,7 +126,7 @@ def _block_dynamic_2d_configs():
     # at one shape with different blocks must not share a winner.
     ["N", "K", "m_bit_length", "GATE", "block_n", "block_k"],
     n_trials=100,
-    benchmark_input=weight_input,
+    cold_weight=gemm_weight,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # 2D outputs are fully written (no sentinel/padding contract), so the numerics veto is safe
     finite_check_args=("C", "Cs"),
@@ -340,7 +340,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     # GATE keys the gate|up arm separately (its stacked dot is 2*BN wide, a distinct config space).
     ["N", "K", "m_bit_length", "GATE"],
     n_trials=100,
-    benchmark_input=weight_input,
+    cold_weight=gemm_weight,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # 2D outputs are fully written (no sentinel/padding contract), so the numerics veto is safe
     finite_check_args=("C", "Cs"),
@@ -502,7 +502,7 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
     # block_n/block_k (the launch-pinned quant block) gate descriptor-box legality and the K tile.
     ["N", "K", "m_bit_length", "GATE", "block_n", "block_k"],
     n_trials=100,
-    benchmark_input=weight_input,
+    cold_weight=gemm_weight,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # 2D outputs are fully written (no sentinel/padding contract), so the numerics veto is safe
     finite_check_args=("C", "Cs"),
@@ -734,7 +734,7 @@ def _mx_matmul_configs():
     # dtype token, so don't lean on the append).
     ["N", "K", "m_bit_length", "ACTIVATION_FORMAT", "SWIZZLED_SCALES", "GATE", "OUTPUT_FORMAT", "SWIZZLED_OUT", "LORA_RANK", "LORA_SPLIT_K"],
     n_trials=100,
-    benchmark_input=weight_input,
+    cold_weight=gemm_weight,
     path_anchor_axes=(*PATH_ANCHOR_AXES, "SPLIT_K", "PERSISTENT"),
     # 2D outputs are fully written (no sentinel/padding contract), so the numerics veto is safe
     finite_check_args=("C", "Cs"),
@@ -980,7 +980,7 @@ assert all(
     ),
     ["N", "K", "m_bit_length", "GATE"],
     n_trials=100,
-    benchmark_input=weight_input,
+    cold_weight=gemm_weight,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # 2D outputs are fully written (no sentinel/padding contract), so the numerics veto is safe
     finite_check_args=("C", "Cs"),
@@ -1148,7 +1148,7 @@ def split_k_reduce(acc, Partials, TileCounters, tile, num_tiles, BM: tl.constexp
     # the width and the scale group decide which tiles fit and compile: part of the key
     ["N", "K", "m_bit_length", "GATE", "INT_BITS", "SCALE_GROUP_K"],
     n_trials=100,
-    benchmark_input=weight_input,
+    cold_weight=gemm_weight,
     path_anchor_axes=PATH_ANCHOR_AXES,
     finite_check_args=("C", "Cs"),
     prune_configs_by={
@@ -1348,7 +1348,7 @@ assert all(
     ),
     ["N", "K", "m_bit_length", "GATE", "BLOCK_N", "BLOCK_K", "GATE_SCALES"],
     n_trials=100,
-    benchmark_input=weight_input,
+    cold_weight=gemm_weight,
     path_anchor_axes=PATH_ANCHOR_AXES,
     coupled_axes=(("BLOCK_SIZE_K", "num_stages"),),
     finite_check_args=("C",),
@@ -1433,7 +1433,7 @@ def block_fp8_weight_only_matmul_2d_kernel(
     # GATE keys the gate|up arm separately (its stacked dot is 2*BN wide).
     ["N", "K", "m_bit_length", "GATE"],
     n_trials=100,
-    benchmark_input=weight_input,
+    cold_weight=gemm_weight,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # 2D outputs are fully written (no sentinel/padding contract), so the numerics veto is safe
     finite_check_args=("C", "Cs"),

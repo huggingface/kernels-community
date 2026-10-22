@@ -24,7 +24,7 @@ import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .bayesian_autotuner import bayesian_autotune
-from .bench import weight_input
+from .bench import gemm_weight
 from .compat import add_op_namespace_prefix, FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, persistent_program_count, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, pipeline_autotuning_configs, persistent_programs_per_sm, is_sm10x
 from .descriptors import build_grouped_operand_descriptors, rebind_grouped_descriptors, rebind_grouped_mx_descriptors
 from .formats import FP8_WEIGHT_ONLY_DEQUANT_MIN_M, block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, row_scale_stride, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, validate_int_operands, INT_WEIGHT_DTYPES
@@ -106,7 +106,7 @@ def _grouped_dot_configs():
     # descriptor-box legality, so checkpoints with different blocks must not share a winner.
     ["N", "K", "tokens_per_expert_bit_length", "GATE", "BLOCK_SIZE_N", "BLOCK_SIZE_K"],
     n_trials=100,
-    benchmark_input=weight_input,
+    cold_weight=gemm_weight,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # Pipeliner-race guard: per launch-BM, WS-only at BM >= 64 and non-WS below (see the pruner).
     prune_configs_by={
@@ -315,7 +315,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     )),
     ["N", "K", "tokens_per_expert_bit_length", "GATE", "BLOCK_SIZE_N", "BLOCK_SIZE_K"],
     n_trials=100,
-    benchmark_input=weight_input,
+    cold_weight=gemm_weight,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # Pipeliner-race WS guard (per launch-BM: forces WS where the default pipeliner races at
     # BM>=64, keeps non-WS below) + descriptor-box limits.
@@ -520,7 +520,7 @@ def _tensor_grouped_configs():
     # GATE keys the gate|up arm separately (its dot is 2*BN wide, a different tile optimum).
     ["N", "K", "tokens_per_expert_bit_length", "GATE"],
     n_trials=100,
-    benchmark_input=weight_input,
+    cold_weight=gemm_weight,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # BLOCK_SIZE_K/N are tuned axes; the K-loop is maskless and the N-tile store is
     # row-masked only — veto non-dividing tiles on both. WS is a pure perf axis here
@@ -741,7 +741,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     # splits them incidentally today; a descriptor Cs has no dtype token).
     ["N", "K", "tokens_per_expert_bit_length", "GATE", "SWIZZLED_SCALES", "OUTPUT_FORMAT", "SWIZZLED_OUT"],
     n_trials=100,
-    benchmark_input=weight_input,
+    cold_weight=gemm_weight,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # BK-within-K veto + the sm_10x dot_scaled shape/trap gates (this kernel had no
     # pruner while its BK span was {128,256} — the union span's BK=64 rows made the
@@ -1023,7 +1023,7 @@ def _mx_weight_only_grouped_configs():
     _mx_weight_only_grouped_configs(),
     ["N", "K", "tokens_per_expert_bit_length", "GATE"],
     n_trials=100,
-    benchmark_input=weight_input,
+    cold_weight=gemm_weight,
     path_anchor_axes=PATH_ANCHOR_AXES,
     prune_configs_by={
         "early_config_prune": compose_pruners(
@@ -1243,7 +1243,7 @@ def _int_grouped_configs():
     # the width and the scale group decide which tiles fit and compile: part of the key
     ["N", "K", "tokens_per_expert_bit_length", "GATE", "INT_BITS", "SCALE_GROUP_K", "SIMULATE_UNFUSED"],
     n_trials=100,
-    benchmark_input=weight_input,
+    cold_weight=gemm_weight,
     path_anchor_axes=PATH_ANCHOR_AXES,
     prune_configs_by={
         "early_config_prune": compose_pruners(
@@ -1455,7 +1455,7 @@ def _full_precision_grouped_configs():
     # GATE keys the gate|up arm separately (its dot is 2*BN wide, a different tile optimum).
     ["N", "K", "tokens_per_expert_bit_length", "GATE"],
     n_trials=100,
-    benchmark_input=weight_input,
+    cold_weight=gemm_weight,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # BLOCK_SIZE_K is a tuned axis and the K-loop is maskless — veto non-dividing BKs.
     prune_configs_by={
@@ -1682,7 +1682,7 @@ def _block_fp8_weight_only_grouped_configs():
     # GATE keys the gate|up arm separately (its dot is 2*BN wide, a different tile optimum).
     ["N", "K", "tokens_per_expert_bit_length", "GATE", "BLOCK_N", "BLOCK_K", "GATE_SCALES"],
     n_trials=100,
-    benchmark_input=weight_input,
+    cold_weight=gemm_weight,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # BLOCK_SIZE_K is a tuned axis and the K-loop is maskless — veto non-dividing BKs.
     prune_configs_by={

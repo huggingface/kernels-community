@@ -60,7 +60,7 @@ Every (row, problem, regime, impl) cell runs in THREE modes:
   cudagraph  do_bench_cudagraph (decode's deployment mode)
   compile    torch.compile(mode="max-autotune", fullgraph=True), warmed, then do_bench
 
-CUDA modes rotate identical weight/input banks whose active weights exceed twice L2.
+CUDA modes rotate banks (MoE: rerouted experts of one stack; dense: weight copies) whose active weights exceed twice L2.
 Elapsed latency is normalized per invocation; cache eviction is never timed.
 
 Regimes: decode T=1 and prefill T=8192 (routed through top_k experts; attn row: M=T).
@@ -1817,6 +1817,35 @@ def _clone_tensors(tensors):
     return tuple(None if t is None else t.clone() for t in tensors)
 
 
+def _routing_banks(cfg, weights, hidden, idx, w, logits):
+    """Cold MoE inputs without copying weights: bank ``k`` swaps the routed experts with the ``k``-th
+    block of unrouted ones of the one stack (the logits permuted alike, for arms that route
+    themselves), cycling more than twice L2 of distinct expert weights. None when the blocks do
+    not fit."""
+    if DEVICE != "cuda":
+        return None
+    E = cfg["E"]
+    active = idx.unique().long()
+    n = active.numel()
+    count = rotation_count(_tensor_bytes(weights) * n // E, 0)
+    if count is None or count * n > E:
+        return None
+    idle = torch.arange(E, device=idx.device)
+    idle = idle[~torch.isin(idle, active)]
+    banks = [(hidden, idx, w, logits)]
+    for k in range(1, count):
+        block = idle[(k - 1) * n:k * n]
+        perm = torch.arange(E, device=idx.device)
+        perm[active], perm[block] = block, active
+        bank_logits = torch.empty_like(logits)
+        bank_logits[:, perm] = logits
+        banks.append((hidden.clone(), perm[idx.long()].to(idx.dtype), w.clone(), bank_logits))
+    print(f"      cache: {CACHE_POLICY}; routing banks={count}, "
+          f"active weights={count * _tensor_bytes(weights) * n / E / 1024**2:.1f} MiB, "
+          f"allocated weights={_tensor_bytes(weights) / 1024**3:.2f} GiB", flush=True)
+    return banks
+
+
 def _weight_banks(weights, active_experts=None):
     """Identical checkpoints with a cyclic active working set larger than CUDA L2."""
     weight_bytes = _tensor_bytes(weights)
@@ -1834,7 +1863,7 @@ def _weight_banks(weights, active_experts=None):
     banks = [weights] + [_clone_tensors(weights) for _ in range(count - 1)]
     for bank in banks:
         _mark_static(*bank)
-    print(f"      cache: {CACHE_POLICY}; banks={count}, "
+    print(f"      cache: {CACHE_POLICY}; weight copies={count}, "
           f"active weights={count * active_bytes / 1024**2:.1f} MiB, "
           f"allocated weights={count * weight_bytes / 1024**3:.2f} GiB", flush=True)
     return banks
@@ -1958,10 +1987,14 @@ def bench_problem_row(row, pname, cfg, arms, weights, rows_out):
                                     ("prefill", PREFILL_TOKENS, True)):
         print(f"   -- {regime}")
         hidden, idx, w, logits = routing(cfg, tokens)
-        banks = _weight_banks(weights, idx.unique().numel())
-        inputs = [(hidden, idx, w, logits)] + [
-            _clone_tensors((hidden, idx, w, logits)) for _ in banks[1:]
-        ]
+        inputs = _routing_banks(cfg, weights, hidden, idx, w, logits)
+        if inputs is not None:
+            banks = [weights] * len(inputs)
+        else:
+            banks = _weight_banks(weights, idx.unique().numel())
+            inputs = [(hidden, idx, w, logits)] + [
+                _clone_tensors((hidden, idx, w, logits)) for _ in banks[1:]
+            ]
         first_args = (cfg, grouped, hidden, idx, w, *banks[0][:6], logits, *banks[0][6:])
         reference = torch_weight_only_arm(*first_args)() if "torch_weight_only" in cfg["baselines"] else None
         if cfg["weights"] in INT_BITS:
