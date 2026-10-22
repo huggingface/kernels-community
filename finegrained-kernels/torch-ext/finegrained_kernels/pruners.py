@@ -1336,7 +1336,10 @@ def mx_auxiliary_pruner():
     """Split the single-token decode reduction (the launch allocates the partials for M=1 without GATE), or persist
     across SVDQuant prefill tiles. Plain M=1 splits only the scalar BM=1 reduce: the native split tile pads the token
     to 128 MMA rows and never crowns there (B200 graph, NVFP4: 5120x5120 scalar 11.3us, scalar split 10.2us, native
-    split 26.2us; N1024 K14336 22.6 / 7.7 / 31.5us); SVDQuant keeps the native split (down: 27.4us vs FlashInfer 33.1us)."""
+    split 26.2us; N1024 K14336 22.6 / 7.7 / 31.5us); SVDQuant keeps the native split (down: 27.4us vs FlashInfer 33.1us).
+    The scalar split only runs where its unsplit grid leaves SMs idle: at a wide N the BN 32/64 tiles already fill the
+    GPU, splitting gains nothing, and its rows crowd the swapped NVFP4 arm out of the search (GLM-5.2 attn
+    N18432 K6144: swap 14.5us, scalar 22.9us, scalar split 23.5us, and the full tune crowned scalar)."""
     def ok(c, args):
         split = c.kwargs.get("SPLIT_K", 1)
         persistent = c.kwargs.get("PERSISTENT", False)
@@ -1348,7 +1351,11 @@ def mx_auxiliary_pruner():
             return args.get("LORA_RANK", 0) > 0 and args["M"] >= 128
         if c.kwargs["COMPUTE_MODE"] != "scalar" and args.get("LORA_RANK", 0) == 0:
             return False
-        return args["M"] == 1 and args["K"] // c.kwargs["BLOCK_SIZE_K"] >= 2 * split
+        return (
+            args["M"] == 1 and args["K"] // c.kwargs["BLOCK_SIZE_K"] >= 2 * split
+            and (args.get("LORA_RANK", 0) > 0
+                 or triton.cdiv(args["N"], c.kwargs["BLOCK_SIZE_N"]) < sm_count(args["A"].device.index))
+        )
     return config_filter(ok)
 
 
