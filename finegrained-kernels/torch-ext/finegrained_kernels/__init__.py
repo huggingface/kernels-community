@@ -23,7 +23,19 @@ from .formats import get_supported_act_fns
 from .norm import get_supported_norms, rms_norm_rows
 from .swizzle import swizzle_mx_scales, unswizzle_mx_scales
 from .loading.scales import prepare_nvfp4_csf_scales, decompress_nvfp4_csf_scales
-from .quant import mxfp4_act_quant, mxfp8_act_quant, nvfp4_act_quant
+from .quant import (
+    mxfp8_act_quant,
+    mxfp4_act_quant,
+    nvfp4_act_quant,
+    dequantize_int_weight,
+    interleave_int_words,
+    fold_act_order_into_gate_up,
+    repack_gptq_int4,
+    repack_awq_int4,
+    repack_modelopt_int4,
+    repack_modelopt_int8,
+    repack_ggml_int,
+)
 
 __all__ = [
     # the three GEMM dispatchers (the weight format is read off the tensors; `activation_format`
@@ -43,8 +55,9 @@ __all__ = [
     "get_supported_norms",
     "rms_norm_rows",
     # load-time helpers: the swizzled scale layout the SM100 scaled-MMA reads, CSF scale-stream
-    # preparation/decoding, and the row-wise quantizers a loader uses to quantize weights into the
-    # group formats
+    # preparation/decoding, the row-wise quantizers a loader uses to quantize weights into the
+    # group formats, and the integer helpers (GPTQ / AWQ / ModelOpt / GGML repacks into the
+    # kernels' word layout, act-order folding, dequantization)
     "swizzle_mx_scales",
     "unswizzle_mx_scales",
     "prepare_nvfp4_csf_scales",
@@ -52,4 +65,12 @@ __all__ = [
     "mxfp8_act_quant",
     "mxfp4_act_quant",
     "nvfp4_act_quant",
+    "dequantize_int_weight",
+    "interleave_int_words",
+    "fold_act_order_into_gate_up",
+    "repack_gptq_int4",
+    "repack_awq_int4",
+    "repack_modelopt_int4",
+    "repack_modelopt_int8",
+    "repack_ggml_int",
 ]

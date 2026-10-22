@@ -18,12 +18,26 @@ import triton.language as tl
 from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
 from .bayesian_autotuner import bayesian_autotune
-from .formats import global_scale_stride, is_per_expert_global
-from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, compile_time_only_triton_wrap, device_context, is_blackwell, pdl_launch_kwargs
+from .formats import global_scale_stride, int_weight_bits, is_per_expert_global, normalize_global_scale
+from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, compile_time_only_triton_wrap, device_context, is_blackwell, is_sm10x, pdl_launch_kwargs
 from .swizzle import swizzle_store_block
 from .scheduling import build_tile_layout, resolve_tile_inline
 
 # ── Triton-side helpers (inlined by ``@triton.jit`` callers) ──────────────────
+
+
+@triton.jit
+def _quantize_modelopt_input(vals, scale, OUT_DTYPE: tl.constexpr):
+    value = vals.to(tl.float32) / scale
+    if OUT_DTYPE == tl.int8:
+        value = tl.clamp(value, -128.0, 127.0)
+        # Round to nearest even, including negative half-way values, on every backend.
+        lower = tl.floor(value)
+        fraction = value - lower
+        value = lower + ((fraction > 0.5) | ((fraction == 0.5) & ((lower.to(tl.int32) & 1) != 0))).to(tl.float32)
+    else:
+        value = tl.clamp(value, -448.0, 448.0)
+    return value.to(tl.int8 if OUT_DTYPE == tl.int8 else tl.float8e4nv)
 
 
 @triton.jit
@@ -427,6 +441,7 @@ def store_mx_act_scales(
 @triton.jit
 def _mx_act_quant_kernel(
     X,
+    PreQuantScale,
     Y,
     S,  # (T, K // SCALE_GROUP_K) row-major scales; None on the swizzled path
     SOut,  # flat SWIZZLE_32_4_4 scale buffer (1, n_tiles, cb, 2, 256); None on the plain path
@@ -508,6 +523,9 @@ def _mx_act_quant_kernel(
         mask=row_mask[:, None],
         other=0.0,
     ).to(tl.float32)
+    if PreQuantScale is not None:
+        # SVDQuant rounds the smoothed input to BF16 before either branch.
+        x = (x * tl.load(PreQuantScale + offs)[None, :]).to(X.dtype.element_ty).to(tl.float32)
     if GlobalScale is not None:
         # NVFP4 two-level: normalize by the calibrated global before the block quant — block
         # scales are then amax/6 of x/g (the canonical two-step); the GEMM folds g back onto the
@@ -584,6 +602,7 @@ def mx_act_quant_grouped(
             lambda META: (n_m_tiles, K // META["BLOCK_K"])
         ](
             x,
+            None,  # PreQuantScale
             y,
             None if swizzled else scales,  # S: row-major scales, affine arm only
             scales if swizzled else None,  # SOut: SWIZZLE_32_4_4 buffer, swizzled arm only
@@ -681,6 +700,7 @@ def mx_act_quant_routed_rows(
             lambda META: (triton.cdiv(S, META["BLOCK_T"]), K // META["BLOCK_K"])
         ](
             x,
+            None,  # PreQuantScale
             y,
             None if store_swizzled else scales,
             scales if store_swizzled else None,
@@ -740,6 +760,7 @@ def mx_act_quant_routed_scales(
             lambda META: (triton.cdiv(T, META["BLOCK_T"]), K // META["BLOCK_K"])
         ](
             x,
+            None,  # PreQuantScale
             y,
             None,
             scales,
@@ -839,6 +860,13 @@ def swizzle_grouped_mx_scales(
     return out.view(scale.dtype), n_m_tiles
 
 
+def row_padded_empty(rows: int, cols: int, row_multiple: int, dtype: torch.dtype, device) -> torch.Tensor:
+    """An empty ``(rows, cols)`` tensor whose storage is rounded up to ``row_multiple`` rows, so a
+    descriptor box over the padded rows reads in bounds (the extra rows are never written)."""
+    padded = triton.cdiv(rows, row_multiple) * row_multiple
+    return torch.empty(padded * cols, device=device, dtype=dtype)[: rows * cols].view(rows, cols)
+
+
 def maybe_act_quant(x, act_quant, min_m):
     """Row-count-gated offline activation pre-quant. Apply ``act_quant`` (a one-pass
     quant kernel, e.g. ``mxfp8_act_quant``) when the GEMM consuming ``x`` is
@@ -857,17 +885,21 @@ def maybe_act_quant(x, act_quant, min_m):
     return x, x
 
 
-def mxfp8_act_quant(x: torch.Tensor, swizzled: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+def mxfp8_act_quant(
+    x: torch.Tensor, swizzled: bool = False, row_multiple: int = 1
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``(T, K)`` activations to MX once (E4M3 values + UE8M0 group-32 uint8 scales)
     instead of inline per weight-tile — the fused gate_up re-ran the inline quant per N-tile
     (16x redundant amax/convert ALU + 2x act bytes), which held it at ~380 TFLOPS while the
     pre-quantized down kernel ran at ~1080. One pass costs ~50µs at 8k tokens. Bit-exact with
     the inline form (same group boundaries). ``swizzled=True`` emits the scale directly in
     SWIZZLE_32_4_4 for the tcgen05 fast path (same dense grid, per-element store)."""
-    return _launch_act_quant(x, "mxfp8", MX_SCALE_GROUP_K, torch.uint8, swizzled)
+    return _launch_act_quant(x, "mxfp8", MX_SCALE_GROUP_K, torch.uint8, swizzled, row_multiple=row_multiple)
 
 
-def mxfp4_act_quant(x: torch.Tensor, swizzled: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+def mxfp4_act_quant(
+    x: torch.Tensor, swizzled: bool = False, row_multiple: int = 1
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``(T, K)`` activations to MXFP4 in one kernel pass: packed-E2M1 values
     (``(T, K//2)`` int8, two codes per byte, first value in the low nibble) + UE8M0
     group-32 uint8 scales (``(T, K//32)``, amax/6 ceil'd to a power of two). Bit-identical
@@ -875,7 +907,7 @@ def mxfp4_act_quant(x: torch.Tensor, swizzled: bool = False) -> tuple[torch.Tens
     W4A4 arm of the MX matmul ops; quantizing activations to fp4 at runtime is an
     accuracy call the caller owns — the ops never do it implicitly. ``swizzled=True`` emits the
     scale directly in SWIZZLE_32_4_4 for the tcgen05 fast path."""
-    return _launch_act_quant(x, "mxfp4", MX_SCALE_GROUP_K, torch.uint8, swizzled)
+    return _launch_act_quant(x, "mxfp4", MX_SCALE_GROUP_K, torch.uint8, swizzled, row_multiple=row_multiple)
 
 
 def nvfp4_act_quant(
@@ -884,6 +916,7 @@ def nvfp4_act_quant(
     global_scale: torch.Tensor | None = None,
     expert_index: torch.Tensor | None = None,
     gather_idx: torch.Tensor | None = None,
+    row_multiple: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``(T, K)`` activations to NVFP4 in one kernel pass: packed-E2M1 values
     (``(T, K//2)`` int8) + E4M3 group-16 block scales (``(T, K//16)`` — ``amax/6`` rounded to
@@ -899,8 +932,121 @@ def nvfp4_act_quant(
     ``None`` = single-level (``g_a = 1``). ``swizzled=True`` emits the scale directly in
     SWIZZLE_32_4_4 for the tcgen05 fast path."""
     return _launch_act_quant(
-        x, "nvfp4", NVFP4_SCALE_GROUP_K, torch.float8_e4m3fn, swizzled, global_scale, expert_index, gather_idx
+        x, "nvfp4", NVFP4_SCALE_GROUP_K, torch.float8_e4m3fn, swizzled, global_scale, expert_index, gather_idx,
+        row_multiple=row_multiple,
     )
+
+
+def _svdquant_pruner(configs, named_args, **kwargs):
+    args = {**named_args, **kwargs}
+    configs = [c for c in configs if args["K"] % c.kwargs["BLOCK_K"] == 0]
+    # One K tile per split cannot amortize padded MMA setup for a rank-32 decode matvec.
+    single_tile_decode = (args["M"] == 1 and args["RANK"] == 32 and args["Y"] is not None
+                          and args["K"] <= args["SPLIT_K"] * max((c.kwargs["BLOCK_K"] for c in configs), default=0))
+    return [c for c in configs if (c.kwargs["BLOCK_M"] > 1 or args["M"] <= 16)
+            and not (c.kwargs["BLOCK_M"] == 1 and c.kwargs["SWAP_AB"])
+            and (not single_tile_decode or c.kwargs["BLOCK_M"] == 1)]
+
+
+@bayesian_autotune(
+    [triton.Config({"BLOCK_M": bm, "BLOCK_K": bk, "SWAP_AB": swap}, num_warps=w, num_stages=s)
+     for bm in (1, 16, 32, 64) for bk in (64, 128, 256) for w in (4, 8) for s in (1, 3)
+     for swap in (False, True)],
+    ["K", "RANK", "m_bucket", "SPLIT_K", "SWIZZLED"],
+    n_trials=100,
+    prune_configs_by={"early_config_prune": _svdquant_pruner},
+)
+@triton.jit
+def _svdquant_act_quant_kernel(
+    X, PreQuantScale, GlobalScale,
+    LoraA,
+    Y, S, SOut, Down, Partials,
+    M, m_bucket,
+    stride_x_m, stride_x_k, stride_la_r, stride_la_k,
+    K: tl.constexpr, SCALE_GROUP_K: tl.constexpr, RANK: tl.constexpr, SPLIT_K: tl.constexpr, SWIZZLED: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr, SWAP_AB: tl.constexpr,
+):
+    """BF16 LoRA-down with optional fused NVFP4 quantization of the smoothed input."""
+    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    split = tl.program_id(1)
+    rank = tl.arange(0, triton.next_power_of_2(RANK))
+    if SWAP_AB:
+        acc = tl.full((triton.next_power_of_2(RANK), BLOCK_M), 0, tl.float32)
+    else:
+        acc = tl.full((BLOCK_M, triton.next_power_of_2(RANK)), 0, tl.float32)
+    if GlobalScale is not None and Y is not None:
+        global_scale = tl.load(GlobalScale)
+    for kb in range(split, K // BLOCK_K, SPLIT_K):
+        cols = kb * BLOCK_K + tl.arange(0, BLOCK_K)
+        x = tl.load(X + rows[:, None] * stride_x_m + cols[None, :] * stride_x_k,
+                    mask=rows[:, None] < M, other=0)
+        if PreQuantScale is not None:
+            x = (x.to(tl.float32) * tl.load(PreQuantScale + cols)[None, :]).to(X.dtype.element_ty)
+        w = tl.load(LoraA + rank[:, None] * stride_la_r + cols[None, :] * stride_la_k,
+                    mask=rank[:, None] < RANK, other=0)
+        if BLOCK_M == 1:
+            acc += tl.sum(x.to(tl.float32)[:, None, :] * w.to(tl.float32)[None, :, :], 2)
+        elif SWAP_AB:
+            acc = tl.dot(w, tl.trans(x), acc)
+        else:
+            acc = tl.dot(x, tl.trans(w), acc)
+        if Y is not None:
+            normalized = x.to(tl.float32)
+            if GlobalScale is not None:
+                normalized /= global_scale
+            y, scales = mx_act_quant_inline(normalized, BLOCK_M, BLOCK_K, SCALE_GROUP_K, "nvfp4")
+            packed_cols = kb * (BLOCK_K // 2) + tl.arange(0, BLOCK_K // 2)
+            tl.store(Y + rows[:, None] * (K // 2) + packed_cols[None, :], y, mask=rows[:, None] < M)
+            store_mx_act_scales(S, SOut, rows, scales, rows < M, kb, M, K,
+                                SCALE_GROUP_K, BLOCK_K, SWIZZLED, "rows")
+    if SWAP_AB:
+        acc = tl.trans(acc)
+    mask = (rows[:, None] < M) & (rank[None, :] < RANK)
+    if SPLIT_K == 1:
+        tl.store(Down + rows[:, None] * RANK + rank[None, :], acc, mask=mask)
+    else:
+        tl.store(Partials + (split * M + rows[:, None]) * RANK + rank[None, :], acc, mask=mask)
+
+
+@triton.jit
+def _svdquant_down_reduce_kernel(Partials, Down, M, RANK: tl.constexpr, SPLIT_K: tl.constexpr, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    splits = tl.arange(0, triton.next_power_of_2(SPLIT_K))
+    parts = tl.load(Partials + splits[:, None] * M * RANK + offsets[None, :],
+                    mask=(splits[:, None] < SPLIT_K) & (offsets[None, :] < M * RANK), other=0)
+    tl.store(Down + offsets, tl.sum(parts, 0), mask=offsets < M * RANK)
+
+
+def svdquant_act_quant(x, lora_a, pre_quant_scale, global_scale, swizzled):
+    """Quantized residual input and BF16 down projection from the same pre-quantized input."""
+    K, rank = x.shape[-1], lora_a.shape[0]
+    x = x.reshape(-1, K)
+    M = x.shape[0]
+    separate_quant = is_sm10x() and rank == 32 and M >= 4096 and M * K >= 1 << 25
+    if separate_quant:
+        # Independent quantization tiles avoid keeping the large input in both quant and MMA layouts.
+        values, scales = _launch_act_quant(
+            x, "nvfp4", NVFP4_SCALE_GROUP_K, torch.float8_e4m3fn,
+            swizzled, global_scale, pre_quant_scale=pre_quant_scale)
+    else:
+        values = torch.empty(M, K // 2, device=x.device, dtype=torch.int8)
+        scale_shape = (1, triton.cdiv(M, 128), triton.cdiv(K // NVFP4_SCALE_GROUP_K, 4), 2, 256) if swizzled else (M, K // NVFP4_SCALE_GROUP_K)
+        scales = torch.empty(scale_shape, device=x.device, dtype=torch.float8_e4m3fn)
+    split_k = min(32, max(1, triton.cdiv(256, triton.cdiv(M, 32))))
+    down = torch.empty(M, rank, device=x.device, dtype=x.dtype) if M > 1 or split_k == 1 else None
+    partials = torch.empty(split_k, M, rank, device=x.device, dtype=torch.float32) if split_k > 1 else None
+    with device_context(x.device):
+        compile_time_only_triton_wrap(_svdquant_act_quant_kernel)[lambda meta: (triton.cdiv(M, meta["BLOCK_M"]), split_k)](
+            x, pre_quant_scale, global_scale, lora_a, None if separate_quant else values,
+            None if separate_quant or swizzled else scales, scales if swizzled and not separate_quant else None, down, partials,
+            M, int(M).bit_length(), x.stride(0), x.stride(1), lora_a.stride(0), lora_a.stride(1),
+            K=K, SCALE_GROUP_K=NVFP4_SCALE_GROUP_K, RANK=rank, SPLIT_K=split_k, SWIZZLED=swizzled,
+        )
+        if split_k > 1 and M > 1:
+            compile_time_only_triton_wrap(_svdquant_down_reduce_kernel)[(triton.cdiv(M * rank, 128),)](
+                partials, down, M, RANK=rank, SPLIT_K=split_k, BLOCK=128,
+            )
+    return values, scales, partials if M == 1 and split_k > 1 else down
 
 
 def nvfp4_quantize_two_level(
@@ -934,7 +1080,7 @@ MX_ACT_QUANT = {
 
 def _launch_act_quant(
     x, activation_format, scale_group, scale_dtype, swizzled=False, global_scale=None,
-    expert_index=None, gather_idx=None,
+    expert_index=None, gather_idx=None, pre_quant_scale=None, row_multiple=1,
 ):
     """One-pass activation quant for every format (``mxfp8`` = E4M3 values, else packed E2M1) and
     both scale layouts. ``swizzled=True`` writes the scale straight into the SWIZZLE_32_4_4 buffer
@@ -943,7 +1089,8 @@ def _launch_act_quant(
     ``(T, K // scale_group)``. ``global_scale`` (NVFP4 two-level, ``(1,)`` fp32) normalizes the
     values before the block quant. ``gather_idx`` quantizes ``x[gather_idx]``, one output row per
     entry, without materializing it — what per-expert globals need for routed rows of one token.
-    Returns ``(values, scales)``."""
+    ``row_multiple`` backs the value rows with storage rounded up to that many rows, as
+    ``fp8_act_quant_tensor_wide``. Returns ``(values, scales)``."""
     K = x.shape[1]
     T = gather_idx.numel() if gather_idx is not None else x.shape[0]
     packed = activation_format != "mxfp8"
@@ -952,9 +1099,8 @@ def _launch_act_quant(
         assert K % (2 * scale_group) == 0, (
             f"K (={K}) must be a multiple of {2 * scale_group} to pack E2M1 pairs"
         )
-    values = torch.empty(
-        T, K // 2 if packed else K, device=x.device,
-        dtype=torch.uint8 if packed else FP8_DTYPE,
+    values = row_padded_empty(
+        T, K // 2 if packed else K, row_multiple, torch.uint8 if packed else FP8_DTYPE, x.device
     )
     if swizzled:
         cb = triton.cdiv(K // scale_group, 4)
@@ -968,6 +1114,7 @@ def _launch_act_quant(
             lambda META: (triton.cdiv(T, META["BLOCK_T"]), K // META["BLOCK_K"])
         ](
             x,
+            pre_quant_scale,  # PreQuantScale
             values,
             None if swizzled else scales,  # S: row-major scales, plain arm only
             scales if swizzled else None,  # SOut: SWIZZLE_32_4_4 buffer, swizzled arm only
@@ -1002,7 +1149,7 @@ def _launch_act_quant(
         for bt in (16, 32, 64, 128)
         for w in (1, 2, 4, 8)
     ],
-    ["K", "BLOCK_K", "t_bucket"],
+    ["K", "BLOCK_K", "t_bucket", "SWIZZLED"],
     n_trials=100,
 )
 @triton.jit
@@ -1018,6 +1165,7 @@ def _fp8_act_quant_block_dynamic_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_T: tl.constexpr,
     UE8M0: tl.constexpr = False,
+    SWIZZLED: tl.constexpr = False,
     PDL: tl.constexpr = False,
 ):
     """One-pass block-FP8 activation quant: rows → E4M3 + one ``amax/448`` scale per
@@ -1027,7 +1175,11 @@ def _fp8_act_quant_block_dynamic_kernel(
     form starved memory (128-byte transactions across ~T*K/BK tiny programs); the row tile
     gives the loads something to coalesce. The span equals the consumer's ``BLOCK_SIZE_K``,
     so results are bit-exact with the inline quant. Arbitrary input strides (no host-side
-    copy); ``BLOCK_K`` is fixed by the scale layout, ``BLOCK_T`` and warps are tuned."""
+    copy); ``BLOCK_K`` is fixed by the scale layout, ``BLOCK_T`` and warps are tuned.
+
+    ``SWIZZLED`` (UE8M0 only) stores each ``1 x BLOCK_K`` scale into its ``BLOCK_K // 32`` group-32
+    slots of the SWIZZLE_32_4_4 layout: the same power-of-two scale repeated, so an MXFP8 GEMM
+    reads exactly the block-FP8 operand."""
     if PDL:
         gdc_wait()
     pid_t = tl.program_id(0)
@@ -1044,21 +1196,35 @@ def _fp8_act_quant_block_dynamic_kernel(
     tl.store(Y + rows[:, None] * K + offs[None, :], y, mask=row_mask[:, None])
     if PDL:
         gdc_launch_dependents()
-    tl.store(S + rows * (K // BLOCK_K) + kb, s, mask=row_mask)
+    if SWIZZLED:
+        store_mx_act_scales(
+            None, S, rows, tl.broadcast_to(s[:, None], (BLOCK_T, BLOCK_K // 32)), row_mask, kb, T, K,
+            32, BLOCK_K, True, "blocks",
+        )
+    else:
+        tl.store(S + rows * (K // BLOCK_K) + kb, s, mask=row_mask)
 
 
 def fp8_act_quant_block_dynamic(
-    x: torch.Tensor, block_k: int, use_ue8m0: bool = False
+    x: torch.Tensor, block_k: int, use_ue8m0: bool = False, row_multiple: int = 1, swizzled: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``(T, K)`` activations to block-FP8 once (E4M3 + per-``block_k`` scales)
     instead of inline per weight-tile — same rationale and layout as ``mxfp8_act_quant`` (a
     GEMM re-reads its activation once per N-tile). Bit-exact with the inline form. Scales are
     fp32 (``amax/448``) or, under ``use_ue8m0``, UE8M0 exponent bytes (power-of-two scales)
-    for the tcgen05 ``dot_scaled`` path — the DeepGEMM-Blackwell format."""
+    for the tcgen05 ``dot_scaled`` path — the DeepGEMM-Blackwell format. ``row_multiple`` backs
+    the E4M3 rows with storage rounded up to that many rows, as ``fp8_act_quant_tensor_wide``.
+    ``swizzled`` (UE8M0 only) emits the scales as the group-32 SWIZZLE_32_4_4 operand of an MXFP8
+    GEMM instead, each block scale repeated over its ``block_k // 32`` groups."""
     T, K = x.shape
-    y = torch.empty(T, K, device=x.device, dtype=FP8_DTYPE)
+    assert use_ue8m0 or not swizzled, "only power-of-two (UE8M0) block scales are MX group scales"
+    y = row_padded_empty(T, K, row_multiple, FP8_DTYPE, x.device)
     s_dtype = torch.uint8 if use_ue8m0 else torch.float32
-    s = torch.empty(T, K // block_k, device=x.device, dtype=s_dtype)
+    if swizzled:
+        cb = triton.cdiv(K // MX_SCALE_GROUP_K, 4)
+        s = torch.empty(1, triton.cdiv(T, 128), cb, 2, 256, device=x.device, dtype=s_dtype)
+    else:
+        s = torch.empty(T, K // block_k, device=x.device, dtype=s_dtype)
 
     def grid(META):
         return (triton.cdiv(T, META["BLOCK_T"]), K // block_k)
@@ -1066,7 +1232,7 @@ def fp8_act_quant_block_dynamic(
     with device_context(x.device):
         compile_time_only_triton_wrap(_fp8_act_quant_block_dynamic_kernel)[grid](
             x, y, s, x.stride(0), x.stride(1), T, T.bit_length(),
-            K=K, BLOCK_K=block_k, UE8M0=use_ue8m0,
+            K=K, BLOCK_K=block_k, UE8M0=use_ue8m0, SWIZZLED=swizzled,
             **pdl_launch_kwargs(),
         )
     return y, s
@@ -1078,6 +1244,7 @@ def fp8_act_quant_block_dynamic(
 @triton.jit
 def _fp8_act_quant_kernel(
     x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr, PADDED_BLOCK: tl.constexpr,
+    AMAX_UPPER_BOUND: tl.constexpr = None,
     PDL: tl.constexpr = False,
 ):
     if PDL:
@@ -1090,7 +1257,12 @@ def _fp8_act_quant_kernel(
     mask = cols < BLOCK_SIZE
     offs = pid * BLOCK_SIZE + cols
     x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-    s = tl.max(tl.abs(x)) / 448.0  # float8_e4m3fn max
+    amax = tl.max(tl.abs(x))
+    if AMAX_UPPER_BOUND is not None:
+        # the amax is capped, and the values past it saturate
+        amax = tl.minimum(amax, AMAX_UPPER_BOUND)
+        x = tl.clamp(x, -amax, amax)
+    s = amax / 448.0  # float8_e4m3fn max
     y = (x / tl.maximum(s, 1e-12)).to(y_ptr.dtype.element_ty)
     tl.store(y_ptr + offs, y, mask=mask)
     if PDL:
@@ -1118,7 +1290,11 @@ def static_expert_act_operands(A, As, num_experts):
 # not alias an input), and it hands back Python strides. The quant kernels it calls carry their
 # own compile handling.
 def tensor_wide_act_operands(
-    A: torch.Tensor, As: torch.Tensor | None, num_experts: int | None = None
+    A: torch.Tensor,
+    As: torch.Tensor | None,
+    num_experts: int | None = None,
+    row_multiple: int = 1,
+    activation_scale_ub: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, int, int]:
     """Activation operands of the tensor-scale FP8 arms: ``(A, As, stride_m, stride_e)``.
 
@@ -1128,10 +1304,13 @@ def tensor_wide_act_operands(
     one per expert, which stays raw for the kernel to quantize each tile against its own expert
     — a gathered row serves several experts, so it has no single pre-quantized form until the
     routed rows are laid out (``quantize_routed_rows_per_expert``). ``num_experts`` ``None`` on
-    the 2D op, whose rows belong to no expert.
+    the 2D op, whose rows belong to no expert. ``row_multiple`` pads the derived rows' storage
+    (``fp8_act_quant_tensor_wide``). ``activation_scale_ub`` caps their dynamic amax.
     """
     if As is None:
-        A, As = fp8_act_quant_tensor_wide(A, A.shape[-1])
+        A, As = fp8_act_quant_tensor_wide(
+            A, A.shape[-1], amax_upper_bound=activation_scale_ub, row_multiple=row_multiple
+        )
         As = As.reshape(-1)
         return A, As, As.stride(0), 0
     if A.dtype == FP8_DTYPE:
@@ -1215,11 +1394,18 @@ def quantize_routed_rows_per_expert(A, As, gather_idx, expert_start, num_experts
 
 
 def fp8_act_quant_tensor_wide(
-    x: torch.Tensor, block_size: int = 128
+    x: torch.Tensor,
+    block_size: int = 128,
+    amax_upper_bound: float | None = None,
+    row_multiple: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """E4M3 + one ``amax / 448`` fp32 scale per ``block_size`` span (``block_size = K``: per
+    token). ``amax_upper_bound`` caps the amax (values past it saturate); ``None`` leaves it
+    uncapped. ``row_multiple`` backs the E4M3 rows with storage rounded up to that many rows
+    (left unwritten), so a TMA box over the padded extent reads in bounds."""
     assert x.is_contiguous()
     assert x.shape[-1] % block_size == 0
-    y = torch.empty_like(x, dtype=FP8_DTYPE)
+    y = row_padded_empty(x.numel() // x.shape[-1], x.shape[-1], row_multiple, FP8_DTYPE, x.device).view(x.shape)
     grid = (triton.cdiv(x.numel(), block_size),)
     s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
 
@@ -1230,9 +1416,541 @@ def fp8_act_quant_tensor_wide(
             s,
             BLOCK_SIZE=block_size,
             PADDED_BLOCK=triton.next_power_of_2(block_size),
+            AMAX_UPPER_BOUND=amax_upper_bound,
             **pdl_launch_kwargs(),
         )
 
     return y, s
 
 
+
+
+# ── int4 checkpoint repacks (load time) ──────────────────────────────────────
+
+
+@triton.jit
+def _repack_int4_kernel(
+    QWeight,  # GPTQ (K // 8, N) words packed along K; AWQ (K, N // 8) words packed along N
+    QZeros,  # (K // group, N // 8) words packed along N; read iff not SYMMETRIC
+    Scales,  # (K // group, N)
+    Perm,  # (K,) int32 act-order K order: output K row j is source row Perm[j]; None: identity (GPTQ only)
+    W,  # out: (N, K // 8) uint32, eight K values per word in the interleaved order (interleave_int_words)
+    Ws,  # out: (N, K // group)
+    Wz,  # out: (N, K // group) uint8; written iff not SYMMETRIC
+    N,
+    stride_qw_0,
+    stride_qw_1,
+    stride_qz_0,
+    stride_qz_1,
+    stride_s_0,
+    stride_s_1,
+    ZEROS_OFFSET: tl.constexpr,
+    AWQ: tl.constexpr,
+    SYMMETRIC: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUPS: tl.constexpr,  # scale groups per K tile
+):
+    """One ``[BLOCK_SIZE_K, BLOCK_SIZE_N]`` tile of a GPTQ or AWQ int4 linear into the GEMMs' layout, its groups'
+    scales and zero points with it: each value's nibble out of the source word, then eight per word along K in the
+    kernels' interleaved order."""
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+    n_mask = (offs_n < N)[None, :]
+    # AWQ interleaves a word's eight columns: column c sits in nibble c // 2 + 4 * (c % 2)
+    n_shift = 4 * ((offs_n % 8) // 2 + 4 * (offs_n % 2)) if AWQ else 4 * (offs_n % 8)
+    if AWQ:
+        src = tl.load(QWeight + offs_k[:, None] * stride_qw_0 + (offs_n // 8)[None, :] * stride_qw_1, mask=n_mask)
+        q = (src >> n_shift[None, :]) & 0xF
+    else:
+        src_k = offs_k if Perm is None else tl.load(Perm + offs_k)
+        src = tl.load(QWeight + (src_k // 8)[:, None] * stride_qw_0 + offs_n[None, :] * stride_qw_1, mask=n_mask)
+        q = (src >> (4 * (src_k % 8))[:, None]) & 0xF
+    # the kernels' interleaved word (interleave_int_words): K offset j of the word in nibble j // 2 + 4 * (j % 2)
+    j = tl.arange(0, 8)
+    words = tl.sum(
+        q.reshape(BLOCK_SIZE_K // 8, 8, BLOCK_SIZE_N) << (4 * (j // 2 + 4 * (j % 2)))[None, :, None], axis=1
+    )
+    offs_w = pid_k * (BLOCK_SIZE_K // 8) + tl.arange(0, BLOCK_SIZE_K // 8)
+    K_WORDS = tl.num_programs(1) * (BLOCK_SIZE_K // 8)
+    tl.store(W + offs_n[None, :] * K_WORDS + offs_w[:, None], words, mask=n_mask)
+
+    offs_g = pid_k * GROUPS + tl.arange(0, GROUPS)
+    n_groups = tl.num_programs(1) * GROUPS
+    out_g = offs_n[None, :] * n_groups + offs_g[:, None]
+    s = tl.load(Scales + offs_g[:, None] * stride_s_0 + offs_n[None, :] * stride_s_1, mask=n_mask)
+    tl.store(Ws + out_g, s, mask=n_mask)
+    if not SYMMETRIC:
+        zw = tl.load(QZeros + offs_g[:, None] * stride_qz_0 + (offs_n // 8)[None, :] * stride_qz_1, mask=n_mask)
+        z = (((zw >> n_shift[None, :]) & 0xF) + ZEROS_OFFSET) & 0xF  # a zero of 0 packs as 0xF under offset 1
+        tl.store(Wz + out_g, z.to(tl.uint8), mask=n_mask)
+
+
+def _repack_int4(qweight, qzeros, scales, K, awq, zeros_offset, symmetric, perm=None):
+    groups, N = scales.shape
+    group = K // groups
+    assert group * groups == K and group % 8 == 0, f"K={K} is not a whole number of groups of {group}"
+    block_k = group * max(1, 64 // group)  # a K tile of whole groups, at least 64 values
+    assert K % block_k == 0, f"K={K} must be a multiple of {block_k}"
+    W = torch.empty(N, K // 8, dtype=torch.uint32, device=qweight.device)
+    Ws = torch.empty(N, groups, dtype=scales.dtype, device=scales.device)
+    Wz = None if symmetric else torch.empty(N, groups, dtype=torch.uint8, device=qweight.device)
+    grid = (triton.cdiv(N, 64), K // block_k)
+    with device_context(qweight.device):
+        _repack_int4_kernel[grid](
+            qweight, None if symmetric else qzeros, scales, perm, W, Ws, Wz, N,
+            qweight.stride(0), qweight.stride(1),
+            *((0, 0) if symmetric else qzeros.stride()),
+            scales.stride(0), scales.stride(1),
+            ZEROS_OFFSET=zeros_offset, AWQ=awq, SYMMETRIC=symmetric,
+            BLOCK_SIZE_N=64, BLOCK_SIZE_K=block_k, GROUPS=block_k // group,
+        )
+    return W, Ws, Wz
+
+
+@triton.jit
+def _permute_cols_kernel(X, Perm, Scale, QuantScale, UnitScale, Out, M, K, stride_x_m, stride_o_m, BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr, UNIT_GROUP: tl.constexpr):
+    """Gather original input columns and optionally apply their AWQ scales in the same pass."""
+    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
+    mask = (rows < M)[:, None] & (cols < K)[None, :]
+    src = cols if Perm is None else tl.load(Perm + cols, mask=cols < K, other=0)
+    rows64 = rows[:, None].to(tl.int64)
+    vals = tl.load(X + rows64 * stride_x_m + src[None, :], mask=mask, other=0)
+    if Scale is not None:
+        vals = (vals.to(tl.float32) * tl.load(Scale + src, mask=cols < K, other=0)[None, :]).to(X.dtype.element_ty)
+    if QuantScale is not None:
+        vals = _quantize_modelopt_input(vals, tl.load(QuantScale), Out.dtype.element_ty)
+    tl.store(Out + rows64 * stride_o_m + cols[None, :], vals, mask=mask)
+    if UnitScale is not None:
+        if tl.program_id(0) == 0:
+            group = tl.program_id(1) * (BLOCK_K // UNIT_GROUP) + tl.arange(0, BLOCK_K // UNIT_GROUP)
+            tl.store(UnitScale + group, 127 if UnitScale.dtype.element_ty == tl.uint8 else 1.0, mask=group < K // UNIT_GROUP)
+
+
+def permute_act_cols(
+    x: torch.Tensor, perm: torch.Tensor | None, pre_quant_scale: torch.Tensor | None = None,
+    quant_scale: torch.Tensor | None = None,
+    quant_dtype: torch.dtype = FP8_DTYPE,
+    unit_scale: torch.Tensor | None = None,
+    unit_group: int = MX_SCALE_GROUP_K,
+    storage_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """``x[..., perm]`` for an act-order weight's K order (``b_perm``), one launch: the activation the natural-order
+    kernels (TMA arms included) then read. ``pre_quant_scale`` optionally multiplies the original columns
+    before permutation, rounded in the activation dtype; ``perm=None`` only applies the transform."""
+    K = x.shape[-1]
+    if pre_quant_scale is not None:
+        assert pre_quant_scale.shape == (K,) and pre_quant_scale.is_contiguous(), "pre_quant_scale must be contiguous (K,)"
+        assert pre_quant_scale.device == x.device and pre_quant_scale.dtype == x.dtype, "pre_quant_scale must match the activation device and dtype"
+    x2 = x.reshape(-1, K)
+    out = torch.empty_like(x2, dtype=(storage_dtype or quant_dtype) if quant_scale is not None else x.dtype)
+    M = x2.shape[0]
+    # one row per program; a long column span per program once rows are many (B200, K=12288: M=1 1.4 vs 2.3us at
+    # 512 vs 4096 columns, M=2048 73.0 vs 46.7us)
+    block_k = min(512 if M <= 64 else 4096, triton.next_power_of_2(K))
+    with device_context(x.device):
+        compile_time_only_triton_wrap(_permute_cols_kernel)[(M, triton.cdiv(K, block_k))](
+            x2, perm, pre_quant_scale, quant_scale, unit_scale, out, M, K, x2.stride(0), out.stride(0),
+            BLOCK_M=1, BLOCK_K=block_k, UNIT_GROUP=unit_group, num_warps=4,
+        )
+    return out.view(x.shape)
+
+
+@triton.jit
+def _permute_routed_rows_kernel(
+    X, Perm, Scale, QuantScale, UnitScale, GatherIdx, ExpertStart, ExpertIds, Out, K, stride_x_m, stride_perm_e, stride_scale_e, stride_quant_e, num_experts,
+    NUM_EXPERTS_POW2: tl.constexpr, BLOCK_K: tl.constexpr,
+    UNIT_GROUP: tl.constexpr,
+):
+    """``Out[s, j] = X[src(s), Perm[e(s), j]]`` over one ``BLOCK_K`` column span of routed row ``s``: ``src`` from
+    ``GatherIdx`` (None: ``s``), the expert from ``ExpertIds`` (batched) or the sorted ranges of ``ExpertStart``
+    (grouped). An EP-sentinel row (off-rank expert) is left unwritten, as the GEMM leaves its output."""
+    s = tl.program_id(0)
+    if UnitScale is not None:
+        if s == 0:
+            group = tl.program_id(1) * (BLOCK_K // UNIT_GROUP) + tl.arange(0, BLOCK_K // UNIT_GROUP)
+            tl.store(UnitScale + group, 127 if UnitScale.dtype.element_ty == tl.uint8 else 1.0, mask=group < K // UNIT_GROUP)
+    if ExpertIds is not None:
+        e = tl.load(ExpertIds + s)
+    else:
+        ends = tl.load(ExpertStart + 1 + tl.arange(0, NUM_EXPERTS_POW2), mask=tl.arange(0, NUM_EXPERTS_POW2) < num_experts, other=2**31 - 1)
+        e = tl.sum((ends <= s).to(tl.int32))
+    if (e >= 0) & (e < num_experts):
+        src = s if GatherIdx is None else tl.load(GatherIdx + s)
+        cols = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
+        mask = cols < K
+        idx = cols if Perm is None else tl.load(Perm + e.to(tl.int64) * stride_perm_e + cols, mask=mask, other=0)
+        vals = tl.load(X + src.to(tl.int64) * stride_x_m + idx, mask=mask)
+        if Scale is not None:
+            scale = tl.load(Scale + e.to(tl.int64) * stride_scale_e + idx, mask=mask, other=0)
+            vals = (vals.to(tl.float32) * scale).to(X.dtype.element_ty)
+        if QuantScale is not None:
+            denom = tl.load(QuantScale + e * stride_quant_e)
+            vals = _quantize_modelopt_input(vals, denom, Out.dtype.element_ty)
+        tl.store(Out + s.to(tl.int64) * K + cols, vals, mask=mask)
+
+
+def permute_routed_rows(
+    x: torch.Tensor, perm: torch.Tensor | None, num_rows: int, gather_idx: torch.Tensor | None = None,
+    expert_start: torch.Tensor | None = None, expert_ids: torch.Tensor | None = None,
+    pre_quant_scale: torch.Tensor | None = None, num_experts: int | None = None,
+    quant_scale: torch.Tensor | None = None,
+    quant_dtype: torch.dtype = FP8_DTYPE,
+    unit_scale: torch.Tensor | None = None,
+    unit_group: int = MX_SCALE_GROUP_K,
+    storage_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """The ``num_rows`` routed activation rows, each read from ``x`` (through ``gather_idx``) in its expert's
+    act-order K order, ``perm`` ``(E, K)``: ``out[s] = x[gather_idx[s], perm[expert(s)]]`` with the expert from
+    ``expert_ids`` (batched) or ``expert_start``'s sorted ranges (grouped). One launch; the routed GEMMs then read
+    contiguous natural-order rows. ``pre_quant_scale`` additionally multiplies each original column by
+    its shared or per-expert AWQ input scale, rounded in the activation dtype; ``perm=None`` retains K order."""
+    K = x.shape[-1]
+    out = x.new_empty(num_rows, K, dtype=(storage_dtype or quant_dtype) if quant_scale is not None else x.dtype)
+    if num_experts is None:
+        num_experts = perm.shape[0]
+    stride_scale_e = 0
+    if pre_quant_scale is not None:
+        assert pre_quant_scale.shape in ((K,), (1, K), (num_experts, K)) and pre_quant_scale.is_contiguous(), (
+            "pre_quant_scale must be contiguous (K,), (1, K), or (E, K)"
+        )
+        assert pre_quant_scale.device == x.device and pre_quant_scale.dtype == x.dtype, "pre_quant_scale must match the activation device and dtype"
+        stride_scale_e = K if pre_quant_scale.numel() > K else 0
+    block_k = min(512, triton.next_power_of_2(K))
+    num_warps = 4
+    if num_rows > 64 and is_sm10x():
+        block_k = min(4096 if perm is not None else 2048, triton.next_power_of_2(K))
+        num_warps = 2 if block_k > 2048 else 1
+    with device_context(x.device):
+        compile_time_only_triton_wrap(_permute_routed_rows_kernel)[(num_rows, triton.cdiv(K, block_k))](
+            x, perm, pre_quant_scale, quant_scale, unit_scale, gather_idx, expert_start, expert_ids, out, K, x.stride(0),
+            perm.stride(0) if perm is not None else 0, stride_scale_e, global_scale_stride(quant_scale), num_experts,
+            NUM_EXPERTS_POW2=triton.next_power_of_2(num_experts), BLOCK_K=block_k, UNIT_GROUP=unit_group, num_warps=num_warps,
+        )
+    return out
+
+
+def prepare_fp8_mx_inputs(
+    A, input_scale, scale_dtype, group, num_experts=1, num_rows=None,
+    gather_idx=None, expert_start=None, expert_ids=None, pre_quant_scale=None, storage_dtype=FP8_DTYPE,
+):
+    """Calibrated tensor-FP8 inputs for FP4/MX loops: quantized rows, unit group scales, and calibration.
+
+    Constant unit group scales preserve ordinary FP8 quantization (one calibrated scale per tensor/expert),
+    rather than re-quantizing each block as MXFP8. Routed quantization and the sorted copy share one pass.
+    BF16 stores FP8-rounded inputs exactly, as well as every finite E2M1 x E4M3 weight-scale product.
+    This lets the wide-K weight-upcast GEMM use the same real operands without unit group scales.
+    """
+    assert input_scale is not None and A.dtype in (torch.bfloat16, torch.float16, torch.float32), (
+        "FP4 with ordinary FP8 activations requires raw inputs and a calibrated input_scale"
+    )
+    assert storage_dtype in (FP8_DTYPE, torch.bfloat16)
+    calibration = normalize_global_scale(input_scale, num_experts)
+    K = A.shape[-1]
+    unit = None if storage_dtype == torch.bfloat16 else torch.empty((1, K // group), device=A.device, dtype=scale_dtype)
+    if num_rows is None:
+        values = permute_act_cols(A.reshape(-1, K), None, pre_quant_scale, quant_scale=calibration, unit_scale=unit, unit_group=group, storage_dtype=storage_dtype)
+    else:
+        values = permute_routed_rows(
+            A, None, num_rows, gather_idx, expert_start, expert_ids,
+            num_experts=num_experts, quant_scale=calibration, unit_scale=unit, unit_group=group, pre_quant_scale=pre_quant_scale, storage_dtype=storage_dtype,
+        )
+    # One row, written by the preparation pass, broadcasts across tokens without a full scale grid.
+    scales = None if storage_dtype == torch.bfloat16 else unit.expand(values.shape[0], K // group)
+    return values.reshape(A.shape) if num_rows is None else values, scales, calibration
+
+
+def interleave_int_words(words: torch.Tensor, bits: int) -> torch.Tensor:
+    """Natural-order integer weight words (``(..., K // VPW)`` int32, ``VPW = 32 // bits`` unsigned values per word
+    along K, the first lowest: compressed-tensors' ``pack-quantized`` layout) into the integer GEMMs' interleaved
+    layout, uint32 words (the dtype marks the layout): within each word, the value at K offset ``j`` moves to slot
+    ``j // 2 + (j % 2) * VPW // 2``, so one shift and one mask yield K-adjacent value pairs in a lane's two 16-bit
+    halves (``int_word_pairs``). A loader-time conversion, done once per weight (the GPTQ / AWQ repacks emit this
+    layout directly)."""
+    assert words.dtype == torch.int32 and bits in (2, 4, 8), f"int32 words of 2/4/8-bit values, got {words.dtype}/{bits}"
+    vpw = 32 // bits
+    mask = (1 << bits) - 1
+    j = torch.arange(vpw, device=words.device, dtype=torch.int32)
+    values = (words.unsqueeze(-1) >> (bits * j)) & mask  # (..., words, vpw), natural slot j
+    slot = j // 2 + (j % 2) * (vpw // 2)
+    return (values << (bits * slot)).sum(-1, dtype=torch.int32).view(torch.uint32)
+
+
+@triton.jit
+def _dequantize_int_kernel(
+    W,  # (rows, K // VPW) uint32 words, interleaved (interleave_int_words)
+    Ws,  # (rows, K // SCALE_GROUP_K) float group scales
+    Wz,  # (rows, K // SCALE_GROUP_K) integer zero points; None for the symmetric 2 ** (BITS - 1)
+    Out,  # (rows, K)
+    rows,
+    K_WORDS,
+    BITS: tl.constexpr,
+    SCALE_GROUP_K: tl.constexpr,
+    BLOCK_SIZE_R: tl.constexpr,
+    BLOCK_SIZE_W: tl.constexpr,
+):
+    """One ``[BLOCK_SIZE_R, BLOCK_SIZE_W]`` word tile back to its ``[BLOCK_SIZE_R, BLOCK_SIZE_W * VPW]`` values:
+    ``((q - zero) * scale)`` rounded in the scale dtype, then cast to ``Out``'s."""
+    VPW: tl.constexpr = 32 // BITS
+    HALF: tl.constexpr = VPW // 2
+    MASK: tl.constexpr = (1 << BITS) - 1
+    offs_r = tl.program_id(0) * BLOCK_SIZE_R + tl.arange(0, BLOCK_SIZE_R)
+    offs_w = tl.program_id(1) * BLOCK_SIZE_W + tl.arange(0, BLOCK_SIZE_W)
+    r_mask = (offs_r < rows)[:, None]
+    w = tl.load(W + offs_r[:, None].to(tl.int64) * K_WORDS + offs_w[None, :], mask=r_mask & (offs_w < K_WORDS)[None, :])
+    shifts = (tl.arange(0, HALF) * BITS)[None, None, :]
+    # slot s < HALF holds K offset 2s, slot s + HALF offset 2s + 1
+    lo = (w[:, :, None] >> shifts) & MASK
+    hi = (w[:, :, None] >> (shifts + HALF * BITS)) & MASK
+    q = tl.join(lo, hi).reshape(BLOCK_SIZE_R, BLOCK_SIZE_W * VPW).to(tl.int32)
+    offs_k = tl.program_id(1) * BLOCK_SIZE_W * VPW + tl.arange(0, BLOCK_SIZE_W * VPW)
+    mask = r_mask & (offs_k < K_WORDS * VPW)[None, :]
+    groups = K_WORDS * VPW // SCALE_GROUP_K
+    g_ptrs = offs_r[:, None].to(tl.int64) * groups + (offs_k // SCALE_GROUP_K)[None, :]
+    scale = tl.load(Ws + g_ptrs, mask=mask)
+    zero = (1 << (BITS - 1)) if Wz is None else tl.load(Wz + g_ptrs, mask=mask).to(tl.int32)
+    v = (q - zero).to(scale.dtype) * scale
+    out_ptrs = Out + offs_r[:, None].to(tl.int64) * (K_WORDS * VPW) + offs_k[None, :]
+    tl.store(out_ptrs, v.to(Out.dtype.element_ty), mask=mask)
+
+
+def dequantize_int_weight(
+    words: torch.Tensor, scales: torch.Tensor, K: int, zeros: torch.Tensor | None = None,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """An integer weight in the GEMMs' interleaved layout (``(..., N, K // VPW)`` uint32, ``interleave_int_words``)
+    back to ``(..., N, K)`` the way the GEMMs dequantize it: ``(q - zero)`` in the scale dtype times the per-group
+    scale, rounded once, then cast to ``dtype`` (``None``: the scale dtype). The width follows from ``K`` and the
+    word count; ``zeros`` ``None`` is the symmetric zero point ``2 ** (bits - 1)``. One fused launch, used by the
+    large-prefill path that dequantizes once and runs the unquantized GEMM."""
+    bits = int_weight_bits(K, words)
+    k_words = words.shape[-1]
+    group = K // scales.shape[-1]
+    rows = words.numel() // k_words
+    assert group * scales.shape[-1] == K and group % (32 // bits) == 0, f"{scales.shape[-1]} groups cannot split K={K}"
+    assert zeros is None or zeros.shape == scales.shape, "zero points are shaped like the scales"
+    out = torch.empty(*words.shape[:-1], K, device=words.device, dtype=dtype or scales.dtype)
+
+    grid = (triton.cdiv(rows, 32), triton.cdiv(k_words, 16))
+    with device_context(words.device):
+        compile_time_only_triton_wrap(_dequantize_int_kernel)[grid](
+            words.contiguous(), scales.contiguous(), None if zeros is None else zeros.contiguous(), out,
+            rows, k_words, BITS=bits, SCALE_GROUP_K=group, BLOCK_SIZE_R=32, BLOCK_SIZE_W=16,
+        )
+    return out
+
+
+def repack_gptq_int4(
+    qweight: torch.Tensor,
+    qzeros: torch.Tensor,
+    scales: torch.Tensor,
+    g_idx: torch.Tensor | None = None,
+    zeros_offset: int = 1,
+    symmetric: bool = False,
+) -> tuple[torch.Tensor, ...]:
+    """A GPTQ int4 linear (``qweight`` ``(K // 8, N)``, ``qzeros`` ``(K // group, N // 8)``, ``scales``
+    ``(K // group, N)``) as the int4 GEMMs' ``(weight, scale, zero)``: ``(N, K // 8)`` uint32, ``(N, K // group)``,
+    ``(N, K // group)`` uint8 or ``None`` for a ``symmetric`` checkpoint (``sym=True``: every zero point 8).
+    ``zeros_offset`` is what the checkpoint subtracted from each zero point before packing: 1 in the original GPTQ
+    format, 0 in ``"gptq_v2"``. An act-order ``g_idx`` (``desc_act=True``: groups scattered across K) sorts K by
+    group, so the weight holds ordinary contiguous groups, and returns that order too, ``(weight, scale, zero,
+    perm)``: ``perm`` ``(K,)`` int32 is the ops' ``b_perm`` (the GEMM contracts ``A[..., perm]``). An identity
+    ``g_idx`` (or none) keeps the three-tensor form."""
+    K = qweight.shape[0] * 8
+    group = K // scales.shape[0]
+    natural = torch.arange(K, device=qweight.device, dtype=torch.int32) // group
+    if g_idx is None or torch.equal(g_idx.to(torch.int32), natural):
+        return _repack_int4(qweight, qzeros, scales, K, False, zeros_offset, symmetric)
+    perm = torch.argsort(g_idx, stable=True).to(torch.int32)
+    if not torch.equal(g_idx.to(torch.int32)[perm.long()], natural):
+        raise ValueError(f"g_idx does not assign exactly {group} K rows to each of its {K // group} groups")
+    return (*_repack_int4(qweight, qzeros, scales, K, False, zeros_offset, symmetric, perm), perm)
+
+
+def fold_act_order_into_gate_up(
+    gate_up: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    gate_up_zero: torch.Tensor | None,
+    gate_up_bias: torch.Tensor | None,
+    down_perm: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Fold an act-order down projection's K order into the gate|up projection that feeds it, at load: the down
+    contracts its input in ``down_perm`` order, so gate|up output pair ``j`` (rows ``2j`` gate, ``2j + 1`` up,
+    interleaved) takes rows ``2 * down_perm[j]`` and ``2 * down_perm[j] + 1``, with their scales, zero points and
+    bias. The GLU output then comes out already in the down's order and the down runs with ``b_perm=None``.
+    ``(E, 2I, ...)`` stacks with ``down_perm`` ``(E, I)``, or one linear: ``(2I, ...)`` with ``(I,)``."""
+    rows = torch.stack([2 * down_perm, 2 * down_perm + 1], dim=-1).flatten(-2).long()  # (..., 2I)
+
+    def take_rows(t):
+        return None if t is None else torch.gather(t, rows.ndim - 1, rows[..., None].expand(*rows.shape, t.shape[-1]))
+
+    bias = None if gate_up_bias is None else torch.gather(gate_up_bias, rows.ndim - 1, rows)
+    return take_rows(gate_up), take_rows(gate_up_scale), take_rows(gate_up_zero), bias
+
+
+def repack_awq_int4(
+    qweight: torch.Tensor, qzeros: torch.Tensor, scales: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """An AWQ (GEMM) int4 linear (``qweight`` ``(K, N // 8)``, ``qzeros`` ``(K // group, N // 8)``, both packed along N
+    in AWQ's interleaved nibble order, ``scales`` ``(K // group, N)``) as the int4 GEMMs' ``(weight, scale, zero)``."""
+    return _repack_int4(qweight, qzeros, scales, qweight.shape[0], True, 0, False)
+
+
+@triton.jit
+def _pack_interleaved_int_tile(q, BITS: tl.constexpr):
+    VPW: tl.constexpr = 32 // BITS
+    j = tl.arange(0, VPW)
+    slot = j // 2 + (j % 2) * (VPW // 2)
+    return tl.sum(q << (BITS * slot)[None, None, :], axis=2)
+
+
+@triton.jit
+def _repack_modelopt_int_kernel(
+    QWeight, W, N, K, stride_e, stride_n, stride_k,
+    BITS: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_W: tl.constexpr,
+):
+    """Signed ModelOpt values to offset-binary, K-interleaved words without an unpacked weight bank."""
+    VPW: tl.constexpr = 32 // BITS
+    n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    w = tl.program_id(1) * BLOCK_W + tl.arange(0, BLOCK_W)
+    j = tl.arange(0, VPW)
+    k = w[:, None] * VPW + j[None, :]
+    if BITS == 4:
+        src_n = n // 2
+    else:
+        src_n = n
+    raw = tl.load(
+        QWeight + tl.program_id(2).to(tl.int64) * stride_e
+        + src_n[:, None, None].to(tl.int64) * stride_n + k[None, :, :] * stride_k,
+        mask=(n < N)[:, None, None] & (k < K)[None, :, :], other=0,
+    ).to(tl.uint32)
+    if BITS == 4:
+        raw >>= (4 * (n % 2))[:, None, None]
+    q = (raw & ((1 << BITS) - 1)) ^ (1 << (BITS - 1))
+    packed = _pack_interleaved_int_tile(q, BITS)
+    tl.store(
+        W + (tl.program_id(2).to(tl.int64) * N + n[:, None]) * (K // VPW) + w[None, :],
+        packed, mask=(n < N)[:, None] & (w < K // VPW)[None, :],
+    )
+
+
+def _repack_modelopt_int(qweight, scales, bits):
+    expected_dtype = torch.uint8 if bits == 4 else torch.int8
+    assert qweight.dtype == expected_dtype and qweight.ndim in (2, 3), (
+        f"ModelOpt INT{bits} weights must be 2D or 3D {expected_dtype}, got {qweight.dtype}/{qweight.ndim}D"
+    )
+    assert scales.device == qweight.device and scales.dtype in (torch.bfloat16, torch.float16, torch.float32), (
+        "ModelOpt weight scales must be bf16/fp16/fp32 on the weight device"
+    )
+    N = qweight.shape[-2] * (2 if bits == 4 else 1)
+    K = qweight.shape[-1]
+    leading = qweight.shape[:-2]
+    if bits == 8 and scales.shape == (*leading, N):
+        scales = scales.unsqueeze(-1)
+    assert scales.ndim == qweight.ndim and scales.shape[:-1] == (*leading, N), (
+        f"ModelOpt weight scales must have shape {(*leading, N, 'K/group')}, got {tuple(scales.shape)}"
+    )
+    groups = scales.shape[-1]
+    vpw = 32 // bits
+    assert groups > 0 and K % groups == 0 and (K // groups) % vpw == 0, (
+        f"K={K} must contain whole scale groups aligned to {vpw} values"
+    )
+    assert bits == 4 or groups == 1, "ModelOpt INT8 weight-only uses one scale per output channel"
+    W = torch.empty(*leading, N, K // vpw, dtype=torch.uint32, device=qweight.device)
+    experts = qweight.shape[0] if qweight.ndim == 3 else 1
+    with device_context(qweight.device):
+        _repack_modelopt_int_kernel[(triton.cdiv(N, 16), triton.cdiv(K // vpw, 16), experts)](
+            qweight, W, N, K, qweight.stride(0) if leading else 0, *qweight.stride()[-2:],
+            BITS=bits, BLOCK_N=16, BLOCK_W=16, num_warps=4,
+        )
+    return W, scales.contiguous(), None
+
+
+def repack_modelopt_int4(
+    qweight: torch.Tensor, scales: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, None]:
+    """ModelOpt ``INT4_AWQ`` / blockwise weight-only export to ``(weight, scale, None)`` for the integer GEMMs.
+
+    ``qweight`` is uint8 ``(..., N // 2, K)``: output row ``2n`` is the low signed two's-complement nibble,
+    row ``2n+1`` the high nibble. ``scales`` is ``(..., N, K // group)``. Returns K-interleaved uint32
+    words ``(..., N, K // 8)`` with implicit zero point 8; scales keep their dtype and calibrated values.
+    Pass the checkpoint's ``pre_quant_scale``, when present, to the GEMM as ``a_pre_quant_scale`` (or fuse it
+    upstream), exactly as in the exported model. This conversion neither applies it nor requantizes weights.
+    ``W4A8_AWQ`` uses the same packing, plus ``activation_format='fp8'``, ``As=input_scale``, and
+    ``b_global_scale=weight_scale_2`` on the GEMM; a repack alone does not apply that recipe.
+    """
+    return _repack_modelopt_int(qweight, scales, 4)
+
+
+def repack_modelopt_int8(
+    qweight: torch.Tensor, scales: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, None]:
+    """ModelOpt ``INT8_WEIGHT_ONLY`` signed int8 ``(..., N, K)`` to the integer GEMMs' K-interleaved uint32
+    words, implicit zero point 128. Per-channel ``scales`` is ``(..., N)`` or ``(..., N, 1)``; returned as
+    ``(..., N, 1)`` without changing its dtype or values. This is W8A16, not INT8 SmoothQuant W8A8.
+    """
+    return _repack_modelopt_int(qweight, scales, 8)
+
+
+@triton.jit
+def _repack_ggml_int_kernel(
+    Blocks, W, Scales, ROWS, GROUPS, BITS: tl.constexpr, BLOCK_R: tl.constexpr, BLOCK_W: tl.constexpr,
+):
+    VPW: tl.constexpr = 32 // BITS
+    BLOCK_BYTES: tl.constexpr = 2 + 32 * BITS // 8
+    r = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
+    w = tl.program_id(1) * BLOCK_W + tl.arange(0, BLOCK_W)
+    k = w[:, None] * VPW + tl.arange(0, VPW)[None, :]
+    block = r[:, None, None].to(tl.int64) * GROUPS + k[None, :, :] // 32
+    qoffset = k % 16 if BITS == 4 else k % 32
+    raw = tl.load(
+        Blocks + block * BLOCK_BYTES + 2 + qoffset[None, :, :],
+        mask=(r < ROWS)[:, None, None] & (k < GROUPS * 32)[None, :, :], other=0,
+    ).to(tl.uint32)
+    if BITS == 4:
+        q = (raw >> (4 * ((k % 32) // 16))[None, :, :]) & 15
+    else:
+        q = raw ^ 128  # signed byte to offset-binary
+    words = _pack_interleaved_int_tile(q, BITS)
+    tl.store(W + r[:, None].to(tl.int64) * (GROUPS * 32 // VPW) + w[None, :], words,
+             mask=(r < ROWS)[:, None] & (w < GROUPS * 32 // VPW)[None, :])
+    group = w // (32 // VPW)
+    scale_ptr = Blocks + (r[:, None].to(tl.int64) * GROUPS + group[None, :]) * BLOCK_BYTES
+    mask = (r < ROWS)[:, None] & (group < GROUPS)[None, :]
+    lo = tl.load(scale_ptr, mask=mask, other=0).to(tl.uint16)
+    hi = tl.load(scale_ptr + 1, mask=mask, other=0).to(tl.uint16)
+    d = (lo | (hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+    tl.store(Scales + r[:, None].to(tl.int64) * GROUPS + group[None, :], d,
+             mask=mask & (w % (32 // VPW) == 0)[None, :])
+
+
+def repack_ggml_int(packed: torch.Tensor, quant_type: str) -> tuple[torch.Tensor, torch.Tensor, None]:
+    """GGML ``Q4_0`` / ``Q8_0`` payload blocks to the existing integer GEMMs, without a GGUF parser.
+
+    ``packed`` is uint8 ``(..., N, K // 32, block_bytes)`` (18 for Q4_0, 34 for Q8_0), in canonical
+    little-endian GGML block order. A GGUF loader reshapes a tensor's raw payload to this shape first.
+    Q4_0 stores the first 16 values in the low nibbles, the next 16 in the high ones; its zero is 8.
+    Q8_0 stores signed int8 values; its zero becomes 128. Both use one FP16 scale per 32 values.
+    Returns ``(interleaved_uint32, fp32_scales, None)``. Scales expand to FP32 because GGML's
+    reference reconstructs weights in FP32 before the GEMM casts them to its activation dtype.
+    No requantization, dense weight bank, or codebook-format approximation is performed.
+    """
+    assert quant_type in ("Q4_0", "Q8_0"), "only affine symmetric GGML Q4_0 and Q8_0 blocks are supported"
+    bits = 4 if quant_type == "Q4_0" else 8
+    block_bytes = 2 + 4 * bits
+    assert packed.dtype == torch.uint8 and packed.ndim in (3, 4) and packed.shape[-1] == block_bytes, (
+        f"{quant_type} needs uint8 (..., N, K // 32, {block_bytes}) payload blocks"
+    )
+    shape = packed.shape[:-2]
+    groups = packed.shape[-2]
+    rows = packed.numel() // (groups * block_bytes)
+    W = torch.empty(*shape, groups * bits, device=packed.device, dtype=torch.uint32)
+    scales = torch.empty(*shape, groups, device=packed.device, dtype=torch.float32)
+    with device_context(packed.device):
+        _repack_ggml_int_kernel[(triton.cdiv(rows, 16), triton.cdiv(groups * bits, 16))](
+            packed.contiguous(), W, scales, rows, groups, BITS=bits, BLOCK_R=16, BLOCK_W=16, num_warps=4,
+        )
+    return W, scales, None

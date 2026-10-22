@@ -31,7 +31,7 @@ ENV_VAR = "FINEGRAINED_AUTOTUNE_CONFIG"
 KEYS = {
     "n_trials": int, "strict": bool, "runoff": bool, "basin_probes": bool,
     "max_refine_iters": int, "log_path": str, "rotate_weights": bool,
-    "key_log_path": str, "call_count_path": str, "tracebacks": bool, "lock_timeout": float,
+    "key_log_path": str, "call_count_path": str, "tracebacks": bool, "lock_timeout": float, "compile_workers": int,
 }
 
 MODES = {
