@@ -382,6 +382,8 @@ def chunk_gla_fwd_kernel_o(
     IS_VARLEN: tl.constexpr,
     USE_GRAPH: tl.constexpr = False,
 ):
+    # Keep in fp32 (some pass it as fp64) which causes issues under compile
+    scale = scale.to(tl.float32)
     i_v, i_t = unflatten_program_id(tl.cdiv(V, BV))
     i_bh = tl.program_id(1).to(tl.int64)
     i_b, i_hv = i_bh // HV, i_bh % HV
