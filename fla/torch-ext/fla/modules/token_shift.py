@@ -156,7 +156,7 @@ def token_shift_fwd_kernel_short(
         for num_warps in NUM_WARPS_AUTOTUNE
         for num_stages in [1, 2, 3]
     ],
-    key=['BD', 'NB'],
+    key=['BD'],
     **autotune_cache_kwargs,
 )
 @triton.jit
@@ -171,7 +171,6 @@ def token_shift_fwd_kernel_long(
     D: tl.constexpr,
     BD: tl.constexpr,
     BT: tl.constexpr,
-    NB: tl.constexpr,
     ND: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
@@ -310,7 +309,7 @@ def token_shift_bwd_kernel_short(
         for num_warps in NUM_WARPS_AUTOTUNE
         for num_stages in [1, 2, 3]
     ],
-    key=['BD', 'NB'],
+    key=['BD'],
     **autotune_cache_kwargs,
 )
 @triton.jit
@@ -325,7 +324,6 @@ def token_shift_bwd_kernel_long(
     D: tl.constexpr,
     BD: tl.constexpr,
     BT: tl.constexpr,
-    NB: tl.constexpr,
     ND: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
@@ -428,7 +426,6 @@ def token_shift_fwd(
 
         BD = triton.next_power_of_2(D)
         ND = triton.cdiv(D, BD)
-        NB = triton.cdiv(B*T, 1024)
 
         def grid(meta): return (ND * NT, 1 if cu_seqlens is not None else N)
         token_shift_fwd_kernel_long[grid](
@@ -442,7 +439,6 @@ def token_shift_fwd(
             D=D,
             BD=BD,
             BT=BT,
-            NB=NB,
             ND=ND,
             STORE_FINAL_STATE=output_cache,
         )
@@ -485,7 +481,6 @@ def token_shift_bwd(
         if chunk_indices is None and cu_seqlens is not None:
             chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
         NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
-        NB = triton.cdiv(N * dy.shape[1], 1024)
         BD = triton.next_power_of_2(D)
         ND = triton.cdiv(D, BD)
 
@@ -501,7 +496,6 @@ def token_shift_bwd(
             D=D,
             BD=BD,
             BT=BT,
-            NB=NB,
             ND=ND,
         )
     return dx, grad_cache_out

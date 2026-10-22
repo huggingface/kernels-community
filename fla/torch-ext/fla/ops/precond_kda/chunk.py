@@ -9,7 +9,7 @@
 
 import torch
 
-from ...modules.l2norm import l2norm_bwd, l2norm_fwd
+from ...modules.norm.l2norm import l2norm_bwd, l2norm_fwd
 from ...ops.atk.chunk_atk_bwd import chunk_atk_bwd
 from ...ops.atk.chunk_atk_fwd import chunk_atk_fwd, recompute_atk_fwd
 from ...ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h

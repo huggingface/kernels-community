@@ -9,7 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ...ops.backends import dispatch
+from ...backends import dispatch
 from ...ops.utils import prepare_chunk_indices
 from ...ops.utils.op import exp2
 from ...utils import autotune_cache_kwargs

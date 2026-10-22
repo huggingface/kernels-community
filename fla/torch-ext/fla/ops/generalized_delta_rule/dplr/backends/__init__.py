@@ -7,9 +7,5 @@
 
 """DPLR backends."""
 
-from .....ops.backends import BackendRegistry, dispatch
 
-dplr_registry = BackendRegistry("generalized_delta_rule.dplr")
-
-
-__all__ = ['dispatch', 'dplr_registry']
+__all__: list[str] = []

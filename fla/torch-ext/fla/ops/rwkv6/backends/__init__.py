@@ -7,9 +7,5 @@
 
 """RWKV6 backends."""
 
-from ....ops.backends import BackendRegistry, dispatch
 
-rwkv6_registry = BackendRegistry("rwkv6")
-
-
-__all__ = ['dispatch', 'rwkv6_registry']
+__all__: list[str] = []

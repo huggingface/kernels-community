@@ -11,7 +11,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ...ops.backends import dispatch
+from ...backends import dispatch
 from ...utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
 

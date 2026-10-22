@@ -7,11 +7,5 @@
 
 """KDA backends."""
 
-from ....ops.backends import BackendRegistry, dispatch
-from ....ops.kda.backends.flash_kda import FlashKDABackend
 
-kda_registry = BackendRegistry("kda")
-kda_registry.register(FlashKDABackend())
-
-
-__all__ = ['dispatch', 'kda_registry']
+__all__: list[str] = []

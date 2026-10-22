@@ -1,6 +1,6 @@
 import torch.nn as nn
 
-from .modules.fused_norm_gate import rms_norm_gated
+from .modules.norm.fused_norm_gate import rms_norm_gated
 from .ops.gated_delta_rule import chunk_gated_delta_rule as chunk_gdn
 from .ops.gated_delta_rule import fused_recurrent_gated_delta_rule as fused_recurrent_gdn
 from .ops.kda import chunk_kda, fused_recurrent_kda

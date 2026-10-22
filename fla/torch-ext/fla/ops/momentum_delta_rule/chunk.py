@@ -7,7 +7,7 @@
 
 import torch
 
-from ...modules.l2norm import l2norm_bwd, l2norm_fwd
+from ...modules.norm.l2norm import l2norm_bwd, l2norm_fwd
 from ...ops.momentum_delta_rule.naive import chunk_momentum_delta_rule_ref
 from ...utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 

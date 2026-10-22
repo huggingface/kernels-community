@@ -7,18 +7,13 @@
 
 """AttnRes backends."""
 
-from ....ops.backends import BackendRegistry, dispatch
 
-attnres_registry = BackendRegistry("attnres")
+__all__: list[str] = []
 
-# gluon.py imports triton.experimental at module load; without this guard, a Triton
-# version without it would break attnres backend registration entirely.
+# gluon.py imports triton.experimental at module load; keep the Ascend backend usable when Gluon is unavailable.
 try:
     from ....ops.attnres.backends.gluon import AttnResGluonBackend
 
-    attnres_registry.register(AttnResGluonBackend())
+    __all__.append('AttnResGluonBackend')
 except ImportError:
     pass
-
-
-__all__ = ['attnres_registry', 'dispatch']

@@ -7,7 +7,7 @@
 
 import torch
 
-from ...modules.l2norm import l2norm_bwd, l2norm_fwd
+from ...modules.norm.l2norm import l2norm_bwd, l2norm_fwd
 from ...ops.common.chunk_h import chunk_bwd_dh
 from ...ops.mesa_net.chunk_cg_solver_bwd import chunk_mesa_cg_bwd
 from ...ops.mesa_net.chunk_cg_solver_fwd import chunk_mesa_cg_fwd

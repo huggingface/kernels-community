@@ -7,9 +7,5 @@
 
 """GLA backends."""
 
-from ....ops.backends import BackendRegistry, dispatch
 
-gla_registry = BackendRegistry("gla")
-
-
-__all__ = ['dispatch', 'gla_registry']
+__all__: list[str] = []

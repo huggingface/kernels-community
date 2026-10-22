@@ -9,7 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ...ops.backends import dispatch
+from ...backends import dispatch
 from ...ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from ...ops.gated_delta_rule.wy_fast import recompute_w_u_fwd
 from ...ops.utils import prepare_chunk_indices, solve_tril

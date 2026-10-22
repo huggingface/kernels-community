@@ -9,7 +9,7 @@ import warnings
 
 import torch
 
-from ....ops.backends import dispatch
+from ....backends import dispatch
 from ....ops.cp import FLACPContext
 from ....ops.cp.chunk_delta_h import (
     chunk_gated_delta_rule_bwd_dhu_pre_process,

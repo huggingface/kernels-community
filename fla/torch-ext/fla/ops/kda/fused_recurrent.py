@@ -13,7 +13,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ...ops.backends import dispatch
+from ...backends import dispatch
 from ...ops.utils.op import exp
 from ...ops.utils.softplus import softplus
 from ...utils import input_guard
@@ -233,7 +233,7 @@ def fused_recurrent_kda_fwd_kernel(
             tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
 
-@dispatch("kda")
+@dispatch('kda')
 def fused_recurrent_kda_fwd(
     q: torch.Tensor,
     k: torch.Tensor,

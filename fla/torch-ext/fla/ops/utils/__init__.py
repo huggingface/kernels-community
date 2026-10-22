@@ -5,8 +5,8 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
-from .csr import prepare_block_csr
-from .cumsum import (
+from ...ops.utils.csr import prepare_block_csr
+from ...ops.utils.cumsum import (
     chunk_global_cumsum,
     chunk_global_cumsum_scalar,
     chunk_global_cumsum_vector,
@@ -14,7 +14,7 @@ from .cumsum import (
     chunk_local_cumsum_scalar,
     chunk_local_cumsum_vector,
 )
-from .index import (
+from ...ops.utils.index import (
     get_max_num_splits,
     prepare_chunk_indices,
     prepare_chunk_indices_static,
@@ -27,13 +27,14 @@ from .index import (
     prepare_sequence_ids,
     prepare_token_indices,
 )
-from .logsumexp import logsumexp_fwd
-from .matmul import addmm, matmul
-from .pack import pack_sequence, unpack_sequence
-from .pooling import mean_pooling
-from .softmax import softmax_bwd, softmax_fwd
-from .softplus import softplus
-from .solve_tril import solve_tril
+from ...ops.utils.logsumexp import logsumexp_fwd
+from ...ops.utils.matmul import addmm, matmul
+from ...ops.utils.pack import pack_sequence, unpack_sequence
+from ...ops.utils.pooling import mean_pooling
+from ...ops.utils.sinkhorn import sinkhorn
+from ...ops.utils.softmax import softmax_bwd, softmax_fwd
+from ...ops.utils.softplus import softplus
+from ...ops.utils.solve_tril import solve_tril
 
 __all__ = [
     "addmm",
@@ -59,9 +60,11 @@ __all__ = [
     "prepare_position_ids",
     "prepare_sequence_ids",
     "prepare_token_indices",
+    "sinkhorn",
     "softmax_bwd",
     "softmax_fwd",
     "softplus",
     "solve_tril",
     "unpack_sequence",
 ]
+
