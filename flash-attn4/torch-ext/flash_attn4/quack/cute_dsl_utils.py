@@ -63,8 +63,23 @@ torch2cute_dtype_map = {
 
 
 @lru_cache
-def get_max_active_clusters(cluster_size):
-    return cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_size=cluster_size)
+def get_device_multiprocessor_count(device_id: int = 0) -> int:
+    return cutlass.utils.HardwareInfo(device_id).get_device_multiprocessor_count()
+
+
+@lru_cache
+def get_max_active_clusters(
+    cluster_size: int,
+    device_capacity: Tuple[int, int] | None = None,
+    device_id: int = 0,
+) -> int:
+    if device_capacity is None:
+        device_capacity = get_device_capacity()
+    if device_capacity[0] < 9:
+        if cluster_size != 1:
+            raise ValueError("SM8x kernels do not support CTA clusters; cluster_size must be 1")
+        return get_device_multiprocessor_count(device_id)
+    return cutlass.utils.HardwareInfo(device_id).get_max_active_clusters(cluster_size=cluster_size)
 
 
 def _parse_arch_str(arch_str: str) -> Tuple[int, int]:
@@ -77,7 +92,7 @@ def _parse_arch_str(arch_str: str) -> Tuple[int, int]:
 
 
 @lru_cache
-def get_device_capacity(device: torch.device = None) -> Tuple[int, int]:
+def _get_device_capacity_cached(device: torch.device = None) -> Tuple[int, int]:
     """Return (major, minor) device capability.
 
     Override with QUACK_ARCH (e.g. 'sm_90' or '90') for CPU-only compilation
@@ -87,6 +102,23 @@ def get_device_capacity(device: torch.device = None) -> Tuple[int, int]:
     if arch_override is not None:
         return _parse_arch_str(arch_override)
     return torch.cuda.get_device_capability(device)
+
+
+def get_device_capacity(
+    device: torch.device | torch.Tensor | None = None,
+) -> Tuple[int, int]:
+    """Return (major, minor) device capability.
+
+    Override with QUACK_ARCH (e.g. 'sm_90' or '90') for CPU-only compilation
+    without a GPU present.
+
+    Accepts either a ``torch.device`` or a tensor and canonicalizes to the
+    underlying device before consulting the cached helper. This avoids leaking
+    tensors through the LRU cache key.
+    """
+    if isinstance(device, torch.Tensor):
+        device = device.device
+    return _get_device_capacity_cached(device)
 
 
 def _partition_fields(obj):

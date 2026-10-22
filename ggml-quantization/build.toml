@@ -1,0 +1,39 @@
+[general]
+name = "ggml-quantization"
+version = 1
+edition = 6
+license = "MIT"
+backends = ["metal"]
+
+[general.hub]
+repo-id = "ggml-org/ggml-quantization"
+
+[torch]
+src = [
+    "torch-ext/torch_binding.cpp",
+    "torch-ext/torch_binding.h",
+]
+
+[kernel.gguf_metal]
+language = "cpp-metal"
+depends = ["torch"]
+include = [
+    "gguf_metal",
+    "torch-ext",
+    "vendor/src",
+    "vendor/src/ggml-metal",
+    "vendor/src/ggml-metal/kernels",
+]
+src = [
+    "gguf_metal/gguf_metal.cpp",
+    "gguf_metal/ggml_dispatch.mm",
+    "gguf_metal/common.h",
+    "vendor/src/ggml-metal/kernels/mul_mv.metal",
+    "vendor/src/ggml-metal/kernels/mul_mm.metal",
+    "vendor/src/ggml-metal/kernels/quantize.metal",
+    "vendor/src/ggml-metal/kernels/common.h",
+    "vendor/src/ggml-metal/kernels/dequantize.h",
+    "vendor/src/ggml-metal/kernels/quantize.h",
+    "vendor/src/ggml-metal/ggml-metal-impl.h",
+    "vendor/src/ggml-common.h",
+]

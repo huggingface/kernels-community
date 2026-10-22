@@ -72,7 +72,7 @@ class KDATileLangBackend(BaseBackend):
         chunk_size: int = 64,
         chunk_indices: torch.LongTensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        from ...ops.kda.backends.tilelang.chunk_bwd_dqkg import (
+        from .....ops.kda.backends.tilelang.chunk_bwd_dqkg import (
             chunk_kda_bwd_wy_dqkg_fused_tilelang,
         )
         return chunk_kda_bwd_wy_dqkg_fused_tilelang(

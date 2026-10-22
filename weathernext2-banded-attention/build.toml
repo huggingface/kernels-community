@@ -1,0 +1,17 @@
+[general]
+name = "weathernext2-banded-attention"
+version = 3
+edition = 6
+license = "Apache-2.0"
+backends = [
+    "cuda",
+    "rocm",
+    "xpu",
+]
+
+[general.hub]
+repo-id = "kernels-community/weathernext2-banded-attention"
+
+[torch-noarch]
+
+[kernel]

@@ -1,5 +1,8 @@
+import kernels
+import pytest
 import torch
-import megablocks
+
+megablocks = kernels.get_kernel("kernels-community/megablocks", version=1)
 
 
 def randn(bs, x, y):
@@ -19,6 +22,8 @@ def gmm(a, b, batch_sizes, trans_b=False):
     return torch.cat(out)
 
 
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_gmm():
     z = 1
     m = 128

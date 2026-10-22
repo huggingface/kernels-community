@@ -40,6 +40,7 @@ BACKEND_TO_WORKFLOWS = {
     "rocm": {"build.yaml"},
     "metal": {"build-mac.yaml"},
     "xpu": {"build.yaml", "build-windows.yaml"},
+    "tpu": {"build.yaml"},
 }
 
 WORKFLOW_TO_BACKENDS = {
@@ -110,21 +111,31 @@ def parse_kernel_arg(token: str) -> tuple[str | None, list[str] | None]:
 
 
 def read_backends(kernel_name: str, ref: str = "") -> list[str] | None:
+    # Ported kernels keep build.toml in <kernel>/src, with flake.nix staying at
+    # <kernel>; every other kernel keeps the two side by side. Try the nested
+    # path first so a ported kernel resolves, then fall back to the flat one.
+    candidates = [f"{kernel_name}/src/build.toml", f"{kernel_name}/build.toml"]
+
     # ref reads build.toml from that revision (the PR branch), not the working tree.
     if ref:
-        try:
-            raw = subprocess.run(
-                ["git", "show", f"{ref}:{kernel_name}/build.toml"],
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout
-        except (FileNotFoundError, subprocess.CalledProcessError):
+        raw = None
+        for candidate in candidates:
+            try:
+                raw = subprocess.run(
+                    ["git", "show", f"{ref}:{candidate}"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout
+                break
+            except (FileNotFoundError, subprocess.CalledProcessError):
+                continue
+        if raw is None:
             return None
         config = tomllib.loads(raw)
     else:
-        build_toml = Path(kernel_name) / "build.toml"
-        if not build_toml.exists():
+        build_toml = next((Path(c) for c in candidates if Path(c).exists()), None)
+        if build_toml is None:
             return None
         with open(build_toml, "rb") as f:
             config = tomllib.load(f)
@@ -611,8 +622,8 @@ def main() -> int:
     parser.add_argument(
         "--mode",
         default="release",
-        choices=["pr", "release"],
-        help="Build mode: pr (CI only) or release (build + upload) (default: release)",
+        choices=["pr", "stage", "release"],
+        help="Build mode: pr (CI only), stage (build + upload + test), or release (build + upload) (default: release)",
     )
     parser.add_argument(
         "--repo",

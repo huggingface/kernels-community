@@ -1,0 +1,37 @@
+[general]
+name = "ggml-attn"
+version = 1
+edition = 6
+license = "MIT"
+backends = ["metal"]
+
+[general.hub]
+repo-id = "ggml-org/ggml-attn"
+
+[torch]
+src = [
+    "torch-ext/torch_binding.cpp",
+    "torch-ext/torch_binding.h",
+]
+
+[kernel.ggml_attn_metal]
+language = "cpp-metal"
+depends = ["torch"]
+include = [
+    "ggml_attn_metal",
+    "torch-ext",
+    "vendor/src",
+    "vendor/src/ggml-metal",
+    "vendor/src/ggml-metal/kernels",
+]
+src = [
+    "ggml_attn_metal/ggml_attn_metal.cpp",
+    "ggml_attn_metal/ggml_dispatch.mm",
+    "ggml_attn_metal/common.h",
+    "ggml_attn_metal/fa.metal",
+    "vendor/src/ggml-metal/kernels/fa.metal.h",
+    "vendor/src/ggml-metal/kernels/common.h",
+    "vendor/src/ggml-metal/kernels/dequantize.h",
+    "vendor/src/ggml-metal/ggml-metal-impl.h",
+    "vendor/src/ggml-common.h",
+]

@@ -121,6 +121,7 @@ struct BwdParam : BwdVarLenParam<VarLen> {
     int num_head_kv;
     int seq_len_q;
     int max_seqlen_q;
+    int total_q;
     int seq_len_q_pad;
     int seq_len_kv;
     int seq_len_kv_pad;
@@ -225,6 +226,12 @@ struct BwdOffset {
         return b_id * param.dv_b_stride + h_id * param.dv_h_stride + s_id * param.dv_r_stride;
     }
     [[nodiscard]] index_t lse_offset(const index_t b_id, const index_t h_id, const index_t s_id) const {
+        if constexpr (VarLen) {
+            return h_id * param.total_q + param.cu_seqlens_q[b_id] + s_id;
+        }
+        return dpsum_offset(b_id, h_id, s_id);
+    }
+    [[nodiscard]] index_t dpsum_offset(const index_t b_id, const index_t h_id, const index_t s_id) const {
         return b_id * param.max_seqlen_q * param.num_head_q + h_id * param.max_seqlen_q + s_id;
     }
     [[nodiscard]] index_t o_offset(const index_t b_id, const index_t h_id, const index_t s_id) const {

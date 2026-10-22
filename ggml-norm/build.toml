@@ -1,0 +1,35 @@
+[general]
+name = "ggml-norm"
+version = 1
+edition = 6
+license = "MIT"
+backends = ["metal"]
+
+[general.hub]
+repo-id = "ggml-org/ggml-norm"
+
+[torch]
+src = [
+    "torch-ext/torch_binding.cpp",
+    "torch-ext/torch_binding.h",
+]
+
+[kernel.ggml_norm_metal]
+language = "cpp-metal"
+depends = ["torch"]
+include = [
+    "ggml_norm_metal",
+    "torch-ext",
+    "vendor/src",
+    "vendor/src/ggml-metal",
+    "vendor/src/ggml-metal/kernels",
+]
+src = [
+    "ggml_norm_metal/ggml_norm_metal.cpp",
+    "ggml_norm_metal/ggml_dispatch.mm",
+    "ggml_norm_metal/common.h",
+    "vendor/src/ggml-metal/kernels/norm.metal",
+    "vendor/src/ggml-metal/kernels/common.h",
+    "vendor/src/ggml-metal/ggml-metal-impl.h",
+    "vendor/src/ggml-common.h",
+]

@@ -31,12 +31,13 @@ void swap_blocks(torch::Tensor &src, torch::Tensor &dst,
       at::mps::MPSStream *stream = at::mps::getCurrentMPSStream();
       TORCH_CHECK(stream, "Failed to get current MPS stream");
 
-      id<MTLCommandBuffer> commandBuffer = stream->commandBuffer();
-      TORCH_CHECK(commandBuffer, "Failed to get MPS command buffer");
-
       dispatch_queue_t serialQueue = stream->queue();
 
       dispatch_sync(serialQueue, ^{
+        stream->endKernelCoalescing();
+        id<MTLCommandBuffer> commandBuffer = stream->commandBuffer();
+        TORCH_CHECK(commandBuffer, "Failed to get MPS command buffer");
+
         id<MTLBlitCommandEncoder> blitEncoder =
             [commandBuffer blitCommandEncoder];
         TORCH_CHECK(blitEncoder, "Failed to create blit command encoder");
@@ -110,8 +111,6 @@ void copy_blocks(const std::vector<torch::Tensor> &key_caches,
     TORCH_CHECK(stream, "Failed to get current MPS stream");
 
     id<MTLDevice> device = stream->device();
-    id<MTLCommandBuffer> cmdBuf = stream->commandBuffer();
-    TORCH_CHECK(cmdBuf, "Failed to get command buffer");
 
     // Load the embedded Metal library from memory
     NSError *error = nil;
@@ -149,7 +148,7 @@ void copy_blocks(const std::vector<torch::Tensor> &key_caches,
 
       dispatch_queue_t q = stream->queue();
       dispatch_sync(q, ^{
-        id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = stream->commandEncoder();
         TORCH_CHECK(enc, "Failed to create compute encoder");
 
         [enc setComputePipelineState:pso];
@@ -184,11 +183,12 @@ void copy_blocks(const std::vector<torch::Tensor> &key_caches,
         MTLSize grid = MTLSizeMake(threadsPerThreadgroup * num_pairs, 1, 1);
 
         [enc dispatchThreads:grid threadsPerThreadgroup:tg];
-        [enc endEncoding];
       });
     }
 
-    stream->synchronize(at::mps::SyncType::COMMIT);
+    dispatch_sync(stream->queue(), ^{
+      stream->synchronize(at::mps::SyncType::COMMIT);
+    });
   }
 }
 
@@ -241,8 +241,6 @@ void reshape_and_cache(
     TORCH_CHECK(stream, "Failed to get current MPS stream");
 
     id<MTLDevice> device = stream->device();
-    id<MTLCommandBuffer> cmdBuf = stream->commandBuffer();
-    TORCH_CHECK(cmdBuf, "Failed to get command buffer");
 
     // Load the embedded Metal library from memory
     NSError *error = nil;
@@ -313,7 +311,7 @@ void reshape_and_cache(
 
     dispatch_queue_t q = stream->queue();
     dispatch_sync(q, ^{
-      id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+      id<MTLComputeCommandEncoder> enc = stream->commandEncoder();
       TORCH_CHECK(enc, "Failed to create compute encoder");
 
       [enc setComputePipelineState:pso];
@@ -399,10 +397,8 @@ void reshape_and_cache(
       MTLSize grid = MTLSizeMake(num_tokens, 1, 1);
 
       [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
-      [enc endEncoding];
+      stream->synchronize(at::mps::SyncType::COMMIT);
     });
-
-    stream->synchronize(at::mps::SyncType::COMMIT);
   }
 }
 
@@ -439,8 +435,6 @@ void reshape_and_cache_flash(
     TORCH_CHECK(stream, "Failed to get current MPS stream");
 
     id<MTLDevice> device = stream->device();
-    id<MTLCommandBuffer> cmdBuf = stream->commandBuffer();
-    TORCH_CHECK(cmdBuf, "Failed to get command buffer");
 
     // Load the embedded Metal library from memory
     NSError *error = nil;
@@ -473,7 +467,7 @@ void reshape_and_cache_flash(
 
     dispatch_queue_t q = stream->queue();
     dispatch_sync(q, ^{
-      id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+      id<MTLComputeCommandEncoder> enc = stream->commandEncoder();
       TORCH_CHECK(enc, "Failed to create compute encoder");
 
       [enc setComputePipelineState:pso];
@@ -539,9 +533,7 @@ void reshape_and_cache_flash(
       MTLSize grid = MTLSizeMake(num_tokens, 1, 1);
 
       [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
-      [enc endEncoding];
+      stream->synchronize(at::mps::SyncType::COMMIT);
     });
-
-    stream->synchronize(at::mps::SyncType::COMMIT);
   }
 }

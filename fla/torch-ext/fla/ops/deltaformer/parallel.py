@@ -23,7 +23,7 @@ except ImportError:
     )
     flash_attn_func = None
 
-from ...utilslayers.utils import pad_input, unpad_input
+from ...utils.layers import pad_input, unpad_input
 
 BLOCK_SIZE_C = 512
 

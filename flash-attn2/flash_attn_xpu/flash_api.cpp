@@ -444,7 +444,7 @@ mha_varlen_fwd(
 
     // Allocate softmax_lse output tensor
     auto opts = q.options().dtype(torch::kFloat32);
-    at::Tensor softmax_lse = torch::zeros({batch_size, num_heads, max_seqlen_q}, opts);
+    at::Tensor softmax_lse = torch::zeros({num_heads, total_q}, opts);
 
     auto queue = c10::xpu::getCurrentXPUStream(device_idx).queue();
 
@@ -592,9 +592,9 @@ mha_varlen_bwd(
                 "k and v head dimensions must match q");
     TORCH_CHECK(num_heads % num_heads_k == 0,
                 "Number of heads in key/value must divide number of heads in query");
-    TORCH_CHECK(softmax_lse_contig.dim() == 3 && softmax_lse_contig.size(0) == batch_size &&
-                softmax_lse_contig.size(1) == num_heads && softmax_lse_contig.size(2) == max_seqlen_q,
-                "softmax_lse must have shape (batch_size, num_heads, max_seqlen_q)");
+    TORCH_CHECK(softmax_lse_contig.dim() == 2 && softmax_lse_contig.size(0) == num_heads &&
+                softmax_lse_contig.size(1) == total_q,
+                "softmax_lse must have shape (num_heads, total_q)");
     const int head_size_padded = round_multiple(head_size_og, 32);
     const bool needs_padding = (head_size_og != head_size_padded);
     const int pad_size = head_size_padded - head_size_og;
@@ -636,6 +636,7 @@ mha_varlen_bwd(
         dv_work = torch::empty({total_k, num_heads_k, head_size_padded}, opts);
     }
 
+    dq_work.zero_();
     at::Tensor softmax_d = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
 
     at::Tensor dk_expanded, dv_expanded;

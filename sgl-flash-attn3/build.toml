@@ -1,6 +1,7 @@
 [general]
 name = "sgl-flash-attn3"
 version = 1
+edition = 6
 license = "BSD-3-Clause"
 backends = ["cuda"]
 
@@ -10,7 +11,7 @@ minver = "12.8"
 maxver = "13.0"
 
 [general.hub]
-repo-id = "sgl-project/sgl-flash-attn3"
+repo-id = "kernels-community/sgl-flash-attn3"
 
 [torch]
 stable-abi = "2.9"
@@ -25,7 +26,7 @@ cxx-flags = [
 ]
 
 [kernel.flash_attn_sm80]
-backend = "cuda"
+language = "cpp-cuda"
 cuda-capabilities = ["8.0"]
 cuda-flags = [
     "-O3",
@@ -198,7 +199,7 @@ src = [
 ]
 
 [kernel.flash_attn]
-backend = "cuda"
+language = "cpp-cuda"
 cuda-capabilities = [
     "8.0",
     "9.0a",
@@ -244,7 +245,7 @@ src = [
 ]
 
 [kernel.flash_attn_sm90]
-backend = "cuda"
+language = "cpp-cuda"
 cuda-capabilities = ["9.0a"]
 cuda-flags = [
     "-O3",

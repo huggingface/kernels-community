@@ -1,0 +1,17 @@
+[general]
+name = "finegrained-kernels"
+version = 0
+edition = 6
+license = "Apache-2.0"
+backends = [
+    "cuda",
+    "rocm",
+    "xpu",
+]
+
+[general.hub]
+repo-id = "kernels-community/finegrained-kernels"
+
+[torch-noarch]
+
+[kernel]

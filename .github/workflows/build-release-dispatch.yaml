@@ -15,15 +15,17 @@ on:
         required: false
         type: string
 
-permissions:
-  actions: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
+permissions: {}
+
 jobs:
   validate:
+    permissions:
+      contents: read
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     outputs:
@@ -38,7 +40,11 @@ jobs:
           KERNEL: ${{ inputs.kernel_name }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            if [ -d "$KERNEL" ] && [ -f "$KERNEL/flake.nix" ] && [ -f "$KERNEL/build.toml" ]; then
+            # Ported kernels keep build.toml in <kernel>/src; the flake stays at
+            # <kernel> and points nix at it.
+            CONFIG="$KERNEL"
+            [ -f "$KERNEL/src/build.toml" ] && CONFIG="$KERNEL/src"
+            if [ -d "$KERNEL" ] && [ -f "$KERNEL/flake.nix" ] && [ -f "$CONFIG/build.toml" ]; then
               echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
               echo "skip=false" >> $GITHUB_OUTPUT
             else
@@ -61,6 +67,9 @@ jobs:
           echo "kernel=$KERNEL"
 
   dispatch:
+    permissions:
+      actions: write
+      contents: read
     needs: validate
     if: needs.validate.outputs.skip == 'false'
     runs-on: ubuntu-latest

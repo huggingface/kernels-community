@@ -1,6 +1,7 @@
 [general]
 name = "cv-utils"
 version = 1
+edition = 6
 license = "Apache-2.0"
 backends = ["cuda"]
 
@@ -13,8 +14,11 @@ src = [
     "torch-ext/torch_binding.h",
 ]
 
+[torch.stable-abi]
+cuda = "2.10"
+
 [kernel.cv_utils]
-backend = "cuda"
+language = "cpp-cuda"
 cuda-flags = [
     "-DCUDA_HAS_FP16=1",
     "-D__CUDA_NO_HALF_OPERATORS__",
@@ -25,4 +29,5 @@ depends = ["torch"]
 src = [
     "cv_utils/connected_components.cu",
     "cv_utils/generic_nms.cu",
+    "cv_utils/stable_utils.h",
 ]

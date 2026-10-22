@@ -1,6 +1,7 @@
 [general]
 name = "quantization-gptq"
 version = 1
+edition = 6
 license = "MIT"
 backends = ["cpu"]
 
@@ -11,7 +12,7 @@ repo-id = "kernels-community/quantization-gptq"
 src = ["torch-ext/torch_binding.cpp"]
 
 [kernel.gptq_cpu]
-backend = "cpu"
+language = "cpp-cpu"
 depends = ["torch"]
 include = ["gptq_cpu"]
 src = [
@@ -22,7 +23,7 @@ src = [
 ]
 
 [kernel.gptq_cpu_avx512]
-backend = "cpu"
+language = "cpp-cpu"
 cxx-flags = [
     "-mfma",
     "-fopenmp",

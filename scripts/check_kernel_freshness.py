@@ -18,12 +18,18 @@ KERNEL_SOURCE_MAPPING = {
     "deformable-detr": "",
     "einops": "https://github.com/arogozhnikov/einops",
     "finegrained-fp8": "",
+    "finegrained-kernels": "",
     "flash-attn-ops": "https://github.com/Dao-AILab/flash-attention",
+    "topk": "",
     "flash-attn2": "https://github.com/Dao-AILab/flash-attention",
     "flash-attn3": "https://github.com/Dao-AILab/flash-attention",
     "flash-attn4": "https://github.com/Dao-AILab/flash-attention",
     "flash-mla": "https://github.com/deepseek-ai/FlashMLA",
     "fp8-fbgemm": "https://github.com/pytorch/FBGEMM",
+    "ggml-attn": "https://github.com/ggml-org/llama.cpp",
+    "ggml-gated-delta-net": "https://github.com/ggml-org/llama.cpp",
+    "ggml-norm": "https://github.com/ggml-org/llama.cpp",
+    "ggml-quantization": "https://github.com/ggml-org/llama.cpp",
     "gpt-oss-metal-kernels": "https://github.com/openai/gpt-oss",
     "layer-norm": "https://github.com/Dao-AILab/flash-attention",
     "mamba-ssm": "https://github.com/state-spaces/mamba",
@@ -42,6 +48,7 @@ KERNEL_SOURCE_MAPPING = {
     "scattermoe": "https://github.com/shawntan/scattermoe",
     "sgl-flash-attn3": "https://github.com/sgl-project/sgl-flash-attn",
     "sonic-moe": "https://github.com/Dao-AILab/sonic-moe",
+    "tdt-loss": "",
     "tinygrad-rms": "https://github.com/tinygrad/tinygrad",
     "trimul-gpumode": "https://github.com/davidberard98/gpumode-trimul",
     "triton-kernels": "https://github.com/triton-lang/triton.git",
@@ -60,12 +67,15 @@ KERNEL_SOURCE_MAPPING = {
     "aiter-flash-attn": "https://github.com/ROCm/aiter",
     "aiter-flash-attn-ck": "https://github.com/ROCm/aiter",
     "aiter-kernels": "https://github.com/ROCm/aiter",
+    "aiter-sage-attention": "https://github.com/ROCm/aiter",
     # Too much stuff happening in vLLM, not worth reporting as MoE freshness.
     "vllm-moe": "",
     "fla": "github.com/fla-org/flash-linear-attention",
     "nvfp4-gemm": "",
     # Developed in-house; upstream is a Hub kernel repo, not a GitHub project.
     "esmfold2-trimul": "",
+    # Written for this repo, so there is no upstream to track.
+    "weathernext2-banded-attention": "",
 }
 
 def parse_args() -> argparse.Namespace:

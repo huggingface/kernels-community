@@ -1,21 +1,40 @@
 [general]
 name = "causal-conv1d"
-version = 1
+version = 2
+edition = 6
 license = "BSD-3-Clause"
-backends = ["cuda"]
+backends = [
+    "cuda",
+    "xpu",
+]
 
 [general.hub]
 repo-id = "kernels-community/causal-conv1d"
 
 [torch]
 src = [
-    "torch-ext/pytorch_shim.h",
     "torch-ext/torch_binding.cpp",
     "torch-ext/torch_binding.h",
 ]
 
+[torch.stable-abi]
+cuda = "2.10"
+xpu = "2.13"
+
+[kernel.causal_conv1d_xpu]
+language = "cpp-xpu"
+depends = ["torch"]
+include = ["causal-conv1d-xpu"]
+src = [
+    "causal-conv1d-xpu/causal_conv1d_xpu_bwd.cpp",
+    "causal-conv1d-xpu/causal_conv1d_xpu_common.hpp",
+    "causal-conv1d-xpu/causal_conv1d_xpu_fwd.cpp",
+    "causal-conv1d-xpu/causal_conv1d_xpu.hpp",
+    "causal-conv1d-xpu/causal_conv1d_xpu_update.cpp",
+]
+
 [kernel.causal_conv1d]
-backend = "cuda"
+language = "cpp-cuda"
 depends = ["torch"]
 include = ["causal-conv1d"]
 src = [

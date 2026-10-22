@@ -18,7 +18,7 @@ import torch
 from ....ops.backends import BaseBackend
 
 if TYPE_CHECKING:
-    from ...ops.cp import FLACPContext
+    from ....ops.cp import FLACPContext
 
 
 class FlashKDABackend(BaseBackend):

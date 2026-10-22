@@ -1,6 +1,7 @@
 [general]
 name = "paged-attention"
-version = 1
+version = 2
+edition = 6
 license = "Apache-2.0"
 backends = [
     "cuda",
@@ -17,8 +18,69 @@ src = [
     "torch-ext/torch_binding.h",
 ]
 
+[torch.stable-abi]
+cuda = "2.10"
+rocm = "2.10"
+
+[kernel.paged_attention_rocm]
+language = "cpp-rocm"
+depends = ["torch"]
+rocm-archs = [
+    "gfx906",
+    "gfx908",
+    "gfx90a",
+    "gfx940",
+    "gfx941",
+    "gfx942",
+    "gfx1030",
+    "gfx1100",
+    "gfx1101",
+]
+include = [
+    "cuda-utils",
+    "paged-attention",
+]
+src = [
+    "cuda-utils/cuda_utils.h",
+    "paged-attention/attention/attention_dtypes.h",
+    "paged-attention/attention/attention_generic.cuh",
+    "paged-attention/attention/attention_kernels.cuh",
+    "paged-attention/attention/attention_utils.cuh",
+    "paged-attention/attention/dtype_bfloat16.cuh",
+    "paged-attention/attention/dtype_float16.cuh",
+    "paged-attention/attention/dtype_float32.cuh",
+    "paged-attention/attention/dtype_fp8.cuh",
+    "paged-attention/attention/paged_attention_v1.cu",
+    "paged-attention/attention/paged_attention_v2.cu",
+    "paged-attention/cache_kernels.cu",
+    "paged-attention/cuda_compat.h",
+    "paged-attention/dispatch_utils.h",
+    "paged-attention/quantization/fp8/amd/quant_utils.cuh",
+    "paged-attention/quantization/fp8/nvidia/quant_utils.cuh",
+    "paged-attention/stable_utils.h",
+]
+
+[kernel.cuda_utils_rocm]
+language = "cpp-rocm"
+depends = ["torch"]
+rocm-archs = [
+    "gfx906",
+    "gfx908",
+    "gfx90a",
+    "gfx940",
+    "gfx941",
+    "gfx942",
+    "gfx1030",
+    "gfx1100",
+    "gfx1101",
+]
+src = [
+    "cuda-utils/cuda_utils.h",
+    "cuda-utils/cuda_utils_kernels.cu",
+]
+
 [kernel.paged_attention]
-backend = "cuda"
+language = "cpp-cuda"
 depends = ["torch"]
 include = [
     "cuda-utils",
@@ -41,10 +103,19 @@ src = [
     "paged-attention/dispatch_utils.h",
     "paged-attention/quantization/fp8/amd/quant_utils.cuh",
     "paged-attention/quantization/fp8/nvidia/quant_utils.cuh",
+    "paged-attention/stable_utils.h",
+]
+
+[kernel.cuda_utils]
+language = "cpp-cuda"
+depends = []
+src = [
+    "cuda-utils/cuda_utils.h",
+    "cuda-utils/cuda_utils_kernels.cu",
 ]
 
 [kernel.paged_attention_metal]
-backend = "metal"
+language = "cpp-metal"
 depends = ["torch"]
 include = ["."]
 src = [
@@ -58,68 +129,4 @@ src = [
     "paged-attention-metal/cache.mm",
     "paged-attention-metal/convert_fp8.mm",
     "paged-attention-metal/device.mm",
-]
-
-[kernel.cuda_utils]
-backend = "cuda"
-depends = []
-src = [
-    "cuda-utils/cuda_utils.h",
-    "cuda-utils/cuda_utils_kernels.cu",
-]
-
-[kernel.paged_attention_rocm]
-backend = "rocm"
-depends = ["torch"]
-rocm-archs = [
-    "gfx906",
-    "gfx908",
-    "gfx90a",
-    "gfx940",
-    "gfx941",
-    "gfx942",
-    "gfx1030",
-    "gfx1100",
-    "gfx1101",
-]
-include = [
-    "cuda-utils",
-    "paged-attention",
-]
-src = [
-    "cuda-utils/cuda_utils.h",
-    "paged-attention/attention/attention_dtypes.h",
-    "paged-attention/attention/attention_generic.cuh",
-    "paged-attention/attention/attention_kernels.cuh",
-    "paged-attention/attention/attention_utils.cuh",
-    "paged-attention/attention/dtype_bfloat16.cuh",
-    "paged-attention/attention/dtype_float16.cuh",
-    "paged-attention/attention/dtype_float32.cuh",
-    "paged-attention/attention/dtype_fp8.cuh",
-    "paged-attention/attention/paged_attention_v1.cu",
-    "paged-attention/attention/paged_attention_v2.cu",
-    "paged-attention/cache_kernels.cu",
-    "paged-attention/cuda_compat.h",
-    "paged-attention/dispatch_utils.h",
-    "paged-attention/quantization/fp8/amd/quant_utils.cuh",
-    "paged-attention/quantization/fp8/nvidia/quant_utils.cuh",
-]
-
-[kernel.cuda_utils_rocm]
-backend = "rocm"
-depends = ["torch"]
-rocm-archs = [
-    "gfx906",
-    "gfx908",
-    "gfx90a",
-    "gfx940",
-    "gfx941",
-    "gfx942",
-    "gfx1030",
-    "gfx1100",
-    "gfx1101",
-]
-src = [
-    "cuda-utils/cuda_utils.h",
-    "cuda-utils/cuda_utils_kernels.cu",
 ]

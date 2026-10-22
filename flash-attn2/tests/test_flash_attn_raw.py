@@ -1,5 +1,7 @@
+import kernels
 import torch
-import flash_attn
+
+flash_attn2 = kernels.get_kernel("kernels-community/flash-attn2", version=3)
 
 # make reproducible
 torch.manual_seed(0)
@@ -41,7 +43,7 @@ def test_flash_attn():
     print(f"Query sum: {query.sum().item()}")
 
     # Test non-causal flash attention
-    out, softmax_lse, p, rng_state = flash_attn.fwd(
+    out, softmax_lse, p, rng_state = flash_attn2.fwd(
         q=query,
         k=key,
         v=value,
@@ -60,7 +62,7 @@ def test_flash_attn():
 
     # Test causal attention
     print("\n--- Testing with causal=True ---")
-    out_causal, _, _, _ = flash_attn.fwd(
+    out_causal, _, _, _ = flash_attn2.fwd(
         q=query,
         k=key,
         v=value,
@@ -150,7 +152,7 @@ def test_mha_varlen_fwd():
     print(f"Golden truth shape: {golden_truth.shape}")
 
     # Run flash attention varlen
-    out, softmax_lse, p, rng_state = flash_attn.varlen_fwd(
+    out, softmax_lse, p, rng_state = flash_attn2.varlen_fwd(
         q=query,
         k=key,
         v=value,
@@ -174,7 +176,7 @@ def test_mha_varlen_fwd():
 
     # Test with causal attention
     print("\n--- Testing with causal=True ---")
-    out_causal, _, _, _ = flash_attn.varlen_fwd(
+    out_causal, _, _, _ = flash_attn2.varlen_fwd(
         q=query,
         k=key,
         v=value,

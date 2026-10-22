@@ -13,7 +13,7 @@ on:
         required: false
         type: string
       mode:
-        description: "Build mode: pr (CI only) or release (build + upload)"
+        description: "Build mode: pr (CI only), stage (build + upload + test), or release (build + upload)"
         required: false
         type: string
         default: "release"
@@ -58,22 +58,34 @@ on:
         type: string
         default: ""
 
-permissions:
-  contents: read
-  statuses: write
 
+# These build workflows are reachable only via workflow_dispatch, so `github.head_ref`
+# is always empty and the group used to collapse to `github.run_id` -- unique per run,
+# which made `cancel-in-progress` a no-op. Key off the dispatch inputs instead so a newer
+# build supersedes the one still in flight for the same PR + kernel (the platform is
+# already distinguished by `github.workflow`, so unrelated kernels/platforms on the same
+# PR are untouched). `upload` stays in the key so a cheap PR CI build cannot cancel a
+# `/kernel-bot build-and-stage` mid Hub upload. Dispatches without a `pr_number` (releases
+# off the default branch) still fall back to `run_id` and are never cancelled.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ inputs.pr_number || github.run_id }}-${{ inputs.kernel_name }}-upload-${{ inputs.upload }}
   cancel-in-progress: true
+
+permissions: {}
 
 jobs:
   # Validate inputs, resolve the kernel directory, and generate the build matrix.
   setup:
+    permissions:
+      contents: read
+      statuses: write
     runs-on: ubuntu-latest
     outputs:
       skip: ${{ steps.validate.outputs.skip }}
       kernel: ${{ steps.validate.outputs.kernel }}
+      config: ${{ steps.validate.outputs.config }}
       matrix: ${{ steps.matrix.outputs.matrix }}
+      tpu-kernel: ${{ steps.matrix.outputs.tpu-kernel }}
     steps:
       # Reject kernel names outside the safe charset before any step uses them.
       # Accepts e.g.: flash-attn3, rejects: $(myevilcommand).
@@ -148,8 +160,14 @@ jobs:
         env:
           KERNEL: ${{ inputs.kernel_name }}
         run: |
-          if [ -d "$KERNEL" ] && [ -f "$KERNEL/flake.nix" ] && [ -f "$KERNEL/build.toml" ]; then
+          # Ported kernels keep their generated tree in <kernel>/src, with the
+          # flake staying at <kernel> and pointing nix at it. Everything else
+          # keeps build.toml beside flake.nix.
+          CONFIG="$KERNEL"
+          [ -f "$KERNEL/src/build.toml" ] && CONFIG="$KERNEL/src"
+          if [ -d "$KERNEL" ] && [ -f "$KERNEL/flake.nix" ] && [ -f "$CONFIG/build.toml" ]; then
             echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
+            echo "config=$CONFIG" >> $GITHUB_OUTPUT
             echo "skip=false" >> $GITHUB_OUTPUT
           else
             echo "skip=true" >> $GITHUB_OUTPUT
@@ -159,10 +177,10 @@ jobs:
       - name: Check that repo-id is present
         if: steps.validate.outputs.skip == 'false' && inputs.mode == 'pr'
         env:
-          KERNEL: ${{ steps.validate.outputs.kernel }}
+          CONFIG: ${{ steps.validate.outputs.config }}
         run: |
-          if ! cat $KERNEL/build.toml | nix run nixpkgs#dasel -- -i toml '$root.general.hub.get("repo-id")' &> /dev/null ; then
-            echo "Mandatory repo-id is missing in $KERNEL/build.toml"
+          if ! cat $CONFIG/build.toml | nix run nixpkgs#dasel -- -i toml '$root.general.hub.get("repo-id")' &> /dev/null ; then
+            echo "Mandatory repo-id is missing in $CONFIG/build.toml"
             exit 1
           fi
 
@@ -184,6 +202,11 @@ jobs:
           ARM_BACKENDS=$(cd "$KERNEL" && nix eval .#${NIX_TARGET} --apply builtins.attrNames --json --system aarch64-linux)
           MATRIX=$(python3 .github/workflows/generate-build-matrix.py "$X86_BACKENDS" "$ARM_BACKENDS")
           echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          TPU_KERNEL=$(python3 -c 'import json, sys; print(str("tpu" in json.loads(sys.argv[1])).lower())' "$X86_BACKENDS")
+          echo "tpu-kernel=$TPU_KERNEL" >> "$GITHUB_OUTPUT"
+          if [ "$TPU_KERNEL" = "true" ]; then
+            echo "TPU support is build-only: hardware tests are not run and test closures are not uploaded." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   # Compile the kernel for each (backend, arch) pair; release mode also uploads to the Hub.
   build-kernel:
@@ -228,6 +251,53 @@ jobs:
         env:
           USER: runner
 
+      - name: Install TPU prefetch tools
+        if: matrix.backend == 'tpu'
+        run: echo "$(nix build nixpkgs#jq --no-link --print-out-paths)/bin" >> "$GITHUB_PATH"
+
+      # Match the Windows workflow: use the kernel's pinned builder helpers.
+      - name: Kernel extract required builder version
+        if: matrix.backend == 'tpu'
+        id: extract-builder-version
+        env:
+          KERNEL: ${{ needs.setup.outputs.kernel }}
+        run: |
+          REVISION=$(jq -er '.nodes["kernel-builder"].locked.rev' "$KERNEL/flake.lock")
+          echo "revision=$REVISION" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout kernels
+        if: matrix.backend == 'tpu'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: huggingface/kernels
+          ref: ${{ steps.extract-builder-version.outputs.revision }}
+          path: kernels
+
+      - name: Resolve TPU wheel versions
+        if: matrix.backend == 'tpu'
+        env:
+          KERNEL: ${{ needs.setup.outputs.kernel }}
+        run: |
+          # requireFile names include the versions and ABI expected by this lockfile.
+          # Newer Nix wraps the output as {"derivations": {...}, "version": N};
+          # older versions emit the derivations as the top-level object.
+          cd "$KERNEL"
+          nix derivation show --recursive .#redistributable.torch-tpu | jq -er '
+            [(.derivations // .)[] | .env.name // "" |
+              capture("^(?<package>torch_tpu|libtpu)-(?<version>[A-Za-z0-9.]+)-(?<abi>cp[0-9]+)-\\k<abi>-manylinux_2_31_x86_64[.]whl$")]
+            | unique
+            | .[] | [.package, .version, .abi] | @tsv
+          ' > "$RUNNER_TEMP/tpu-wheels.tsv"
+
+      - name: Prefetch gated TPU wheels
+        if: matrix.backend == 'tpu'
+        env:
+          GCLOUD_ACCESS_TOKEN: ${{ secrets.GCLOUD_ACCESS_TOKEN }}
+        run: |
+          while IFS=$'\t' read -r package version abi; do
+            bash kernels/nix-builder/scripts/helpers/prefetch-tpu-wheel.sh "$package" "$version" "$abi"
+          done < "$RUNNER_TEMP/tpu-wheels.tsv"
+
       # PR mode builds backendCi (single representative variant);
       # release mode builds backendBundle (full set of variants).
       - name: Build kernel
@@ -236,12 +306,24 @@ jobs:
           MODE: ${{ inputs.mode }}
           BACKEND: ${{ matrix.backend }}
         run: |
-          if [ "$MODE" = "pr" ]; then
+          if [ "$BACKEND" = "tpu" ]; then
+            ( cd "$KERNEL" && nix build -L .#redistributable.torch-tpu && ls -l result/ )
+          elif [ "$MODE" = "pr" ]; then
             ( cd "$KERNEL" && nix build -L ".#backendCi.$BACKEND" && ls -l result/ )
           else
             ( cd "$KERNEL" && nix build -L ".#backendBundle.$BACKEND" && ls -l result/ )
           fi
           ( cd "$KERNEL" && cp -rL result build && rm result && chmod -R u+w build )
+
+      # Direct builds already contain the variant directory, but lack the bundle card.
+      - name: Fill TPU kernel card
+        if: matrix.backend == 'tpu' && inputs.mode != 'pr'
+        env:
+          KERNEL: ${{ needs.setup.outputs.kernel }}
+        run: |
+          if [ -f "$KERNEL/CARD.md" ]; then
+            nix run -L github:huggingface/kernels#kernel-builder -- fill-card "$KERNEL" "$KERNEL/build/CARD.md"
+          fi
 
       # cosign-installer >= v4.1.1 requires envsubst (gettext), which is not
       # preinstalled on the custom runner images.
@@ -287,15 +369,18 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           KERNEL: ${{ needs.setup.outputs.kernel }}
+          CONFIG: ${{ needs.setup.outputs.config }}
           REPO_PREFIX: ${{ inputs.repo_prefix }}
         run: |
           TARGET_FLAG=$(python3 .github/scripts/hub_pr_upload_args.py upload-args "$KERNEL" "$REPO_PREFIX")
+          # Resolve before the cd: CONFIG is repo-root relative and may be <kernel>/src.
+          BUILD_TOML="$PWD/$CONFIG/build.toml"
           cd "$KERNEL"
 
           # Check if build.toml exists, has version = 1, and does not specify a branch.
-          if [ -f "build.toml" ]; then
-            VERSION=$(grep -E '^\s*version\s*=\s*1\s*$' build.toml || true)
-            BRANCH=$(grep -E '^\s*branch\s*=' build.toml || true)
+          if [ -f "$BUILD_TOML" ]; then
+            VERSION=$(grep -E '^\s*version\s*=\s*1\s*$' "$BUILD_TOML" || true)
+            BRANCH=$(grep -E '^\s*branch\s*=' "$BUILD_TOML" || true)
             if [ -n "$VERSION" ] && [ -z "$BRANCH" ]; then
               nix run -L github:huggingface/kernels#kernel-builder -- upload \
                 --repo-type kernel $TARGET_FLAG --branch main \
@@ -313,9 +398,12 @@ jobs:
 
   # Build the ci-test derivation and export its Nix closure as an artifact
   # so the GPU test job can import it on a GPU-enabled runner.
+  # `stage` uploads like `release` but tests too, so the tests run post-upload.
   build-ci-test:
+    permissions:
+      contents: read
     needs: setup
-    if: needs.setup.outputs.skip == 'false' && inputs.mode == 'pr'
+    if: needs.setup.outputs.skip == 'false' && needs.setup.outputs.tpu-kernel != 'true' && (inputs.mode == 'pr' || inputs.mode == 'stage')
     runs-on:
       group: aws-highmemory-32-plus-nix
     timeout-minutes: 600 # 10h
@@ -377,8 +465,9 @@ jobs:
   # Import the ci-test closure onto a GPU runner and execute the test suite.
   # Runs after both build-kernel and build-ci-test complete.
   test-kernel-gpu:
+    permissions: {}
     needs: [setup, build-kernel, build-ci-test]
-    if: needs.setup.outputs.skip == 'false' && inputs.mode == 'pr'
+    if: needs.setup.outputs.skip == 'false' && needs.setup.outputs.tpu-kernel != 'true' && (inputs.mode == 'pr' || inputs.mode == 'stage')
     runs-on:
       group: aws-g6-12xlarge-plus
     steps:
@@ -483,5 +572,5 @@ jobs:
           REPO_PREFIX: ${{ inputs.repo_prefix }}
         run: |
           BODY=$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$BOT_COMMENT_ID" --jq .body)
-          BODY=$(python3 .github/scripts/format_hub_upload_comment.py --base "$BODY" "$KERNEL" "$REPO_PREFIX" hub-uploads/**/*.json)
+          BODY=$(python3 .github/scripts/format_hub_upload_comment.py --base "$BODY" "$KERNEL" "$REPO_PREFIX" hub-uploads)
           gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$BOT_COMMENT_ID" -f body="$BODY"

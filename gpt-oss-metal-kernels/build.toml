@@ -1,6 +1,7 @@
 [general]
 name = "gpt-oss-metal-kernels"
 version = 1
+edition = 6
 license = "MIT"
 backends = ["metal"]
 
@@ -14,7 +15,7 @@ src = [
 ]
 
 [kernel.gpt_oss_metal_kernels]
-backend = "metal"
+language = "cpp-metal"
 depends = ["torch"]
 include = [
     "gptoss_kernels/source/include",

@@ -1,0 +1,39 @@
+[general]
+name = "ggml-gated-delta-net"
+version = 1
+edition = 6
+license = "MIT"
+backends = ["metal"]
+
+[general.hub]
+repo-id = "ggml-org/ggml-gated-delta-net"
+
+[torch]
+src = [
+    "torch-ext/torch_binding.cpp",
+    "torch-ext/torch_binding.h",
+]
+
+[kernel.ggml_gdn_metal]
+language = "cpp-metal"
+depends = ["torch"]
+include = [
+    "ggml_gdn_metal",
+    "torch-ext",
+    "vendor/src",
+    "vendor/src/ggml-metal",
+    "vendor/src/ggml-metal/kernels",
+]
+src = [
+    "ggml_gdn_metal/ggml_gdn_metal.cpp",
+    "ggml_gdn_metal/ggml_dispatch.mm",
+    "ggml_gdn_metal/common.h",
+    "ggml_gdn_metal/delta_gates.metal",
+    "ggml_gdn_metal/rms_norm_gate.metal",
+    "ggml_gdn_metal/causal_conv.metal",
+    "vendor/src/ggml-metal/kernels/gated_delta_net.metal",
+    "vendor/src/ggml-metal/kernels/norm.metal",
+    "vendor/src/ggml-metal/kernels/common.h",
+    "vendor/src/ggml-metal/ggml-metal-impl.h",
+    "vendor/src/ggml-common.h",
+]

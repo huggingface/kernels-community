@@ -18,9 +18,11 @@
 # ///
 import argparse
 import ast
+import enum
 import json
 import sys
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 
 import pygit2
@@ -28,6 +30,14 @@ import pygit2
 # Private by name but still part of the public contract.
 PUBLIC_DUNDERS = {"__init__", "__call__"}
 CPP_EXT = (".cpp", ".cc", ".cxx", ".cu", ".cuh", ".h", ".hpp", ".hh")
+# A ported kernel is generated into <kernel>/src, leaving only the flake and the
+# port recipe beside it; every other kernel keeps its manifest at the top level.
+# Resolve to whichever directory actually holds build.toml.
+def kernel_root(root: Path) -> Path:
+    nested = root / "src"
+    return nested if (nested / "build.toml").is_file() else root
+
+
 # Python package lives under a build-variant dir, e.g. torch-ext or tvm-ffi-ext.
 EXT_SUFFIX = "-ext"
 
@@ -46,6 +56,7 @@ class Source:
 
     @staticmethod
     def from_disk(root: Path) -> "Source":
+        root = kernel_root(root)
         if not root.is_dir():
             return Source({}, None)
         files = {
@@ -61,6 +72,15 @@ class Source:
             return Source({}, None)
         if not isinstance(obj, pygit2.Tree):
             return Source({}, None)
+        # Ported kernels keep the generated tree one level down; see kernel_root.
+        try:
+            nested = obj["src"]
+            obj["src/build.toml"]
+        except KeyError:
+            pass
+        else:
+            if nested.type_str == "tree":
+                obj = repo[nested.id]
         files = {}
 
         def walk(tree, prefix):
@@ -316,6 +336,41 @@ def extract_api(src: Source) -> dict:
     return api
 
 
+# Version and build-flavour metadata from a kernel's build.toml.
+
+
+def _build_toml(src: Source) -> dict:
+    if not src.is_file("build.toml"):
+        return {}
+    try:
+        return tomllib.loads(src.read("build.toml"))
+    except tomllib.TOMLDecodeError:
+        return {}
+
+
+def kernel_version(src: Source):
+    return _build_toml(src).get("general", {}).get("version")
+
+
+# Build flavours where adding a symbol cannot break already-published
+# variants, because every variant is refreshed by the next build: no-arch
+# kernels ship a single variant, and stable-ABI kernels keep one build working
+# across Torch versions. Removals and signature changes still need a bump.
+class Flavour(enum.StrEnum):
+    NO_ARCH = "no-arch"
+    STABLE_ABI = "stable-ABI"
+
+
+# The flavour that exempts this kernel from a bump on additions, if any.
+def additive_safe(src: Source) -> Flavour | None:
+    data = _build_toml(src)
+    if "torch-noarch" in data:
+        return Flavour.NO_ARCH
+    if "stable-abi" in data.get("torch", {}):
+        return Flavour.STABLE_ABI
+    return None
+
+
 # Resolve a branch/tag/SHA via libgit2.
 def resolve_ref(repo, ref: str):
     return repo.revparse_single(ref).peel(pygit2.Commit)
@@ -326,7 +381,10 @@ def changed_kernels(base_tree, head_tree) -> list:
     for delta in base_tree.diff_to_tree(head_tree).deltas:
         for path in (delta.old_file.path, delta.new_file.path):
             top = path.split("/", 1)[0]
-            if "/" in path and (Path(top) / "build.toml").is_file():
+            if "/" in path and (
+                (Path(top) / "build.toml").is_file()
+                or (Path(top) / "src" / "build.toml").is_file()
+            ):
                 found.add(top)
     return sorted(found)
 
@@ -346,11 +404,36 @@ def _tree(items: list) -> None:
             print(f"     {'  ' if last else '| '} {d}")
 
 
+# __all__ is a single API entry per module, so exporting a new name shows up as a
+# changed entry rather than an added one. Detecting the superset case classifies
+# it as additive instead: it still needs a version bump, but it stays eligible for
+# the no-arch and stable-ABI exemptions, which removals and signature changes are
+# not.
+def _all_grew(base: str, head: str) -> bool:
+    try:
+        old = ast.literal_eval(base)
+        new = ast.literal_eval(head)
+    except (ValueError, SyntaxError):
+        return False
+    return isinstance(old, list) and isinstance(new, list) and set(old) < set(new)
+
+
+@dataclass(frozen=True)
+class ApiDiff:
+    breaking: bool
+    additive: bool
+
+
+# Breaking covers symbols that were removed or whose signature changed;
+# additive covers newly exposed ones. Both require a version bump.
 def report(
     kernel: str, base: dict, head: dict, limit: int = 20, preview: int = 6
-) -> bool:
+) -> ApiDiff:
+    # In the baseline, gone from the head.
     removed = sorted(k for k in base if k not in head)
+    # In both, but with a different signature.
     changed = sorted(k for k in base if k in head and base[k] != head[k])
+    # In the head only.
     added = sorted(k for k in head if k not in base)
 
     if not (removed or changed or added):
@@ -360,7 +443,7 @@ def report(
         if len(keys) > preview:
             items.append((f"... and {len(keys) - preview} more", []))
         _tree(items)
-        return False
+        return ApiDiff(breaking=False, additive=False)
 
     counts = ", ".join(
         f"{n} {label}"
@@ -380,7 +463,17 @@ def report(
     if len(items) > limit:
         items = items[:limit] + [(f"... and {len(items) - limit} more", [])]
     _tree(items)
-    return True
+
+    # Changed `__all__` entries that only gained names.
+    grown = [
+        k for k in changed if k.endswith(" __all__") and _all_grew(base[k], head[k])
+    ]
+    # Everything else that changed is a real signature change.
+    signature_changed = set(changed) - set(grown)
+    return ApiDiff(
+        breaking=bool(removed or signature_changed),
+        additive=bool(added or grown),
+    )
 
 
 def main() -> int:
@@ -435,19 +528,55 @@ def main() -> int:
         print("  (no kernel sources changed)")
         return 0
 
-    changed = False
+    unbumped = False
     for kernel in kernels:
         if not Path(kernel).is_dir():
             print(f"  [skip] {kernel}: directory not found")
             continue
-        base_api = extract_api(Source.from_tree(repo, base_tree, kernel))
-        head_api = extract_api(Source.from_disk(Path(kernel)))
-        if report(kernel, base_api, head_api):
-            changed = True
+        base_src = Source.from_tree(repo, base_tree, kernel)
+        head_src = Source.from_disk(Path(kernel))
+        # A kernel added by this PR has no baseline API to diff against, and no
+        # published variants that could go stale.
+        if not base_src.is_file("build.toml"):
+            print(f"  [new] {kernel}: not in the base tree, nothing to compare")
+            continue
 
-    if changed:
+        diff = report(kernel, extract_api(base_src), extract_api(head_src))
+        if not (diff.breaking or diff.additive):
+            continue
+
+        old_version = kernel_version(base_src)
+        new_version = kernel_version(head_src)
+        if (
+            isinstance(old_version, int)
+            and isinstance(new_version, int)
+            and new_version > old_version
+        ):
+            print(f"     => version bumped {old_version} -> {new_version}")
+            continue
+
+        flavour = additive_safe(head_src)
+        if diff.additive and not diff.breaking and flavour is not None:
+            print(f"     => additions only on a {flavour} kernel, bump not required")
+            continue
+
+        print(f"     => version is still {old_version}, needs a bump")
+        unbumped = True
+
+    if unbumped:
         print(
-            "\nERROR: public API changed - bump the kernel version if intentional.",
+            "\nERROR: public API changed without a version bump in build.toml.\n"
+            "\n"
+            "Increment [general] version for every public API change, additions\n"
+            "included. Only the last two Torch versions get rebuilt, so a symbol\n"
+            "added under the current version is absent from the older variants\n"
+            "that still advertise it, and downstream callers hit an unresolved\n"
+            "symbol there. A bump instead makes kernels report that no build\n"
+            "variant matches the user's system.\n"
+            "\n"
+            "The cases where every published variant is refreshed anyway, and no\n"
+            "bump is needed - brand-new, no-arch, and Torch stable-ABI kernels -\n"
+            "are recognised here already.",
             file=sys.stderr,
         )
         return 1

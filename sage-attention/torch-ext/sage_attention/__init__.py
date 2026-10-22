@@ -1,17 +1,22 @@
-from .quant import per_block_int8, per_warp_int8, sub_mean, per_channel_fp8
-from .core import sageattn
-
-try:
-    from .sm100_compile import sageattn3_blackwell
-    SM100_ENABLED = True
-except Exception:
-    SM100_ENABLED = False
+from .core import (
+    sageattn,
+    sageattn_qk_int8_pv_fp8_cuda,
+    sageattn_qk_int8_pv_fp8_cuda_sm90,
+    sageattn_qk_int8_pv_fp16_cuda,
+    sageattn_qk_int8_pv_fp16_triton,
+    sageattn_varlen,
+)
+from .quant import per_block_int8, per_channel_fp8, per_warp_int8, sub_mean
 
 __all__ = [
     "per_block_int8",
-    "per_warp_int8",
-    "sub_mean",
     "per_channel_fp8",
+    "per_warp_int8",
     "sageattn",
-    "sageattn3_blackwell",
+    "sageattn_qk_int8_pv_fp16_cuda",
+    "sageattn_qk_int8_pv_fp16_triton",
+    "sageattn_qk_int8_pv_fp8_cuda",
+    "sageattn_qk_int8_pv_fp8_cuda_sm90",
+    "sageattn_varlen",
+    "sub_mean",
 ]

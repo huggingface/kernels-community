@@ -1,15 +1,24 @@
 # Copyright 2024 Databricks
 # SPDX-License-Identifier: Apache-2.0
 
+
 from functools import partial
 
+import kernels
 import pytest
 import torch
 
-from megablocks._layers.arguments import Arguments
-from megablocks._layers.moe import MoE, batched_load_balancing_loss, clear_load_balancing_loss
-from megablocks._layers.router import batched_router_zloss, clear_router_zloss
-from tests.layers.architectures import FFN
+from .architectures import FFN
+
+megablocks = kernels.get_kernel("kernels-community/megablocks", version=1)
+Arguments = megablocks.Arguments
+MoE = megablocks.MoE
+moe = megablocks._private_for_testing.moe
+router = megablocks._private_for_testing.router
+batched_load_balancing_loss = moe.batched_load_balancing_loss
+clear_load_balancing_loss = moe.clear_load_balancing_loss
+batched_router_zloss = router.batched_router_zloss
+clear_router_zloss = router.clear_router_zloss
 
 _FORWARD_TESTS = (
     (16, 1024, 512, 1, 1),

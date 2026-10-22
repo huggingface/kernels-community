@@ -1,8 +1,12 @@
 [general]
 name = "mamba-ssm"
-version = 2
+version = 4
+edition = 6
 license = "Apache-2.0"
-backends = ["cuda"]
+backends = [
+    "cuda",
+    "xpu",
+]
 python-depends = ["einops"]
 
 [general.hub]
@@ -16,7 +20,7 @@ src = [
 ]
 
 [kernel.selective_scan]
-backend = "cuda"
+language = "cpp-cuda"
 depends = ["torch"]
 src = [
     "selective-scan/reverse_scan.cuh",
@@ -38,8 +42,20 @@ src = [
     "selective-scan/uninitialized_copy.cuh",
 ]
 
+[kernel.causal_conv1d_xpu]
+language = "cpp-xpu"
+depends = ["torch"]
+include = ["causal-conv1d-xpu"]
+src = [
+    "causal-conv1d-xpu/causal_conv1d_xpu_bwd.cpp",
+    "causal-conv1d-xpu/causal_conv1d_xpu_common.hpp",
+    "causal-conv1d-xpu/causal_conv1d_xpu_fwd.cpp",
+    "causal-conv1d-xpu/causal_conv1d_xpu.hpp",
+    "causal-conv1d-xpu/causal_conv1d_xpu_update.cpp",
+]
+
 [kernel.causal_conv1d]
-backend = "cuda"
+language = "cpp-cuda"
 depends = ["torch"]
 src = [
     "causal-conv1d/causal_conv1d_bwd.cu",

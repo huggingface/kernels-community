@@ -12,6 +12,8 @@ import triton.language as tl
 
 from einops import rearrange, repeat
 
+from ...utils.device import device_guard, get_sm_count
+
 from .softplus import softplus
 
 
@@ -82,15 +84,16 @@ def _chunk_cumsum_fwd_kernel(
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE_H': 1}, pre_hook=init_to_zero(["dA_ptr", "ddt_bias_ptr"])),
-        triton.Config({'BLOCK_SIZE_H': 2}, pre_hook=init_to_zero(["dA_ptr", "ddt_bias_ptr"])),
-        triton.Config({'BLOCK_SIZE_H': 4}, pre_hook=init_to_zero(["dA_ptr", "ddt_bias_ptr"])),
-        triton.Config({'BLOCK_SIZE_H': 8}, pre_hook=init_to_zero(["dA_ptr", "ddt_bias_ptr"])),
-        triton.Config({'BLOCK_SIZE_H': 16}, pre_hook=init_to_zero(["dA_ptr", "ddt_bias_ptr"])),
-        triton.Config({'BLOCK_SIZE_H': 32}, pre_hook=init_to_zero(["dA_ptr", "ddt_bias_ptr"])),
-        triton.Config({'BLOCK_SIZE_H': 64}, pre_hook=init_to_zero(["dA_ptr", "ddt_bias_ptr"])),
+        triton.Config({'BLOCK_SIZE_H': 1}),
+        triton.Config({'BLOCK_SIZE_H': 2}),
+        triton.Config({'BLOCK_SIZE_H': 4}),
+        triton.Config({'BLOCK_SIZE_H': 8}),
+        triton.Config({'BLOCK_SIZE_H': 16}),
+        triton.Config({'BLOCK_SIZE_H': 32}),
+        triton.Config({'BLOCK_SIZE_H': 64}),
     ],
     key=['chunk_size', 'nheads'],
+    reset_to_zero=["dA_ptr", "ddt_bias_ptr"],
 )
 @triton.jit
 def _chunk_cumsum_bwd_kernel(
@@ -356,16 +359,17 @@ def _chunk_state_bwd_dx_kernel(
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 128}, num_stages=3, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32}, num_stages=3, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128}, num_stages=3, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64}, num_stages=3, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64}, num_stages=3, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32}, num_stages=3, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
-        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64}, num_stages=3, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
-        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32}, num_stages=3, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 128}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32}, num_stages=3, num_warps=4),
     ],
     key=['chunk_size', 'dstate', 'hdim'],
+    reset_to_zero=["ddA_cumsum_ptr"],
 )
 @triton.jit
 def _chunk_state_bwd_db_kernel(
@@ -680,7 +684,7 @@ def _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias=None, dt_softplus=False, dt_lim
     dt_out = torch.empty(batch, nheads, nchunks, chunk_size, device=dt.device, dtype=torch.float32)
     dA_cumsum = torch.empty(batch, nheads, nchunks, chunk_size, device=dt.device, dtype=torch.float32)
     grid_chunk_cs = lambda META: (batch, nchunks, triton.cdiv(nheads, META['BLOCK_SIZE_H']))
-    with torch.cuda.device(dt.device.index):
+    with device_guard(dt):
         _chunk_cumsum_fwd_kernel[grid_chunk_cs](
             dt, A, dt_bias, dt_out, dA_cumsum,
             batch, seqlen, nheads, chunk_size,
@@ -705,18 +709,19 @@ def _chunk_cumsum_bwd(ddA, ddt_out, dt, A, dt_bias=None, dt_softplus=False, dt_l
     assert A.shape == (nheads,)
     if dt_bias is not None:
         assert dt_bias.shape == (nheads,)
-        ddt_bias = torch.empty_like(dt_bias, dtype=torch.float32)
+        ddt_bias = torch.zeros_like(dt_bias, dtype=torch.float32)
     else:
         ddt_bias = None
     if ddt is not None:
         assert ddt.shape == dt.shape
     else:
         ddt = torch.empty_like(dt)
-    dA = torch.empty_like(A, dtype=torch.float32)
+    dA = torch.zeros_like(A, dtype=torch.float32)
     grid_chunk_cs = lambda META: (batch, nchunks, triton.cdiv(nheads, META['BLOCK_SIZE_H']))
-    with torch.cuda.device(dt.device.index):
+    with device_guard(dt):
         _chunk_cumsum_bwd_kernel[grid_chunk_cs](
-            ddA, ddt_out, dt, A, dt_bias, ddt, dA, ddt_bias,
+            # `reset_to_zero` needs a tensor even when the kernel ignores it (no dt_bias).
+            ddA, ddt_out, dt, A, dt_bias, ddt, dA, ddt_bias if ddt_bias is not None else dA.new_zeros(1),
             batch, seqlen, nheads, chunk_size,
             dt_limit[0], dt_limit[1],
             ddA.stride(0), ddA.stride(2), ddA.stride(1), ddA.stride(3),
@@ -751,7 +756,7 @@ def _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=None, states=None, states_in_f
         states = torch.empty((batch, nchunks, nheads, headdim, dstate), device=x.device, dtype=states_dtype)
     grid = lambda META: (triton.cdiv(headdim, META['BLOCK_SIZE_M']) * triton.cdiv(dstate, META['BLOCK_SIZE_N']),
                     batch * nchunks, nheads)
-    with torch.cuda.device(x.device.index):
+    with device_guard(x):
         _chunk_state_fwd_kernel[grid](
             x, B, states, dt, dA_cumsum, seq_idx,
             headdim, dstate, chunk_size,
@@ -784,7 +789,7 @@ def _chunk_state_bwd_dx(B, x, dt, dA_cumsum, dstates, dx=None):
     ddA_cumsum = torch.empty(batch, nheads, nchunks, chunk_size, device=dA_cumsum.device, dtype=torch.float32)
     grid_dx = lambda META: (triton.cdiv(chunk_size, META['BLOCK_SIZE_M']) * triton.cdiv(headdim, META['BLOCK_SIZE_N']),
                        batch * nchunks, nheads)
-    with torch.cuda.device(x.device.index):
+    with device_guard(x):
         _chunk_state_bwd_dx_kernel[grid_dx](
             x, B, dstates, dt, dA_cumsum, dx, ddt, ddA_cumsum,
             chunk_size, headdim, dstate,
@@ -814,23 +819,24 @@ def _chunk_state_bwd_db(x, dt, dA_cumsum, dstates, seq_idx=None, B=None, ngroups
     if B is not None:
         assert B.shape == (batch, seqlen, ngroups, dstate)
         B_strides = (B.stride(0), B.stride(1), B.stride(2), B.stride(3))
-        # Use torch.empty since the Triton kernel will call init_to_zero
-        ddA_cumsum = torch.empty(batch, nheads, nchunks, chunk_size, device=x.device, dtype=torch.float32)
+        # Zero-initialized: `reset_to_zero` only zeroes it while autotuning
+        ddA_cumsum = torch.zeros(batch, nheads, nchunks, chunk_size, device=x.device, dtype=torch.float32)
         ddA_cumsum_strides = (ddA_cumsum.stride(0), ddA_cumsum.stride(2), ddA_cumsum.stride(1), ddA_cumsum.stride(3))
     else:
         B_strides = (0, 0, 0, 0)
         ddA_cumsum = None
         ddA_cumsum_strides = (0, 0, 0, 0)
     nheads_ngroups_ratio = nheads // ngroups
-    sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count
+    sm_count = get_sm_count(x.device)
     nheads_per_program = max(min(math.ceil(batch * nchunks * nheads / sm_count), nheads_ngroups_ratio), 1)
     nsplits = triton.cdiv(nheads_ngroups_ratio, nheads_per_program)
     dB = torch.empty(batch, seqlen, nsplits, ngroups, dstate, device=x.device, dtype=torch.float32)
     grid_db = lambda META: (triton.cdiv(chunk_size, META['BLOCK_SIZE_M']) * triton.cdiv(dstate, META['BLOCK_SIZE_N']),
                         batch * nchunks, nsplits * ngroups)
-    with torch.cuda.device(x.device.index):
+    with device_guard(x):
         _chunk_state_bwd_db_kernel[grid_db](
-            x, dstates, B, dt, dA_cumsum, seq_idx, dB, ddA_cumsum,
+            # `reset_to_zero` needs a tensor even when the kernel ignores it (no B).
+            x, dstates, B, dt, dA_cumsum, seq_idx, dB, ddA_cumsum if ddA_cumsum is not None else dB.new_zeros(1),
             chunk_size, dstate, headdim,
             batch, seqlen, nheads, nheads_per_program, ngroups,
             x.stride(0), x.stride(1), x.stride(2), x.stride(3),
@@ -870,7 +876,7 @@ def _chunk_state_bwd_ddAcs_stable(B, x, dt, dA_cumsum, dstates, seq_idx=None):
     ddA_cumsum = torch.empty(batch, nheads, nchunks, chunk_size, device=x.device, dtype=torch.float32)
     grid_ddtcs = lambda META: (triton.cdiv(chunk_size, META['BLOCK_SIZE_M']) * triton.cdiv(headdim, META['BLOCK_SIZE_N']),
                           batch * nchunks, nheads)
-    with torch.cuda.device(x.device.index):
+    with device_guard(x):
         _chunk_state_bwd_ddAcs_stable_kernel[grid_ddtcs](
             x, B, dstates, dt, dA_cumsum, seq_idx, ddA_cumsum,
             chunk_size, headdim, dstate,
@@ -904,7 +910,7 @@ def chunk_state_varlen(B, x, dt, dA_cumsum, cu_seqlens, chunk_states):
     states = torch.empty(batch, nheads, headdim, dstate, dtype=chunk_states.dtype, device=chunk_states.device)
     grid = lambda META: (triton.cdiv(headdim, META['BLOCK_SIZE_M']) * triton.cdiv(dstate, META['BLOCK_SIZE_N']),
                     batch, nheads)
-    with torch.cuda.device(x.device.index):
+    with device_guard(x):
         _chunk_state_varlen_kernel[grid](
             x, B, dt, dA_cumsum, chunk_states, cu_seqlens, states,
             headdim, dstate, chunk_size,

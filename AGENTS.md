@@ -100,6 +100,118 @@ def test_relu():
 These are the tests run by `nix run .#ci-test` (`pytest -m kernels_ci`), which
 is what kernels-community CI executes on a GPU runner.
 
+## Kernel versions
+
+Any change to a kernel's public API needs the `version` in the `[general]`
+section of its `build.toml` incremented. This covers *additions* — a new
+function, layer, or Torch operator — just as much as it covers removals and
+signature changes.
+
+Additions matter because only the last two Torch versions are rebuilt. Say
+`mykernel` version 1 exposes `a` and has builds for Torch 2.9 through 2.13.
+Adding `b` without a bump leaves version 1 advertising `b` while the 2.9-2.11
+variants, which are not rebuilt, still only carry `a`. Downstream code that
+starts calling `b` then fails on those Torch versions with a symbol that
+cannot be found. Bumping to version 2 instead means `kernels` simply reports
+that no build variant exists for the user's system.
+
+No bump is needed where every published variant gets refreshed anyway:
+
+- No-arch kernels (a `[torch-noarch]` build).
+- Torch stable-ABI kernels, as long as the CUDA versions built overlap with
+  the current build variants.
+- AoT-compiled kernels where a build replaces all variants.
+- Brand-new kernels, which only have builds for the latest two Torch versions.
+
+The `Check Public API` workflow enforces this via
+`scripts/check_public_api.py`, which recognises the no-arch, stable-ABI, and
+brand-new cases on its own. The AoT case is not visible from the repo, so bump
+the version there anyway - a bump is never wrong.
+
+## Torch Stable ABI
+
+When converting kernels to the Torch stable ABI, see
+[Torch Stable ABI](https://docs.pytorch.org/docs/main/notes/libtorch_stable_abi.html)
+for a general overview of the ABI. This section gives more details on how
+the stable ABI works in kernel-builder.
+
+### Converting existing kernels
+
+Keep changes to vendored upstream code minimal and line-for-line; avoid new
+abstractions. The goal is to make it straightforward to sync new versions
+from upstream.
+
+### Enabling the stable ABI for a backend
+
+The stable ABI is enabled per backend in `build.toml` in the `torch.stable-abi`
+section. For example:
+
+```toml
+[torch.stable-abi]
+cuda = "2.10"
+xpu = "2.13"
+```
+
+We aim to target 2.10 as the lowest Torch stable ABI version. However, in some
+cases this is not possible, because only newer versions might provide an API that
+is needed for a backend. So, always aim for the lowest possible version for a
+backend (with 2.10 as the lower bound).
+
+The following versions are built through a bundle build (`nix build .#bundle`
+or `nix build .#backendBundle.<backend>`), given a stable ABI version `n.m`:
+
+- Only a single stable ABI version will be built for each Torch >= `n.m`. Note
+  there may still be multiple builds for different backend versions (e.g. CUDA 12.6,
+  13.0, and 13.2).
+- For each supported version < `n.m` a non-stable ABI build variant will be made.
+
+For example, given the TOML above, the outputs could be:
+
+```
+torch210-xpu20253-x86_64-linux
+torch211-xpu20253-x86_64-linux
+torch212-xpu20253-x86_64-linux
+torch-stable-abi213-xpu20260-x86_64-linux
+torch-stable-abi213-xpu20261-x86_64-linux
+torch-stable-abi210-cu126-x86_64-linux
+torch-stable-abi210-cu130-x86_64-linux
+torch-stable-abi210-cu132-x86_64-linux
+```
+
+### Handling non-stable ABI versions
+
+Given the example in the previous section, for XPU it would still be possible
+to use stable ABI functions for functions that are available in e.g. Torch 2.10.
+For functions that are not available in the stable ABI for these older versions,
+it is typically best to use conditional compilation. For instance, getting the XPU SYCL
+queue through `getCurrentStream(...).nativeHandle()` is only available since
+Torch 2.13. Guard such code on `TORCH_FEATURE_VERSION`, which is the stable
+ABI target in stable-ABI builds and the Torch version otherwise:
+
+```cpp
+#if TORCH_FEATURE_VERSION >= TORCH_VERSION_2_13_0
+inline sycl::queue &current_queue(const Tensor &t) {
+  void *handle =
+      torch::stable::accelerator::getCurrentStream(t.get_device_index())
+          .nativeHandle();
+  STD_TORCH_CHECK(handle != nullptr, "could not get the current XPU queue");
+  return *static_cast<sycl::queue *>(handle);
+}
+#else
+inline sycl::queue &current_queue(const Tensor &t) {
+  return c10::xpu::getCurrentXPUStream(t.get_device_index()).queue();
+}
+#endif
+```
+
+Use `#ifdef TORCH_TARGET_VERSION` only to distinguish stable-ABI builds from
+non-stable builds, e.g. for op registration.
+
+### Reference conversions
+
+`activation`, `causal-conv1d` (CUDA and XPU), `cv-utils`,
+`paged-attention` (stable CUDA/ROCm next to non-stable Metal).
+
 # Kernel-specific instructions
 
 ## flash-attn3
@@ -148,7 +260,21 @@ steps:
 - Fetch the upstream Git repository from https://github.com/Dao-AILab/flash-attention.git
 - Check out the tag that the user specified.
 - Flash Attention 4 is in the directory `flash_attn/cute` of the upstream repo.
-- Copy Flash Attention 4 upstream files to `flash-attn4/torch-ext/flash_attn4`.
+- Copy Flash Attention 4 upstream files to `flash-attn4/torch-ext/flash_attn4`,
+  except the benchmarking and tuning scripts, which are deliberately not
+  vendored:
+  - `benchmark.py`
+  - `benchmark_flash_attention_fp8.py`
+  - `bench_utils.py`
+  - `sm90_config_search.py`
+
+  Nothing in the kernel imports these, and every `.py` in this directory is
+  shipped in the build, so vendoring them just adds dead weight to what users
+  download. They are also standalone `argparse` CLIs meant to be run as
+  `python -m flash_attn.cute.<name>`, which cannot work for a Hub kernel since
+  it is loaded under a hashed module name. Do not re-add them. After a sync,
+  check that no newly added upstream file is unreachable from `__init__.py`
+  for the same reason.
 - Copy tests from the tests from the upstream directory `tests/cute` to
   `flash-attn4/tests/cute`.
 - Check in `flash_attn/cute/pyproject.toml` upstream what version of quack is
@@ -159,6 +285,19 @@ steps:
   `flash-attn4/torch-ext/flash_attn4` and `flash-attn4/torch-ext/flash_attn4/quack`
   relative imports.
 - Remove all quack files in `flash-attn4/torch-ext/flash_attn4/quack` that are not used.
+  Decide this by following imports, but note that an import graph does **not**
+  capture modules whose only job is an import-time side effect. In particular,
+  keep `quack/dsl/cute_tensor_indexing.py` and have `quack/__init__.py` do
+  `from . import dsl`, mirroring upstream's `quack/__init__.py`. That module
+  monkey-patches CuTe's tensor classes so that `...` and `:` work in
+  `__getitem__`/`__setitem__`; `quack/copy_utils.py` relies on the sugar
+  (`tRS_sC[..., dst_idx]`), as do `softmax.py` and `testing.py`. Without it the
+  sm90 backward kernel dies with
+  `ValueError: Expected Coord, whose leaves are integers or None, but got (Ellipsis, ...)`.
+  Nothing catches this locally: the CI runner is sm89, where the whole sm90
+  backward path is unreachable, and sm100 does not use it either. Upstream's
+  `quack/__init__.py` cannot be copied verbatim, since it also imports
+  `rmsnorm`/`softmax`/`cross_entropy`, which are not vendored.
 - Update imports of `flash_attn.cute` in `flash-attn4/tests/cute` to `flash_attn4`.
 - Set `__version__` in `flash-attn4/torch-ext/flash_attn4/__init__.py` to the
   version from the tag (e.g. for tag `fa4-v4.0.0.beta8` set it to
@@ -375,6 +514,80 @@ carry out the following steps:
 If the user did not specify the version tag, stop and ask which tag to sync
 from.
 
+## sage-attention
+
+This package mirrors the **SageAttention / SageAttention2 / SageAttention2++**
+CUDA stack from upstream. SageAttention3 (microscaling FP4 for consumer
+Blackwell, sm120/sm121) is deliberately **not** part of this kernel — it lives
+in its own directory. Note that SageAttention3 is *not* a datacenter-Blackwell
+kernel: its FP4 mainloop uses the warp-level `mma.sync ... kind::mxf4nvf4`
+instruction, which only exists on sm120/sm121. Datacenter Blackwell (sm100)
+drives FP4 through the unrelated CTA-level `tcgen05.mma` path instead, so it
+cannot run those kernels. When the user asks to sync a sage-attention release,
+carry out the following steps:
+
+- Fetch the upstream Git repository from https://github.com/thu-ml/SageAttention.git
+- Check out the tag or commit that the user specified. Note that upstream tags
+  lag `main` by a long way (the newest tag is `v2.2.0` while `main` carries
+  many later fixes), so syncing from `main` is usually what is wanted.
+- The mirrored upstream trees are:
+  - `csrc/` → `sage-attention/sage_attention/`
+  - `sageattention/*.py` (except `fa3_wrapper.py`) →
+    `sage-attention/torch-ext/sage_attention/`
+  - `sageattention/triton/` → `sage-attention/torch-ext/sage_attention/_triton/`
+    (**renamed**, see below)
+- The Triton modules are vendored verbatim, but the directory **must** be named
+  `_triton/`, not `triton/`. The builder flattens `torch-ext/sage_attention/*`
+  onto the top level of the build variant directory, and that directory is put
+  on `PYTHONPATH`; a top-level `triton/` there shadows the real Triton package,
+  so `import triton.language` inside the vendored kernels fails with
+  `ModuleNotFoundError`. Rewrite upstream's `from .triton.<x>` imports in
+  `core.py` to `from ._triton.<x>`. The module contents themselves need no
+  rewriting — they only import `torch`, `triton` and `math`. They back
+  `sageattn_qk_int8_pv_fp16_triton`, `sageattn_varlen` and the `sm86` dispatch
+  branch, so `torch-ext/sage_attention/core.py` should carry upstream's full set
+  of entry points. After a sync, check that the `def` list in `core.py` and the
+  `__all__` in `__init__.py` still match upstream's `core.py` and
+  `sageattention/__init__.py`.
+- Everything under `sageattention3_blackwell/` is out of scope, as are
+  `fa3_wrapper.py` (it needs an external `flash_attn_interface`), `bench/`,
+  `example/` and `setup.py`.
+- The CUDA sources otherwise track upstream byte-for-byte, so when syncing,
+  diff the upstream files against the local copies and re-apply only these
+  local porting changes:
+  - `<torch/extension.h>` and `<torch/python.h>` → `<torch/torch.h>`.
+  - Drop `PYBIND11_MODULE` blocks; ops are registered in
+    `torch-ext/torch_binding.cpp` instead.
+  - `qattn/attn_cuda_sm90.h` and `qattn/qk_int_sv_f8_cuda_sm90.cu`: rename
+    `qk_int8_sv_f8_accum_f32_attn_inst_buf` and
+    `qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf` to carry an `_sm90`
+    suffix. Upstream keeps the SM89 and SM90 kernels in separate extension
+    modules, but here every op shares one namespace and the SM89 kernels own
+    the un-suffixed names. `torch_binding.{h,cpp}` and `sm90_compile.py` must
+    use the suffixed names too.
+  - `qattn/qk_int_sv_f8_cuda_sm90.cu`: resolve `cuTensorMapEncodeTiled` at
+    runtime through `at::DynamicLibrary` rather than linking it, and include
+    `sage_attention/cuda_tensormap_shim.cuh` (a local file with no upstream
+    counterpart).
+  - `qattn/qk_int_sv_f8_cuda_sm89.cuh`: `<cuda_fp16.h>` stays commented out.
+  - `fused/fused.cu`: initialise `block_sum_val` to `0.0f`.
+- On the Python side, the modules dispatch through `._ops` instead of the
+  per-arch pybind extensions. Upstream's `@torch.library.custom_op` wrappers
+  are replaced by direct `ops.<name>` aliases plus `register_fake`
+  registrations. Never reintroduce upstream's fixed op namespaces
+  (`sageattention::`, `sageattention_sm89::`, `sageattention_sm90::`) — use
+  `add_op_namespace_prefix` from `._ops`.
+- `quant.py`: the bound `quant_per_block_int8_cuda` op takes an `sm_scale`
+  argument that upstream's `_fused` binding does not. Pass `1.0` when
+  quantizing K so no scaling is applied.
+- Keep `torch-ext/sage_attention/__init__.py` `__all__` in sync with the public
+  API surface.
+- Do not relax `[general.cuda] minver` in `build.toml`. The CUDA 12.6 toolkit
+  compiles the sm89 FP8 attention kernels but they fail at launch with
+  `cudaErrorLaunchFailure`; only the quantization ops survive. Building a
+  variant is therefore *not* enough to validate a toolkit — run
+  `nix run .#ciTests.<variant>` for each one.
+  
 ## sage-blackwell
 
 This package mirrors **SageAttention3**, the microscaling FP4 attention stack

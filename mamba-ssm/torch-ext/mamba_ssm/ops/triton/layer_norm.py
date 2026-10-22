@@ -12,6 +12,7 @@ import warnings
 import torch
 import torch.nn.functional as F
 from ...utils.torch import custom_bwd, custom_fwd
+from ...utils.device import device_guard, get_sm_count
 
 import triton
 import triton.language as tl
@@ -365,7 +366,7 @@ def _layer_norm_fwd(
     BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
     if N > BLOCK_N:
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-    with torch.cuda.device(x.device.index):
+    with device_guard(x):
         _layer_norm_fwd_1pass_kernel[(M,)](
             x,
             y,
@@ -655,7 +656,7 @@ def _layer_norm_bwd(
     BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
     if N > BLOCK_N:
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-    sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count
+    sm_count = get_sm_count(x.device)
     _dw = torch.empty((sm_count, N), dtype=torch.float32, device=weight.device)
     _db = (
         torch.empty((sm_count, N), dtype=torch.float32, device=bias.device)
@@ -666,7 +667,7 @@ def _layer_norm_bwd(
     _db1 = torch.empty_like(_db) if bias1 is not None else None
     rows_per_program = math.ceil(M / sm_count)
     grid = (sm_count,)
-    with torch.cuda.device(x.device.index):
+    with device_guard(x):
         _layer_norm_bwd_kernel[grid](
             x,
             weight,
@@ -1014,18 +1015,19 @@ class LayerNormLinearFn(torch.autograd.Function):
             if residual is not None
             else (torch.float32 if residual_in_fp32 else None)
         )
+        device_type = x.device.type
         y, _, mean, rstd, residual_out, *rest = _layer_norm_fwd(
             x,
             norm_weight,
             norm_bias,
             eps,
             residual,
-            out_dtype=None if not torch.is_autocast_enabled() else torch.get_autocast_gpu_dtype(),
+            out_dtype=None if not torch.is_autocast_enabled(device_type) else torch.get_autocast_dtype(device_type),
             residual_dtype=residual_dtype,
             is_rms_norm=is_rms_norm,
         )
         y = y.reshape(x_shape_og)
-        dtype = torch.get_autocast_gpu_dtype() if torch.is_autocast_enabled() else y.dtype
+        dtype = torch.get_autocast_dtype(device_type) if torch.is_autocast_enabled(device_type) else y.dtype
         linear_weight = linear_weight.to(dtype)
         linear_bias = linear_bias.to(dtype) if linear_bias is not None else None
         out = F.linear(y.to(linear_weight.dtype), linear_weight, linear_bias)
