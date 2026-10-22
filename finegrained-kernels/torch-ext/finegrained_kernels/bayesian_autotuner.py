@@ -60,7 +60,7 @@ from triton.runtime.autotuner import (
 )
 
 from .autotune_config import load_autotune_config
-from .bench import do_bench, weight_banks
+from .bench import do_bench
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +105,7 @@ class BayesianAutotuner(Autotuner):
         path_anchor_axes: tuple[str, ...] = (),
         coupled_axes: tuple[tuple[str, ...], ...] = (),
         finite_check_args: tuple[str, ...] = (),
-        cold_weight=None,
+        cold_banks=None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -114,7 +114,7 @@ class BayesianAutotuner(Autotuner):
         # Large-model weights exceed L2, so time candidates on rotated cold weights; turning it off
         # times warm graph replay, closer to small workloads that stay L2-resident.
         self.rotate_weights = overrides.get("rotate_weights", True)
-        self.cold_weight = cold_weight
+        self.cold_banks = cold_banks
         self._cold_banks = None
         # Bayesian trial budget — the per-decorator default, overridable via ``n_trials`` in
         # FINEGRAINED_AUTOTUNE_CONFIG (quick sweeps / exhaustive runs without touching the
@@ -264,7 +264,7 @@ class BayesianAutotuner(Autotuner):
             self._failures.append((config, memo[sig] + "  [memoized]"))
             return [float("inf")] * 3
         try:
-            if self.cold_weight is not None and self.rotate_weights and self._owns_timing():
+            if self.cold_banks is not None and self.rotate_weights and self._owns_timing():
                 timing = self._bench_rotating(*args, config=config, **meta)
             else:
                 timing = super()._bench(*args, config=config, **meta)
@@ -397,17 +397,17 @@ class BayesianAutotuner(Autotuner):
             pass  # persistence is best-effort; the in-memory memo still holds
 
     def _bench_rotating(self, *args, config, **meta):
-        """Cold-weight timing: one CUDA graph replays the launch over every identical weight bank
-        (built once per tune, ``bench.weight_banks``), so each call reads ``B`` from beyond L2;
-        the time is per call. Falls back to cold event timing when no banks can be built."""
+        """Cold timing: one CUDA graph replays the launch over every argument set ``cold_banks``
+        returns (built once per tune), each reading its inputs from beyond L2; the time is per call.
+        Falls back to cold event timing when there are no banks, or when a bank would swap an argument
+        the tuner resets or restores between launches."""
         if self._cold_banks is None:
             arguments = {**dict(zip(self.arg_names, args)), **meta}
-            weight, active_bytes = self.cold_weight(arguments)
+            banks = self.cold_banks(arguments)
             mutated = self.reset_to_zero + self.restore_value
-            if any(arguments.get(name) is weight for name in mutated):
-                self._cold_banks = False
-            else:
-                self._cold_banks = weight_banks(arguments, weight, active_bytes) or False
+            if banks and any(bank.get(name) is not arguments.get(name) for bank in banks for name in mutated):
+                banks = None
+            self._cold_banks = banks or False
             if self._cold_banks is False:
                 logger.info("[autotune] %s: weight rotation unavailable; using cold event timing", self.fn_name)
         if self._cold_banks is False:
@@ -908,7 +908,7 @@ class BayesianAutotuner(Autotuner):
             str(self.keys),
             f"n_trials={self.n_trials},n_startup_trials={self.n_startup_trials},gamma={self.gamma},"
             f"runoff={self.runoff},basin_probes={self.basin_probes},max_refine_iters={self.max_refine_iters},"
-            f"coupled_axes={self.coupled_axes},rotate_weights={self.rotate_weights},cold_weight={self.cold_weight is not None}",
+            f"coupled_axes={self.coupled_axes},rotate_weights={self.rotate_weights},cold_banks={self.cold_banks is not None}",
             str(tuning_key),
         ] + [str(c) for c in configs]  # str(Config) is pre_hook-free and process-stable
         cache_key = hashlib.sha256("-".join(cache_key).encode("utf-8")).hexdigest()
@@ -1049,7 +1049,7 @@ def bayesian_autotune(
     path_anchor_axes: tuple[str, ...] = (),
     coupled_axes: tuple[tuple[str, ...], ...] = (),
     finite_check_args: tuple[str, ...] = (),
-    cold_weight=None,
+    cold_banks=None,
     cache_results: bool = True,
     reset_to_zero=None,
     restore_value=None,
@@ -1073,8 +1073,9 @@ def bayesian_autotune(
                               tuner stays independent of configuration details
     coupled_axes:             groups of config fields treated as joint choices by TPE and
                               refinement, including Config fields such as num_stages
-    cold_weight:              ``nargs -> (weight, bytes read per call)``: the read-only weight to
-                              time cold, rotated through identical copies (e.g. ``gemm_weight``)
+    cold_banks:               ``nargs -> [launch args, ...] | None``: argument sets that together read
+                              more than L2, timed as one CUDA graph per candidate so each call
+                              runs cold (e.g. ``bench.gemm_cold_banks``); None falls back to events
     max_failures:             abort the tune once this many configs fail to compile/run before
                               the measured budget is met (default n_trials; runtime override
                               ``strict`` in FINEGRAINED_AUTOTUNE_CONFIG sets 0). Without it a broadly broken
@@ -1103,7 +1104,7 @@ def bayesian_autotune(
             path_anchor_axes=path_anchor_axes,
             coupled_axes=coupled_axes,
             finite_check_args=finite_check_args,
-            cold_weight=cold_weight,
+            cold_banks=cold_banks,
             cache_results=cache_results,
             **kwargs,
         )
