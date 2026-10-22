@@ -943,7 +943,7 @@ def chunk_kda_fwd_intra(
     return w, u, qg, kg, Aqk, Akk
 
 
-@dispatch('kda')
+# @dispatch('kda')
 def chunk_kda_bwd_intra(
     q: torch.Tensor,
     k: torch.Tensor,

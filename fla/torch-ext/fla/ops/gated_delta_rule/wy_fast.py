@@ -251,7 +251,8 @@ def prepare_wy_repr_bwd_kernel(
         tl.store(p_dg, b_dg.to(p_dg.dtype.element_ty), mask=m_t)
 
 
-@dispatch('gated_delta_rule')
+# avoid dispatches
+# @dispatch('gated_delta_rule')
 def recompute_w_u_fwd(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -294,7 +295,7 @@ def recompute_w_u_fwd(
     return w, u
 
 
-@dispatch('gated_delta_rule')
+# @dispatch('gated_delta_rule')
 def prepare_wy_repr_bwd(
     k: torch.Tensor,
     v: torch.Tensor,

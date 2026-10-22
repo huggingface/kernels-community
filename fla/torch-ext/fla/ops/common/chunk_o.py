@@ -203,6 +203,7 @@ def chunk_bwd_kernel_dqkwg(
     STATE_V_FIRST: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
+    scale = scale.to(tl.float32)
     i_k, i_t = unflatten_program_id(tl.cdiv(K, BK))
     i_bh = tl.program_id(1).to(tl.int64)
     i_b, i_h = i_bh // HV, i_bh % HV
@@ -542,7 +543,7 @@ def chunk_bwd_kernel_dv_local(
         tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), mask=m_t[:, None] & m_v[None, :])
 
 
-@dispatch('common')
+# @dispatch('common')
 def chunk_fwd_o(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -652,7 +653,7 @@ def chunk_bwd_dv(
     return dv
 
 
-@dispatch('common')
+# @dispatch('common')
 def chunk_bwd_dv_local(
     q: torch.Tensor,
     k: torch.Tensor,

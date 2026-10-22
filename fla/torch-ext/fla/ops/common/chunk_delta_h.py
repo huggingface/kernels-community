@@ -751,7 +751,7 @@ def chunk_gated_delta_rule_fwd_h(
     return h, v_new, final_state
 
 
-@dispatch('common')
+# @dispatch('common')
 def chunk_gated_delta_rule_bwd_dhu(
     q: torch.Tensor,
     k: torch.Tensor,
