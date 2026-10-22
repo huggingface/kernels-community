@@ -144,7 +144,7 @@ _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_ROOT, "torch-ext"))
 sys.path.insert(0, os.path.join(_ROOT, "tests"))
 import finegrained_kernels as fgm  # noqa: E402  local branch
-from finegrained_kernels.bench import do_bench, rotation_count  # noqa: E402
+from finegrained_kernels.bench import do_bench, free_device_bytes, rotation_count  # noqa: E402
 from finegrained_kernels.quant import fp8_act_quant_tensor_wide  # noqa: E402
 from kernels import get_kernel  # noqa: E402
 
@@ -1826,8 +1826,7 @@ def _weight_banks(weights, active_experts=None):
     if count is None:
         raise RuntimeError("cold weight working set needs too many rotation banks")
     if DEVICE == "cuda":
-        free, _ = ACCELERATOR.mem_get_info()
-        free += ACCELERATOR.memory_reserved() - ACCELERATOR.memory_allocated()
+        free = free_device_bytes(0)
         required = (count - 1) * weight_bytes
         if required > free:
             raise RuntimeError(f"cold weight banks need {required / 1024**3:.2f} GiB extra, "

@@ -63,6 +63,12 @@ def rotation_count(active_bytes, device):
     return count if count <= 1024 else None
 
 
+def free_device_bytes(device):
+    """Memory a new bank can take: free device memory plus the caching allocator's unused reserve."""
+    free, _ = torch.cuda.mem_get_info(device)
+    return free + torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+
+
 def weight_banks(nargs, weight, active_bytes):
     """Rotate the forward GEMMs' readonly B and its full-weight host descriptor.
 
@@ -83,10 +89,7 @@ def weight_banks(nargs, weight, active_bytes):
                 or not base.is_contiguous() or base.data_ptr() != weight.data_ptr()
                 or base.numel() * base.element_size() != span_bytes):
             return None
-    free, _ = torch.cuda.mem_get_info(weight.device)
-    free += (torch.cuda.memory_reserved(weight.device)
-             - torch.cuda.memory_allocated(weight.device))
-    if (count - 1) * span_bytes > free:
+    if (count - 1) * span_bytes > free_device_bytes(weight.device):
         return None
     banks = [nargs]
     try:
