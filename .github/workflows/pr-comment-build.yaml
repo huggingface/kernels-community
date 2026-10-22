@@ -40,6 +40,10 @@ jobs:
           COMMENT_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -eu
+          # People sometimes add newlines (Unix or Windows). Trim trailing
+          # whitespace (including \r and \n) so that it does not fail the
+          # validation. Only the end is trimmed, like Python's strip().
+          COMMENT_BODY="${COMMENT_BODY%"${COMMENT_BODY##*[![:space:]]}"}"
           if [ "${#COMMENT_BODY}" -gt 1024 ]; then
             echo "Ignoring oversized comment payload."
             exit 0
@@ -52,7 +56,7 @@ jobs:
               ;;
           esac
           if ! printf '%s' "$COMMENT_BODY" | grep -Eq '^/kernel-bot[][ A-Za-z0-9_,./-]*$'; then
-            echo "Ignoring /kernel-bot comment with unsupported characters."
+            echo "::warning::Ignoring /kernel-bot comment with unsupported characters."
             exit 0
           fi
           if [[ "$COMMENT_AUTHOR_ASSOCIATION" != "MEMBER" && "$COMMENT_AUTHOR_ASSOCIATION" != "OWNER" && "$COMMENT_AUTHOR_ASSOCIATION" != "COLLABORATOR" ]]; then
