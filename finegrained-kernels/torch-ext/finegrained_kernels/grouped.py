@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+from typing import List
+
 import torch
 import triton
 import triton.language as tl
@@ -21,13 +23,14 @@ import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .bayesian_autotuner import bayesian_autotune
-from .compat import add_op_namespace_prefix, FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, sm_count, tl_dtype
+from .compat import add_op_namespace_prefix, FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, persistent_program_count, sm_count, tl_dtype
 from .descriptors import build_grouped_operand_descriptors, rebind_grouped_descriptors, rebind_grouped_mx_descriptors
-from .formats import check_activation_format, global_scale_stride, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
-from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mx_act_quant_grouped, swizzle_grouped_mx_scales
+from .formats import check_activation_format, global_scale_stride, gate_out_cols, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
+from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, mx_act_quant_grouped, mx_act_quant_routed_rows, quantize_routed_rows_per_expert, static_expert_act_operands, swizzle_grouped_mx_scales, tensor_wide_act_operands
 from .swizzle import swizzled_scale_descriptor
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
-from .scheduling import build_tile_layout, expand_gather_below_parity, build_packed_schedule, load_packed_schedule, prefetch_packed_entry, resolve_grouped_tile, resolve_grouped_tile_packed
+from .scheduling import build_tile_layout, expand_gather_below_parity, expand_regime, build_packed_schedule, load_packed_schedule, prefetch_packed_entry, resolve_grouped_tile, resolve_grouped_tile_packed
+from .loading.scales import csf_weight_scales
 from .loading.tiles import (
     load_act_block_dynamic,
     load_act_mx,
@@ -37,11 +40,12 @@ from .loading.tiles import (
     load_weight_mx,
     load_weight_plain,
     load_weight_static,
+    operand_tile_descriptor,
     operand_tile_ptrs,
     weight_tile_ptrs,
 )
 from .epilogue import acc_init, bias_strides, gemm_epilogue
-from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, global_scale_warp_spec_pruner, weight_only_warp_spec_matched_mode_pruner, packed_schedule_scope_pruner, affine_scale_warp_spec_pruner, block_dynamic_grouped_matmul_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gate_stacked_tmem_trap_pruner, gated_pointer_weight_warp_spec_pruner, mx_config_pruner, require_moe_dims_aligned, smem_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, swizzled_scales_bm_pruner, warp_spec_compile_guard_pruner
+from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, raw_activation_pointer_pruner, global_scale_warp_spec_pruner, warp_spec_memory_mode_pruner, packed_schedule_scope_pruner, affine_scale_warp_spec_pruner, block_dynamic_grouped_matmul_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gate_stacked_tmem_trap_pruner, gated_pointer_weight_warp_spec_pruner, mx_config_pruner, require_moe_dims_aligned, smem_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, swizzled_scales_bm_pruner, warp_spec_compile_guard_pruner
 
 
 @bayesian_autotune(
@@ -69,6 +73,7 @@ from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, global_scale_warp_sp
             fp8_dot_warp_pruner(),
             packed_schedule_scope_pruner(),
             block_dynamic_grouped_matmul_pruner(),
+            warp_spec_memory_mode_pruner(),
             descriptor_box_pruner(),
         )
     },
@@ -203,8 +208,8 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
             stride_b_k,
             False,
         )
-        # under GATE the tile's two scale blocks are the adjacent pair at 2*pid_n; non-GATE reads
-        # the single block (up_s_ptr dead).
+        # under GATE the tile's two scale blocks are the adjacent (gate, up) pair at 2*pid_n; non-GATE
+        # reads the single block (up_s_ptr dead).
         gate_s_ptr = Bs + expert_id64 * stride_bs_e + ((2 if GATE else 1) * pid_n) * stride_bs_n
         up_s_ptr = gate_s_ptr + stride_bs_n
 
@@ -274,6 +279,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
             packed_schedule_scope_pruner(),
             block_dynamic_grouped_matmul_pruner(),
             descriptor_box_pruner(),
+            raw_activation_pointer_pruner(),
         )
     },
 )
@@ -281,7 +287,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
 def w8a8_block_static_fp8_matmul_grouped_kernel(
     A,  # (num_tokens, K) E4M3 activations (pre-quantized against the static scale by the wrapper)
     ADescriptor,  # host TMA descriptor over A (rows, K), box (BM, BK); read iff A_MEMORY_MODE != "pointer"
-    As,  # scalar — static per-tensor activation scale (calibration-time)
+    As,  # calibrated (static) activation scale: one value, or one per expert
     B,  # (num_experts, N, K) FP8 weights; under GATE the (num_experts, 2N, K) gate|up stack
     BDescriptor,  # host TMA descriptor over B viewed (E, 2N|N, K), box (1, (2|1)*BN, BK); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (num_experts, N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales (2N under GATE)
@@ -302,6 +308,7 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
     stride_b_e,
     stride_b_k,
     stride_b_n,
+    stride_as_e,  # 0 = one calibrated scale shared by every expert
     stride_bs_e,
     stride_bs_k,
     stride_bs_n,
@@ -342,7 +349,6 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
     weight scales apply per-K-tile (plain ``tl.dot`` + software rescale, ``accumulate("static")``),
     and the scalar activation scale multiplies the accumulator once after the loop. GATE=False is
     the plain grouped GEMM (down projection), bit-identical."""
-    a_s_static = tl.load(As)  # per-tensor static activation scale, applied post-loop
     start_pid = tl.program_id(axis=0)
     if PACKED_SCHEDULE:
         total_m_tiles = load_packed_schedule(Schedule, BLOCK_SIZE_M)
@@ -391,10 +397,13 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
         gate_s_ptr = Bs + expert_id64 * stride_bs_e + ((2 if GATE else 1) * pid_n) * stride_bs_n
         up_s_ptr = gate_s_ptr + stride_bs_n
 
+        # this tile's expert scale: stride 0 means one calibrated scale for every expert.
+        # It feeds the inline quant arm (raw A) and folds back onto the accumulator post-loop.
+        a_s_static = tl.load(As + expert_id64.to(tl.int32) * stride_as_e)
         acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
             a, a_dead = load_act_static(
-                a_ptrs, ADescriptor, m_start, k * BLOCK_SIZE_K, row_mask, in_row, 0.0,
+                a_ptrs, ADescriptor, m_start, k * BLOCK_SIZE_K, row_mask, in_row, a_s_static,
                 A_MEMORY_MODE, GatherIdx is not None,
             )
             w, w_s = load_weight_static(
@@ -466,6 +475,7 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
             warp_spec_compile_guard_pruner(),
             descriptor_box_pruner(),
             smem_pruner(),
+            raw_activation_pointer_pruner(),
         )
     },
 )
@@ -473,7 +483,7 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
 def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     A,  # (num_tokens, K) pre-quantized FP8 activations, any row order
     ADescriptor,  # host TMA descriptor over A (rows, K), box (BM, BK); read iff A_MEMORY_MODE != "pointer"
-    As,  # (S,) per-token activation scales
+    As,  # per-token activation scales (S,), or a calibrated (static) one: shared, or per expert
     B,  # (num_experts, N, K) FP8 weights; under GATE the (num_experts, 2N, K) gate|up stack
     BDescriptor,  # host TMA descriptor over B viewed (E, 2N|N, K), box (1, (2|1)*BN, BK); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (num_experts, 1, 1) per-tensor weight scales (one scalar covers the gate|up stack)
@@ -492,6 +502,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     stride_a_m,
     stride_a_k,
     stride_as_m,
+    stride_as_e,  # 0 = the scale is per token; 1 = one calibrated scale per expert
     stride_b_e,
     stride_b_k,
     stride_b_n,
@@ -580,13 +591,17 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
             stride_b_k,
             False,
         )
-        a_s = tl.load(As + in_row * stride_as_m, mask=row_mask, other=0.0)
+        # per token, or the tile's own expert under a calibrated scale (stride_as_m 0); 1.0 on
+        # the masked rows so the static arm's in-register divide never sees a zero
+        a_s = tl.load(
+            As + in_row * stride_as_m + expert_id64.to(tl.int32) * stride_as_e, mask=row_mask, other=1.0
+        )
         b_s = tl.load(Bs + expert_id64 * stride_bs_e)
 
         acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
-            a, _as = load_act_plain(
-                a_ptrs, ADescriptor, m_start, k * BLOCK_SIZE_K, row_mask, in_row,
+            a, _as = load_act_static(
+                a_ptrs, ADescriptor, m_start, k * BLOCK_SIZE_K, row_mask, in_row, a_s[:, None],
                 A_MEMORY_MODE, GatherIdx is not None,
             )
             w, _ws = load_weight_plain(
@@ -665,6 +680,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
             smem_pruner(min_sets=2),  # two full buffer sets: the grouped pipeline's floor (see smem_pruner)
             warp_spec_compile_guard_pruner(),
             affine_scale_warp_spec_pruner(),
+            warp_spec_memory_mode_pruner(),
         )
     },
 )
@@ -916,7 +932,7 @@ def mx_dynamic_matmul_grouped_kernel(
     path_anchor_axes=PATH_ANCHOR_AXES,
     prune_configs_by={
         "early_config_prune": compose_pruners(
-            weight_only_warp_spec_matched_mode_pruner(),
+            warp_spec_memory_mode_pruner(weight_only=True),
             packed_schedule_scope_pruner(),
             # the tail tile slides back in bounds (see the K-loop) — BK only has to fit
             block_fits_dim_pruner("K"),
@@ -1207,18 +1223,43 @@ def full_precision_matmul_grouped_kernel(
         )
 
         acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
+        # Resolve each descriptor operand once per tile: the host-built box as passed, or an
+        # in-kernel tensormap where the host cannot build one (a host descriptor IS a TMA
+        # descriptor, and Xe has no TMA). The weight box is 2D over THIS expert's slab rather
+        # than 3D over the stack, for two reasons: a device-built 3D box silently drops its
+        # outermost offset on Xe (measured — every expert reads expert 0), and the slab's own
+        # K-contiguous axes are the orientation the Xe 2D block load needs to reach rate (a
+        # (K, N) view, what the pointer arm effectively does, falls well off it). A needs no
+        # such care — its box is 2D either way, and no gather reaches the descriptor arm here
+        # (``descriptor_box_pruner`` fences gathered descriptor A to sm_100), so the rows are
+        # the contiguous span at ``m_start``, tails zero-fill like the affine arm's mask, and
+        # rows outside the expert are dropped by the epilogue's row_mask.
+        a_desc = operand_tile_descriptor(
+            ADescriptor, A, S, K, stride_a_m, 1,  # K is the contiguous dim of (S, K)
+            BLOCK_SIZE_M, BLOCK_SIZE_K, A_MEMORY_MODE,
+        )
+        b_desc = operand_tile_descriptor(
+            BDescriptor, B + expert_id64 * stride_b_e, N, K, stride_b_n, 1,  # and of the slab
+            BLOCK_SIZE_N, BLOCK_SIZE_K, B_MEMORY_MODE, GATE,
+        )
+        # The box's rank, not the backend: only this kernel resolves its own 2D per-expert box
+        # (above). The other grouped kernels run the same mode on Xe against host-built 3D boxes.
+        B_DESCRIPTOR_IS_2D: tl.constexpr = B_MEMORY_MODE == "device_descriptor"
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
             a, _as = load_act_plain(
-                a_ptrs, ADescriptor, m_start, k * BLOCK_SIZE_K, row_mask, in_row,
+                a_ptrs, a_desc, m_start, k * BLOCK_SIZE_K, row_mask, in_row,
                 A_MEMORY_MODE, GatherIdx is not None,
             )
             w, _ws = load_weight_plain(
-                b_ptrs, BDescriptor, row0, n_off, k * BLOCK_SIZE_K,
+                b_ptrs, b_desc, row0, n_off, k * BLOCK_SIZE_K,
                 GATE, True, B_MEMORY_MODE, False, BLOCK_SIZE_N, BLOCK_SIZE_K,
+                B_DESCRIPTOR_IS_2D=B_DESCRIPTOR_IS_2D,
             )
             acc = acc + fp8_dot(a, w, False, BLOCK_SIZE_K)
-            a_ptrs += BLOCK_SIZE_K * stride_a_k
-            b_ptrs += BLOCK_SIZE_K * stride_b_k
+            if A_MEMORY_MODE == "pointer":
+                a_ptrs += BLOCK_SIZE_K * stride_a_k
+            if B_MEMORY_MODE == "pointer":
+                b_ptrs += BLOCK_SIZE_K * stride_b_k
 
         gemm_epilogue(
             C,
@@ -1260,9 +1301,9 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
     As: torch.Tensor | None,
     Bs: torch.Tensor,
     expert_start: torch.Tensor,
-    block_size: list[int],
+    block_size: List[int],
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
@@ -1272,7 +1313,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     """Block-scale grouped FP8 matmul over expert-sorted positions (per-tile
     gather/scatter, the sort is virtual — see ``compute_grouped_scheduling`` for the maps).
     Raw activations are quantized here (``fp8_act_quant_block_dynamic``, one offline pass);
@@ -1329,7 +1370,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
             A, block_k, use_ue8m0=bs_u8.dtype == torch.uint8
         )
         # post-quant: trade the in-kernel gather for one packed-row copy where that wins
-        A, As, gather_idx = expand_gather_below_parity(A, As, gather_idx, num_experts)
+        A, As, gather_idx = expand_gather_below_parity(A, As, gather_idx, num_experts, expert_start)
     if requant:
         C = A.new_empty(S, N, dtype=FP8_DTYPE)
         # UE8M0 model (ue8m0 weights) -> UE8M0 intermediate scales so the down proj reads
@@ -1338,9 +1379,9 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
         cs_dtype = bs_u8.dtype
         Cs = torch.empty(S, N // block_n, device=A.device, dtype=cs_dtype)
     else:
-        C = A.new_empty(S, N, dtype=output_dtype)
+        C = A.new_empty(S, gate_out_cols(N, gate, act_fn), dtype=output_dtype)
         Cs = None  # unread without an OUTPUT_FORMAT; strides literal below
-    num_sms = sm_count(A.device.index)
+    num_sms = persistent_program_count(A.device.index)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
         A, B.view(num_experts, 2 * N if gate else N, K)
     )
@@ -1414,9 +1455,9 @@ def w8a8_block_static_fp8_matmul_grouped(
     As: torch.Tensor,
     Bs: torch.Tensor,
     expert_start: torch.Tensor,
-    block_size: list[int],
+    block_size: List[int],
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
@@ -1426,7 +1467,7 @@ def w8a8_block_static_fp8_matmul_grouped(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     """Block-scale grouped FP8 matmul with a static (per-tensor calibrated) activation scale —
     the block-dynamic sibling with the 2D ``block_static`` format. ``A`` is raw here: the op
     quantizes it against the scalar ``As`` (offline, ``(A / As).to(fp8)``), the kernel applies the
@@ -1436,7 +1477,8 @@ def w8a8_block_static_fp8_matmul_grouped(
 
     A:  (S, K) raw bf16/fp16 activations — rows addressed via ``gather_idx``
     B:  (num_experts, N, K) FP8 weights; under ``gate`` the (num_experts, 2N, K) gate|up stack
-    As: scalar / (1,) — the calibrated per-tensor (static) activation scale
+    As: scalar / (1,) for one calibrated scale, or (num_experts,) for a MoE that
+        calibrates each expert separately
     Bs: (num_experts, N // block_n, K // block_k) per-block weight scales (2N under gate)
     """
     validate_dense_operands(A, B)
@@ -1463,20 +1505,17 @@ def w8a8_block_static_fp8_matmul_grouped(
     )
 
     output_dtype = resolve_output_dtype(output_dtype, A, None)
-    As = As.reshape(1).to(torch.float32)
+    A_q, As, as_stride = static_expert_act_operands(A, As, num_experts)
     bs_u8 = ue8m0_as_uint8(Bs)
-    # Pre-quantize the raw activations against the calibrated scalar (offline — MoE always
-    # pre-quants; the kernel folds the scalar back post-loop).
-    A_q = (A.to(torch.float32) / As).to(FP8_DTYPE)
     if requant:
         C = A.new_empty(S, N, dtype=FP8_DTYPE)
         # UE8M0 model (ue8m0 weights) -> UE8M0 intermediate scales; the epilogue infers the format
         # from this dtype (fp32 weights keep fp32), matching the block-dynamic requant.
         Cs = torch.empty(S, N // block_n, device=A.device, dtype=bs_u8.dtype)
     else:
-        C = A.new_empty(S, N, dtype=output_dtype)
+        C = A.new_empty(S, gate_out_cols(N, gate, act_fn), dtype=output_dtype)
         Cs = None  # unread without an OUTPUT_FORMAT; strides literal below
-    num_sms = sm_count(A.device.index)
+    num_sms = persistent_program_count(A.device.index)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
         A_q, B.view(num_experts, 2 * N if gate else N, K)
     )
@@ -1510,6 +1549,7 @@ def w8a8_block_static_fp8_matmul_grouped(
             B.stride(0),
             B.stride(2),
             B.stride(1),
+            as_stride,
             bs_u8.stride(0),
             bs_u8.stride(2),
             bs_u8.stride(1),
@@ -1549,7 +1589,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
     Bs: torch.Tensor,
     expert_start: torch.Tensor,
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
@@ -1559,7 +1599,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     """Tensor-scale grouped FP8 matmul over expert-sorted positions (per-tile
     gather/scatter, the sort is virtual — see ``compute_grouped_scheduling`` for the maps).
     Raw activations are quantized here (``fp8_act_quant_tensor_wide``, one offline pass);
@@ -1569,7 +1609,8 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
 
     A:  (S, K) pre-quantized FP8 activations — rows addressed via ``gather_idx``
     B:  (num_experts, N, K) FP8 expert weights; under ``gate`` the (num_experts, 2N, K) stack
-    As: (S,) per-token activation scales
+    As: (S,) per-token scales alongside a pre-quantized A, or — on a raw A — the calibrated
+        (static) activation scale: one value, or one per expert
     Bs: (num_experts,) or (num_experts, 1, 1) per-expert weight scales
     expert_start: (num_experts_pow2 + 1,) int32 — cumulative sorted-row starts, S sentinel
     gather_idx: optional (S,) — sorted position -> source row of A; None = A is expert-sorted
@@ -1593,14 +1634,20 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
     # Normalize Bs to (num_experts, 1, 1) — one per-tensor scale (covers the gate|up stack)
     Bs = normalize_per_expert_scale(Bs, num_experts)
 
-    # A raw (As is None) -> quantize here (offline, per-token); else pre-quantized.
     output_dtype = resolve_output_dtype(output_dtype, A, As)
-    if As is None:
-        A, As = fp8_act_quant_tensor_wide(A, K)
-        # post-quant: trade the in-kernel gather for one packed-row copy where that wins
-        A, _, gather_idx = expand_gather_below_parity(A, None, gather_idx, num_experts)
-    C = A.new_empty(S, N, dtype=output_dtype)
-    num_sms = sm_count(A.device.index)
+    A, As, as_stride_m, as_stride_e = tensor_wide_act_operands(A, As, num_experts)
+    if as_stride_e and expand_regime(S, num_experts):
+        # a per-expert calibrated scale: lay the routed rows out quantized rather than read
+        # them raw through every N-tile — the same copy-amortizes-at-prefill law below
+        A = quantize_routed_rows_per_expert(A, As, gather_idx, expert_start, num_experts)
+        gather_idx = None  # spent: the rows are laid out now
+    if A.dtype == FP8_DTYPE:
+        # post-quant: trade the in-kernel gather for one packed-row copy where that wins. Keyed
+        # on A being quantized, which the dynamic quant, a shared calibrated scale and the
+        # per-expert layout above all reach; raw rows (decode) keep the gather.
+        A, _, gather_idx = expand_gather_below_parity(A, None, gather_idx, num_experts, expert_start)
+    C = A.new_empty(S, gate_out_cols(N, gate, act_fn), dtype=output_dtype)
+    num_sms = persistent_program_count(A.device.index)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
         A, B.view(num_experts, 2 * N if gate else N, K)
     )
@@ -1631,7 +1678,8 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
             K,
             A.stride(0),
             A.stride(1),
-            As.stride(0),
+            as_stride_m,
+            as_stride_e,
             B.stride(0),
             B.stride(2),
             B.stride(1),
@@ -1667,7 +1715,7 @@ def mx_dynamic_matmul_grouped(
     Bs: torch.Tensor,
     expert_start: torch.Tensor,
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
@@ -1680,7 +1728,7 @@ def mx_dynamic_matmul_grouped(
     b_global_scale: torch.Tensor | None = None,
     output_global_scale: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     """Grouped MX matmul over expert-sorted positions (per-tile gather/scatter, the
     sort is virtual — see ``compute_grouped_scheduling`` for the maps). Activations arrive
     pre-quantized: the caller owns the act-quant (``mxfp8_act_quant``). The
@@ -1768,20 +1816,22 @@ def mx_dynamic_matmul_grouped(
     # pre-quantized As) and rides down as AsGlobal for the accumulator to multiply back — grouped A
     # is always quantized before the GEMM, so no in-kernel inline quant reads it.
     act_global_scale = normalize_global_scale(a_global_scale, num_experts)
+    # A per-expert g_a quantizes each row against ITS expert's global. A gathered A holds one row
+    # per token, routed to top_k experts at once, so it quantizes per routed row, into expert-sorted
+    # rows the GEMM then reads without a gather.
+    quantize_per_routed_row = is_per_expert_global(a_global_scale) and gather_idx is not None
     if a_global_scale is not None:
         assert activation_format == "nvfp4", "an activation global is NVFP4-only"
-        # A per-expert g_a quantizes each row against ITS expert's global, so every row must
-        # belong to one expert — i.e. A is expert-sorted (``gather_idx`` None: the down of both
-        # MoE chains, raw or pre-quantized). Under a gather, A is one row per SOURCE token routed
-        # to top_k experts at once and no single quant can serve per-expert globals, so that call
-        # takes one global for the tensor (the global is a split of the block scale, not a value
-        # the GEMM loses: the accumulator multiplies back whatever the quant divided by).
-        assert not is_per_expert_global(a_global_scale) or gather_idx is None, (
-            "a per-expert a_global_scale needs an expert-sorted A (gather_idx None) — a gathered "
-            "A holds one row per source token, routed to several experts at once, so pass one "
-            "global for the tensor"
+        assert not quantize_per_routed_row or As is None, (
+            "a per-expert a_global_scale under a gather needs a raw A"
         )
-    if swizzled_scales:
+    if quantize_per_routed_row:
+        a_vals, act_scales, n_m_tiles = mx_act_quant_routed_rows(
+            A, activation_format, scale_group, scale_dtype, gather_idx, expert_start, act_global_scale,
+            swizzled=swizzled_scales,
+        )
+        gather_idx = None
+    elif swizzled_scales:
         if As is None and gather_idx is not None:
             # Quantize ONCE at (num_tokens, K) and let the kernel gather the packed rows:
             # the fused sorted-quant below re-reads and re-quantizes each row per routed
@@ -1802,7 +1852,7 @@ def mx_dynamic_matmul_grouped(
                 A, activation_format, scale_group, scale_dtype, gather_idx, expert_start,
                 act_global_scale,
             )
-        elif As.ndim == 5:  # pre-swizzled by the gate_up requant epilogue (fused down) — read as is
+        elif As.ndim == 5:  # pre-swizzled (requant epilogue, a forward's routed quant) — read as is
             a_vals, act_scales, n_m_tiles = A, As, As.shape[1]
         else:  # given row-major scales -> gather+swizzle into the tcgen05 layout
             a_vals = A
@@ -1833,7 +1883,7 @@ def mx_dynamic_matmul_grouped(
         # GLM shape): the affine scale gather forfeits WS and the descriptor-A configs, so
         # materialized rows keep the faster GEMM.
         a_vals, act_scales, gather_idx = expand_gather_below_parity(
-            a_vals, act_scales, gather_idx, num_experts
+            a_vals, act_scales, gather_idx, num_experts, expert_start
         )
         n_rows = gather_idx.numel() if gather_idx is not None else a_vals.shape[0]
         n_m_tiles = n_rows // 128 + num_experts
@@ -1867,7 +1917,7 @@ def mx_dynamic_matmul_grouped(
     elif requant:
         C = A.new_empty((S, N), dtype=FP8_DTYPE)
     else:
-        C = A.new_empty((S, N), dtype=output_dtype)
+        C = A.new_empty((S, gate_out_cols(N, gate, act_fn)), dtype=output_dtype)
     if swizzled_out:
         cb_cs = triton.cdiv(N // scale_group, 4)
         cs_ret = torch.empty(1, n_m_tiles, cb_cs, 2, 256, device=A.device, dtype=scale_dtype)
@@ -1878,7 +1928,7 @@ def mx_dynamic_matmul_grouped(
         Cs, CSDescriptor = cs_ret, None
     else:
         cs_ret, Cs, CSDescriptor = None, None, None  # unread (no OUTPUT_FORMAT)
-    num_sms = sm_count(A.device.index)
+    num_sms = persistent_program_count(A.device.index)
     # NVFP4 accumulator correction: the per-expert g_a·g_b product folded onto the fp32 accumulator
     # (grouped A is pre-quantized, so the kernel needs only this product, never g_a alone).
     # g_b per expert and g_a scalar go down SEPARATELY; the kernel multiplies them in-register
@@ -1968,7 +2018,7 @@ def full_precision_matmul_grouped(
     B: torch.Tensor,
     expert_start: torch.Tensor,
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
@@ -1978,7 +2028,7 @@ def full_precision_matmul_grouped(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     """Full-precision (BF16/FP16) grouped matmul over expert-sorted positions (per-tile
     gather/scatter, the sort is virtual — see ``compute_grouped_scheduling`` for the maps).
     No quantization anywhere: activations and weights share one high-precision dtype and the
@@ -2005,8 +2055,8 @@ def full_precision_matmul_grouped(
     S = routed_rows(A, gather_idx, scatter_idx, expert_start, num_experts)
 
     output_dtype = resolve_output_dtype(output_dtype, A, None)
-    C = A.new_empty(S, N, dtype=output_dtype)
-    num_sms = sm_count(A.device.index)
+    C = A.new_empty(S, gate_out_cols(N, gate, act_fn), dtype=output_dtype)
+    num_sms = persistent_program_count(A.device.index)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
         A, B.view(num_experts, 2 * N if gate else N, K)
     )
@@ -2065,7 +2115,7 @@ def mx_weight_only_matmul_grouped(
     Bs: torch.Tensor,
     expert_start: torch.Tensor,
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
@@ -2074,7 +2124,7 @@ def mx_weight_only_matmul_grouped(
     scatter_idx: torch.Tensor | None = None,
     b_global_scale: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     """weight-only grouped matmul: raw bf16/fp16 activations against MXFP4/NVFP4/MXFP8 weights upcast
     to bf16 in-loop — the ``matmul_ogs`` format (fp4/fp8 weight bytes, bf16 acts, weight upcast in-MMA).
     Affine (3D) weight scales — UE8M0 group-32 (MX) or E4M3 group-16 (NVFP4, whose per-expert fp32
@@ -2096,8 +2146,8 @@ def mx_weight_only_matmul_grouped(
     b_global_scale = normalize_global_scale(b_global_scale, num_experts)
     S = routed_rows(A, gather_idx, scatter_idx, expert_start, num_experts)
     output_dtype = resolve_output_dtype(output_dtype, A, None)
-    C = A.new_empty(S, N, dtype=output_dtype)
-    num_sms = sm_count(A.device.index)
+    C = A.new_empty(S, gate_out_cols(N, gate, act_fn), dtype=output_dtype)
+    num_sms = persistent_program_count(A.device.index)
     b_u8 = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)
     # Operand host-TMA descriptors (A over (S, K), B over the (E, 2N|N, K_bytes) weight view);
@@ -2168,7 +2218,7 @@ def matmul_grouped(
     bias: torch.Tensor | None = None,  # (E, N_out) per-expert output bias; (N_out,) for 2D
     activation_format: str | None = None,
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     quantize_output: bool = False,
@@ -2178,6 +2228,8 @@ def matmul_grouped(
     scatter_idx: torch.Tensor | None = None,
     a_global_scale: torch.Tensor | None = None,
     b_global_scale: torch.Tensor | None = None,
+    b_scale_exceptions: torch.Tensor | None = None,
+    b_scale_exception_offsets: torch.Tensor | None = None,
     output_global_scale: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Grouped matmul dispatcher (W8A8 FP8, W4A8/W4A4 FP4, or full-precision).
@@ -2193,7 +2245,8 @@ def matmul_grouped(
     packed E2M1 activations). ``Bs`` ``None`` = unquantized BF16/FP16 weights.
     ``quantize_output`` requantizes the output into ``activation_format`` — the return is then
     ``(C, Cs)``. ``gate``/``act_fn``/``swiglu_alpha``/``swiglu_limit`` fuse the gate|up GLU into the
-    epilogue.
+    epilogue; ``act_fn=None`` with ``gate`` skips it, returning the raw interleaved gate|up
+    output for a host-side activation.
     ``As``/``Bs`` are each a bare block-scale tensor; the two-level NVFP4 second-level scales ride
     the separate ``a_global_scale``/``b_global_scale`` (fp32 per-tensor, weights per-expert ``(E,)``;
     from ``nvfp4_quantize_two_level``), and the op folds ``g_a · g_b`` onto the accumulator. The
@@ -2206,8 +2259,8 @@ def matmul_grouped(
     already expert-ordered), ``scatter_idx`` scatters the output. The fused MoE chain is one
     scheduling pass: gate_up with ``scatter_idx=None`` + ``gate=True`` + ``quantize_output=True``,
     then down with ``gather_idx=None`` and the
-    intermediate's scales as ``As``. EP-sentinel routes fall past ``expert_start[-1]`` and
-    are never touched.
+    intermediate's scales as ``As``. EP-sentinel routes sit past ``expert_start[-1]``, which
+    no tile reaches.
 
     Routes by what the weight tensors themselves say (there is no ``block_size``
     parameter — the quantization block is derived from the scale shape,
@@ -2218,13 +2271,18 @@ def matmul_grouped(
     - one scale per expert (``Bs`` ``(E,)``/``(E, 1, 1)``) →
       ``w8a8_tensor_dynamic_fp8_matmul_grouped``.
     - block scales (``Bs`` ``(E, N/bn, K/bk)``) → ``w8a8_block_dynamic_fp8_matmul_grouped``.
+    - CSF-compressed NVFP4 weight scales (``prepare_nvfp4_csf_scales``): ``Bs`` is the fixed
+      stream, ``b_scale_exceptions``/``b_scale_exception_offsets`` its exceptions and expert
+      offsets; the op decodes them before the GEMM (only the routed experts when routing allows).
     """
+    Bs = csf_weight_scales(Bs, b_scale_exceptions, b_scale_exception_offsets, expert_start)
     check_activation_format(activation_format, quantize_output)
+    assert act_fn is not None or not quantize_output, "the raw gate|up output (act_fn=None) is not requantized"
     if gather_idx is not None and activation_format == "bf16" and As is None:
         # weight-only: raw bf16 rows are what the kernel consumes, so the trade is decided
         # here; the QUANTIZED formats decide it in their family wrappers AFTER the act quant
         # (expanding packed rows + scales — see ``expand_gather_below_parity``).
-        A, _, gather_idx = expand_gather_below_parity(A, None, gather_idx, B.shape[0])
+        A, _, gather_idx = expand_gather_below_parity(A, None, gather_idx, B.shape[0], expert_start)
     assert (a_global_scale is None and b_global_scale is None) or (
         Bs is not None and weight_format(B, Bs) == "nvfp4"
     ), "two-level globals (a_global_scale / b_global_scale) are NVFP4-only"
@@ -2234,12 +2292,15 @@ def matmul_grouped(
         "output_global_scale is the NVFP4 requant second level — it requires quantize_output=True on NVFP4 "
         "(the epilogue would otherwise normalize by it with nothing downstream to compensate)"
     )
-    if As is not None and As.numel() == 1:
-        # static (per-tensor calibrated) activation quant: a per-tensor scalar As for block-scale FP8
-        # weights — the caller hands raw A, the op quantizes it against the scalar (As IS the scale).
-        assert Bs is not None and not is_mx(B, Bs) and weight_block_size(B, Bs) is not None, (
-            "a per-tensor scalar As (static activation scale) needs block-scale FP8 weights"
+    # a calibrated (static) scale on a raw A (see `tensor_wide_act_operands`): block-scale weights
+    # have a dedicated static kernel, per-tensor ones read the same As on the tensor-wide arm
+    static_act = As is not None and As.ndim <= 1 and As.numel() in (1, B.shape[0]) and A.dtype != FP8_DTYPE
+    if static_act:
+        assert Bs is not None and not is_mx(B, Bs), (
+            "a calibrated (static) activation scale is an FP8 form — MX activations carry a scale "
+            "per group, derived per call"
         )
+    if static_act and weight_block_size(B, Bs) is not None:
         out = w8a8_block_static_fp8_matmul_grouped(
             A,
             B,

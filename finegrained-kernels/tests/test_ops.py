@@ -24,32 +24,43 @@ shapes, torch.compile) ride one format each. One ``Problem`` list feeds all thre
 ``op`` axis (``test_op_scenarios``): the routed ops (``batched`` / ``grouped``) run
 every Problem; ``matmul`` — the single-GEMM sibling — runs each Problem it can represent (no
 expert routing, a quantized format it routes, requant on MX weights only), one weight matrix and
-no gather/scatter. Two orthogonal knobs ride the same list: ``static`` (per-tensor calibrated
-activation quant, all three ops) and ``swizzled`` (MX weight scales pre-swizzled into the 5D
-SWIZZLE_32_4_4 tcgen05 layout — a pure layout variant checked against the affine reference).
+no gather/scatter. Two orthogonal knobs ride the same list: ``static`` (calibrated activation
+quant — a shared scale on all three ops, one per expert on the routed pair) and ``swizzled`` (MX
+weight scales pre-swizzled into the 5D SWIZZLE_32_4_4 tcgen05 layout — a pure layout variant
+checked against the affine reference).
 Nothing in this file uses a kernel under test as the oracle."""
 
 from dataclasses import dataclass
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
 from utils import (  # type: ignore
     DTYPE_TO_TOL,
     REQUANT_FN,
     REQUANT_GROUP,
+    SUPPORTS_SWIZZLED_SCALES,
     TEST_DEVICE,
     WEIGHTS,
+    dequant_gate_up,
+    dq_block_fp8,
     dq_grouped,
     dq_scale,
+    make_gate_up,
     make_static_activation_scale,
     maybe_compile,
     quant_dequant_a,
+    prepare_weight_scales,
 )
 
 import finegrained_kernels  # type: ignore
+from finegrained_kernels.embedding import embedding_lookup
 from finegrained_kernels import swizzle_mx_scales, unswizzle_mx_scales  # type: ignore
 from finegrained_kernels.compat import NVFP4_SCALE_GROUP_K  # type: ignore
+from finegrained_kernels.formats import is_mxfp4, is_mxfp8, mx_scale_family, ue8m0_as_uint8
+from finegrained_kernels.loading.scales import decode_group_scale
 from finegrained_kernels.quant import nvfp4_act_quant  # type: ignore
 from finegrained_kernels.epilogue import apply_glu  # type: ignore
 
@@ -76,12 +87,14 @@ class Problem:
     quantize_output: bool = False
     per_expert_globals: bool = False  # activation (and requant output) globals calibrated per expert
     prequant: bool = False  # pass As explicitly (must be bit-identical to raw A)
-    static: bool = False  # per-tensor calibrated activation scale (block-scale FP8 path)
+    static: bool = False  # calibrated (static) activation scale instead of a runtime one
+    csf_encoding: bool = False  # lossless CSF compression of NVFP4 scales
     swizzled: bool = False  # pass MX weight scales pre-swizzled (5D SWIZZLE_32_4_4 fast path)
     sentinel_fraction: float = 0.0
     noncontiguous: bool = False
     empty_expert: bool = False
     compile: bool = False
+    bias: bool = False  # a per-expert output bias, added on the accumulator before the GLU
     dtype: torch.dtype = torch.bfloat16
 
     @property
@@ -103,6 +116,8 @@ class Problem:
             tag += "_prequant"
         if self.static:
             tag += "_static"
+        if self.csf_encoding:
+            tag += "_csf"
         if self.swizzled:
             tag += "_swizzled"
         if self.sentinel_fraction:
@@ -113,6 +128,8 @@ class Problem:
             tag += "_emptyexpert"
         if self.compile:
             tag += "_compile"
+        if self.bias:
+            tag += "_bias"
         if self.dtype != torch.bfloat16:
             tag += f"_{str(self.dtype).rsplit('.', 1)[-1]}"  # float16 / float32
         return f"{tag}_S{self.S}_E{self.E}_N{self.N}_K{self.K}"
@@ -164,11 +181,19 @@ def scenarios() -> list[Problem]:
         Problem(weights="mxfp8", prequant=True),
         Problem(weights="nvfp4", prequant=True),
         Problem(weights="mxfp8", sentinel_fraction=0.25),
+        # the prefill expansion (>= 4096 routed rows below 1024 per expert) copies only the local rows:
+        # values + 2D scales, and raw bf16 rows
+        Problem(weights="fp8_128x128", S=4096, E=8, sentinel_fraction=0.5),
+        Problem(weights="bf16", S=4096, E=8, sentinel_fraction=0.5),
         Problem(weights="mxfp8", noncontiguous=True),
         Problem(weights="mxfp8", empty_expert=True),
         # decode shape (small M — inline act-quant on MX, the software/scalar arms elsewhere)
         Problem(weights="mxfp8", S=8),
         Problem(weights="nvfp4", S=8),
+        # the TOP of the 2D swap decode band (mx_2d_swap_scope_pruner scopes SWAP_AB to M <= 16):
+        # the arm's tile choices differ across the band, and an A-descriptor trap that is clean at
+        # S=4 fires by S=16, so the edge is the cell that sees it
+        Problem(weights="nvfp4", S=16),
         Problem(weights="fp8_128x128", S=8),
         Problem(weights="fp8_128x128_ue8m0", S=8),
         Problem(weights="mxfp4", S=8),
@@ -206,6 +231,10 @@ def scenarios() -> list[Problem]:
         # per-projection input_scale), which the act quant applies by the row's expert
         Problem(weights="nvfp4", per_expert_globals=True),
         Problem(weights="nvfp4", gate=True, activation_format="nvfp4", quantize_output=True, per_expert_globals=True),
+        Problem(weights="nvfp4", csf_encoding=True, S=8),
+        Problem(weights="nvfp4", csf_encoding=True, empty_expert=True, sentinel_fraction=0.25, compile=True),
+        Problem(weights="nvfp4", csf_encoding=True, activation_format="bf16"),
+        Problem(weights="nvfp4", csf_encoding=True, gate=True, activation_format="nvfp4", quantize_output=True, compile=True),
         # swizzled decode (S=8) — the bench's pre-swizzled batched decode arm per fp4 family
         Problem(weights="mxfp4", swizzled=True, S=8),
         Problem(weights="nvfp4", swizzled=True, S=8),
@@ -221,10 +250,15 @@ def scenarios() -> list[Problem]:
         Problem(weights="fp8_128x128", compile=True),
         Problem(weights="mxfp4", compile=True),
         Problem(weights="bf16", compile=True),  # the fp kernel's pre_hook under compile
-        # static (per-tensor calibrated) activation quant — the block_static path, reached when
-        # As is a per-tensor scalar; runs on all three ops (2D / grouped / batched).
+        Problem(weights="fp8_tensor", static=True, compile=True),  # the static arm's operand marshalling
+        # calibrated (static) activation quant, reached when As is a calibrated scale rather than
+        # per-block. One value per quantized module, so the OP fixes the shape: a dense linear
+        # calibrates once, a MoE calibrates each expert separately. Runs on all three ops.
         Problem(weights="fp8_128x128", static=True),
         Problem(weights="fp8_128x128", gate=True, static=True),
+        # per-TENSOR weights: the shipped static form (Ministral-3 dense, Mistral-4 MoE — both
+        # write qscheme_act="TENSOR" with weight_block_size=None)
+        Problem(weights="fp8_tensor", static=True),
         # non-aligned N (64-grid, off the 128-grid — gpt-oss H=I=2880 shape). matmul_2d masks the
         # N-tail; routed MX runs the affine arm (per-row scales, any BN|N); routed FP8 rejects it
         # (its scales are 128-blocked along N — raises pointing to matmul_2d).
@@ -244,6 +278,23 @@ def scenarios() -> list[Problem]:
         Problem(weights="mxfp4", dtype=torch.float32),
         Problem(weights="mxfp8", dtype=torch.float16),
         Problem(weights="mxfp8", dtype=torch.float32),
+        # output bias (gpt-oss ships one on both projections), added in the shared epilogue: one cell per kernel
+        # (full precision, block-FP8 dynamic and static, per-tensor FP8, MX dynamic, MX weight-only), then the
+        # epilogue paths — the two-level global applied before it, the gated columns, the swapped decode tile,
+        # block-FP8's unstacked-gate decode band, the requantized output — and the gpt-oss gate_up itself
+        Problem(weights="bf16", bias=True),
+        Problem(weights="fp8_128x128", bias=True),
+        Problem(weights="fp8_128x128", static=True, bias=True),
+        Problem(weights="fp8_tensor", bias=True),
+        Problem(weights="mxfp8", bias=True),
+        Problem(weights="mxfp8", activation_format="bf16", bias=True),
+        Problem(weights="nvfp4", bias=True),
+        Problem(weights="mxfp8", gate=True, bias=True),
+        Problem(weights="nvfp4", S=8, bias=True),
+        Problem(weights="fp8_128x128", gate=True, S=8, bias=True),
+        Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, bias=True),
+        Problem(weights="mxfp4", activation_format="bf16", gate=True, swiglu_alpha=1.702, swiglu_limit=7.0, bias=True),
+        Problem(weights="mxfp4", activation_format="bf16", gate=True, swiglu_alpha=1.702, swiglu_limit=7.0, bias=True, S=8),
     ]
     return out
 
@@ -271,6 +322,18 @@ def _routed(problem: Problem):
     return A, expert_ids
 
 
+def _bias(problem: Problem, op):
+    """The scenario's output bias, else None: ``(E, N_out)`` for the routed ops, ``(N_out,)`` for
+    ``matmul``, ``N_out`` the GEMM's width (the interleaved gate|up columns under gate). Seeded, so the
+    reference and the op read the identical values; large enough that dropping it fails the check."""
+    if not problem.bias:
+        return None
+    g = torch.Generator(device=TEST_DEVICE).manual_seed(1)
+    rows = 2 * problem.N if problem.gate else problem.N
+    bias = torch.randn(problem.E, rows, device=TEST_DEVICE, generator=g).to(problem.dtype)
+    return bias[0] if op == "matmul" else bias
+
+
 def _make_noncontig(x):
     base = torch.empty((x.numel(), 2), dtype=x.dtype, device=x.device)
     base[:, 0] = x
@@ -278,10 +341,19 @@ def _make_noncontig(x):
     return base[:, 0]
 
 
-def _static_scale(problem: Problem, A):
-    """Per-tensor calibrated activation scale for the static (block-scale FP8) path, else None —
-    deterministic in ``A``, so the reference and the op derive the identical scalar."""
-    return make_static_activation_scale(A) if problem.static else None
+def _static_scale(problem: Problem, op, A):
+    """The calibrated activation scale, else None. A checkpoint calibrates one per quantized
+    module, so the op fixes the shape: one value for ``matmul``, the single linear, and one per
+    expert for the routed ops, whose experts are each their own module — fanned around the
+    per-tensor value so an entry read against the wrong expert shows up. Deterministic in ``A``,
+    so the reference and the op derive identical numbers."""
+    if not problem.static:
+        return None
+    scale = make_static_activation_scale(A)
+    if op == "matmul":
+        return scale
+    fan = torch.linspace(0.5, 2.0, problem.E, device=A.device, dtype=torch.float32)
+    return (scale * fan).contiguous()
 
 
 def _nvfp4_global(x):
@@ -315,15 +387,15 @@ def _rowwise(problem: Problem, g, expert_ids):
     return g[expert_ids.to(torch.long).clamp(max=problem.E - 1)].reshape(-1, 1)
 
 
-def _dequant_a(problem: Problem, A, expert_ids=None):
+def _dequant_a(problem: Problem, op, A, expert_ids=None):
     """``A`` dequantized to fp32 on the format's grid (the exact host quant the op calls, or the
-    static per-tensor scale), plus the pre-quantized ``(Aq, As)`` form for the prequant round-trip
+    calibrated static scale of each row's expert), plus the pre-quantized ``(Aq, As)`` form for the prequant round-trip
     check (``None`` where ``A`` stays raw)."""
     row = WEIGHTS[problem.weights]
-    static_scale = _static_scale(problem, A)
+    static_scale = _static_scale(problem, op, A)
     act_global = _act_global(problem, A, expert_ids)
-    if static_scale is not None:  # static per-tensor activation quant
-        return quant_dequant_a(A, problem.K, scale=static_scale), None
+    if static_scale is not None:  # static (calibrated) activation quant
+        return quant_dequant_a(A, problem.K, scale=_rowwise(problem, static_scale, expert_ids)), None
     if act_global is not None:
         # nvfp4 acts are always two-level: quantize A/g_a per block (the exact host fn the op
         # calls), dequantize × g_a; the pre-quantized form is the bare block scale (the g_a
@@ -344,20 +416,20 @@ def _dequant_a(problem: Problem, A, expert_ids=None):
     return row["dq_act"](Aq, As), (Aq, As)
 
 
-def _prequant_args(problem: Problem, A, expert_ids=None):
+def _prequant_args(problem: Problem, op, A, expert_ids=None):
     """The pre-quantized ``(Aq, As)`` form of ``A`` (``As`` = bare block scale) — the ``As`` half of
     ``_dequant_a``, handed to the op (and the reference) exactly as the op would compute it. The nvfp4
     activation global rides separately (``_act_global`` on the raw ``A``)."""
-    return _dequant_a(problem, A, expert_ids)[1]
+    return _dequant_a(problem, op, A, expert_ids)[1]
 
 
-def _act_dequant(problem: Problem, A, As=None, As_global=None, expert_ids=None):
+def _act_dequant(problem: Problem, op, A, As=None, As_global=None, expert_ids=None):
     """The fp32 activation the op multiplies by — from raw ``A`` (``As`` None: quantize+dequant on
     the format grid, the exact host quant the op applies) or from a pre-quantized ``(Aq, As)`` (dequant
     it, folding the nvfp4 ``As_global`` back). Both land on the same values, so the reference reads
     whatever the op was handed."""
     if As is None:
-        return _dequant_a(problem, A, expert_ids)[0]
+        return _dequant_a(problem, op, A, expert_ids)[0]
     if As_global is not None:  # nvfp4 two-level: block scale As, global As_global
         return dq_grouped(A.view(torch.int8), As, NVFP4_SCALE_GROUP_K) * _rowwise(
             problem, As_global, expert_ids
@@ -372,13 +444,19 @@ def _fp32_intermediate(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As
     gather ``W[expert]`` and zero sentinel rows; GLU in fp32 (the production epilogue applies it to
     the fp32 accumulator directly)."""
     row = WEIGHTS[problem.weights]
-    A_dq = _act_dequant(problem, A, As, As_global, expert_ids)
-    W = row["dequant"](B, Bs, Bs_global)  # (E, rows, K) fp32
+    A_dq = _act_dequant(problem, op, A, As, As_global, expert_ids)
+    # (E, rows, K) fp32
+    W = dequant_gate_up(row, B, Bs, Bs_global) if problem.gate else row["dequant"](B, Bs, Bs_global)
+    bias = _bias(problem, op)
     if op == "matmul":
         ref = A_dq @ W[0].T  # single linear, no routing
+        if bias is not None:
+            ref = ref + bias.float()
     else:
         local = expert_ids.long().clamp(max=problem.E - 1)
         ref = torch.einsum("sk,snk->sn", A_dq, W[local])
+        if bias is not None:
+            ref = ref + bias.float()[local]
         ref[expert_ids.long() >= problem.E] = 0
     if problem.gate:
         gate_v, up_v = ref[..., 0::2], ref[..., 1::2]
@@ -443,10 +521,12 @@ def _op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_globa
         )
     if not problem.quantize_output:
         kw["output_dtype"] = problem.dtype
+    if problem.bias:
+        kw["bias"] = _bias(problem, op)
     if out_global is not None:  # provided NVFP4 output global (next proj's input_scale)
         kw["output_global_scale"] = out_global
-    if problem.static:  # fused static (per-tensor) activation quant — As is the calibrated scalar
-        As = _static_scale(problem, A)
+    if problem.static:  # fused static activation quant — As is the calibrated scale
+        As = _static_scale(problem, op, A)
     # matmul is the single-GEMM sibling: slice to the one weight matrix (expert 0) and drop the
     # routing maps; the call is otherwise identical to the routed ops.
     if op == "matmul":
@@ -455,18 +535,20 @@ def _op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_globa
         Bs_global = Bs_global[:1] if Bs_global is not None else None
     # weight-scale swizzle, shared by all three ops — a pure layout change (values unchanged),
     # so the op's result still matches the affine-Bs reference.
+    if problem.swizzled and not SUPPORTS_SWIZZLED_SCALES:
+        pytest.skip("the SWIZZLE_32_4_4 scale layout is the tcgen05 fast path (CUDA-only)")
     bs = swizzle_mx_scales(Bs) if problem.swizzled and Bs is not None else Bs
     globals_kw = dict(a_global_scale=As_global, b_global_scale=Bs_global)
     if op == "matmul":
-        fn = maybe_compile(finegrained_kernels.matmul_2d, problem.compile)
+        fn = prepare_weight_scales(bs, problem.csf_encoding, finegrained_kernels.matmul_2d, problem.compile)
         return fn(A, B, As, bs, **globals_kw, **kw)
     if op == "batched":
-        fn = maybe_compile(finegrained_kernels.matmul_batched, problem.compile)
+        fn = prepare_weight_scales(bs, problem.csf_encoding, finegrained_kernels.matmul_batched, problem.compile)
         return fn(A, B, As, bs, expert_ids=expert_ids, **globals_kw, **kw)
     expert_start, gather_idx, scatter_idx = finegrained_kernels.scheduling.compute_grouped_scheduling(
         expert_ids, problem.E, 1
     )
-    fn = maybe_compile(finegrained_kernels.matmul_grouped, problem.compile)
+    fn = prepare_weight_scales(bs, problem.csf_encoding, finegrained_kernels.matmul_grouped, problem.compile)
     raw = fn(
         A,
         B,
@@ -560,16 +642,23 @@ def _check(problem: Problem, dq_out, ref_cmp, expert_ids, op):
 
 
 def _make_weights(problem: Problem, row, E):
-    """The scenario's weights: ``(B, Bs, Bs_global)`` at the stack's row count (doubled under gate)."""
-    return row["make"](2 * problem.N if problem.gate else problem.N, problem.K, E)
+    """The scenario's weights: ``(B, Bs, Bs_global)``; under gate the interleaved gate|up stack."""
+    if problem.gate:
+        weight, scales, global_scale = make_gate_up(row, problem.N, problem.K, E)
+    else:
+        weight, scales, global_scale = row["make"](problem.N, problem.K, E)
+    if problem.csf_encoding:
+        # E4M3 codes 24 apart (more than the 15 a CSF offset holds): an exception in every expert
+        scales[..., 0, :2] = scales.new_tensor([0.125, 1.0])
+    return weight, scales, global_scale
 
 
 def _skip_moe_only(problem: Problem, op: str) -> None:
     """matmul_2d is the single-GEMM sibling: skip only the scenarios it can't represent — expert
     routing (sentinel / noncontiguous / empty-expert / the MoE prequant-As check) and non-MX
     input/output format knobs (its FP8 paths infer the quant from the scale shape and return the
-    intermediate dense). Everything else — including full-precision (BF16/FP16) weights and static
-    activation quant — runs on all three ops."""
+    intermediate dense). Everything else — including full-precision (BF16/FP16) weights and a
+    shared static activation scale — runs on all three ops."""
     if op != "matmul":
         return
     if problem.sentinel_fraction or problem.noncontiguous or problem.empty_expert or problem.prequant:
@@ -583,18 +672,13 @@ def _skip_moe_only(problem: Problem, op: str) -> None:
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 @pytest.mark.parametrize("op", ["batched", "grouped", "matmul"])
 @pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
 def test_op_scenarios(problem: Problem, op):
     """Reference (the op written in torch) vs op (the kernel): same inputs, each returning the op's
     own output format, compared once through the shared ``_dequant``."""
     _skip_moe_only(problem, op)
-    if problem.per_expert_globals and op == "grouped":
-        # the grouped op quantizes one row per SOURCE token and gathers it per routed slot, so a
-        # per-expert activation global needs expert-sorted rows — the fused down, covered end to
-        # end by the MoE chain tests
-        pytest.skip("grouped takes per-expert activation globals on expert-sorted rows only")
     A, expert_ids = _routed(problem)
     row = WEIGHTS[problem.weights]
     E = 1 if op == "matmul" else problem.E  # matmul is a single weight matrix
@@ -625,7 +709,7 @@ def _run_ref_vs_op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, shared
         As = None
         As_global = _act_global(problem, A, expert_ids)
         if problem.prequant:
-            A, As = _prequant_args(problem, A, expert_ids)
+            A, As = _prequant_args(problem, op, A, expert_ids)
         g_out = _out_global(problem, op, A, expert_ids, B, Bs, Bs_global, As, As_global)
         ref = _reference(problem, op, A, expert_ids, B, Bs, Bs_global, As=As, As_global=As_global, out_global=g_out)
         if shared is not None:
@@ -653,15 +737,24 @@ def _run_ref_vs_op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, shared
 # (E4M3 scales: the nvfp4_native_ok fence + software decode arms).
 _SWEEP_CELLS = [
     (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True), "grouped", "mx_dynamic_matmul_grouped_kernel"),
+    # K off the BK=128 grid admits the BK=64 rows, the family a K=256 cell never reaches
+    (Problem(weights="mxfp4", K=320), "grouped", "mx_dynamic_matmul_grouped_kernel"),
+    (Problem(weights="mxfp8", K=320), "grouped", "mx_dynamic_matmul_grouped_kernel"),
     (Problem(weights="mxfp4", S=8), "batched", "mx_dynamic_matmul_batched_kernel"),
     (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "grouped", "mx_dynamic_matmul_grouped_kernel"),
     (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "matmul", "mx_dynamic_matmul_kernel"),
+    # non-128 N on the 2D gate|up tile (gpt-oss-style N=320): the BN=128 tile overhangs N
+    (Problem(weights="mxfp4", gate=True, activation_format="mxfp4", quantize_output=True, N=320, K=320), "matmul", "mx_dynamic_matmul_kernel"),
     (Problem(weights="nvfp4", gate=True, activation_format="nvfp4", quantize_output=True, swizzled=True, S=8), "batched", "mx_dynamic_matmul_batched_kernel"),
+    # the calibrated (static) arm on per-tensor weights: it hands the kernel a RAW A to quantize
+    # per tile, the one activation form that cannot ride the TMA gather, so its admitted set is
+    # the one a memory-mode fence gets wrong (silently — the tuner forgives what will not lower)
+    (Problem(weights="fp8_tensor", static=True), "grouped", "w8a8_tensor_dynamic_fp8_matmul_grouped_kernel"),
 ]
 
 
 @pytest.mark.slow
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 @pytest.mark.parametrize(
     "problem, op, kernel_name",
     _SWEEP_CELLS,
@@ -729,3 +822,238 @@ def test_every_admitted_config_is_correct(problem: Problem, op, kernel_name):
         print(f"\n[sweep] {len(forgiven)} admitted config(s) failed to compile/run (forgiven):")
         for cfg, err in forgiven:
             print(f"  {cfg}: {err}")
+
+
+@triton.jit
+def _decode_ue8m0_scales(Scales, Out):
+    offsets = tl.arange(0, 8)
+    tl.store(Out + offsets, decode_group_scale(tl.load(Scales + offsets)))
+
+
+@pytest.mark.kernels_ci
+def test_ue8m0_scale_bytes():
+    values = [0, 1, 2, 126, 127, 128, 254, 255]
+    scales = torch.tensor(values, dtype=torch.uint8, device=TEST_DEVICE)
+    actual = torch.empty(8, dtype=torch.float32, device=TEST_DEVICE)
+    _decode_ue8m0_scales[(1,)](scales, actual)
+    expected = torch.tensor(
+        [2.0 ** (byte - 127) for byte in values[:-1]] + [float("nan")],
+        dtype=torch.float32, device=TEST_DEVICE,
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+
+
+@pytest.mark.kernels_ci
+def test_uint8_mx_scales_without_native_ue8m0(monkeypatch):
+    """MX format checks accept raw exponent bytes without a native UE8M0 dtype."""
+    scale = torch.full((16, 4), 127, dtype=torch.uint8)
+    if (native_dtype := finegrained_kernels.compat.UE8M0_DTYPE) is not None:
+        native_scale = scale.view(native_dtype)
+        assert torch.equal(ue8m0_as_uint8(native_scale), scale)
+        assert mx_scale_family(native_scale, 128) == 32
+
+    # What torch < 2.7 resolves at import time.
+    monkeypatch.setattr(finegrained_kernels.formats, "UE8M0_DTYPE", None)
+    monkeypatch.setattr(finegrained_kernels.formats, "UE8M0_SCALE_DTYPES", (torch.uint8,))
+    assert ue8m0_as_uint8(scale) is scale
+    assert is_mxfp8(
+        torch.empty((16, 128), dtype=torch.float8_e4m3fn), scale
+    )
+    assert is_mxfp4(torch.empty((16, 64), dtype=torch.int8), scale)
+    assert mx_scale_family(scale, 128) == 32
+    fp32 = torch.ones((16, 4), dtype=torch.float32)
+    assert ue8m0_as_uint8(fp32) is fp32
+
+
+# Embedding lookup has no GEMM operands or epilogue: check the selected-row operation directly.
+
+
+_EMBEDDING_CASES = [
+    pytest.param("fp8", "tensor", dtype, id=f"fp8_tensor_{dtype}")
+    for dtype in (torch.float32, torch.bfloat16, torch.float16)
+] + [
+    pytest.param("fp8", "row", torch.bfloat16, id="fp8_row"),
+    pytest.param("fp8", "block", torch.float32, id="fp8_block"),
+    pytest.param("nvfp4", "group", torch.bfloat16, id="nvfp4"),
+    pytest.param("mxfp8", "group", torch.bfloat16, id="mxfp8"),
+    pytest.param("mxfp4", "group", torch.float16, id="mxfp4"),
+    pytest.param("int8", "row", torch.float32, id="int8"),
+    pytest.param("int4", "group", torch.bfloat16, id="int4"),
+]
+
+
+def _embedding_table(weight_format, layout, dtype, sliced=False):
+    rows, width = 38, 256 if sliced else 160
+    if weight_format in ("nvfp4", "mxfp4", "int4"):
+        shape = (rows // 2, width) if weight_format == "int4" else (rows, width // 2)
+        weight = torch.randint(0, 256, shape, device=TEST_DEVICE, dtype=torch.uint8)
+        # Every nibble, including signed INT4's -8/-1 and E2M1's signed zero.
+        weight[0] = (
+            torch.arange(16, device=TEST_DEVICE, dtype=torch.uint8)
+            .mul(17)
+            .repeat(shape[1] // 16)
+        )
+    elif weight_format == "int8":
+        weight = torch.randint(
+            -128, 128, (rows, width), device=TEST_DEVICE, dtype=torch.int8
+        )
+    else:
+        weight = (torch.randn(rows, width, device=TEST_DEVICE) * 3).to(
+            torch.float8_e4m3fn
+        )
+    group = 16 if weight_format == "nvfp4" else 32
+    scale_shape = {
+        "tensor": (1,),
+        "row": (rows,),
+        "block": ((rows + 31) // 32, (width + 31) // 32),
+        "group": (rows, width // group),
+    }[layout]
+    if weight_format in ("mxfp8", "mxfp4"):
+        scale = torch.randint(
+            124, 131, scale_shape, device=TEST_DEVICE, dtype=torch.uint8
+        )
+    else:
+        scale_dtype = torch.float8_e4m3fn if weight_format == "nvfp4" else dtype
+        scale = (torch.rand(scale_shape, device=TEST_DEVICE) * 3 + 0.125).to(
+            scale_dtype
+        )
+    global_scale = (
+        torch.tensor([0.0371], device=TEST_DEVICE) if weight_format == "nvfp4" else None
+    )
+    if sliced:
+        if layout == "row":
+            scale = scale[:, None]
+        # Retain shape while exercising non-unit column strides and offset storage.
+        views = []
+        for tensor in (weight, scale):
+            backing = torch.empty(
+                (*tensor.shape[:-1], tensor.shape[-1] * 2 + 1),
+                device=tensor.device,
+                dtype=tensor.dtype,
+            )
+            view = backing[..., 1::2]
+            view.copy_(tensor)
+            views.append(view)
+        weight, scale = views
+        if weight_format == "nvfp4":
+            weight = weight.view(torch.int8)
+            # Zero column stride exercises scalar scale loads in packed decoding.
+            scale = scale[:, :1].expand_as(scale)
+        if weight_format in ("mxfp8", "mxfp4"):
+            scale = scale.view(torch.float8_e8m0fnu)
+    return weight, scale, global_scale
+
+
+def _embedding_reference(
+    weight, ids, scale, global_scale, dtype, weight_format, layout
+):
+    if weight_format == "int4":
+        u = weight.to(torch.uint8).long()
+        values = torch.stack((u & 15, u >> 4), dim=1).reshape(weight.shape[0] * 2, -1)
+        values = torch.where(values >= 8, values - 16, values).float()
+        values = values * scale.repeat_interleave(32, -1)
+    elif layout == "group":
+        values = dq_grouped(weight, scale, 16 if weight_format == "nvfp4" else 32)
+    elif layout == "block":
+        values = dq_block_fp8(weight, scale, 32, 32)
+    else:
+        values = weight.float() * (scale.reshape(-1, 1) if layout == "row" else scale)
+    if global_scale is not None:
+        values = values * global_scale
+    return torch.nn.functional.embedding(ids, values.to(dtype))
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("weight_format,layout,dtype", _EMBEDDING_CASES)
+@pytest.mark.parametrize("sliced", [False, True])
+def test_embedding_lookup_matches_selected_rows(weight_format, layout, dtype, sliced):
+    weight, scale, global_scale = _embedding_table(weight_format, layout, dtype, sliced)
+    ids = torch.tensor([[3, 0, 3], [37, 4, 1]], device=weight.device).t()
+    for indices in (ids, ids.to(torch.int32), ids.new_empty((2, 0)), ids.new_tensor(3)):
+        actual = embedding_lookup(
+            weight,
+            indices,
+            scale,
+            global_scale,
+            dtype,
+            weight_format=weight_format,
+            block_size=32,
+        )
+        torch.testing.assert_close(
+            actual,
+            _embedding_reference(
+                weight, indices, scale, global_scale, dtype, weight_format, layout
+            ),
+            rtol=0,
+            atol=0,
+        )
+        assert actual.dtype == dtype
+    # Keep the original positional FP8/NVFP4 entry points covered.
+    if layout == "tensor" or weight_format == "nvfp4":
+        default = embedding_lookup(weight, ids, scale, global_scale)
+        default_dtype = torch.bfloat16 if weight_format == "nvfp4" else scale.dtype
+        assert default.dtype == default_dtype
+        torch.testing.assert_close(
+            default,
+            _embedding_reference(
+                weight, ids, scale, global_scale, default_dtype, weight_format, layout
+            ),
+            rtol=0,
+            atol=0,
+        )
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("weight_format,layout,dtype", _EMBEDDING_CASES)
+def test_embedding_lookup_fullgraph_compile(weight_format, layout, dtype):
+    weight, scale, global_scale = _embedding_table(
+        weight_format, layout, dtype, sliced=True
+    )
+    ids = torch.tensor([[3, 0, 3], [37, 4, 1]], device=weight.device).t()
+    lookup = maybe_compile(embedding_lookup, True)
+    actual = lookup(
+        weight,
+        ids,
+        scale,
+        global_scale,
+        dtype,
+        weight_format=weight_format,
+        block_size=32,
+    )
+    torch.testing.assert_close(
+        actual,
+        _embedding_reference(
+            weight, ids, scale, global_scale, dtype, weight_format, layout
+        ),
+        rtol=0,
+        atol=0,
+    )
+
+
+def _embedding_invalid_index(_rank, index, packed):
+    weight = torch.ones(37, 16 if packed else 32, device=TEST_DEVICE).to(
+        torch.uint8 if packed else torch.float8_e4m3fn
+    )
+    scale = (
+        torch.ones(37, 2, device=TEST_DEVICE).to(torch.float8_e4m3fn)
+        if packed
+        else torch.ones(1, device=TEST_DEVICE)
+    )
+    global_scale = torch.ones(1, device=TEST_DEVICE) if packed else None
+    embedding_lookup(
+        weight, torch.tensor([index], device=TEST_DEVICE), scale, global_scale
+    )
+    getattr(torch, torch.device(TEST_DEVICE).type).synchronize()
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("index", [-1, 37])
+def test_embedding_invalid_index_fails_in_separate_process(index, packed):
+    # Isolate the poisoned device context, as for native embedding's bounds assertions.
+    with pytest.raises(
+        torch.multiprocessing.ProcessRaisedException,
+        match="(?i)device-side assert|assertion failure",
+    ):
+        torch.multiprocessing.spawn(
+            _embedding_invalid_index, args=(index, packed), nprocs=1
+        )

@@ -55,6 +55,7 @@ struct fmha_bwd_args_t {
 
   // Pre-allocated intermediate buffer (P and dS tiles)
   void* pbuff = nullptr;
+  int total_q = 0;
 };
 
 enum class BwdCutlassType {

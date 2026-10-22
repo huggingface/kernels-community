@@ -8,12 +8,13 @@ from ._custom_ops import (
     reshape_and_cache_flash,
     swap_blocks,
 )
-from ._ops import ops
+
+from . import _private_for_testing  # noqa: F401
 
 __all__ = [
+    "_private_for_testing",
     "convert_fp8",
     "copy_blocks",
-    "ops",
     "paged_attention_v1",
     "paged_attention_v2",
     "reshape_and_cache",

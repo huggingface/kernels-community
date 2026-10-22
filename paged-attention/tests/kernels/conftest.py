@@ -4,7 +4,7 @@ import kernels
 import pytest
 import torch
 
-ops = kernels.get_kernel("kernels-community/paged-attention", version=1)
+ops = kernels.get_kernel("kernels-community/paged-attention", version=2)
 current_platform = ops.platforms.current_platform
 
 

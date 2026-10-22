@@ -417,7 +417,7 @@ def test_dgrad_grouped_every_admitted_config_accumulates():
             tuner.cache.clear()
             try:
                 dX = launch()
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
             except Exception:
                 continue  # the tuner's forgiven-inf path: a config may decline, never lie
             rel = _rel(dX, floor)

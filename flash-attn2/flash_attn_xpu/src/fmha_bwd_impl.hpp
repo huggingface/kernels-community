@@ -543,7 +543,7 @@ dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType, Trait::is_varle
 
     Tensor mLSE = make_tensor(make_gmem_ptr(param.lse_ptr + lse_offset),
                               make_layout(Shape<Int<kBlockM>>{}, Stride<_1>{}));
-    Tensor mdPsum = make_tensor(make_gmem_ptr(param.odo_ptr + lse_offset),
+    Tensor mdPsum = make_tensor(make_gmem_ptr(param.odo_ptr + bofst.dpsum_offset(bidb, bidh, 0)),
                                 make_layout(Shape<Int<kBlockM>>{}, Stride<_1>{}));
 
     Tensor mdV = make_tensor(make_gmem_ptr(param.dv_ptr + dv_offset),
@@ -739,7 +739,7 @@ compute_o_dot_do(T &trait, BwdParam<typename T::DType, T::is_varlen> &param,
 
     const index_t o_offset = bofst.o_offset(bidb, bidh, m_block * kBlockM);
     const index_t dqaccum_offset = bofst.dqaccum_offset(bidb, bidh, m_block * kBlockM);
-    const index_t dpsum_offset = bofst.lse_offset(bidb, bidh, m_block * kBlockM);
+    const index_t dpsum_offset = bofst.dpsum_offset(bidb, bidh, m_block * kBlockM);
 
     using ShapeO = Shape<std::conditional_t<Is_even_M, Int<kBlockM>, int>, Int<kHeadDim>>;
     using ShapeP = Shape<std::conditional_t<Is_even_M, Int<kBlockM>, int>>;
@@ -1042,6 +1042,7 @@ struct BwdKernelLauncher {
         param.num_nb_per_blk = std::max(N_BLOCK * NUM_HEAD_Q * BATCH / 1024, 1);
         param.seq_len_q = SEQ_LEN_Q;
         param.max_seqlen_q = SEQ_LEN_Q;
+        param.total_q = args.total_q;
         param.seq_len_kv = SEQ_LEN_KV;
         param.head_dim = kHeadDim;
         param.n_block = N_BLOCK;

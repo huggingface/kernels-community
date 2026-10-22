@@ -23,8 +23,9 @@ Original code: https://github.com/ROCm/aiter (MIT, © Advanced Micro Devices, In
 Apply NEOX-style RoPE to query and key tensors.
 
 - `q`, `k`: `(batch, num_heads, seq, head_dim)`.
-- `cos`, `sin`: `(batch, seq, head_dim // 2)` — the pre-`unsqueeze` form
-  transformers produces from `position_ids`.
+- `cos`, `sin`: `(batch, seq, head_dim)` or `(batch, seq, head_dim // 2)` — the
+  pre-`unsqueeze` form transformers produces from `position_ids`. Rows may hold
+  different positions (e.g. left padding).
 - Returns `(q_embed, k_embed)` in the same shape as `q`, `k`.
 
 Also exposes the lower-level entry points from AITER for direct use:

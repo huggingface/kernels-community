@@ -35,10 +35,25 @@ DECODE_PDL = os.environ.get("FINEGRAINED_PDL", "1") == "1"
 
 
 def decode_pdl() -> bool:
-    """PDL for this launch: the flag, and not under torch.compile — dynamo's TTIR access analysis
-    cannot read the ``griddepcontrol`` inline asm and would mark every input mutated (extra copies,
-    no fusion). Deployment decode runs eager launches under cudagraphs, where PDL applies."""
-    return DECODE_PDL and not torch.compiler.is_compiling()
+    """PDL for this launch: the flag, a CUDA backend, and not under torch.compile — dynamo's TTIR
+    access analysis cannot read the ``griddepcontrol`` inline asm and would mark every input mutated
+    (extra copies, no fusion). Deployment decode runs eager launches under cudagraphs, where PDL
+    applies. ``griddepcontrol`` is an NVIDIA primitive, so every other backend reads False and the
+    ``gdc_*`` intrinsics stay behind their ``PDL`` constexpr."""
+    return DECODE_PDL and not torch.compiler.is_compiling() and get_active_device_type() == "cuda"
+
+
+def pdl_launch_kwargs() -> dict:
+    """Only works on CUDA, and not under torch.compile (Dynamo cannot read the inline asm)."""
+    return {"PDL": True, "launch_pdl": True} if decode_pdl() else {"PDL": False}
+
+# The scaled_grouped_mm scaling enums the torch MoE baseline hands its scale operands. Older
+# torch has neither them nor the op, and only that one baseline reads them, so a missing pair is
+# ``None`` here and the baseline refuses on it rather than the whole package failing to import.
+try:
+    from torch.nn.functional import ScalingType, SwizzleType
+except ImportError:
+    ScalingType = SwizzleType = None
 
 # kernel-builder generates ``_ops.py`` into the built variant (the op namespace carries the build's
 # unique id) and refuses to build over a tracked one, so the source tree has none: an unbuilt
@@ -58,6 +73,11 @@ except ImportError:
 
 # FP8 (E4M3) is the main format for weights and activations;
 FP8_DTYPE = torch.float8_e4m3fn
+
+# UE8M0 MX scales are a torch dtype (``float8_e8m0fnu``) only from torch 2.7. Older torch carries
+# them as raw ``uint8`` exponent bytes, which the kernels decode the same way, so this is ``None``
+# there and the format checks accept ``uint8`` alone.
+UE8M0_DTYPE = torch.float8_e8m0fnu if torch.__version__ >= "2.7" else None
 
 # FP4 (E2M1) packs two 4-bit nibbles per byte. MX formats (MXFP4 weights, MXFP8
 # E4M3 weights/activations) share one UE8M0 scale per 32-element K-group — the OCP
@@ -194,14 +214,31 @@ def sm_count(device_index: int) -> int:
         ]
     except Exception:
         active_device = get_active_device_type()
+        if device_index is None:
+            # the triton path rejects a None index outright, so callers holding a bare
+            # torch.device (index None) land here; resolve it the way torch would
+            device_index = getattr(torch, active_device).current_device()
         if active_device == "cuda":
             return torch.cuda.get_device_properties(device_index).multi_processor_count
         elif active_device == "xpu":
-            return torch.xpu.get_device_properties(device_index).multi_processor_count
+            return torch.xpu.get_device_properties(device_index).gpu_subslice_count
         else:
             raise RuntimeError(
                 f"Unsupported device type {active_device} for sm_count; only cuda/xpu are supported."
             )
+
+
+@functools.lru_cache(maxsize=8)
+def persistent_program_count(device_index: int) -> int:
+    """Grid for the persistent grouped GEMMs, whose tile loop strides by a matching NUM_SMS
+    constexpr — the program count is a free parameter, not a shape.
+
+    One program per processor is CUDA sizing: an SM runs the whole CTA and hides latency
+    within it. An Xe-core does not — it holds several hardware threads per vector engine and
+    needs more than one work-group to fill them. Measured on Xe, BF16 MoE prefill: 2x is
+    1.6x faster than 1x (bit-identical output), and 4x and beyond give the win back."""
+    n = sm_count(device_index)
+    return n * 2 if get_active_device_type() == "xpu" else n
 
 
 
@@ -294,12 +331,13 @@ def get_accelerator_autotuning_configs(
       bursts are the one in-block lever that helps (+12% on the dsv4 swap GEMV; deeper
       num_stages and split-K both measured WORSE). Prefill tunes carry the same rows as
       trial-budget dilution (descriptor_box_pruner drops the illegal e4m3 boxes).
-    - ``warp_spec`` (CUDA only): warp-specialize the K-loop, crossed over every mode —
+    - ``warp_spec``: warp-specialize the K-loop, crossed over every mode —
       pair it with ``warp_spec_compile_guard_pruner``, which owns the can't-compile
       regions (including dot_scaled + WS, a PassManager failure). Compile support is
       (shape, config)-dependent on Triton 3.7.1, so it is a tuner axis — failures score
       inf and self-prune; where it compiles it is both faster and (bd grouped gate_up)
-      load-bearing for correctness.
+      load-bearing for correctness. Off CUDA the axis collapses to the single value
+      False (no warp specialization), but it is still emitted.
     - ``a_memory_modes``: the A_MEMORY_MODE activation-load axis (descriptor legal only
       without a gather — the tile's rows are the contiguous sorted positions; the pruner
       fences descriptor rows when GatherIdx is passed).
@@ -341,8 +379,17 @@ def get_accelerator_autotuning_configs(
     #                     cell, so the axis is not emitted at the six batched sites
     num_warps = [8, 16] if is_xpu else [2, 4, 8, 16]
     num_stages = [2, 3, 4, 5, 6]
-    bn_span = (128,) if is_xpu else (32, 64, 128, 256)
-    bk_span = (128,) if is_xpu else (64, 128, 256, 512)
+    # XPU narrows N but must keep values below 128: the grid is the ONLY source of tiles, so a
+    # span of just 128 makes every N that is not a multiple of 128 unschedulable (e.g. N=320
+    # raises "not a multiple of any BLOCK_SIZE_N in the autotune grid" before anything is
+    # benched). 32 is also the measured GATE winner — see gate_tile_cap_pruner, which pins it.
+    #
+    # K is NOT narrowed. The MX weight-scale tile is (n_width, BK//32) read at stride K//32, so
+    # each scale row costs a full cache line of which only BK//32 bytes are used — 4 of 64 at
+    # BK=128. Capping XPU at 128 cost 16% of MXFP8 decode on BMG; BK=256 wins, 512 loses to its
+    # larger tile, so the span keeps every value and lets the tuner choose.
+    bn_span = (32, 64, 128) if is_xpu else (32, 64, 128, 256)
+    bk_span = (64, 128, 256, 512)
 
     # no tuned tile -> one empty meta-dict (the tile comes from the launch kwargs)
     blocks = (
@@ -377,8 +424,10 @@ def get_accelerator_autotuning_configs(
     if tune_block_n:
         blocks = [{**b, "BLOCK_SIZE_N": bn} for b in blocks for bn in (64, 128, 256)]
 
-    if warp_spec and get_active_device_type() == "cuda":
-        blocks = [{**b, "WARP_SPEC": ws} for b in blocks for ws in (False, True)]
+    if warp_spec:
+        # The axis is always EMITTED, pinned to False where warp specialization does not exist
+        ws_values = (False, True) if get_active_device_type() == "cuda" else (False,)
+        blocks = [{**b, "WARP_SPEC": ws} for b in blocks for ws in ws_values]
 
     if packed_schedule:
         # grouped M-tile resolution axis: packed-table loads vs the E-wide register-resident
@@ -454,6 +503,18 @@ def is_sm10x() -> bool:
 
 
 @functools.cache
+def is_blackwell() -> bool:
+    """Whether the CURRENT device is any Blackwell family: sm_10x (datacenter), sm_11x
+    (Jetson Thor) or sm_12x (consumer). Wider than ``is_sm10x``: these share the FP4
+    conversion instructions but not TMEM scaled-MMA."""
+    return (
+        torch.cuda.is_available()
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability()[0] in (10, 11, 12)
+    )
+
+
+@functools.cache
 def is_sm90() -> bool:
     """Whether the CURRENT device is Hopper (sm_90) — the target the measured NVIDIA-backend
     MMA-lowering guards are scoped to. A POSITIVE arch test on purpose: ``not is_sm10x()`` is
@@ -489,9 +550,8 @@ def sm_shared_memory_limit() -> int:
                 device_index
             ).shared_memory_per_block_optin
         elif dev == "xpu":
-            return torch.xpu.get_device_properties(
-                device_index
-            ).shared_memory_per_block_optin
+            # the SLM per work-group; what triton reports as max_shared_mem (verified equal)
+            return torch.xpu.get_device_properties(device_index).local_mem_size
         else:
             raise RuntimeError(
                 f"Unsupported device type {dev} for sm_shared_memory_limit; only cuda/xpu are supported."

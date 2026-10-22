@@ -1,9 +1,11 @@
-import platform
-
+import kernels
+import pytest
 import torch
 
-from rmsnorm.layers import RMSNorm
+rmsnorm = kernels.get_kernel("kernels-community/rmsnorm", version=1)
+RMSNorm = rmsnorm.layers.RMSNorm
 
+@pytest.mark.kernels_ci
 def test_rmsnorm():
     if hasattr(torch, "xpu") and torch.xpu.is_available():
         device = torch.device("xpu")
@@ -22,6 +24,7 @@ def test_rmsnorm():
     torch.testing.assert_close(output, ref_out.to(torch.bfloat16))
 
 
+@pytest.mark.kernels_ci
 def test_rmsnorm_backward():
     if hasattr(torch, "xpu") and torch.xpu.is_available():
         device = torch.device("xpu")

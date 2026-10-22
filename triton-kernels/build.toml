@@ -1,9 +1,12 @@
 [general]
 name = "triton-kernels"
 version = 1
-edition = 5
+edition = 6
 license = "Apache-2.0"
-backends = ["cuda", "xpu"]
+backends = [
+    "cuda",
+    "xpu",
+]
 
 [general.hub]
 repo-id = "kernels-community/triton-kernels"

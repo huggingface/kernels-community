@@ -21,7 +21,7 @@ indexed `[value][key]` — store what the op returns rather than transposing it.
 import torch
 from kernels import get_kernel
 
-gdn = get_kernel("transformers-community/ggml-gated-delta-net", version=1)
+gdn = get_kernel("ggml-org/ggml-gated-delta-net", version=1)
 
 n_seqs, n_tokens, n_heads, head_dim = 1, 1, 32, 128
 q = torch.randn(n_seqs, n_tokens, n_heads, head_dim, device="mps")

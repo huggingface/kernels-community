@@ -29,11 +29,15 @@ import torch
 from utils import (  # type: ignore
     DTYPE_TAG,
     DTYPE_TO_TOL,
+    SUPPORTS_SWIZZLED_SCALES,
     TEST_DEVICE,
     WEIGHTS,
+    dequant_gate_up,
+    make_gate_up,
+    prepare_csf,
 )
 
-from finegrained_kernels import moe, swizzle_mx_scales  # type: ignore
+from finegrained_kernels import moe, scheduling, swizzle_mx_scales  # type: ignore
 from finegrained_kernels.epilogue import fused_glu  # type: ignore
 
 
@@ -51,15 +55,19 @@ class MoEProblem:
     intermediate_dim: int = 256
     num_top_k: int = 8
     sentinel_fraction: float = 0.0
+    negative_sentinels: bool = False  # off-rank routes as -1 rather than num_experts
     dtype: torch.dtype = torch.bfloat16
     activation_format: Optional[str] = None
     swiglu_alpha: Optional[float] = None
     swiglu_limit: Optional[float] = None
     act_fn: Union[str, Callable] = "silu"  # a callable runs on the host between the GEMMs
     swizzled: bool = False  # pre-swizzled (5D SWIZZLE_32_4_4) weight scales — the deployment layout
+    csf_encoding: bool = False  # NVFP4 weight scales handed to the fused block as CSF streams
     input_globals: bool = False  # calibrated NVFP4 activation input_scale per projection
     expert_globals: bool = False  # the down's calibrated input_scale differs per expert
+    static: bool = False  # calibrated (static) activation scale, one per expert
     post_expert_norm: Optional[str] = None  # a model's per-expert output norm, by name
+    bias: bool = False  # a per-expert output bias on both projections (GPT-OSS ships them)
 
     @property
     def id(self):
@@ -78,10 +86,14 @@ class MoEProblem:
             f"{self.weights}_T{self.num_tokens}_E{self.num_experts}_H{self.hidden_dim}"
             f"_I{self.intermediate_dim}_top{self.num_top_k}_{DTYPE_TAG[self.dtype]}"
             f"{act}{fmt}{'_swizzled' if self.swizzled else ''}"
+            f"{'_csf' if self.csf_encoding else ''}"
             f"{'_inputglobals' if self.input_globals else ''}"
             f"{'_expertglobals' if self.expert_globals else ''}"
+            f"{'_static' if self.static else ''}"
             f"{'_' + self.post_expert_norm if self.post_expert_norm else ''}"
+            f"{'_bias' if self.bias else ''}"
             f"{'_sentinel' if self.sentinel_fraction > 0 else ''}"
+            f"{'_negative' if self.negative_sentinels else ''}"
         )
 
 
@@ -97,6 +109,21 @@ MOE_PROBLEMS = [
     MoEProblem(weights="mxfp8_u8"),
     MoEProblem(weights="fp8_128x128", num_tokens=1),
     MoEProblem(weights="fp8_128x128"),
+    # calibrated (static) activation quant: the scales replace the runtime ones in both GEMMs of
+    # both chains, and the intermediate stays bf16 — an epilogue requant has no calibrated scale
+    # to emit. Each expert is its own quantized module, so each carries its own scale, and
+    # ``num_top_k`` stays below ``num_experts`` so each calibrates on its own tokens.
+    MoEProblem(weights="fp8_128x128", num_tokens=64, num_top_k=2, static=True),
+    # per-TENSOR weights under the same scheme: what Mistral-4 carries (qscheme_act="TENSOR",
+    # weight_block_size None, top-4). Ministral-3 is its dense counterpart, on the 2D op.
+    MoEProblem(weights="fp8_tensor", num_tokens=64, num_top_k=4, static=True),
+    # and at decode, where the batched op runs BLOCK_SIZE_M=1 and the tuner's swap arm reshapes
+    # the single token — the gate|up span doubles there, which the prefill cell above never sees
+    MoEProblem(weights="fp8_tensor", num_tokens=1, num_top_k=4, static=True),
+    # past the row count where a per-expert scale stops reading raw rows per tile and lays them
+    # out quantized instead (``quantize_routed_rows_per_expert``): 4096 routed rows, which the
+    # 64-token cells above never reach, so only this one runs the kernel's pre-quantized arm
+    MoEProblem(weights="fp8_tensor", num_tokens=1024, num_top_k=4, static=True),
     # block-FP8 with UE8M0 (power-of-two) scales — the whole-model UE8M0 contract: acts,
     # weights, and the fused intermediate requant all power-of-two (DeepSeek-V4 attn / B200).
     MoEProblem(weights="fp8_128x128_ue8m0", num_tokens=1),
@@ -116,6 +143,8 @@ MOE_PROBLEMS = [
     MoEProblem(weights="mxfp4", num_tokens=1, swizzled=True),
     MoEProblem(weights="nvfp4", swizzled=True),
     MoEProblem(weights="nvfp4", num_tokens=1, swizzled=True),
+    MoEProblem(weights="nvfp4", csf_encoding=True),
+    MoEProblem(weights="nvfp4", num_tokens=1, csf_encoding=True),
     # the full deployment stack for a calibrated NVFP4 checkpoint: pre-swizzled artifact +
     # per-projection input globals, at decode batch (the bench's GLM-NVFP4 decode cell)
     MoEProblem(weights="nvfp4", num_tokens=1, swizzled=True, input_globals=True),
@@ -159,9 +188,24 @@ MOE_PROBLEMS = [
     # ── GeGLU / ReGLU (activation orthogonal to format, one MXFP8 shape each) ──
     MoEProblem(weights="mxfp8", act_fn="gelu"),
     MoEProblem(weights="mxfp8", act_fn="relu"),
+    # ── per-expert output bias on both projections, one cell per kernel family; block-FP8 also inside its
+    # unstacked-gate decode band (<= 16 routed rows), and the GPT-OSS gate_up (weight-only MXFP4, clamped SwiGLU,
+    # always unstacked) ──
+    MoEProblem(weights="bf16", bias=True),
+    MoEProblem(weights="fp8_128x128", bias=True),
+    MoEProblem(weights="fp8_128x128", num_tokens=1, bias=True),
+    MoEProblem(weights="fp8_tensor", num_top_k=4, static=True, bias=True),
+    MoEProblem(weights="mxfp8", bias=True),
+    MoEProblem(weights="nvfp4", input_globals=True, bias=True),
+    MoEProblem(weights="mxfp4", activation_format="bf16", swiglu_alpha=1.702, swiglu_limit=7.0, num_tokens=1, bias=True),
     # ── expert parallelism: non-local experts sentinel-masked ──
     MoEProblem(weights="mxfp8", num_tokens=8, sentinel_fraction=0.875),
     MoEProblem(weights="fp8_128x128", num_tokens=8, sentinel_fraction=0.875),
+    MoEProblem(weights="mxfp8", num_tokens=8, sentinel_fraction=0.875, negative_sentinels=True),
+    # swizzled MX scales quantize the activations once per token into every routed row's tile, which a token
+    # routed only to other ranks' experts must not write
+    MoEProblem(weights="mxfp8", num_tokens=8, swizzled=True, sentinel_fraction=0.875),
+    MoEProblem(weights="nvfp4", num_tokens=8, swizzled=True, sentinel_fraction=0.875),
     # int32 pointer-offset overflow guard for the fused paths: the last experts'
     # gate_up offsets exceed 2^31 elements (127 * 2*2048 * 6144 = 3.196e9); a regressed
     # int64 cast corrupts the high-routed tokens vs the torch reference. E is a power of
@@ -183,16 +227,22 @@ def _make_moe_weights(problem: MoEProblem):
     deployment contract, not per call): the gate_up scale is the ONE gate-interleaved artifact
     (6D — the shape carries the layout) and every forward consumes it directly — fused kernels
     read block pairs, the unfused plain GEMM remaps its block index in-kernel."""
-    make = WEIGHTS[problem.weights]["make"]
-    gate_up, gate_up_s, gate_up_g = make(
-        2 * problem.intermediate_dim, problem.hidden_dim, problem.num_experts
+    row = WEIGHTS[problem.weights]
+    gate_up, gate_up_s, gate_up_g = make_gate_up(
+        row, problem.intermediate_dim, problem.hidden_dim, problem.num_experts
     )
-    down, down_s, down_g = make(
+    down, down_s, down_g = row["make"](
         problem.hidden_dim, problem.intermediate_dim, problem.num_experts
     )
     if problem.swizzled:
+        if not SUPPORTS_SWIZZLED_SCALES:
+            pytest.skip("the SWIZZLE_32_4_4 scale layout is the tcgen05 fast path (CUDA-only)")
         gate_up_s = swizzle_mx_scales(gate_up_s)
         down_s = swizzle_mx_scales(down_s)
+    if problem.csf_encoding:
+        # E4M3 codes 24 apart (more than the 15 a CSF offset holds): an exception in every expert, of both projections
+        gate_up_s[..., 0, :2] = gate_up_s.new_tensor([0.125, 1.0])
+        down_s[..., 0, :2] = down_s.new_tensor([0.125, 1.0])
     return gate_up, gate_up_s, gate_up_g, down, down_s, down_g
 
 
@@ -210,11 +260,11 @@ def _make_moe_inputs(problem: MoEProblem):
     )
     if problem.sentinel_fraction > 0:
         # EP: mark a random subset of routed slots non-local with an out-of-range id
-        # (== num_experts), which the fused path must skip.
+        # (num_experts, or -1), which the fused path must skip.
         flat = top_k_index.reshape(-1)
         n_sentinel = int(round(flat.numel() * problem.sentinel_fraction))
         idx = torch.randperm(flat.numel(), device=flat.device)[:n_sentinel]
-        flat[idx] = problem.num_experts
+        flat[idx] = -1 if problem.negative_sentinels else problem.num_experts
     top_k_weights = torch.rand(
         problem.num_tokens, problem.num_top_k, device=TEST_DEVICE, dtype=problem.dtype
     )
@@ -242,22 +292,61 @@ def _input_globals(problem: MoEProblem, hidden):
     return gate_up_in_g, down_in_g
 
 
-def _common_kwargs(problem: MoEProblem, hidden, gate_up_g, down_g):
-    """The kwargs every forward takes: the weights' second-level globals, the calibrated
-    activation globals, the GLU knobs, and a model's per-expert output norm. The fused chain
+def _static_scales(problem: MoEProblem, hidden, gate_up, gate_up_s, top_k_index):
+    """The calibrated activation scales, derived the way a calibration pass derives them: ``amax /
+    448`` of what each GEMM actually sees — the routed hidden states for gate_up, the GLU
+    intermediate for down — one per expert, each being its own quantized module, over the tokens
+    routed to it. ``None`` on a dynamic problem, which quantizes at runtime instead."""
+    if not problem.static:
+        return None, None
+    weight = dequant_gate_up(WEIGHTS[problem.weights], gate_up, gate_up_s).float()
+    inter = fused_glu(
+        torch.einsum("th,enh->etn", hidden.float(), weight),
+        problem.act_fn,
+        problem.swiglu_alpha,
+        problem.swiglu_limit,
+    )
+    routed = torch.stack([(top_k_index == e).any(dim=1) for e in range(problem.num_experts)])
+
+    def calibrate(seen):  # (E, T, C) over every token -> (E,) over the ones each expert sees
+        return (seen.abs() * routed[..., None]).amax(dim=(1, 2)).div(448.0).clamp(min=1e-12).float()
+
+    scales = [calibrate(hidden.float().expand(problem.num_experts, -1, -1)), calibrate(inter)]
+    return tuple(scale.contiguous() for scale in scales)
+
+
+def _biases(problem: MoEProblem):
+    """The per-expert output biases, ``(E, 2I)`` on gate_up (added before the GLU) and ``(E, H)`` on down, at the
+    activation dtype as a checkpoint ships them; ``None`` on a problem without them."""
+    if not problem.bias:
+        return None, None
+    gate_up_bias = torch.randn(problem.num_experts, 2 * problem.intermediate_dim, device=TEST_DEVICE, dtype=problem.dtype)
+    down_bias = torch.randn(problem.num_experts, problem.hidden_dim, device=TEST_DEVICE, dtype=problem.dtype)
+    return gate_up_bias, down_bias
+
+
+def _common_kwargs(problem: MoEProblem, hidden, top_k_index, gate_up, gate_up_s, gate_up_g, down_g):
+    """The kwargs every forward takes: the per-expert biases, the weights' second-level globals, the calibrated
+    activation globals and scales, the GLU knobs, and a model's per-expert output norm. The fused chain
     folds a named norm into its reduce while the unfused reference normalizes the routed rows in
     a pass of their own, so handing both the same weight is what makes that a parity check."""
     gate_up_in_g, down_in_g = _input_globals(problem, hidden)
+    gate_up_act_s, down_act_s = _static_scales(problem, hidden, gate_up, gate_up_s, top_k_index)
     norm_weight = (
         torch.randn(problem.hidden_dim, device=TEST_DEVICE, dtype=problem.dtype) * 0.3
         if problem.post_expert_norm
         else None
     )
+    gate_up_bias, down_bias = _biases(problem)
     return dict(
+        gate_up_proj_bias=gate_up_bias,
+        down_proj_bias=down_bias,
         gate_up_proj_weight_global_scale=gate_up_g,
         down_proj_weight_global_scale=down_g,
         gate_up_proj_input_global_scale=gate_up_in_g,
         down_proj_input_global_scale=down_in_g,
+        gate_up_proj_activation_scale=gate_up_act_s,
+        down_proj_activation_scale=down_act_s,
         act_fn=problem.act_fn,
         swiglu_alpha=problem.swiglu_alpha,
         swiglu_limit=problem.swiglu_limit,
@@ -275,28 +364,73 @@ def _assert_fused_correctness(out, ref, problem: MoEProblem):
     torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
 
 
+def _fused_scales(problem: MoEProblem, gate_up_s, down_s):
+    """The fused block's ``(gate_up_proj_scale_inv, down_proj_scale_inv, kwargs)``: the dense
+    scales, or under ``csf_encoding`` their CSF fixed streams with the exceptions as kwargs (the
+    block decodes them itself; the unfused reference keeps the dense scales)."""
+    if not problem.csf_encoding:
+        return gate_up_s, down_s, {}
+    gate_up_fixed, gate_up_exceptions, gate_up_offsets = prepare_csf(gate_up_s)
+    down_fixed, down_exceptions, down_offsets = prepare_csf(down_s)
+    return gate_up_fixed, down_fixed, dict(
+        gate_up_proj_scale_exceptions=gate_up_exceptions,
+        gate_up_proj_scale_exception_offsets=gate_up_offsets,
+        down_proj_scale_exceptions=down_exceptions,
+        down_proj_scale_exception_offsets=down_offsets,
+    )
+
+
 def _run_pair(problem: MoEProblem, fused_fn, unfused_fn):
     torch.manual_seed(0)
     gate_up, gate_up_s, gate_up_g, down, down_s, down_g = _make_moe_weights(problem)
     hidden, top_k_index, top_k_weights = _make_moe_inputs(problem)
     # The decoupled API takes pure block scales + the globals as separate args (nvfp4 weights are
     # two-level; other formats have a bare block scale + None global).
-    common = _common_kwargs(problem, hidden, gate_up_g, down_g)
+    common = _common_kwargs(problem, hidden, top_k_index, gate_up, gate_up_s, gate_up_g, down_g)
     ref = unfused_fn(
         hidden, top_k_index, top_k_weights, gate_up, down, gate_up_s, down_s, **common
     )
+    fused_gate_up_s, fused_down_s, csf = _fused_scales(problem, gate_up_s, down_s)
     out = fused_fn(
         hidden,
         top_k_index,
         top_k_weights,
         gate_up,
         down,
-        gate_up_s,
-        down_s,
+        fused_gate_up_s,
+        fused_down_s,
         simulate_unfused=True,
         **common,
+         **csf,
     )
     _assert_fused_correctness(out, ref, problem)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
+@pytest.mark.parametrize("sentinel_fraction", [0.5, 1.0])
+@pytest.mark.parametrize("negative", [False, True], ids=["past_experts", "negative"])
+def test_grouped_scheduling_defines_every_route(sentinel_fraction, negative):
+    """Both maps are a permutation of the ``S`` routes: the local rows expert-sorted up to ``expert_start[E]``,
+    the EP-sentinel routes (another rank's experts, any id outside ``[0, E)``) after them, so a consumer over
+    all ``S`` rows reads real slots and tokens."""
+    E, T, K = 8, 300, 4
+    g = torch.Generator(device=TEST_DEVICE).manual_seed(0)
+    expert_ids = torch.randint(0, E, (T, K), device=TEST_DEVICE, generator=g)
+    off_rank = torch.rand(T, K, device=TEST_DEVICE, generator=g) < sentinel_fraction
+    expert_ids = torch.where(off_rank, -1 if negative else E, expert_ids)
+    # the caching allocator hands these freed blocks to the `torch.empty` maps: an unwritten slot reads -1
+    poison = [torch.full((T * K,), -1, device=TEST_DEVICE, dtype=torch.int32) for _ in range(2)]
+    del poison
+    expert_start, gather_idx, scatter_idx = scheduling.compute_grouped_scheduling(expert_ids, E, K)
+    local = int((~off_rank).sum())
+    assert int(expert_start[-1]) == local
+    assert torch.equal(scatter_idx.long().sort().values, torch.arange(T * K, device=TEST_DEVICE))
+    assert torch.equal(gather_idx.long(), scatter_idx.long() // K)
+    routed = expert_ids.flatten()[scatter_idx.long()]
+    assert not bool(scheduling.off_rank(routed[:local], E).any())
+    assert bool(scheduling.off_rank(routed[local:], E).all())
+    assert torch.equal(routed[:local].sort().values, routed[:local])
 
 
 @pytest.mark.kernels_ci
@@ -326,6 +460,7 @@ _PRODUCTION_ARM_PROBLEMS = [
     MoEProblem(weights="fp8_128x128"),
     MoEProblem(weights="nvfp4", input_globals=True),
     MoEProblem(weights="mxfp8", num_tokens=8, sentinel_fraction=0.875),
+    MoEProblem(weights="mxfp4", activation_format="bf16", swiglu_alpha=1.702, swiglu_limit=7.0, num_tokens=1, bias=True),
 ]
 
 
@@ -345,7 +480,7 @@ def test_fused_production_arm(problem, fused_fn, unfused_fn):
     torch.manual_seed(0)
     gate_up, gate_up_s, gate_up_g, down, down_s, down_g = _make_moe_weights(problem)
     hidden, top_k_index, top_k_weights = _make_moe_inputs(problem)
-    common = _common_kwargs(problem, hidden, gate_up_g, down_g)
+    common = _common_kwargs(problem, hidden, top_k_index, gate_up, gate_up_s, gate_up_g, down_g)
     ref = unfused_fn(
         hidden, top_k_index, top_k_weights, gate_up, down, gate_up_s, down_s, **common
     )
@@ -363,11 +498,12 @@ _TORCH_BASELINE_PROBLEMS = [
     MoEProblem(weights="mxfp4", num_tokens=64),
     MoEProblem(weights="nvfp4", num_tokens=64),
     MoEProblem(weights="nvfp4", num_tokens=64, input_globals=True),
+    MoEProblem(weights="mxfp8", num_tokens=64, sentinel_fraction=0.875),
 ]
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 @pytest.mark.parametrize("problem", _TORCH_BASELINE_PROBLEMS, ids=lambda p: p.id)
 def test_torch_grouped_baseline(problem):
     """``moe_torch_grouped`` (the cuBLAS ``scaled_grouped_mm`` baseline the bench compares
@@ -382,7 +518,7 @@ def test_torch_grouped_baseline(problem):
     torch.manual_seed(0)
     gate_up, gate_up_s, gate_up_g, down, down_s, down_g = _make_moe_weights(problem)
     hidden, top_k_index, top_k_weights = _make_moe_inputs(problem)
-    common = _common_kwargs(problem, hidden, gate_up_g, down_g)
+    common = _common_kwargs(problem, hidden, top_k_index, gate_up, gate_up_s, gate_up_g, down_g)
     ref = moe.moe_unfused_grouped(
         hidden, top_k_index, top_k_weights, gate_up, down, gate_up_s, down_s, **common
     )
@@ -432,7 +568,7 @@ def _run_compiled_across_shapes(fused_fn):
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 def test_fused_batched_compiles_across_shapes():
     """``moe_fused_batched`` through the shared two-shape compile check (see
     ``_run_compiled_across_shapes`` for the dynamo failure class it guards)."""
@@ -440,7 +576,7 @@ def test_fused_batched_compiles_across_shapes():
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 def test_fused_grouped_compiles_across_shapes():
     """``moe_fused_grouped`` through the same two-shape compile check — the grouped chain
     additionally puts ``compute_grouped_scheduling`` (an opaque custom op) inside the

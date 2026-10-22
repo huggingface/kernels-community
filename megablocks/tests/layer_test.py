@@ -1,18 +1,22 @@
+import kernels
+import pytest
 import torch
 
 from collections import namedtuple
 
+megablocks = kernels.get_kernel("kernels-community/megablocks", version=1)
+MegaBlocksMoeMLP = megablocks.layers.MegaBlocksMoeMLP
 
+
+@pytest.mark.kernels_ci
 def test_megablocks_moe_mlp_import():
     """Test if MegaBlocksMoeMLP can be imported."""
-    from megablocks.layers import MegaBlocksMoeMLP
 
     assert MegaBlocksMoeMLP is not None, "MegaBlocksMoeMLP import failed."
 
 
 def test_megablocks_moe_mlp_functionality(device):
     """Test the functionality of MegaBlocksMoeMLP."""
-    from megablocks.layers import MegaBlocksMoeMLP
 
     # Create a simple instance of MegaBlocksMoeMLP
     model = MegaBlocksMoeMLP()

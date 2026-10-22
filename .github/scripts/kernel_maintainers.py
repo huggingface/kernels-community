@@ -22,7 +22,9 @@ def load_registry() -> dict:
 
 def check_registry() -> None:
     registry = load_registry()
+    # Ported kernels keep build.toml in <kernel>/src.
     kernels = {path.parent.name for path in Path(".").glob("*/build.toml")}
+    kernels |= {path.parent.parent.name for path in Path(".").glob("*/src/build.toml")}
     registered = set(registry)
 
     problems = [

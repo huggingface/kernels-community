@@ -21,16 +21,16 @@ import torch
 from finegrained_kernels.compat import (  # type: ignore
     MX_SCALE_GROUP_K,
     NVFP4_SCALE_GROUP_K,
+    is_sm10x,
 )
+from finegrained_kernels.loading.scales import prepare_nvfp4_csf_scales
 
 
 # ── Device + capability ───────────────────────────────────────────────────────
 
 TEST_DEVICE = (
-    "cuda"
-    if torch.cuda.is_available()
-    else "xpu"
-    if hasattr(torch, "xpu") and torch.xpu.is_available()
+    torch.accelerator.current_accelerator().type
+    if torch.accelerator.is_available()
     else None
 )
 # FP8 kernels require Hopper (SM90) or newer on CUDA. SM89 (Ada Lovelace) can
@@ -47,6 +47,11 @@ SUPPORTS_FP8 = TEST_DEVICE == "xpu" or (
 # SM90 (Hopper, e.g. H100) is the only architecture the benchmark baselines
 # are calibrated against — every other SM has its own latency profile.
 IS_SM90 = TEST_DEVICE == "cuda" and torch.cuda.get_device_capability() == (9, 0)
+# The SWIZZLE_32_4_4 scale layout exists to feed tcgen05, so the ops only grow a
+# swizzled arm where that instruction is: sm_10x. Elsewhere the scales stay row-major
+# (affine) and the pre-swizzled variants of each problem are skipped rather than run
+# unswizzled.
+SUPPORTS_SWIZZLED_SCALES = is_sm10x()
 DTYPE_TAG = {
     torch.bfloat16: "bf16",
     torch.float16: "fp16",
@@ -59,14 +64,6 @@ DTYPE_TO_TOL = {
 }
 
 
-def accelerator_module():
-    if TEST_DEVICE == "cuda":
-        return torch.cuda
-    if TEST_DEVICE == "xpu":
-        return torch.xpu
-    raise RuntimeError("No supported accelerator available")
-
-
 def maybe_compile(fn, enabled):
     """Wrap ``fn`` in ``torch.compile`` (max-autotune, fullgraph) when ``enabled``,
     resetting the compiler and clearing the allocator cache first; otherwise return
@@ -74,7 +71,7 @@ def maybe_compile(fn, enabled):
     if not enabled:
         return fn
     torch.compiler.reset()
-    accelerator_module().empty_cache()
+    torch.accelerator.empty_cache()
     return torch.compile(fn, mode="max-autotune", fullgraph=True)
 
 
@@ -480,3 +477,92 @@ def dequantize_weight(
     return out
 
 
+def encode_csf_scales(scales):
+    """Independent CSF fixture encoder; the original dense bytes remain the oracle."""
+    shape = scales.shape
+    values = scales.cpu().contiguous().view(torch.uint8)
+    values = values.reshape(-1, shape[-2], shape[-1])
+    experts, rows, cols = values.shape
+    bases = values.amin(dim=-1, keepdim=True).clamp_max(240)
+    delta = values.to(torch.int16) - bases.to(torch.int16)
+    nibbles = delta.clamp(0, 15).to(torch.uint8)
+    packed = nibbles[:, :, ::2] | (nibbles[:, :, 1::2] << 4)
+    fixed = torch.cat(
+        (
+            bases.reshape(experts, rows // 16, 16),
+            packed.reshape(experts, rows // 16, 16 * cols // 2),
+        ),
+        dim=-1,
+    )
+    streams = []
+    for expert in range(experts):
+        positions = (
+            ((delta[expert] < 0) | (delta[expert] > 15)).flatten().nonzero().flatten()
+        )
+        streams.append(
+            (positions | (values[expert].flatten()[positions].long() << 24)).to(
+                torch.uint32
+            )
+        )
+    return fixed, streams
+
+
+def prepare_csf(scales):
+    """Encode dense NVFP4 scales to the prepared CSF streams ``(fixed, exceptions, expert_offsets)``."""
+    fixed, exceptions = encode_csf_scales(scales)
+    return prepare_nvfp4_csf_scales(
+        fixed.to(scales.device), [stream.to(scales.device) for stream in exceptions]
+    )
+
+
+def prepare_weight_scales(scales, csf_encoding, fn, compiled=False):
+    """Wrap a matrix Problem's existing op; CSF cases hand the op the compressed streams, which
+    it decodes itself (compiled cases capture decode + GEMM together)."""
+    if not csf_encoding:
+        return maybe_compile(fn, compiled)
+    fixed, exceptions, expert_offsets = prepare_csf(scales)
+
+    def run(A, B, As, Bs, **kwargs):
+        return fn(
+            A, B, As, fixed, b_scale_exceptions=exceptions,
+            b_scale_exception_offsets=expert_offsets, **kwargs,
+        )
+
+    return maybe_compile(run, compiled)
+
+
+def interleave_rows(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    """``[g0, u0, g1, u1, ...]`` along the row dim (-2), the fused gate|up weight layout."""
+    byte = gate.element_size() == 1 and gate.dtype.is_floating_point  # fp8/e8m0 can't stack
+    g, u = (gate.view(torch.uint8), up.view(torch.uint8)) if byte else (gate, up)
+    out = torch.stack((g, u), dim=-2).flatten(-3, -2)
+    return out.view(gate.dtype) if byte else out
+
+
+def _row_scaled(Bs, Bs_global) -> bool:
+    """Whether a weight's scales live on its rows (per-row groups or row blocks) with no stack-wide
+    second level — so gate and up can each keep their own, interleaved with the rows."""
+    return Bs is None or (Bs_global is None and Bs.ndim == 3 and Bs.shape[-2] > 1)
+
+
+def make_gate_up(row: dict, N: int, K: int, E):
+    """A ``(E, 2N, K)`` gate|up weight as checkpoints ship it: gate and up quantized as separate
+    projections, then their rows and scale rows interleaved — so a 128x128 scale block covers rows
+    of ONE projection. Never quantize the interleaved stack instead: a reference dequantizing that
+    shares the kernel's ``row // block_n`` assumption and cannot catch a wrong scale lookup. Only a
+    stack-wide scale (tensor-wide FP8, the NVFP4 global) is quantized over the stack, since the
+    kernels take one per expert and a loader folds the two projections' into it."""
+    gate, gate_s, gate_g = row["make"](N, K, E)
+    if not _row_scaled(gate_s, gate_g):
+        return row["make"](2 * N, K, E)
+    up, up_s, _ = row["make"](N, K, E)
+    return interleave_rows(gate, up), None if gate_s is None else interleave_rows(gate_s, up_s), None
+
+
+def dequant_gate_up(row: dict, B, Bs, Bs_global=None) -> torch.Tensor:
+    """fp32 of a ``make_gate_up`` weight, each projection dequantized against its own scales."""
+    if not _row_scaled(Bs, Bs_global):
+        return row["dequant"](B, Bs, Bs_global)
+    return interleave_rows(*(
+        row["dequant"](B[..., p::2, :], None if Bs is None else Bs[..., p::2, :]) for p in (0, 1)
+    ))
