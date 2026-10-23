@@ -1200,7 +1200,7 @@ def w8a8_block_static_fp8_matmul(
     # Host-TMA descriptors over (M, K)/(N, K); placeholder boxes re-bound per config by
     # rebind_bd_descriptors. Read only by the descriptor configs the tuner picks for wide-N
     # prefill (offline fp8 A); pointer/inline configs never touch them.
-    a_descriptor = TensorDescriptor.from_tensor(A_q, [1, block_k])
+    a_descriptor = maybe_descriptor(A_q, [1, block_k])
     b_descriptor = maybe_descriptor(B, [1, block_k])
 
     with device_context(A.device):
@@ -1293,7 +1293,7 @@ def w8a8_tensor_dynamic_fp8_matmul(
     assert Bs.numel() == 1, f"Bs must be scalar or (1,), got {tuple(Bs.shape)}"
 
     # one scale per row (derived here), or the calibrated one every row reads (stride 0)
-    qA, As, as_stride_m, _ = tensor_wide_act_operands(A, As)
+    qA, As, as_stride_m, _ = tensor_wide_act_operands(A.view(M, K), As)
     Bs = Bs.reshape(1)
 
     C = A.new_empty(A.shape[:-1] + (gate_out_cols(N, gate, act_fn),), dtype=output_dtype)
@@ -1373,7 +1373,7 @@ def mx_dynamic_matmul(
     assert B.dtype in (torch.int8, torch.float8_e4m3fn), (
         f"B must be int8 (packed E2M1) or float8_e4m3fn (E4M3), got {B.dtype}"
     )
-    assert A.is_contiguous(), "A must be contiguous"
+    assert A.stride(-1) == 1, f"A's rows must be contiguous, got strides {tuple(A.stride())}"
     # B may be row-major (the forward weight) or a transposed view of one: the kernel reads
     # both of B's strides, and `descriptor_box_pruner` keeps the TMA arms — which need a
     # unit-stride innermost dim — off the transposed form. This is what lets a backward pass
@@ -1501,7 +1501,7 @@ def mx_dynamic_matmul(
     # Host-TMA descriptors over the packed (M, K_bytes) / (N, K_bytes) matrices — placeholder
     # box rebound per tuned config by rebind_mx_descriptors. Read only by the descriptor
     # configs the tuner picks; pointer configs never touch them.
-    a_descriptor = TensorDescriptor.from_tensor(A_q, [1, 32])
+    a_descriptor = maybe_descriptor(A_q, [1, 32])
     b_descriptor = TensorDescriptor.from_tensor(b_u8, [1, 32])
     # One scale pointer per operand (as_u8/bs_u8) — the swizzled buffer on the fast path (also the
     # base for the BM<128 / BN<128 scalar gather), the affine scale otherwise — plus its descriptor,
@@ -1598,6 +1598,8 @@ def full_precision_matmul_2d(
     # Under gate|up fusion B is the (2N, K) gate|up stack; N is the per-projection output width.
     N = rows // 2 if gate else rows
     M = A.numel() // A.shape[-1]
+    # a row-strided A, e.g. the last position of each sequence in `generate`, flattens to a view
+    A_2d = A.view(M, K)
     C = A.new_empty(A.shape[:-1] + (gate_out_cols(N, gate, act_fn),), dtype=output_dtype)
 
     def grid(META):
@@ -1609,7 +1611,7 @@ def full_precision_matmul_2d(
     with device_context(A.device):
         bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(full_precision_matmul_2d_kernel)[grid](
-            A,
+            A_2d,
             B,
             C,
             bias,
@@ -1617,8 +1619,8 @@ def full_precision_matmul_2d(
             N,
             K,
             int(M).bit_length(),  # m_bit_length key bucket
-            A.stride(-2),
-            A.stride(-1),
+            A_2d.stride(0),
+            A_2d.stride(1),
             B.stride(1),
             B.stride(0),
             C.stride(-2),
@@ -1677,7 +1679,9 @@ def mx_weight_only_matmul_2d(
     assert Bs.shape == (rows, K // scale_group), (
         f"Bs shape {tuple(Bs.shape)} != ({rows}, {K // scale_group})"
     )
-    assert A.is_contiguous(), "A must be contiguous (the host-TMA descriptor arm reads its box)"
+    assert A.stride(-1) == 1, f"A's rows must be contiguous, got strides {tuple(A.stride())}"
+    # a row-strided A, e.g. the last position of each sequence in `generate`, flattens to a view
+    A_2d = A.view(M, K)
     b_u8 = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)
     b_global_scale = normalize_global_scale(b_global_scale, 1)
@@ -1685,7 +1689,7 @@ def mx_weight_only_matmul_2d(
     # Host-TMA descriptors over the (M, K) bf16 A and packed (N, K_bytes) weight — placeholder box
     # rebound per tuned config by rebind_weight_only_descriptors, read only by the descriptor configs the
     # tuner picks (pointer configs never touch them). Scales stay affine (no scale descriptor).
-    a_descriptor = TensorDescriptor.from_tensor(A.view(M, K), [1, 32])
+    a_descriptor = maybe_descriptor(A_2d, [1, 32])
     b_descriptor = TensorDescriptor.from_tensor(b_u8, [1, 32])
 
     def grid(META):
@@ -1697,7 +1701,7 @@ def mx_weight_only_matmul_2d(
     with device_context(A.device):
         bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(mx_weight_only_matmul_2d_kernel)[grid](
-            A,
+            A_2d,
             a_descriptor,
             b_u8,
             b_descriptor,
@@ -1709,8 +1713,8 @@ def mx_weight_only_matmul_2d(
             N,
             K,
             int(M).bit_length(),
-            A.stride(-2),
-            A.stride(-1),
+            A_2d.stride(0),
+            A_2d.stride(1),
             b_u8.stride(0),
             b_u8.stride(1),
             bs_u8.stride(0),
