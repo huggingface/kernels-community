@@ -17,6 +17,10 @@ build
 !.github/
 !/.gitattributes
 
+# Rust build outputs
+target
+flash-attn2-rs/kernels-ptx
+
 # Python stuff
 __pycache__/
 

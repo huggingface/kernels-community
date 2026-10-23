@@ -1,0 +1,19 @@
+[general]
+backends = ["cuda"]
+edition = 6
+license = "Apache-2.0"
+name = "flash-attn2-rs"
+version = 1
+
+[general.hub]
+repo-id = "kernels-community/flash-attn2-rs"
+
+# No C++ binding sources: the `__tvm_ffi_*` exports come from the Rust crate.
+[tvm-ffi]
+
+[kernel.flash_attn2_rs]
+language = "rust-cuda"
+cargo-manifest = "Cargo.toml"
+depends = []
+src = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "src"]
+cuda-capabilities = ["8.0", "8.9", "9.0", "10.0", "12.0"]

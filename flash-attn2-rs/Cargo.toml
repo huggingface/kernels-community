@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "flash-attn2-rs"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# One crate for kernels and host, built with the cuda-oxide backend.
+[workspace]
+
+[lib]
+name = "flash_attn2_rs"
+crate-type = ["staticlib"]
+
+[dependencies]
+cuda-device = { git = "https://github.com/drbh/cuda-oxide.git", rev = "d9d4e379e9a80d1ce7c681d88a086aacec95ba23" }
+# Pre-generated driver bindings, loaded at runtime: no bindgen or libcuda link.
+cudarc = { version = "0.19.9", default-features = false, features = ["std", "driver", "dynamic-loading", "cuda-12060"] }
+tvm-ffi = "0.1.0-alpha.0"
+tvm-ffi-sys = "0.1.0-alpha.0"
