@@ -27,8 +27,9 @@ from pathlib import Path
 # both stayed invisible until a bench came back with empty cells). Strict mode aborts the tune on the
 # first reject so a test reports it. Deployment keeps the default, where forgiveness is what
 # lets a crowned config survive one unrelated bad neighbour.
+# The tests check correctness, not speed, so each tune compiles and measures one config.
 # An explicit FINEGRAINED_AUTOTUNE_CONFIG takes over (add "strict": true to keep this).
-os.environ.setdefault("FINEGRAINED_AUTOTUNE_CONFIG", '{"strict": true}')
+os.environ.setdefault("FINEGRAINED_AUTOTUNE_CONFIG", '{"mode": "fast", "strict": true}')
 
 
 def _visible_gpu_pool(env_var: str, list_cmd: list[str]) -> list[str]:
