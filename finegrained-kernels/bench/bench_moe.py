@@ -2068,11 +2068,11 @@ def bench_modes(runs, tag, reference=None):
         out = run()
         torch.accelerator.synchronize()  # warm + tune before ANY timing/capture
         if reference is not None:
-            for output in out:
-                error = rel_diff(output[:reference.shape[0]], reference)
-                if not torch.isfinite(output).all() or error > 0.05:
-                    print(f"      [{tag} dequant reference mismatch (rel {error:.2e}); skipping timings]", flush=True)
-                    return {m: None for m in MODES}, None
+            # the reference is the first bank's: the other banks route to other experts (cold weights)
+            error = rel_diff(out[0][:reference.shape[0]], reference)
+            if not all(torch.isfinite(output).all() for output in out) or error > 0.05:
+                print(f"      [{tag} dequant reference mismatch (rel {error:.2e}); skipping timings]", flush=True)
+                return {m: None for m in MODES}, None
         res["eager"] = do_bench(run, return_mode="min") * 1e3 / count
         print(f"      {tag:14s} eager      {res['eager']:9.1f}us", flush=True)
     except Exception as e:
@@ -2110,10 +2110,9 @@ def bench_modes(runs, tag, reference=None):
                 if drift > 0.25:
                     raise RuntimeError(f"compiled output diverges from eager (rel {drift:.2e})")
         if reference is not None:
-            for output in cout:
-                error = rel_diff(output[:reference.shape[0]], reference)
-                if not torch.isfinite(output).all() or error > 0.05:
-                    raise RuntimeError(f"compiled dequant reference mismatch (rel {error:.2e})")
+            error = rel_diff(cout[0][:reference.shape[0]], reference)  # the first bank's, as in eager
+            if not all(torch.isfinite(output).all() for output in cout) or error > 0.05:
+                raise RuntimeError(f"compiled dequant reference mismatch (rel {error:.2e})")
         res["compile"] = do_bench(crun, return_mode="min") * 1e3 / count
         print(f"      {tag:14s} compile    {res['compile']:9.1f}us", flush=True)
     except Exception as e:
@@ -2627,8 +2626,9 @@ def bench_attn_row(row, pname, cfg, rows_out):
         reference = bank_arms[0]["torch_weight_only"]() if "torch_weight_only" in bank_arms[0] else None
         if ONLY_ARMS is not None:
             bank_arms = [{k: v for k, v in arms.items() if k in ONLY_ARMS} for arms in bank_arms]
-            if reference is None and cfg["weights"] not in INT_BITS:
-                # our arm is not the parity anchor here: check against x @ dequant(W)^T on a few rows
+            if reference is None and cfg["weights"] not in INT_BITS and not _quantized_acts(cfg):
+                # our arm is not the parity anchor here: check a weight-only arm against x @ dequant(W)^T on a
+                # few rows (quantized activations would need the arm's own activation quantization)
                 dequant = _dequant_weight(cfg, W, Ws, W_g).float().reshape(N, K)
                 reference = (x[:32].float() @ dequant.t()).to(x.dtype)
         if cfg["weights"] in INT_BITS:
