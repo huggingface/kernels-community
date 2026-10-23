@@ -728,7 +728,9 @@ def test_matmul_2d_reads_row_strided_activations(weights, activation_format, swi
     if swizzled:
         Bs = swizzle_mx_scales(Bs)
     A = torch.randn(S, K, device=TEST_DEVICE, dtype=torch.bfloat16)
-    strided = torch.empty(S, row_stride, device=TEST_DEVICE, dtype=torch.bfloat16)[:, :K]
+    # the offset start puts the base off the 16-byte grid too, unless the stride is aligned
+    offset = 0 if row_stride % 8 == 0 else 1
+    strided = torch.empty(S, row_stride, device=TEST_DEVICE, dtype=torch.bfloat16)[:, offset : offset + K]
     strided.copy_(A)
     kw = dict(activation_format=activation_format, output_dtype=torch.bfloat16, b_global_scale=B_global)
     expected = finegrained_kernels.matmul_2d(A, B, None, Bs, **kw)
