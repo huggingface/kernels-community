@@ -7,6 +7,8 @@ from .ops.kda import chunk_kda, fused_recurrent_kda
 
 
 class FusedRMSNormGated(nn.Module):
+    can_torch_compile = True
+
     def forward(self, hidden_states, gate=None):
         return rms_norm_gated(
             hidden_states,
@@ -22,6 +24,8 @@ class FusedRMSNormGated(nn.Module):
 
 
 class chunk_kimi_delta_attention(nn.Module):
+    can_torch_compile = True
+
     def forward(
         self,
         query,
@@ -54,6 +58,8 @@ class chunk_kimi_delta_attention(nn.Module):
 
 
 class recurrent_kimi_delta_attention(nn.Module):
+    can_torch_compile = True
+
     def forward(
         self, query, key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel=False, **kwargs,
     ):
@@ -75,6 +81,8 @@ class recurrent_kimi_delta_attention(nn.Module):
 
 
 class chunk_gated_delta_rule(nn.Module):
+    can_torch_compile = True
+
     def forward(
         self,
         query,
@@ -107,6 +115,8 @@ class chunk_gated_delta_rule(nn.Module):
 
 
 class recurrent_gated_delta_rule(nn.Module):
+    can_torch_compile = True
+
     def forward(
         self, query, key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel=False, **kwargs,
     ):

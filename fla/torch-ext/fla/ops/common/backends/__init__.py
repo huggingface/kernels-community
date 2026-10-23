@@ -7,15 +7,7 @@
 
 """Common backends for shared operations like chunk_gated_delta_rule_fwd_h."""
 
-from ....ops.backends import BackendRegistry, dispatch
 from ....ops.common.backends.intracard import IntraCardCPBackend
-from ....ops.common.backends.tilelang import TileLangBackend
+from ....ops.common.backends.tilelang import CommonTileLangBackend
 
-common_registry = BackendRegistry("common")
-
-
-common_registry.register(IntraCardCPBackend())
-common_registry.register(TileLangBackend())
-
-
-__all__ = ['common_registry', 'dispatch']
+__all__ = ['CommonTileLangBackend', 'IntraCardCPBackend']
