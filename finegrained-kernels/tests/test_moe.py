@@ -27,18 +27,22 @@ import pytest
 import torch
 
 from utils import (  # type: ignore
+    dequant_gate_up,
     DTYPE_TAG,
     DTYPE_TO_TOL,
+    finegrained_kernels,
+    internals,
+    make_gate_up,
+    prepare_csf,
     SUPPORTS_SWIZZLED_SCALES,
     TEST_DEVICE,
     WEIGHTS,
-    dequant_gate_up,
-    make_gate_up,
-    prepare_csf,
 )
 
-from finegrained_kernels import moe, scheduling, swizzle_mx_scales  # type: ignore
-from finegrained_kernels.epilogue import fused_glu  # type: ignore
+moe = internals.moe
+scheduling = internals.scheduling
+swizzle_mx_scales = finegrained_kernels.swizzle_mx_scales
+fused_glu = internals.epilogue.fused_glu
 
 
 @dataclass(frozen=True)

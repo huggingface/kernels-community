@@ -11,18 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Auto-loaded by pytest before any test module imports — adds the package's
-``torch-ext`` source dir to ``sys.path`` so the suite runs without an install
-step, pins each xdist worker to its own GPU, then gates the whole suite on FP8
-hardware support."""
+"""Auto-loaded by pytest before any test module imports — pins each xdist worker to its
+own GPU, then gates the whole suite on FP8 hardware support. The tests load the kernel with
+``get_kernel`` (see ``utils.py``)."""
 
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent / "torch-ext"))
 
 # Under test, a config the tuner cannot compile or run is a PRUNER GAP, not something to
 # tolerate: forgiving it leaves the suite green while the arm silently drops out of the search

@@ -11,22 +11,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared test helpers: quantized-weight constructors and dequant references.
+"""Shared test helpers: the kernel under test, quantized-weight constructors and dequant references.
 
-The ``finegrained_kernels`` package is on ``sys.path`` via ``conftest.py`` (pytest
-auto-loads it before any test module)."""
+The tests load the kernel with ``get_kernel``, as users do. ``kernel-builder testshell`` sets
+``LOCAL_KERNELS`` so that the local build loads instead of the Hub one."""
 
 import torch
-
-from finegrained_kernels.compat import (  # type: ignore
-    MX_SCALE_GROUP_K,
-    NVFP4_SCALE_GROUP_K,
-    is_sm10x,
-)
-from finegrained_kernels.loading.scales import prepare_nvfp4_csf_scales
+from kernels import get_kernel
 
 
-# ── Device + capability ───────────────────────────────────────────────────────
+finegrained_kernels = get_kernel("kernels-community/finegrained-kernels", version=0)
+# the internal modules the tests reach into
+internals = finegrained_kernels._private_for_testing
+
+MX_SCALE_GROUP_K = internals.compat.MX_SCALE_GROUP_K
+NVFP4_SCALE_GROUP_K = internals.compat.NVFP4_SCALE_GROUP_K
+is_sm10x = internals.compat.is_sm10x
+prepare_nvfp4_csf_scales = internals.scales.prepare_nvfp4_csf_scales
 
 TEST_DEVICE = (
     torch.accelerator.current_accelerator().type
@@ -236,7 +237,12 @@ def quant_dequant_a(
 # (E, N, K); act_quant[activation_format] -> the host quant fn the ops themselves call (None = the
 # family default applied to a raw A); dq_act dequantizes its output for the torch oracle.
 
-from finegrained_kernels.quant import fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mxfp4_act_quant, mxfp8_act_quant, nvfp4_act_quant, nvfp4_quantize_two_level  # type: ignore  # noqa: E402
+fp8_act_quant_block_dynamic = internals.quant.fp8_act_quant_block_dynamic
+fp8_act_quant_tensor_wide = internals.quant.fp8_act_quant_tensor_wide
+mxfp4_act_quant = internals.quant.mxfp4_act_quant
+mxfp8_act_quant = internals.quant.mxfp8_act_quant
+nvfp4_act_quant = internals.quant.nvfp4_act_quant
+nvfp4_quantize_two_level = internals.quant.nvfp4_quantize_two_level
 
 _E2M1_LUT = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 _E2M1_LUT = _E2M1_LUT + [-v for v in _E2M1_LUT]
