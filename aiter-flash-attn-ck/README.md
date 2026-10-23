@@ -70,7 +70,7 @@ instance.
 import torch
 from kernels import get_kernel
 
-flash_attn = get_kernel("amd/aiter-flash-attn-ck")
+flash_attn = get_kernel("amd/aiter-flash-attn-ck", version=1)
 
 q = torch.randn(2, 1024, 8, 128, device="cuda", dtype=torch.bfloat16)
 k = torch.randn(2, 1024, 8, 128, device="cuda", dtype=torch.bfloat16)

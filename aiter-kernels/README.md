@@ -62,7 +62,7 @@ Some ops also carry per-arch fast paths for `gfx1250` (Gluon) and `gfx1151`.
 import torch
 from kernels import get_kernel
 
-aiter = get_kernel("amd/aiter-kernels")
+aiter = get_kernel("amd/aiter-kernels", version=2)
 
 # Example: rotary
 B, H, S, D = 2, 8, 32, 64
