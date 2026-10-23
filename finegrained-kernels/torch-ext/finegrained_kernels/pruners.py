@@ -15,7 +15,8 @@
 import torch
 import triton
 
-from .compat import FP8_DTYPE, get_active_device_type, is_sm10x, is_sm90, sm_count, sm_shared_memory_limit, triton_version
+from .autotune_config import load_autotune_config
+from .compat import FP8_DTYPE, get_active_device_type, is_sm10x, is_sm90, sm_count, sm_shared_memory_limit, triton_version, two_cta_mma_available, two_cta_scaled_mma_available
 from .mma import MMA_N_ATOM_WIDTH
 
 # ── config pruners ────────────────────────────────────────────────────────────
@@ -950,8 +951,9 @@ def warp_spec_memory_mode_pruner(weight_only: bool = False, gather_only: bool = 
                 not weight_only and getattr(args.get("A"), "dtype", None) == FP8_DTYPE
                 and c.kwargs.get("PIPELINE", "k_loop") != "k_loop" and a == b == "host_descriptor"
             )
+            # per CTA: a two-CTA pair's 256-row tile is 128 rows in each CTA
             return not descriptor or (
-                config_dim(c, args, "BLOCK_SIZE_M") == 128
+                config_dim(c, args, "BLOCK_SIZE_M") // c.num_ctas == 128
                 and (c.num_warps == 4 or ((prefill_tile or pipeline_tile or fp8_pipeline_tile) and c.num_warps == 8))
             )
         if descriptor:
@@ -1115,8 +1117,10 @@ def swizzled_out_bm_pruner():
     entirely swizzled). Un-swizzled requant keeps every BM/BN — it stores Cs row-major."""
 
     def ok(c, args):
+        # a two-CTA pair's 256-row tile stores its two 128-row blocks separately
+        bm = config_dim(c, args, "BLOCK_SIZE_M")
         return (
-            config_dim(c, args, "BLOCK_SIZE_M") == 128
+            (bm == 128 or (bm == 256 and c.num_ctas == 2))
             and config_dim(c, args, "BLOCK_SIZE_N") == 128
         )
 
@@ -1125,9 +1129,10 @@ def swizzled_out_bm_pruner():
 
 def swizzled_scales_bm_pruner():
     """``early_config_prune`` pinning the grouped MX pre-swizzled (``SWIZZLED_SCALES``) arm to
-    ``BLOCK_SIZE_M == 128`` and a whole-128-block ``BLOCK_SIZE_N``. BM: the offline act-quant lays each expert's scale
-    slab out 128-padded, and the kernel's per-tile scale-block index (``pid_m``) only lines up
-    when the M tile is exactly 128 (``build_tile_layout`` pads experts on the same granularity).
+    ``BLOCK_SIZE_M == 128`` (or 256 on the packed schedule) and a whole-128-block ``BLOCK_SIZE_N``. BM: the offline
+    act-quant lays each expert's scale slab out 128-padded, and the kernel's per-tile scale-block index (``pid_m``)
+    only lines up when the M tile is exactly 128 (``build_tile_layout`` pads experts on the same granularity); a
+    256-row tile reads its first block off the packed schedule instead.
     BN: the scale is read as whole 128-row SWIZZLE_32_4_4 blocks off the descriptor (under GATE,
     the gate 128-block + the up 128-block stacked into the 2*BN tile); a sub-128 BN would need a
     partial-block read the descriptor can't express, while any whole multiple is a multi-block bulk
@@ -1139,12 +1144,47 @@ def swizzled_scales_bm_pruner():
     indexed by the gathered row, not ``pid_m``."""
 
     def ok(c, args):
+        # a 256-row tile (a two-CTA pair or one CTA) starts mid-slab and takes its first scale block
+        # from the packed schedule, which only PACKED_SCHEDULE builds
+        bm = config_dim(c, args, "BLOCK_SIZE_M")
         return (
-            config_dim(c, args, "BLOCK_SIZE_M") == 128
+            (bm == 128 or (bm == 256 and c.kwargs.get("PACKED_SCHEDULE", True)))
             and config_dim(c, args, "BLOCK_SIZE_N") % 128 == 0
         )
 
     return config_filter(ok, when=lambda args: args.get("SWIZZLED_SCALES"))
+
+
+def two_cta_pruner(scaled: bool = True):
+    """``early_config_prune`` for the ``num_ctas=2`` scaled-MMA pairs (``two_cta_scaled_configs``):
+    kept only where Triton lowers them to ``cta_group::2`` (``two_cta_scaled_mma_available``) and
+    the launch can feed the pairing — it needs TMA operands (a box, or a gather for A, whose rows
+    the pair splits) and the ``tcgen05.cp`` scale path, so affine scales would leave
+    ``num_ctas=2`` without it. A
+    warp-specialized K loop inside the persistent tile loop does not lower for a pair (its per-tile
+    barrier inits leave ``TritonNvidiaGPUMembar`` no cross-CTA sync point), so a pair specializes
+    the tile loop (``PIPELINE``) instead.
+
+    ``scaled=False`` is the ``tl.dot`` kernels' variant (``two_cta_configs``): their pairs already have
+    TMA operands, so they need only a compiler that pairs a ``tl.dot`` (``two_cta_mma_available``)."""
+
+    # two_cta coverage (FINEGRAINED_AUTOTUNE_CONFIG) runs the pairs the compiler is not known to lower too
+    coverage = load_autotune_config().get("two_cta", False)
+
+    def ok(c, args):
+        if c.num_ctas == 1:
+            return True
+        if not scaled:  # a tl.dot pair (two_cta_configs) needs only the paired lowering
+            return two_cta_mma_available()
+        if coverage and two_cta_scaled_mma_available():
+            return True
+        return (
+            not (c.kwargs.get("WARP_SPEC") and c.kwargs.get("PIPELINE", "k_loop") == "k_loop")
+            and two_cta_scaled_mma_available()
+            and args.get("SWIZZLED_SCALES", False)
+        )
+
+    return config_filter(ok)
 
 
 def swizzled_scale_config_pruner(allow_gate_subblock=False):
@@ -1539,6 +1579,8 @@ def smem_pruner(
     ``ws_full_stages``: ``full_stages`` for warp-specialized configs only (the K-loop pipeliner still
     clamps the others): the tensor-wide grouped gate|up tune at Mistral-4 drops all 32 WS
     shared-memory failures and none of 105 compiling configs.
+    Two-CTA pairs (``num_ctas=2``): every bound counts one CTA's half of the A rows and of the B
+    columns; the ``dot_scaled`` B scale tile stays whole (the pair broadcasts it).
 
     These are lower bounds on the observed IR allocations, not a complete allocator
     model: omitted storage keeps borderline configs for the compiler to check. Samples
@@ -1563,6 +1605,8 @@ def smem_pruner(
         packed = 2 if b.dtype == torch.uint8 else 1
         bm = config_dim(c, args, "BLOCK_SIZE_M")
         bn = config_dim(c, args, "BLOCK_SIZE_N")
+        # a two-CTA pair stages half of A (its rows) and half of B (its columns) per CTA
+        pair = c.num_ctas
         if unquantized:
             # sampled minima of the fixed allocations beside the operand buffers
             # (the barrier terms vary by tens of bytes with warps; minima only ever
@@ -1574,7 +1618,7 @@ def smem_pruner(
             )
             # an integer weight is uint32 words of 32 // bits K values: bits / 8 bytes per K per row
             b_bytes_per_k = 4 * b.shape[-1] / args["K"] if b.dtype == torch.uint32 else b.element_size()
-            need = fixed + stages * bk * (a.element_size() * bm + b_bytes_per_k * tiles * bn)
+            need = fixed + stages * bk * (a.element_size() * bm + b_bytes_per_k * tiles * bn) // pair
         elif c.kwargs.get("COMPUTE_MODE") == "dot_scaled":
             # KEEP-SIDE bound = HALF of one buffer set: operands stored PACKED (fp4 = 2
             # values/byte) plus both group scale tiles (BK/group cols; group 32 UE8M0, 16
@@ -1584,13 +1628,14 @@ def smem_pruner(
             # have rescued. Proven est<=actual on 1,099 metadata.shared samples across the
             # family (see OPTIMIZATION_LOG: smem-keep-side-refit).
             group = 16 if getattr(args.get("Bs"), "dtype", None) == torch.float8_e4m3fn else 32
+            # the pair broadcasts the whole B scale tile to both CTAs
             # A's smem bytes follow its LAUNCH dtype: packed E2M1 (int8/uint8) = 2 values/byte,
             # E4M3 = 1 B/value, raw bf16/fp16 (weight-only) = element_size B/value
             a_dtype = a.dtype
             if a_dtype in (torch.int8, torch.uint8):
-                a_bytes = (bk // 2) * bm
+                a_bytes = (bk // 2) * (bm // pair)
             else:
-                a_bytes = bk * bm * a.element_size()
+                a_bytes = bk * (bm // pair) * a.element_size()
             # HALF a set: the sampled lower envelope. The 2D kernel's nvfp4 arm can compile an
             # s2 request into half a buffer set (sub-tile pipelining: BN=64/128/256 x BK=512
             # all landed at set/2 + <=8 B), so the full set is not a lower bound; the half set
@@ -1600,9 +1645,9 @@ def smem_pruner(
             # The family-wide keep-side model counts fp4 weights PACKED; the grouped pipeline stages
             # them at full E4M3 width (BN=256, BK=128, s5 OOMs at 253 KB = 5 x 50 KB sets, which only
             # a full-width B tile adds up to), so the whole-set bound (min_sets >= 1) uses full width.
-            b_bytes = bk * tiles * bn if min_sets >= 1 else (bk // packed) * tiles * bn
+            b_bytes = (bk if min_sets >= 1 else bk // packed) * tiles * bn // pair
             need = int(
-                (a_bytes + b_bytes + (bk // group) * bm + (bk // group) * tiles * bn) * min_sets
+                (a_bytes + b_bytes + (bk // group) * (bm // pair) + (bk // group) * tiles * bn) * min_sets
             )
         elif (
             is_sm10x()
@@ -1617,10 +1662,10 @@ def smem_pruner(
             # Pointer loads can use fewer buffers; a swapped lhs can live in tmem.
             b_stages = c.num_stages if c.kwargs.get("WARP_SPEC") else c.num_stages - 1
             need = bk * (c.num_stages * a.element_size() * bm
-                         + (b_stages + a.element_size()) * tiles * bn)
+                         + (b_stages + a.element_size()) * tiles * bn) // pair
         else:
             # Other dot/scalar pipelines retain their raw-operand lower bound.
-            need = stages * (bk * bm + (bk // packed) * tiles * bn)
+            need = stages * (bk * bm + (bk // packed) * tiles * bn) // pair
         if staged_weights:
             rows = tiles * bn
             if c.kwargs.get("COMPUTE_MODE") == "dot_scaled":

@@ -295,8 +295,10 @@ def packed_schedule_capacity(num_routed_tokens: int, num_experts: int) -> int:
 
 def packed_schedule_buffer(num_routed_tokens: int, num_experts: int, device: torch.device) -> torch.Tensor:
     """The packed tile schedule's buffer: fixed shape (graph-safe), shared by every config of a launch so the tuned
-    configs see identical args; ``fill_packed_schedule`` writes it for the configs that read it."""
-    return torch.empty(1 + 3 * packed_schedule_capacity(num_routed_tokens, num_experts), dtype=torch.int32, device=device)
+    configs see identical args; ``fill_packed_schedule`` writes it for the configs that read it. Layout: the tile
+    count, ``capacity`` ``(expert_id, m_start, row_end)`` triples, then ``capacity`` scale row blocks
+    (``load_packed_scale_block``). The 128-row capacity bounds every taller tile height too."""
+    return torch.empty(1 + 4 * packed_schedule_capacity(num_routed_tokens, num_experts), dtype=torch.int32, device=device)
 
 
 def fill_packed_schedule(nargs):
@@ -308,18 +310,21 @@ def fill_packed_schedule(nargs):
     pow2 = triton.next_power_of_2(expert_start.shape[0] - 1)
     with device_context(expert_start.device):
         compile_time_only_triton_wrap(_packed_schedule_kernel)[(pow2,)](
-            expert_start, nargs["Schedule"], NUM_EXPERTS=pow2
+            expert_start, nargs["Schedule"], (nargs["Schedule"].numel() - 1) // 4,
+            NUM_EXPERTS=pow2, BM=nargs["BLOCK_SIZE_M"],
         )
 
 
 @triton.jit
-def _packed_schedule_kernel(ExpertStart, Schedule, NUM_EXPERTS: tl.constexpr):
+def _packed_schedule_kernel(ExpertStart, Schedule, capacity, NUM_EXPERTS: tl.constexpr, BM: tl.constexpr):
     """Build the packed tile schedule in one launch: one program per expert writes its
     tiles' ``(expert_id, m_start, row_end)`` triples (header slot 0 = total tile count,
     written by expert 0 from the full cumsum). Replaces the kernels' O(E)
     register-resident tile layout with O(1) loads — the packed-schedule tuner axis
-    (register relief; wins at the pressure-walled BM=128 configs)."""
-    BM: tl.constexpr = 128  # PACKED_SCHEDULE_BM
+    (register relief; wins at the pressure-walled BM=128 configs). Each tile's first 128-row
+    block in the expert-sorted, 128-padded swizzled activation scales goes to the trailing
+    region: a 256-row tile starts mid-slab there, and the layout's cumsum cannot run inside a
+    two-CTA kernel (the scan lowering has no cross-CTA form)."""
     e = tl.program_id(0)
     e_start = tl.load(ExpertStart + e)
     e_end = tl.load(ExpertStart + e + 1)
@@ -328,6 +333,7 @@ def _packed_schedule_kernel(ExpertStart, Schedule, NUM_EXPERTS: tl.constexpr):
     ends = tl.load(ExpertStart + offs + 1)
     tiles_per = (ends - starts + BM - 1) // BM
     before = tl.sum(tl.where(offs < e, tiles_per, 0), 0)
+    scale_blocks_before = tl.sum(tl.where(offs < e, (ends - starts + 127) // 128, 0), 0)
     if e == 0:
         tl.store(Schedule, tl.sum(tiles_per, 0))  # header: total_m_tiles
     n_tiles = (e_end - e_start + BM - 1) // BM
@@ -336,15 +342,25 @@ def _packed_schedule_kernel(ExpertStart, Schedule, NUM_EXPERTS: tl.constexpr):
         tl.store(Schedule + base, e)
         tl.store(Schedule + base + 1, e_start + t * BM)
         tl.store(Schedule + base + 2, e_end)
+        tl.store(Schedule + 1 + 3 * capacity + before + t, scale_blocks_before + t * (BM // 128))
 
 
 @triton.jit
 def load_packed_schedule(Schedule, BLOCK_SIZE_M: tl.constexpr):
     """The packed counterpart of ``build_tile_layout``: read the header (total_m_tiles).
-    The schedule is built for BM=128 only — the sole region the packed resolve wins (see
-    ``packed_schedule_scope_pruner``); the static_assert is the self-fence."""
-    tl.static_assert(BLOCK_SIZE_M == 128, "the packed schedule is built for BM=128")
+    The schedule is built for BM=128 — the sole region the packed resolve wins (see
+    ``packed_schedule_scope_pruner``) — and for the two-CTA 256-row tile, which needs it;
+    the static_assert is the self-fence."""
+    tl.static_assert(BLOCK_SIZE_M == 128 or BLOCK_SIZE_M == 256, "the packed schedule is built for BM=128/256")
     return tl.load(Schedule)
+
+
+@triton.jit
+def load_packed_scale_block(Schedule, pid_m, S, num_experts):
+    """M-tile ``pid_m``'s first 128-row block in the expert-sorted swizzled activation scales
+    (``_packed_schedule_kernel``'s trailing region; ``packed_schedule_capacity`` in-kernel)."""
+    capacity = (S + 127) // 128 + num_experts
+    return tl.load(Schedule + 1 + 3 * capacity + pid_m)
 
 
 @triton.jit

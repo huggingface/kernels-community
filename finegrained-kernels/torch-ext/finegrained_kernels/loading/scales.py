@@ -77,14 +77,15 @@ def load_block_fp8_act_tile(
 
 @triton.jit
 def load_swizzled_scale(
-    desc, blk_idx, k_idx,
+    desc, row_block, k_idx,
     REP: tl.constexpr, REP_K: tl.constexpr, BLOCK: tl.constexpr, SCALE_COLS: tl.constexpr,
 ):
     """Bulk-load one scale tile from a ``SWIZZLE_32_4_4`` descriptor and un-swizzle it to the
     ``(BLOCK, SCALE_COLS)`` layout ``tl.dot_scaled`` consumes. ``REP = BLOCK // 128``,
-    ``REP_K = SCALE_COLS // 4``; ``blk_idx``/``k_idx`` are the tile's row-block / K-block ids.
+    ``REP_K = SCALE_COLS // 4``; ``row_block`` is the tile's first 128-row block (absolute, so a
+    tile may start on any block) and ``k_idx`` its K-block id.
     Descriptor is over the swizzled scale viewed ``(1, rows//128, cols//4, 2, 256)``."""
-    s = desc.load([0, blk_idx * REP, k_idx * REP_K, 0, 0])
+    s = desc.load([0, row_block, k_idx * REP_K, 0, 0])
     return s.reshape(REP, REP_K, 32, 4, 4).trans(0, 3, 2, 1, 4).reshape(BLOCK, SCALE_COLS)
 
 
@@ -100,6 +101,7 @@ def load_swizzled_scale_tile(
     BLOCK: tl.constexpr,
     SCALE_COLS: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
+    row_block=None,
 ):
     """One swizzled-scale tile ``(BLOCK, SCALE_COLS)`` for a row-tile of ANY operand — batched
     weight (``group_id = expert``), 2D weight / 2D activation (``group_id = 0``, dense). Scales are
@@ -108,9 +110,9 @@ def load_swizzled_scale_tile(
 
     - ``BLOCK`` a multiple of 128 with whole 4-group K bands (``BK % 128 == 0``): the fast path —
       bulk-load the ``REP = BLOCK//128`` row-blocks via the TMA ``descriptor`` (box
-      ``[1, REP, rep_k, 2, 256]``), un-swizzle, feed ``dot_scaled``. Today's pruners cap every
-      swizzled tile at 128 (REP=1); the REP>1 form is written for a future >128-tile descriptor
-      read, not reachable from the current grids.
+      ``[1, REP, rep_k, 2, 256]``), un-swizzle, feed ``dot_scaled``. ``row_block`` overrides the
+      tile's first 128-row block where tiles do not start at multiples of ``REP`` (the grouped
+      two-CTA 256-row tile over 128-padded expert slabs).
     - Otherwise (sub-128 tile — fp8 ``scalar`` decode / small-M offline; or ``BK<128``): the block
       layout can't be TMA-sliced, so pointer-GATHER exactly this tile's rows. The swizzle is a fixed
       permutation: logical (row ``r``, K-group ``col``) → byte
@@ -126,8 +128,9 @@ def load_swizzled_scale_tile(
         REP: tl.constexpr = BLOCK // 128
         # absolute 128-block base = group_id*nrb + pid*REP; load_swizzled_scale multiplies blk by REP.
         # Non-128 ``rows`` (odd ``nrb``) pins REP=1 (BN=128) in the pruner, so group_id*nrb//REP is exact.
-        blk = (group_id * nrb // REP + pid).to(tl.int32)
-        return load_swizzled_scale(descriptor, blk, k_idx, REP, SCALE_COLS // 4, BLOCK, SCALE_COLS)
+        if row_block is None:
+            row_block = ((group_id * nrb // REP + pid) * REP).to(tl.int32)
+        return load_swizzled_scale(descriptor, row_block, k_idx, REP, SCALE_COLS // 4, BLOCK, SCALE_COLS)
     cols4 = (K // SCALE_GROUP_K + 3) // 4  # cdiv: the buffer pads cols to whole 4-group chunks
     r = pid * BLOCK + tl.arange(0, BLOCK)
     lin = r // 128

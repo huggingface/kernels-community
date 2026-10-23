@@ -26,7 +26,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .bayesian_autotuner import bayesian_autotune
 from .bench import gemm_cold_banks
-from .compat import add_op_namespace_prefix, FP8_DTYPE, is_sm10x, launches_skipped, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, pdl_launch_kwargs, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, narrow_dot_autotuning_configs, narrow_scalar_autotuning_configs, split_k_autotuning_configs, persistent_program_count, pipeline_autotuning_configs
+from .compat import add_op_namespace_prefix, FP8_DTYPE, is_sm10x, launches_skipped, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, pdl_launch_kwargs, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, narrow_dot_autotuning_configs, narrow_scalar_autotuning_configs, split_k_autotuning_configs, persistent_program_count, pipeline_autotuning_configs, two_cta_scaled_configs
 from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_tiled_descriptors, rebind_weight_only_descriptors
 from .formats import FP8_WEIGHT_ONLY_DEQUANT_MIN_M, INT_WEIGHT_ONLY_DEQUANT_MIN_DIM, INT_WEIGHT_ONLY_DEQUANT_MIN_M, block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, normalize_global_scale, e2m1_as_uint8, is_mx, is_rowwise, mx_scale_family, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_2d_operands, weight_format, validate_int_operands, validate_svdquant_operands, INT_WEIGHT_DTYPES
 from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
@@ -54,7 +54,7 @@ from .loading.tiles import (
     swizzle_offsets,
 )
 from .epilogue import acc_finalize, acc_init, add_bias, bias_strides, gemm_epilogue, store_masked, store_masked_oriented
-from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, gate_stacked_tmem_trap_pruner, block_dynamic_2d_warp_spec_pruner, block_dynamic_mma_width_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, descriptor_needs_prequant_pruner, matched_memory_modes_pruner, mx_2d_swap_scope_pruner, native_mma_m_pruner, mx_config_pruner, scalar_max_m_pruner, smem_pruner, swap_decode_scope_pruner, swap_max_m_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, warp_spec_compile_guard_pruner, warp_spec_memory_mode_pruner, mx_auxiliary_pruner, block_m_cap_pruner, int_2d_warp_spec_pruner, int_split_k_pruner, scalar_block_m_pruner, int_scale_group_tile_pruner
+from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, gate_stacked_tmem_trap_pruner, block_dynamic_2d_warp_spec_pruner, block_dynamic_mma_width_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, descriptor_needs_prequant_pruner, matched_memory_modes_pruner, mx_2d_swap_scope_pruner, native_mma_m_pruner, mx_config_pruner, scalar_max_m_pruner, smem_pruner, swap_decode_scope_pruner, swap_max_m_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, warp_spec_compile_guard_pruner, warp_spec_memory_mode_pruner, mx_auxiliary_pruner, block_m_cap_pruner, int_2d_warp_spec_pruner, int_split_k_pruner, scalar_block_m_pruner, int_scale_group_tile_pruner, two_cta_pruner
 
 # The 2D-grid kernels' L2-locality swizzle depth is derived per-tile inside
 # ``swizzle_offsets`` (see SWIZZLE_GROUP_A_BYTES there) — no per-kernel constant here.
@@ -99,6 +99,7 @@ def _block_dynamic_2d_configs():
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
         pre_hook=rebind_bd_descriptors,
+        two_cta=True,
     )
     seeds = [c for c in configs if c.kwargs.get("WARP_SPEC") and c.kwargs.get("BLOCK_SIZE_M", 0) >= 64
              and c.kwargs.get("A_MEMORY_MODE") == c.kwargs.get("B_MEMORY_MODE") == "host_descriptor"]
@@ -137,6 +138,7 @@ def _block_dynamic_2d_configs():
     # carries the sm_10x scaled-MMA width cap — GATE at BN=256 would emit a width-512 trap.
     prune_configs_by={
         "early_config_prune": compose_pruners(
+            two_cta_pruner(scaled=False),
             fp8_dot_warp_pruner(),
             warp_spec_compile_guard_pruner(),
             matched_memory_modes_pruner(),
@@ -336,6 +338,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
         pre_hook=rebind_tiled_descriptors,
+        two_cta=True,
     ),
     # GATE keys the gate|up arm separately (its stacked dot is 2*BN wide, a distinct config space).
     ["N", "K", "m_bit_length", "GATE"],
@@ -348,6 +351,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     # WS is a pure perf axis here (non-WS is the validated state), compile-guarded.
     prune_configs_by={
         "early_config_prune": compose_pruners(
+            two_cta_pruner(scaled=False),
             fp8_dot_warp_pruner(),
             block_within_dim_pruner("K"),
             warp_spec_compile_guard_pruner(),
@@ -497,6 +501,7 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
         pre_hook=rebind_bd_descriptors,
+        two_cta=True,
     ),
     # GATE keys the gate|up arm separately (its stacked dot is 2*BN wide, a distinct config space);
     # block_n/block_k (the launch-pinned quant block) gate descriptor-box legality and the K tile.
@@ -510,6 +515,7 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
     # N-apart gate/up rows), so prune the B-descriptor configs under GATE.
     prune_configs_by={
         "early_config_prune": compose_pruners(
+            two_cta_pruner(scaled=False),
             fp8_dot_warp_pruner(),
             warp_spec_compile_guard_pruner(),
             descriptor_needs_prequant_pruner(),
@@ -702,6 +708,10 @@ def _mx_matmul_configs():
               and not c.kwargs["SWAP_AB"] and c.kwargs["WARP_SPEC"] and c.num_warps in (4, 8)]
     persistent = [triton.Config(dict(c.kwargs, PERSISTENT=True), num_warps=c.num_warps,
                                 num_stages=c.num_stages, pre_hook=c.pre_hook) for c in native]
+    # the persistent tiles also warp-specialize the tile loop (one tile's epilogue overlaps the next
+    # tile's MMA), on one CTA or as a two-CTA pair over a 256-row tile
+    persistent += pipeline_autotuning_configs(persistent, ("tile_loop", "flattened"))
+    persistent += two_cta_scaled_configs(persistent)
     # the single-token scalar reduce, split along K: its BM=1 GEVM leaves most SMs idle on a deep K
     scalar = [c for c in configs if c.kwargs["COMPUTE_MODE"] == "scalar" and c.kwargs["BLOCK_SIZE_M"] == 1
               and c.kwargs["A_MEMORY_MODE"] == c.kwargs["B_MEMORY_MODE"] == "pointer"
@@ -754,6 +764,7 @@ def _mx_matmul_configs():
             descriptor_box_pruner("BLOCK_SIZE_K"),
             swizzled_scale_config_pruner(),
             warp_spec_compile_guard_pruner(),
+            two_cta_pruner(),
         )
     },
 )
@@ -832,6 +843,8 @@ def mx_dynamic_matmul_kernel(
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
     WARP_SPEC: tl.constexpr = False,  # tuner axis; +4% at prefill (guard: num_warps%4, BM>=64)
+    PIPELINE: tl.constexpr = "k_loop",  # tuner axis: warp-specialize the K loop, or the persistent tile loop ("tile_loop"/"flattened")
+    TWO_CTA: tl.constexpr = False,  # tuner axis: a num_ctas=2 pair over a 256-row tile (two_cta_scaled_configs)
     SWAP_AB: tl.constexpr = False,  # swapped decode orientation (BM=1); scoped by mx_2d_swap_scope_pruner
     PDL: tl.constexpr = False,
 ):
@@ -851,7 +864,12 @@ def mx_dynamic_matmul_kernel(
     if PDL:
         gdc_wait()
     tile_start, tile_end, tile_step = output_tile_range(M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, PERSISTENT)
-    for tile_id in range(tile_start, tile_end, tile_step):
+    # Two accumulators of a 256-wide tile and the block scales overflow the 512 tensor-memory columns.
+    for tile_id in tl.range(
+        tile_start, tile_end, tile_step,
+        flatten=PIPELINE == "flattened", warp_specialize=WARP_SPEC and PIPELINE != "k_loop",
+        disallow_acc_multi_buffer=PIPELINE != "k_loop" and (2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N) >= 256,
+    ):
         # uint8 A = packed-E2M1 activations (W4A4 — the dtype IS the activation format)
         ACT_VALUES_PER_BYTE: tl.constexpr = 2 if A.dtype.element_ty == tl.uint8 else 1
         WEIGHT_VALUES_PER_BYTE: tl.constexpr = 2 if B.dtype.element_ty == tl.uint8 else 1
@@ -889,7 +907,7 @@ def mx_dynamic_matmul_kernel(
             as_ptrs += split * (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_as_k
             bs_ptrs += split * (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
         accumulator = acc_init(COMPUTE_MODE if SWAP_AB else "dot", BLOCK_SIZE_M, n_width, SWAP_AB)
-        for k in tl.range(split, tl.cdiv(K, BLOCK_SIZE_K), SPLIT_K, warp_specialize=WARP_SPEC):
+        for k in tl.range(split, tl.cdiv(K, BLOCK_SIZE_K), SPLIT_K, warp_specialize=WARP_SPEC and PIPELINE == "k_loop"):
             a, a_s = load_act_mx(
                 a_ptrs, as_ptrs, AsGlobal, 0, None, as_mask, ADescriptor, pid_m * BLOCK_SIZE_M,
                 k * (BLOCK_SIZE_K // ACT_VALUES_PER_BYTE), ASDescriptor, As, 0, 0, pid_m, k, M, K,
@@ -1428,7 +1446,7 @@ def block_fp8_weight_only_matmul_2d_kernel(
         tune_block_nk=True, warp_spec=True, tune_block_m=True,
         swap_ab=True, swap_block_sizes_m=(1, 2, 4, 8),
         a_memory_modes=("descriptor", "pointer"), b_memory_modes=("descriptor", "pointer"),
-        pre_hook=rebind_weight_only_descriptors,
+        pre_hook=rebind_weight_only_descriptors, two_cta=True,
     ),
     # GATE keys the gate|up arm separately (its stacked dot is 2*BN wide).
     ["N", "K", "m_bit_length", "GATE"],
@@ -1439,6 +1457,7 @@ def block_fp8_weight_only_matmul_2d_kernel(
     finite_check_args=("C", "Cs"),
     prune_configs_by={
         "early_config_prune": compose_pruners(
+            two_cta_pruner(scaled=False),
             block_within_dim_pruner("K"),
             swap_max_m_pruner("M", max_m=8),
             matched_memory_modes_pruner(),

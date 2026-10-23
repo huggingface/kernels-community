@@ -181,14 +181,16 @@ def build_grouped_operand_descriptors(a_operand, b_operand):
 
 
 def rebind_grouped_mx_descriptors(nargs):
-    """MX composite pre_hook: the operand boxes plus the two SWIZZLE_32_4_4 scale boxes
+    """MX composite pre_hook: the operand boxes (the weight as ``batched_weight_descriptor``'s 2D
+    expert stack — a 2D box is what a two-CTA MMA splits) plus the two SWIZZLE_32_4_4 scale boxes
     ``[1, BLOCK // 128, (BK // SCALE_GROUP_K) // 4, 2, 256]`` over the swizzled
-    ``(1, rows // 128, cols // 4, 2, 256)`` views. Activation box is BM // 128 (BM pinned 128);
+    ``(1, rows // 128, cols // 4, 2, 256)`` views. Activation box is BM // 128;
     the weight box is ``(2 if GATE else 1) * BN // 128`` — the stacked gate|up tile is one 2*BN
     block (BN pinned 128 under GATE by ``swizzled_scales_bm_pruner``). Mutate in place. Both scale
     descriptors are None on the un-swizzled arm (affine read — one SWIZZLED_SCALES flag governs both
     operands), so their boxes are skipped."""
-    rebind_grouped_descriptors(nargs)
+    rebind_batched_weight_descriptor(nargs)
+    rebind_grouped_act_descriptor(nargs)
     # BK below 4 scale groups (BK=64 rows the pruner rejects) still passes through here when a
     # descriptor is unread — clamp like bn_blocks below so it keeps a valid, non-degenerate
     # shape (a 0-block box traps the descriptor-encoding pass).

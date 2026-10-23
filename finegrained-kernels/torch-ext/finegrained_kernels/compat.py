@@ -19,11 +19,14 @@ from contextlib import contextmanager
 
 
 import os
+import sys
 
 import torch
 import triton
 import triton.language as tl
 from torch.library import triton_op, wrap_triton
+
+from .autotune_config import load_autotune_config
 
 # Programmatic dependent launch for the decode chain (batched GEMMs, GLU, act quant, reduce): each
 # kernel waits on its grid dependency at the top and releases its dependents just before the
@@ -239,11 +242,14 @@ def persistent_program_count(device_index: int, block_m: int | None = None) -> i
     """Size the persistent grid, including extra programs for small SM10x tiles.
 
     Small tiles need several programs per SM to hide memory latency. Xe uses
-    two work-groups per core regardless of the tile size.
+    two work-groups per core regardless of the tile size. A 256-row tile is a two-CTA
+    pair (the tuned grids stop at 128 rows on one CTA), so one program covers two SMs.
     """
     n = sm_count(device_index)
     if block_m is not None and block_m < 64 and is_sm10x():
         n *= persistent_programs_per_sm(block_m)
+    if block_m is not None and block_m > 128:
+        n //= 2
     return n * 2 if get_active_device_type() == "xpu" else n
 
 
@@ -317,6 +323,7 @@ def get_accelerator_autotuning_configs(
     a_memory_modes=None,
     b_memory_modes=None,
     pre_hook=None,
+    two_cta: bool = False,
 ):
     """Autotune search grid for the current accelerator — the single generator for every
     GEMM kernel. One union span serves both families: num_warps {2,4,8,16} x num_stages
@@ -519,9 +526,48 @@ def get_accelerator_autotuning_configs(
                 if packed_schedule:
                     kwargs["PACKED_SCHEDULE"] = False
                 configs.append(triton.Config(kwargs, num_warps=8, num_stages=stages, pre_hook=pre_hook))
+    if two_cta:
+        configs += two_cta_configs(configs)
+    if load_autotune_config().get("two_cta"):
+        configs += two_cta_coverage_configs(configs)
     # dedup: the scalar BM=1 pin and the MX "dot" BK override collapse swept axes onto
     # one value, leaving identical copies that would each be benched.
     return list({str(c): c for c in configs}.values())
+
+
+def two_cta_configs(configs):
+    """``two_cta``: the two-CTA pairs of the MMA tiles in ``configs`` whose operands both come in
+    through host TMA descriptors: each BM=128 tile becomes a ``num_ctas=2`` cluster over a 256-row
+    tile, the CTAs splitting A by rows and B by columns (``tcgen05.mma.cta_group::2``), so each CTA
+    stages half the weight tile. ``two_cta_pruner`` keeps them only where the compiler pairs them.
+    Pointer operands and weights dequantized in registers do not pair, and a grouped pair reads the
+    packed schedule: the in-kernel tile layout under a warp-specialized tile loop computes wrong tiles
+    across the pair."""
+    return [
+        triton.Config(dict(c.kwargs, BLOCK_SIZE_M=256), num_warps=c.num_warps, num_stages=c.num_stages,
+                      num_ctas=2, maxnreg=c.maxnreg, pre_hook=c.pre_hook)
+        for c in configs
+        if c.kwargs.get("BLOCK_SIZE_M") == 128 and c.kwargs.get("COMPUTE_MODE") != "scalar"
+        and c.kwargs.get("A_MEMORY_MODE") == c.kwargs.get("B_MEMORY_MODE") == "host_descriptor"
+        and not c.kwargs.get("SWAP_AB") and c.kwargs.get("PACKED_SCHEDULE", True) and c.num_warps in (4, 8)
+    ]
+
+
+def two_cta_coverage_configs(configs):
+    """``two_cta`` in FINEGRAINED_AUTOTUNE_CONFIG: every MMA tile at BM=128 also as a ``num_ctas=2``
+    pair over a 256-row tile, which a compiler with two-CTA MMA lowers to ``cta_group::2``, plus the
+    same 256-row tile on one CTA. It turns every GEMM kernel into coverage for the two-CTA lowering:
+    a pair that fails where its one-CTA twin passes is a compiler bug, not the kernel's."""
+    pairs = []
+    for c in configs:
+        if (c.kwargs.get("BLOCK_SIZE_M") != 128 or c.kwargs.get("COMPUTE_MODE") == "scalar"
+                or c.kwargs.get("SWAP_AB") or c.num_warps not in (4, 8)):
+            continue
+        for num_ctas in (1, 2):
+            pairs.append(triton.Config(dict(c.kwargs, BLOCK_SIZE_M=256), num_warps=c.num_warps,
+                                       num_stages=c.num_stages, num_ctas=num_ctas, maxnreg=c.maxnreg,
+                                       pre_hook=c.pre_hook))
+    return pairs
 
 
 def pipeline_autotuning_configs(configs, pipelines, *, num_warps=None):
@@ -537,6 +583,25 @@ def pipeline_autotuning_configs(configs, pipelines, *, num_warps=None):
         )
         for config in configs
         for pipeline in pipelines
+    ]
+
+
+def two_cta_scaled_configs(configs):
+    """The two-CTA pairs of the native scaled-MMA tiles in ``configs``: each ``dot_scaled`` BM=128
+    tile on host descriptors becomes a ``num_ctas=2`` cluster over a 256-row tile, the CTAs splitting
+    A by rows and B by columns (``tcgen05.mma.cta_group::2``), so each CTA stages half the weight
+    tile. ``two_cta_pruner`` keeps them only where the compiler lowers that pairing. The kernel's
+    ``TWO_CTA`` constexpr marks them, which also makes them a tuner basin of their own (a numeric
+    BM=256 alone sat at the edge of the M axis, where the TPE never sampled it). A grouped pair reads
+    the packed schedule: the in-kernel tile layout's cumsum has no cross-CTA lowering."""
+    return [
+        triton.Config(dict(c.kwargs, BLOCK_SIZE_M=256, TWO_CTA=True), num_warps=c.num_warps, num_stages=c.num_stages,
+                      num_ctas=2, maxnreg=c.maxnreg, pre_hook=c.pre_hook)
+        for c in configs
+        if c.kwargs.get("COMPUTE_MODE") == "dot_scaled" and c.kwargs.get("BLOCK_SIZE_M") == 128
+        and c.kwargs.get("BLOCK_SIZE_N", 0) >= 128
+        and c.kwargs.get("A_MEMORY_MODE") == c.kwargs.get("B_MEMORY_MODE") == "host_descriptor"
+        and not c.kwargs.get("SWAP_AB") and c.kwargs.get("PACKED_SCHEDULE", True) and c.num_warps in (4, 8)
     ]
 
 
@@ -629,6 +694,84 @@ def is_sm10x() -> bool:
     otherwise raise); cached (pruners call this per tune, and a process is pinned to one
     device)."""
     return is_nvidia() and torch.cuda.get_device_capability()[0] == 10
+
+
+@contextmanager
+def _quiet_stderr():
+    """Silence the compiler's own diagnostics (written to fd 2 by C++) around a capability probe that is
+    expected to fail on compilers without the feature."""
+    sys.stderr.flush()
+    saved = os.dup(2)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, 2)
+        yield
+    finally:
+        os.dup2(saved, 2)
+        os.close(devnull)
+        os.close(saved)
+
+
+@triton.jit
+def _two_cta_mma_probe(ADescriptor, BDescriptor, C):
+    acc = tl.dot(ADescriptor.load([0, 0]), BDescriptor.load([0, 0]).T)
+    offs = tl.arange(0, 256)
+    tl.store(C + offs[:, None] * 256 + offs[None, :], acc)
+
+
+@functools.cache
+def two_cta_mma_available() -> bool:
+    """Whether Triton lowers a ``num_ctas=2`` ``tl.dot`` on TMA operands to the paired
+    ``tcgen05.mma.cta_group::2``. Without it ``num_ctas=2`` leaves each CTA its own MMA (slower,
+    miscompiles with TMA; see ``get_accelerator_autotuning_configs``). One cached probe compile."""
+    if not is_sm10x():
+        return False
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    operand = TensorDescriptor.from_tensor(torch.zeros(256, 64, device="cuda", dtype=torch.bfloat16), [256, 64])
+    out = torch.empty(256, 256, device="cuda", dtype=torch.float32)
+    try:
+        with _quiet_stderr():
+            kernel = _two_cta_mma_probe.warmup(operand, operand, out, grid=(1,), num_ctas=2, num_warps=4)
+    except Exception:
+        return False
+    return any("tcgen05.mma" in line and "cta_group::2" in line for line in kernel.asm["ptx"].splitlines())
+
+
+@triton.jit
+def _two_cta_scaled_mma_probe(ADescriptor, ASDescriptor, BDescriptor, BSDescriptor, C):
+    a = ADescriptor.load([0, 0])
+    b = BDescriptor.load([0, 0])
+    a_s = ASDescriptor.load([0, 0, 0, 0, 0]).reshape(2, 1, 32, 4, 4).trans(0, 3, 2, 1, 4).reshape(256, 4)
+    b_s = BSDescriptor.load([0, 0, 0, 0, 0]).reshape(2, 1, 32, 4, 4).trans(0, 3, 2, 1, 4).reshape(256, 4)
+    acc = tl.dot_scaled(a, a_s, "e4m3", b.T, b_s, "e4m3")
+    offs = tl.arange(0, 256)
+    tl.store(C + offs[:, None] * 256 + offs[None, :], acc)
+
+
+@functools.cache
+def two_cta_scaled_mma_available() -> bool:
+    """Whether Triton lowers a ``num_ctas=2`` ``tl.dot_scaled`` to the paired
+    ``tcgen05.mma.cta_group::2`` (a compiler with two-CTA scaled MMA). Without it ``num_ctas=2``
+    leaves each CTA its own MMA — the dead ``num_ctas`` axis (slower, miscompiles with TMA; see
+    ``get_accelerator_autotuning_configs``). One cached compile of a single-tile probe."""
+    if not is_sm10x():
+        return False
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    values = torch.zeros(256, 128, device="cuda", dtype=FP8_DTYPE)
+    scales = torch.zeros(1, 2, 1, 2, 256, device="cuda", dtype=torch.uint8)
+    operand = TensorDescriptor.from_tensor(values, [256, 128])
+    scale = TensorDescriptor.from_tensor(scales, [1, 2, 1, 2, 256])
+    out = torch.empty(256, 256, device="cuda", dtype=torch.float32)
+    try:
+        with _quiet_stderr():
+            kernel = _two_cta_scaled_mma_probe.warmup(
+                operand, scale, operand, scale, out, grid=(1,), num_ctas=2, num_warps=4
+            )
+    except Exception:
+        return False
+    return any("tcgen05.mma" in line and "cta_group::2" in line for line in kernel.asm["ptx"].splitlines())
 
 
 @functools.cache
