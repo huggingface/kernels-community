@@ -8,7 +8,7 @@ tags:
 Self-contained repackaging of the **Composable Kernel (CK) FlashAttention**
 forward kernels from the [ROCm/aiter](https://github.com/ROCm/aiter) project,
 exposed as a Hugging Face Hub kernel. This is the compiled HIP counterpart to
-the Triton-based [`aiter-flash-attn`](https://huggingface.co/kernels-community/aiter-flash-attn)
+the Triton-based [`aiter-flash-attn`](https://huggingface.co/kernels/amd/aiter-flash-attn)
 kernel: instead of Triton, it builds the `ck_tile` FMHA kernels ahead of time
 for AMD ROCm GPUs (MI300X / gfx942, MI355X / gfx950).
 
@@ -70,7 +70,7 @@ instance.
 import torch
 from kernels import get_kernel
 
-flash_attn = get_kernel("kernels-community/aiter-flash-attn-ck")
+flash_attn = get_kernel("amd/aiter-flash-attn-ck")
 
 q = torch.randn(2, 1024, 8, 128, device="cuda", dtype=torch.bfloat16)
 k = torch.randn(2, 1024, 8, 128, device="cuda", dtype=torch.bfloat16)
@@ -95,7 +95,7 @@ from transformers import AutoModelForCausalLM
 model = AutoModelForCausalLM.from_pretrained(
     "Qwen/Qwen3-0.6B",
     dtype="bfloat16",
-    attn_implementation="kernels-community/aiter-flash-attn-ck",
+    attn_implementation="amd/aiter-flash-attn-ck",
 ).to("cuda")
 ```
 

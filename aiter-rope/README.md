@@ -52,7 +52,7 @@ have been rewritten to package-relative form per the
 import torch
 from kernels import get_kernel
 
-rope = get_kernel("kernels-community/aiter-rope")
+rope = get_kernel("amd/aiter-rope")
 
 B, H, S, D = 2, 8, 32, 64
 q = torch.randn(B, H, S, D, device="cuda", dtype=torch.float16)
