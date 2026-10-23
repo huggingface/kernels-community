@@ -102,10 +102,10 @@ def test_wide_gate_dot_scaled_configs_are_pruned():
         )
         for bn in (64, 128, 256)  # GATE width = 2*BN
     ]
-    kept = prune(cfgs, {"K": 4096, "GATE": True})
+    kept = prune(cfgs, {"K": 4096, "N": 4096, "GATE": True})
     # 2*256 > the 256 cap
     assert {c.kwargs["BLOCK_SIZE_N"] for c in kept} == {64, 128}
-    plain = prune(cfgs, {"K": 4096, "GATE": False})
+    plain = prune(cfgs, {"K": 4096, "N": 4096, "GATE": False})
     assert {c.kwargs["BLOCK_SIZE_N"] for c in plain} == {64, 128, 256}
 
 
