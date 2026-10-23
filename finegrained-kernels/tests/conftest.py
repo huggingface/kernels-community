@@ -97,6 +97,15 @@ import pytest  # noqa: E402
 from utils import SUPPORTS_FP8  # type: ignore  # noqa: E402
 
 
+@pytest.hookimpl(tryfirst=True)
+def pytest_cmdline_main(config):
+    """Under ``-n``, a free worker (a free GPU) takes the next pending test. xdist's default
+    ``load`` scheduler splits the tail evenly, leaving GPUs idle behind one slow tune. Set here,
+    not in ``pytest.ini``, as ``--dist`` only parses with xdist installed."""
+    if getattr(config.option, "numprocesses", None) and config.option.dist == "no":
+        config.option.dist = "worksteal"
+
+
 def pytest_collection_modifyitems(config, items):
     """Skip every test when FP8 is unsupported — kernels require SM90+ on CUDA
     (Hopper/Blackwell) or XPU. SM<89 can't even compile ``fp8e4nv``; SM89 (Ada)

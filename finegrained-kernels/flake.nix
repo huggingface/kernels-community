@@ -13,7 +13,5 @@
     kernel-builder.lib.genKernelFlakeOutputs {
       inherit self;
       path = ./.;
-      # pytest.ini sets `--dist`, which only parses with xdist installed
-      pythonCheckInputs = ps: with ps; [ pytest-xdist ];
     };
 }
