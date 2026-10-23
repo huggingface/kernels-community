@@ -11,7 +11,7 @@ import pytest
 import torch
 
 
-aiter_rope = kernels.get_kernel("kernels-community/aiter-rope", version=3)
+aiter_rope = kernels.get_kernel("amd/aiter-rope", version=3)
 
 
 def _apply_rotary_emb_ref(x, cos, sin):
