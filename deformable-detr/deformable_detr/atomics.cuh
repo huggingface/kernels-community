@@ -6,12 +6,16 @@
 // <torch/headeronly/cuda/Atomic.h>, but older Torch versions do not ship that
 // header, so this mirrors its Half/BFloat16 implementation.
 
+#ifdef USE_ROCM
+#include <hip/hip_runtime.h>
+#else
 #include <cuda.h>
 #include <cuda_fp16.h>
+#endif
 #include <torch/headeronly/util/BFloat16.h>
 #include <torch/headeronly/util/Half.h>
 
-#if !(defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800))
+#if !defined(USE_ROCM) && !(defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800))
 #include <cuda_bf16.h>
 #endif
 
@@ -44,7 +48,8 @@ inline __device__ T atomic_add_16bit_cas(T* address, T val) {
 inline __device__ torch::headeronly::Half atomicAdd(
     torch::headeronly::Half* address,
     torch::headeronly::Half val) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700)
+// On ROCm, use the CAS path for Half/BFloat16, like Torch does.
+#if defined(USE_ROCM) || (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700))
   return deformable_detr_atomics::atomic_add_16bit_cas(address, val);
 #else
   return atomicAdd(reinterpret_cast<__half*>(address), val);
@@ -54,7 +59,7 @@ inline __device__ torch::headeronly::Half atomicAdd(
 inline __device__ torch::headeronly::BFloat16 atomicAdd(
     torch::headeronly::BFloat16* address,
     torch::headeronly::BFloat16 val) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
+#if defined(USE_ROCM) || (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800))
   return deformable_detr_atomics::atomic_add_16bit_cas(address, val);
 #else
   __nv_bfloat16 r = atomicAdd(
