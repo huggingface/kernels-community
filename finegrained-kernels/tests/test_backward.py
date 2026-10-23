@@ -49,7 +49,7 @@ dgrad_matmul_grouped = internals.backward.dgrad_matmul_grouped
 glu_backward = internals.backward.glu_backward
 
 
-pytestmark = pytest.mark.skipif(not SUPPORTS_FP8, reason="FP8 kernels require SM90+")
+pytestmark = pytest.mark.skipif(not SUPPORTS_FP8, reason="FP8 kernels require SM89+")
 
 M, N, K = 512, 1024, 768  # 128-aligned on every axis so every format's blocks divide evenly
 

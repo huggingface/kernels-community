@@ -34,12 +34,9 @@ TEST_DEVICE = (
     if torch.accelerator.is_available()
     else None
 )
-# FP8 kernels require Hopper (SM90) or newer on CUDA. SM89 (Ada Lovelace) can
-# technically compile fp8e4nv but its numerics drift from the dequant+matmul
-# reference by enough to need separate tolerances — not worth maintaining for
-# a non-target deployment SM.
+# FP8 kernels require Ada (SM89) or newer on CUDA, the first with FP8 tensor cores.
 SUPPORTS_FP8 = TEST_DEVICE == "xpu" or (
-    TEST_DEVICE == "cuda" and torch.cuda.get_device_capability() >= (9, 0)
+    TEST_DEVICE == "cuda" and torch.cuda.get_device_capability() >= (8, 9)
 )
 # The MX paths (MXFP4/MXFP8) need no extra gate: ``tl.dot_scaled`` runs natively on
 # Blackwell (SM100+) and via software emulation (the DecomposeScaledBlocked pass —
