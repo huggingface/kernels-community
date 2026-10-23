@@ -700,6 +700,42 @@ def test_op_scenarios(problem: Problem, op):
     _run_ref_vs_op(problem, op, A, expert_ids, B, Bs, Bs_global)
 
 
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
+@pytest.mark.parametrize("row_stride", [3 * 256, 256 + 1], ids=["aligned", "unaligned"])
+@pytest.mark.parametrize(
+    "weights, activation_format, swizzled",
+    [
+        ("bf16", None, False),
+        ("fp8_tensor", None, False),
+        ("fp8_128x128", None, False),
+        ("fp8_128x128_ue8m0", None, False),
+        ("mxfp8", None, False),
+        ("mxfp8", None, True),
+        ("nvfp4", None, False),
+        ("mxfp4", "bf16", False),
+    ],
+)
+def test_matmul_2d_reads_row_strided_activations(weights, activation_format, swizzled, row_stride):
+    """``generate`` hands an LM head the last position of each sequence, rows a sequence apart. Every
+    dense route reads that view as it is. A row stride off the 16-byte grid cannot back a TMA
+    descriptor, so the pointer arms serve it."""
+    torch.manual_seed(0)
+    S, N, K = 128, 128, 256
+    B, Bs, B_global = WEIGHTS[weights]["make"](N, K, 1)
+    B, Bs = B[0], None if Bs is None else Bs[0]
+    B_global = None if B_global is None else B_global[0].reshape(1)
+    if swizzled:
+        Bs = swizzle_mx_scales(Bs)
+    A = torch.randn(S, K, device=TEST_DEVICE, dtype=torch.bfloat16)
+    strided = torch.empty(S, row_stride, device=TEST_DEVICE, dtype=torch.bfloat16)[:, :K]
+    strided.copy_(A)
+    kw = dict(activation_format=activation_format, output_dtype=torch.bfloat16, b_global_scale=B_global)
+    expected = finegrained_kernels.matmul_2d(A, B, None, Bs, **kw)
+    out = finegrained_kernels.matmul_2d(strided, B, None, Bs, **kw)
+    torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-2)
+
+
 def _run_ref_vs_op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, shared=None):
     """The shared ref-vs-op body: build the activation-side operands, run both sides, compare
     through the one ``_dequant``. Factored out so the forced-config sweep runs the identical
