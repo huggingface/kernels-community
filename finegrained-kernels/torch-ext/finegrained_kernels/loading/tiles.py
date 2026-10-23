@@ -240,10 +240,11 @@ def load_act_mx(
     as_descriptor, as_ptr, gather_rows, stride_as_m, pid_m, k, M, K,
     A_MEMORY_MODE: tl.constexpr, A_GATHER: tl.constexpr, GROUPED: tl.constexpr,
     SWIZZLED_SCALES: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-    SCALE_GROUP_K: tl.constexpr, ACTIVATION_FORMAT: tl.constexpr,
+    SCALE_GROUP_K: tl.constexpr, ACTIVATION_FORMAT: tl.constexpr, scale_row_block=None,
 ):
-    """MX activation tile + scale. Offline-quantized A under a swizzled weight -> pre-swizzled
-    SWIZZLE_32_4_4 scale (tcgen05 fast path); grouped -> gathered per-(row, K-group) affine scale off
+    """MX activation tile + scale. ``scale_row_block`` is the swizzled scale tile's first 128-row
+    block when it is not ``pid_m * BLOCK_SIZE_M // 128`` (see ``load_swizzled_scale_tile``).
+    Offline-quantized A under a swizzled weight -> pre-swizzled SWIZZLE_32_4_4 scale (tcgen05 fast path); grouped -> gathered per-(row, K-group) affine scale off
     the source-order ``As``; else (2D / decode raw A) -> ``load_mx_act_tile`` inline-quant / in-register.
     Raw bf16 A stays in-register affine even under a swizzled weight (the dot_scaled mix is fine)."""
     SCALE_COLS: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
@@ -255,7 +256,8 @@ def load_act_mx(
             a_ptrs, a_descriptor, m_off, k_off, value_mask, gather_rows, A_MEMORY_MODE, A_GATHER
         )
         a_s = load_swizzled_scale_tile(
-            as_descriptor, as_ptr, 0, pid_m, k, M, K, BLOCK_SIZE_M, SCALE_COLS, SCALE_GROUP_K
+            as_descriptor, as_ptr, 0, pid_m, k, M, K, BLOCK_SIZE_M, SCALE_COLS, SCALE_GROUP_K,
+            row_block=scale_row_block,
         )
     elif GROUPED:  # gathered per-(row, K-group) affine scale off the row-major source-order As
         a = load_grouped_act_tile(
@@ -379,7 +381,7 @@ def _weight_scale_mx(
             # BN=64 under GATE is one 128-row block, not 2 * (64 // 128) == 0
             NREP: tl.constexpr = max(1, NW // 128)
             b_s = load_swizzled_scale(
-                bs_descriptor, blk_idx, k, NREP, SCALE_COLS // 4, NW, SCALE_COLS
+                bs_descriptor, blk_idx * NREP, k, NREP, SCALE_COLS // 4, NW, SCALE_COLS
             )
         else:  # affine per-group read off the un-swizzled 3D Bs (num_experts, n_rows, K//g)
             NW: tl.constexpr = (2 if GATE else 1) * BLOCK_SIZE_N
@@ -497,12 +499,17 @@ def load_weight_mx(
     BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, SCALE_GROUP_K: tl.constexpr,
     WEIGHT_VALUES_PER_BYTE: tl.constexpr,
     k_col_off=0,
+    B_DESCRIPTOR_IS_2D: tl.constexpr = False,
 ):
     """The MX weight path: value tile + pre-swizzled/affine group scale. ``k_col_off`` shifts the
-    affine scale read for a K-tile the caller clamped back in bounds (0 for aligned callers)."""
+    affine scale read for a K-tile the caller clamped back in bounds (0 for aligned callers).
+    ``B_DESCRIPTOR_IS_2D``: see ``load_grouped_weight_tile``."""
     KB: tl.constexpr = BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE
     SCALE_COLS: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
-    w = _weight_value(b_ptrs, b_descriptor, row0, n_off, k_off, GATE, GROUPED, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, KB)
+    w = _weight_value(
+        b_ptrs, b_descriptor, row0, n_off, k_off, GATE, GROUPED, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, KB,
+        B_DESCRIPTOR_IS_2D,
+    )
     w_s = _weight_scale_mx(
         bs_ptrs, bs_mask, bs_descriptor, bs_ptr, blk_idx, expert_id, pid_n, k, N, K,
         stride_bs_e, stride_bs_n, stride_bs_k,

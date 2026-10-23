@@ -802,13 +802,15 @@ class BayesianAutotuner(Autotuner):
                 if isinstance(v, (bool, str))
             }
         )
-        if not basin_axes:
+        if not basin_axes and len({c.num_ctas for c in configs}) == 1:
             return []
 
-        # A basin = the compute-path axes (constexprs selecting different compiled code).
+        # A basin = the compute-path axes (constexprs selecting different compiled code). A cluster
+        # size (two-CTA pairs) is one too: the paired MMA is different compiled code.
+        mixed_ctas = len({c.num_ctas for c in configs}) > 1
         groups: Dict = {}
         for i, c in enumerate(configs):
-            basin = tuple(c.kwargs.get(k) for k in basin_axes)
+            basin = tuple(c.kwargs.get(k) for k in basin_axes) + ((c.num_ctas,) if mixed_ctas else ())
             groups.setdefault(basin, []).append(i)
 
         if len(groups) <= 1:

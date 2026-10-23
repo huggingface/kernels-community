@@ -499,10 +499,11 @@ def _epilogue_requant_mx(
 ):
     """Requantize the SwiGLU intermediate to MX group-``SCALE_GROUP_K`` (mxfp8 UE8M0 / mxfp4 / nvfp4
     E4M3 — the fp4 formats pack nibble pairs so ``C`` halves). ``SWIZZLED_OUT`` writes ``Cs`` straight
-    into the down proj's SWIZZLE_32_4_4 descriptor at block ``(pid_m, pid_n)`` (BM/BN pinned 128), else
-    a row-major affine store. NVFP4 two-level: normalize by the next proj's provided input_scale
-    (``CsGlobal[cs_global_row]`` — per tensor or this expert's) before the block quant. FAKE_BATCH
-    collapses replicated rows via the row-max."""
+    into the down proj's SWIZZLE_32_4_4 descriptor at block ``(pid_m, pid_n)`` (``pid_m`` the tile's
+    first 128-row block; BN pinned 128, BM 128 or a two-CTA 256), else a row-major affine store.
+    NVFP4 two-level: normalize by the next proj's provided input_scale (``CsGlobal[cs_global_row]`` —
+    per tensor or this expert's) before the block quant. FAKE_BATCH collapses replicated rows via the
+    row-max."""
     if CsGlobal is not None:
         # NVFP4 two-level requant: normalize the fp32 GLU intermediate by the NEXT proj's provided
         # (calibrated) input_scale before the block quant — the canonical two-step. The down folds it
@@ -514,14 +515,25 @@ def _epilogue_requant_mx(
                N_COLS if OUTPUT_FORMAT == "mxfp8" else N_COLS // 2)
     if SWIZZLED_OUT:
         # group scales straight into the down proj's SWIZZLE_32_4_4 layout (inverse of
-        # load_swizzled_scale) at block (pid_m, pid_n) — BM/BN pinned 128.
+        # load_swizzled_scale) at 128-row block pid_m, column block pid_n — BN pinned 128.
         REP_K_CS: tl.constexpr = (BLOCK_SIZE_N // SCALE_GROUP_K) // 4
-        sw = (
-            q_s.reshape(1, 4, 32, REP_K_CS, 4)
-            .trans(0, 3, 2, 1, 4)
-            .reshape(1, 1, REP_K_CS, 2, 256)
-        )
-        CSDescriptor.store([0, pid_m, pid_n * REP_K_CS, 0, 0], sw)
+        if BLOCK_SIZE_M == 128:
+            sw = (
+                q_s.reshape(1, 4, 32, REP_K_CS, 4)
+                .trans(0, 3, 2, 1, 4)
+                .reshape(1, 1, REP_K_CS, 2, 256)
+            )
+            CSDescriptor.store([0, pid_m, pid_n * REP_K_CS, 0, 0], sw)
+        else:
+            # a two-CTA 256-row tile: two 128-row blocks, stored one at a time — the second may lie
+            # past this expert's 128-padded slab (the next expert's block), so it is written only
+            # when the tile has rows there
+            tl.static_assert(BLOCK_SIZE_M == 256, "the swizzled requant stores 128- or 256-row tiles")
+            sw = q_s.reshape(2, 4, 32, REP_K_CS, 4).trans(0, 3, 2, 1, 4).reshape(2, REP_K_CS * 512)
+            first, second = tl.split(sw.trans(1, 0))
+            CSDescriptor.store([0, pid_m, pid_n * REP_K_CS, 0, 0], first.reshape(1, 1, REP_K_CS, 2, 256))
+            if tl.max(tl.where(tl.arange(0, BLOCK_SIZE_M) >= 128, row_mask, False).to(tl.int32), 0) > 0:
+                CSDescriptor.store([0, pid_m + 1, pid_n * REP_K_CS, 0, 0], second.reshape(1, 1, REP_K_CS, 2, 256))
     else:
         offs_sc = pid_n * (BLOCK_SIZE_N // SCALE_GROUP_K) + tl.arange(0, BLOCK_SIZE_N // SCALE_GROUP_K)
         if FAKE_BATCH:
