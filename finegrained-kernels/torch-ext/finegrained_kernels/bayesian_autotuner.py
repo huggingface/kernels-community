@@ -114,6 +114,8 @@ class BayesianAutotuner(Autotuner):
         # Large-model weights exceed L2, so time candidates on rotated cold weights; turning it off
         # times warm graph replay, closer to small workloads that stay L2-resident.
         self.rotate_weights = overrides.get("rotate_weights", True)
+        force = overrides.get("force", {})
+        self.force = {**{k: v for k, v in force.items() if not isinstance(v, dict)}, **force.get(self.fn_name, {})}
         self.cold_banks = cold_banks
         self._cold_banks = None
         # Bayesian trial budget — the per-decorator default, overridable via ``n_trials`` in
@@ -169,10 +171,23 @@ class BayesianAutotuner(Autotuner):
 
     def prune_configs(self, kwargs):
         pruned = super().prune_configs(kwargs)
+        if self.force:
+            pruned = self._forced(pruned)
         if self.compile_workers > 1 and len(pruned) <= self.n_trials:
             # deferred to the first bench, so a disk-cached crown compiles nothing
             self._precompile_pending = (pruned, self.launch_snapshot({**self.nargs, **kwargs}))
         return pruned
+
+    def _forced(self, configs: List[Config]) -> List[Config]:
+        """The pruned configs that carry every ``force`` value (FINEGRAINED_AUTOTUNE_CONFIG) on an axis this kernel
+        has: a new axis can be tuned in isolation (e.g. only two-CTA pairs) without editing the grids. Filtering
+        after the pruners keeps their fences; the disk-cache key hashes the surviving configs, so a forced crown
+        never answers an unforced tune."""
+        axes = {k: v for k, v in self.force.items() if any(k in c.all_kwargs() for c in configs)}
+        kept = [c for c in configs if all(c.all_kwargs().get(k) == v for k, v in axes.items())]
+        if not kept:
+            raise RuntimeError(f"[autotune] {self.fn_name}: no pruned config matches force={axes}")
+        return kept
 
     @staticmethod
     def launch_snapshot(nargs: dict) -> dict:
