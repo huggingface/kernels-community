@@ -824,10 +824,13 @@ class BayesianAutotuner(Autotuner):
             # do not outweigh axes with few; the anchor is the config closest to 0.5 on
             # all of them (smallest squared distance), i.e. the basin's interior.
             values = [configs[i].all_kwargs() for i in idxs]
+            # only the axes every config of the basin carries: a grid concatenated from several
+            # generators can leave an axis (e.g. K_SLICES) off the configs of the others
+            shared = set(values[0]).intersection(*values[1:])
             axes = {
                 k: sorted({v[k] for v in values})
                 for k, value in values[0].items()
-                if isinstance(value, (int, float)) and not isinstance(value, bool)
+                if k in shared and isinstance(value, (int, float)) and not isinstance(value, bool)
             }
 
             def distance(i):

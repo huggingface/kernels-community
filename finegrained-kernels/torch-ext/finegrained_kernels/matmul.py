@@ -30,9 +30,9 @@ from .compat import add_op_namespace_prefix, FP8_DTYPE, is_sm10x, launches_skipp
 from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_tiled_descriptors, rebind_weight_only_descriptors
 from .formats import FP8_WEIGHT_ONLY_DEQUANT_MIN_M, INT_WEIGHT_ONLY_DEQUANT_MIN_DIM, INT_WEIGHT_ONLY_DEQUANT_MIN_M, block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, normalize_global_scale, e2m1_as_uint8, is_mx, is_rowwise, mx_scale_family, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_2d_operands, weight_format, validate_int_operands, validate_svdquant_operands, INT_WEIGHT_DTYPES
 from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
-from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, maybe_act_quant, mxfp8_act_quant, nvfp4_act_quant, quantize_rows_static, tensor_wide_act_operands, prepare_fp8_mx_inputs, dequantize_int_weight, permute_act_cols, svdquant_act_quant
+from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, maybe_act_quant, mxfp8_act_quant, nvfp4_act_quant, quantize_calibrated_act, quantize_rows_static, tensor_wide_act_operands, prepare_fp8_mx_inputs, dequantize_int_weight, permute_act_cols, svdquant_act_quant
 from .loading.scales import apply_row_scale, dequant_block_fp8_weight, mx_2d_scale_ptrs, weight_scale_rows, csf_weight_scales
-from .mma import SM10X, block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, plain_dot, static_dot, int_weight_only_compute
+from .mma import SM10X, block_dynamic_dot, fp8_dot, k_slices_sum, mx_compute, mx_weight_only_compute, plain_dot, static_dot, int_weight_only_compute
 from .loading.tiles import (
     advance_ptrs,
     output_tile_range,
@@ -54,7 +54,7 @@ from .loading.tiles import (
     swizzle_offsets,
 )
 from .epilogue import acc_finalize, acc_init, add_bias, bias_strides, gemm_epilogue, store_masked, store_masked_oriented
-from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, gate_stacked_tmem_trap_pruner, block_dynamic_2d_warp_spec_pruner, block_dynamic_mma_width_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, descriptor_needs_prequant_pruner, matched_memory_modes_pruner, mx_2d_swap_scope_pruner, native_mma_m_pruner, mx_config_pruner, scalar_max_m_pruner, smem_pruner, swap_decode_scope_pruner, swap_max_m_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, warp_spec_compile_guard_pruner, warp_spec_memory_mode_pruner, mx_auxiliary_pruner, block_m_cap_pruner, int_2d_warp_spec_pruner, int_split_k_pruner, scalar_block_m_pruner, int_scale_group_tile_pruner
+from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, gate_stacked_tmem_trap_pruner, block_dynamic_2d_warp_spec_pruner, block_dynamic_mma_width_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, descriptor_needs_prequant_pruner, matched_memory_modes_pruner, mx_2d_swap_scope_pruner, native_mma_m_pruner, mx_config_pruner, scalar_max_m_pruner, smem_pruner, swap_decode_scope_pruner, swap_max_m_pruner, k_slices_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, warp_spec_compile_guard_pruner, warp_spec_memory_mode_pruner, mx_auxiliary_pruner, block_m_cap_pruner, int_2d_warp_spec_pruner, int_split_k_pruner, scalar_block_m_pruner, int_scale_group_tile_pruner
 
 # The 2D-grid kernels' L2-locality swizzle depth is derived per-tile inside
 # ``swizzle_offsets`` (see SWIZZLE_GROUP_A_BYTES there) — no per-kernel constant here.
@@ -562,6 +562,7 @@ def w8a8_block_static_fp8_matmul_kernel(
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+    PDL: tl.constexpr = False,
 ):
     """Block-scale FP8 GEMM with static (per-tensor) activation scale.
 
@@ -570,6 +571,8 @@ def w8a8_block_static_fp8_matmul_kernel(
     per-K-tile during accumulation; the scalar activation scale is applied once at
     the end.
     """
+    if PDL:
+        gdc_wait()
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
     n_rows = 2 * N if GATE else N
     pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
@@ -607,6 +610,8 @@ def w8a8_block_static_fp8_matmul_kernel(
             block_k * stride_a_k, 0, block_k * stride_b_k, stride_bs_k,
             A_MEMORY_MODE, B_MEMORY_MODE, False, True, False,
         )
+    if PDL:
+        gdc_launch_dependents()
 
     accumulator = accumulator * a_s_static
     if GATE:
@@ -1041,12 +1046,15 @@ def mx_weight_only_matmul_2d_kernel(
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
     SWAP_AB: tl.constexpr = False,
+    PDL: tl.constexpr = False,
 ):
     """weight-only dense matmul: ``C = A @ B.T`` with a RAW bf16 activation and an MXFP4/MXFP8 weight
     upcast to bf16 in-loop (unpack E2M1->E4M3, per-group group-scale multiply), then a plain bf16
     ``tl.dot``. This is the ``matmul_ogs`` format (fp4/fp8 weight bytes kept in memory, bf16 acts,
     weight upcast in-MMA) — no activation quant, no ``dot_scaled``. Pointer/affine scales only.
     ``GATE`` loads the stacked (2N, K) gate|up weight as one ``[BK, 2*BN]`` dot + applies the GLU."""
+    if PDL:
+        gdc_wait()
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
     n_rows = 2 * N if GATE else N
     SCALE_COLS: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
@@ -1090,6 +1098,8 @@ def mx_weight_only_matmul_2d_kernel(
         a_ptrs += BLOCK_SIZE_K * stride_a_k
         b_ptrs += (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE) * stride_b_k
         bs_ptrs += SCALE_COLS * stride_bs_k
+    if PDL:
+        gdc_launch_dependents()
 
     if SWAP_AB:
         accumulator = tl.trans(accumulator)
@@ -1134,6 +1144,7 @@ def split_k_reduce(acc, Partials, TileCounters, tile, num_tiles, BM: tl.constexp
         tune_block_nk=True,
         tune_block_m=True,
         warp_spec=True,
+        k_slices=(1, 2, 4),
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
         pre_hook=rebind_weight_only_descriptors,
@@ -1146,7 +1157,7 @@ def split_k_reduce(acc, Partials, TileCounters, tile, num_tiles, BM: tl.constexp
     + split_k_autotuning_configs(SPLIT_K_VALUES, pre_hook=rebind_weight_only_descriptors, WARP_SPEC=False)
     + narrow_scalar_autotuning_configs(block_ms=(1, 2, 4)),
     # the width and the scale group decide which tiles fit and compile: part of the key
-    ["N", "K", "m_bit_length", "GATE", "INT_BITS", "SCALE_GROUP_K"],
+    ["N", "K", "m_bit_length", "GATE", "INT_BITS", "SCALE_GROUP_K", "ACT_QUANT"],
     n_trials=100,
     cold_banks=gemm_cold_banks,
     path_anchor_axes=PATH_ANCHOR_AXES,
@@ -1155,6 +1166,7 @@ def split_k_reduce(acc, Partials, TileCounters, tile, num_tiles, BM: tl.constexp
         "early_config_prune": compose_pruners(
             block_within_dim_pruner("K"),
             int_scale_group_tile_pruner(),
+            k_slices_pruner(),
             # the CUDA-core reduce (int_words_dot) beats the BM=16 mma.sync tile up to M=4 (INT4, B200, 4096x4096:
             # M=2 7.7 vs 11.2us, M=4 9.9 vs 11.2us)
             scalar_max_m_pruner("M", max_m=4),
@@ -1215,12 +1227,17 @@ def int_weight_only_matmul_2d_kernel(
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
     SPLIT_K: tl.constexpr = 1,
     INT_BITS: tl.constexpr = 4,
+    ACT_QUANT: tl.constexpr = None,  # "fp8" / "int8": A is raw and quantized against AsGlobal on load (decode)
+    K_SLICES: tl.constexpr = 1,
+    PDL: tl.constexpr = False,
 ):
     """Integer dense matmul: bf16/fp16 weight-only, calibrated INT4/FP8, or INT8 SmoothQuant.
     ``int_weight_only_compute`` runs the MMA or small-token scalar reduce. ``GATE`` loads the stacked (2N, K)
     gate|up weight as one ``2*BN``-wide tile + applies the GLU. ``SPLIT_K`` (decode) splits K across that many
     programs per output tile (``program_id(2)``); each stores its fp32 partial, and the last to arrive sums all of
     them in split order (deterministic) and runs the epilogue, in the same launch."""
+    if PDL:
+        gdc_wait()
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
     n_rows = 2 * N if GATE else N
     # Wider groups keep the pointer base; int_group_ptrs selects the tile's group.
@@ -1244,7 +1261,13 @@ def int_weight_only_matmul_2d_kernel(
     ROWS_MAJOR: tl.constexpr = COMPUTE_MODE == "scalar" or BLOCK_SIZE_M < 64
     b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_kb, stride_b_n, stride_b_k, B_MEMORY_MODE, ROWS_MAJOR)
 
-    accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False, tl.int32 if A.dtype.element_ty == tl.int8 else tl.float32)
+    # the dtype the MMA multiplies: A's, or the quantized form of a raw A (ACT_QUANT)
+    if ACT_QUANT is None:
+        A_DTYPE: tl.constexpr = A.dtype.element_ty
+    else:
+        A_DTYPE: tl.constexpr = tl.int8 if ACT_QUANT == "int8" else tl.float8e4nv
+        act_scale = tl.load(AsGlobal)
+    accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False, tl.int32 if A_DTYPE == tl.int8 else tl.float32, K_SLICES)
     if SWAP_AB and COMPUTE_MODE == "dot":
         accumulator = tl.trans(accumulator)
     # this program's share of the K tiles (int_split_k_pruner: the split divides them)
@@ -1284,6 +1307,8 @@ def int_weight_only_matmul_2d_kernel(
         a, a_scale_dead = load_act_plain(
             a_ptrs, ADescriptor, pid_m * BLOCK_SIZE_M, k * BLOCK_SIZE_K, None, 0, A_MEMORY_MODE, False
         )
+        if ACT_QUANT is not None:
+            a = quantize_calibrated_act(a, act_scale, A_DTYPE)
         b, b_s = load_weight_int(
             b_ptrs, BDescriptor, int_group_ptrs(bs_ptrs, k, stride_bs_k, BLOCK_SIZE_K, SCALE_GROUP_K), Bs, 0,
             pid_n * n_width, k * (BLOCK_SIZE_K // VPW), 0, pid_n, k, N, K, 0, stride_bs_n, stride_bs_k, GATE, False,
@@ -1300,7 +1325,7 @@ def int_weight_only_matmul_2d_kernel(
             )
         accumulator = int_weight_only_compute(
             accumulator, a, b, b_s, b_z, BLOCK_SIZE_K, n_width, SCALE_GROUP_K, COMPUTE_MODE, ROWS_MAJOR,
-            INT_BITS, SWAP_AB, weight_global=None if BsGlobal is None else tl.load(BsGlobal),
+            INT_BITS, SWAP_AB, weight_global=None if BsGlobal is None else tl.load(BsGlobal), K_SLICES=K_SLICES,
         )
         a_ptrs += BLOCK_SIZE_K * stride_a_k
         b_ptrs += (BLOCK_SIZE_K // VPW) * stride_b_k
@@ -1308,6 +1333,9 @@ def int_weight_only_matmul_2d_kernel(
         if Bz is not None:
             bz_ptrs += SCALE_STEP * stride_bz_k
 
+    if PDL:
+        gdc_launch_dependents()
+    accumulator = k_slices_sum(accumulator, K_SLICES)
     if SWAP_AB and COMPUTE_MODE == "dot":
         accumulator = tl.trans(accumulator)
     if SPLIT_K > 1:
@@ -1319,7 +1347,7 @@ def int_weight_only_matmul_2d_kernel(
         last = True
     if last:
         output_scale = BsGlobal
-        if A.dtype.element_ty == tl.int8:
+        if A_DTYPE == tl.int8:
             output_scale = Bs + offs_bn_lin * stride_bs_n
         out_row = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         gemm_epilogue(
@@ -1341,7 +1369,7 @@ assert all(
 @bayesian_autotune(
     get_accelerator_autotuning_configs(
         tune_block_nk=True, tune_block_m=True, warp_spec=True,
-        swap_ab=True, swap_block_sizes_m=(1, 2, 4, 8),
+        swap_ab=True, swap_block_sizes_m=(1, 2, 4, 8), k_slices=(1, 2, 4),
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
         pre_hook=rebind_weight_only_descriptors,
@@ -1360,6 +1388,7 @@ assert all(
             warp_spec_compile_guard_pruner(),
             descriptor_box_pruner(),
             smem_pruner(),
+            k_slices_pruner(),
         )
     },
 )
@@ -1386,15 +1415,19 @@ def block_fp8_weight_only_matmul_2d_kernel(
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+    K_SLICES: tl.constexpr = 1,
+    PDL: tl.constexpr = False,
 ):
     """Dense FP8 W8A16 GEMM with in-tile weight rescaling."""
+    if PDL:
+        gdc_wait()
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
     pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
         M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GATE=GATE
     )
     a_ptrs = operand_tile_ptrs(A, offs_am, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
     b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, B_MEMORY_MODE, SWAP_AB)
-    accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False)
+    accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False, K_SLICES=K_SLICES)
     for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
         a, _ = load_act_plain(
             a_ptrs, ADescriptor, pid_m * BLOCK_SIZE_M, k * BLOCK_SIZE_K, None, 0,
@@ -1407,9 +1440,12 @@ def block_fp8_weight_only_matmul_2d_kernel(
             GATE, False, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
             BLOCK_N, BLOCK_K, GATE_SCALES, a.dtype,
         )
-        accumulator = plain_dot(accumulator, a, w, SWAP_AB)
+        accumulator = plain_dot(accumulator, a, w, SWAP_AB, K_SLICES)
         a_ptrs += BLOCK_SIZE_K * stride_a_k
         b_ptrs += BLOCK_SIZE_K * stride_b_k
+    if PDL:
+        gdc_launch_dependents()
+    accumulator = k_slices_sum(accumulator, K_SLICES)
     out_row = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     gemm_epilogue(
         C, None, accumulator, out_row, pid_n, pid_m, out_row < M,
@@ -1426,7 +1462,7 @@ def block_fp8_weight_only_matmul_2d_kernel(
     # The same pointer/descriptor loaders as the quantized GEMMs, without scale loads.
     get_accelerator_autotuning_configs(
         tune_block_nk=True, warp_spec=True, tune_block_m=True,
-        swap_ab=True, swap_block_sizes_m=(1, 2, 4, 8),
+        swap_ab=True, swap_block_sizes_m=(1, 2, 4, 8), k_slices=(1, 2, 4),
         a_memory_modes=("descriptor", "pointer"), b_memory_modes=("descriptor", "pointer"),
         pre_hook=rebind_weight_only_descriptors,
     ),
@@ -1446,6 +1482,7 @@ def block_fp8_weight_only_matmul_2d_kernel(
             gate_stacked_tmem_trap_pruner(),
             smem_pruner(),
             warp_spec_compile_guard_pruner(),
+            k_slices_pruner(),
         )
     },
 )
@@ -1487,6 +1524,8 @@ def full_precision_matmul_2d_kernel(
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+    K_SLICES: tl.constexpr = 1,
+    PDL: tl.constexpr = False,
 ):
     """Full-precision (BF16/FP16) 2D matmul — the single-GEMM sibling of
     ``full_precision_matmul_grouped/batched``: plain ``tl.dot``, fp32 accumulation, no scales.
@@ -1494,6 +1533,8 @@ def full_precision_matmul_2d_kernel(
     ``ACT_FN``/SwiGLU GLU; ``GATE=False`` is the plain dense GEMM. ``SWAP_AB`` (small-M decode) puts the
     weight rows on the MMA lhs and keeps the logical ``[BM, N]`` accumulator (``plain_dot``). 2D grid
     with swizzle for L2 reuse."""
+    if PDL:
+        gdc_wait()
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
     pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
         M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GATE=GATE
@@ -1503,16 +1544,19 @@ def full_precision_matmul_2d_kernel(
 
     a_desc = operand_tile_descriptor(ADescriptor, A, M, K, stride_a_m, stride_a_k, BLOCK_SIZE_M, BLOCK_SIZE_K, A_MEMORY_MODE)
     b_desc = operand_tile_descriptor(BDescriptor, B, N, K, stride_b_n, stride_b_k, BLOCK_SIZE_N, BLOCK_SIZE_K, B_MEMORY_MODE, GATE)
-    accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False)
+    accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False, K_SLICES=K_SLICES)
     for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
         a, _ = load_act_plain(a_ptrs, a_desc, pid_m * BLOCK_SIZE_M, k * BLOCK_SIZE_K, None, offs_am, A_MEMORY_MODE, False)
         w, _ = load_weight_plain(
             b_ptrs, b_desc, 0, pid_n * n_width, k * BLOCK_SIZE_K,
             GATE, False, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
         )
-        accumulator = plain_dot(accumulator, a, w, SWAP_AB)
+        accumulator = plain_dot(accumulator, a, w, SWAP_AB, K_SLICES)
         a_ptrs += BLOCK_SIZE_K * stride_a_k
         b_ptrs += BLOCK_SIZE_K * stride_b_k
+    if PDL:
+        gdc_launch_dependents()
+    accumulator = k_slices_sum(accumulator, K_SLICES)
 
     if GATE:
         out_row = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
@@ -1771,6 +1815,7 @@ def w8a8_block_static_fp8_matmul(
             SWIGLU_LIMIT=swiglu_limit,
             SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(resolve_output_dtype(output_dtype, A, None)),
+            **pdl_launch_kwargs(),
         )
 
     return [C]
@@ -2247,6 +2292,7 @@ def full_precision_matmul_2d(
             SWIGLU_LIMIT=swiglu_limit,
             SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(resolve_output_dtype(output_dtype, A, None)),
+            **pdl_launch_kwargs(),
         )
 
     return [C]
@@ -2351,6 +2397,7 @@ def mx_weight_only_matmul_2d(
             SWIGLU_LIMIT=swiglu_limit,
             SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(resolve_output_dtype(output_dtype, A, None)),
+            **pdl_launch_kwargs(),
         )
 
     return [C]
@@ -2414,6 +2461,7 @@ def block_fp8_weight_only_matmul_2d(
             SWIGLU_LIMIT=swiglu_limit, SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(dtype),
             GATE_SCALES=gate and Bs.shape[0] > 1,
+            **pdl_launch_kwargs(),
         )
     return [C]
 
@@ -2456,7 +2504,12 @@ def int_weight_only_matmul_2d(
     K = A.shape[-1]
     M = A.numel() // K
     N = rows // 2 if gate else rows
-    if b_perm is not None or a_pre_quant_scale is not None or a_scale is not None:
+    # Decode quantizes a calibrated activation on load, saving the separate pass's launch (1.6us of the ModelOpt
+    # W4A8 6144x4096 M=1 call); larger M quantizes once rather than once per N tile.
+    quantize_on_load = (
+        a_scale is not None and b_perm is None and a_pre_quant_scale is None and M < STATIC_MATMUL_ACT_PREQUANT_MIN_M
+    )
+    if (b_perm is not None or a_pre_quant_scale is not None or a_scale is not None) and not quantize_on_load:
         A = permute_act_cols(A, b_perm, a_pre_quant_scale, a_scale, torch.int8 if smoothquant else FP8_DTYPE)
     assert A.is_contiguous(), "A must be contiguous (the host-TMA descriptor arm reads its box)"
     # Large prefill amortizes a per-call dequantization into cuBLAS, as the FP8 weight-only route does
@@ -2522,6 +2575,8 @@ def int_weight_only_matmul_2d(
             bias_stride_n,
             SCALE_GROUP_K=K // Bs.shape[1],
             INT_BITS=bits,
+            ACT_QUANT=("int8" if smoothquant else "fp8") if quantize_on_load else None,
+            **pdl_launch_kwargs(),
             GATE=gate,
             ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha,

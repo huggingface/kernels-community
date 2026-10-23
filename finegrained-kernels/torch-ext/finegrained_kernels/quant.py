@@ -20,6 +20,7 @@ from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 from .bayesian_autotuner import bayesian_autotune
 from .formats import global_scale_stride, int_weight_bits, is_per_expert_global, normalize_global_scale
 from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, compile_time_only_triton_wrap, device_context, is_blackwell, is_sm10x, pdl_launch_kwargs
+from .ptx import e2m1x2_to_e4m3x2, e2m1x2_to_f16x2, f32x2_to_e2m1x2
 from .swizzle import swizzle_store_block
 from .scheduling import build_tile_layout, resolve_tile_inline
 
@@ -27,7 +28,10 @@ from .scheduling import build_tile_layout, resolve_tile_inline
 
 
 @triton.jit
-def _quantize_modelopt_input(vals, scale, OUT_DTYPE: tl.constexpr):
+def quantize_calibrated_act(vals, scale, OUT_DTYPE: tl.constexpr):
+    """Static per-tensor activation quantization against a calibrated ``scale``, bit for bit with ModelOpt's input
+    quantizer: ``vals / scale`` (a true divide; a reciprocal multiply rounds differently), clamped to the target's range,
+    then INT8 rounded half-to-even (negative half-way values included; a cast would truncate) or saturating E4M3."""
     value = vals.to(tl.float32) / scale
     if OUT_DTYPE == tl.int8:
         value = tl.clamp(value, -128.0, 127.0)
@@ -89,14 +93,7 @@ def _quant_e2m1_packed(v, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr
     nearest-even and the ALU form rounds half-up. Only the taken arm compiles."""
     if _E2M1_HW_CVT:
         lo, hi = tl.split(tl.reshape(v, (BLOCK_SIZE_M, BLOCK_SIZE_K // 2, 2)))
-        packed = tl.inline_asm_elementwise(
-            "{ .reg .b8 t8; cvt.rn.satfinite.e2m1x2.f32 t8, $1, $2; cvt.u16.u8 $0, t8; }",
-            "=h,f,f",
-            [hi, lo],
-            dtype=tl.uint16,
-            is_pure=True,
-            pack=1,
-        )
+        packed = f32x2_to_e2m1x2(hi, lo)
         values = (packed & 0xFF).to(tl.uint8)
     else:
         av = tl.abs(v)
@@ -197,25 +194,6 @@ def _e2m1_code_to_bf16_bits(code):
 
 
 @triton.jit
-def _e2m1_pair_to_f16(packed):
-    """One packed E2M1 byte -> the two fp16 values it holds, as a uint32 (low half = low nibble),
-    through the Blackwell CVT unit: ONE instruction per pair against the bit-twiddle form's ~10
-    integer ops. Every E2M1 magnitude is exact in fp16, so this is a value-identical decode, and
-    the direction of the unpack is irrelevant to the cost — the arithmetic is the whole bill
-    (measured on the gpt-oss W4A16 decode weight stream: 39.6us bit-twiddle, either axis, vs
-    11.6us here, against an 8.0us load-only floor). PTX has no 8-bit asm operand, so the byte
-    rides in a 16-bit register and is narrowed inside the block."""
-    return tl.inline_asm_elementwise(
-        "{ .reg .b8 t; cvt.u8.u16 t, $1; cvt.rn.f16x2.e2m1x2 $0, t; }",
-        "=r,h",
-        [packed.to(tl.uint16)],
-        dtype=tl.uint32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
 def e2m1_to_bf16(b_packed):
     """Unpack packed MXFP4 (E2M1, two nibbles/byte along K) straight to bf16, doubling the K (row)
     dim: ``(R, C) uint8 -> (2R, C) bf16``. Direct (no E4M3 round-trip), and the low/high nibbles
@@ -223,10 +201,10 @@ def e2m1_to_bf16(b_packed):
     reshape) instead of the three 2D transposes ``e2m1_to_e4m3`` needs — the weight-only unpack hot path
     (fp4 weight upcast in-loop, the caller widening to the activation dtype). K order low-nibble-first, matching
     ``e2m1_to_e4m3``: ``[byte0_lo, byte0_hi, byte1_lo, ...]``. On Blackwell the codes decode through
-    the hardware CVT (``_e2m1_pair_to_f16``, fp16 being exact for the grid); elsewhere the integer
+    the hardware CVT (``ptx.e2m1x2_to_f16x2``, fp16 being exact for the grid); elsewhere the integer
     bit-build. Only the taken arm compiles."""
     if _E2M1_HW_CVT:
-        pair = _e2m1_pair_to_f16(b_packed)
+        pair = e2m1x2_to_f16x2(b_packed)
         lo = (pair & 0xFFFF).to(tl.uint16)
         hi = (pair >> 16).to(tl.uint16)
         paired = tl.trans(tl.join(lo, hi), 0, 2, 1)
@@ -243,30 +221,13 @@ def e2m1_to_bf16(b_packed):
 
 
 @triton.jit
-def _e2m1_pair_to_e4m3(packed):
-    """One packed E2M1 byte -> its two values as an E4M3 pair (uint16, low byte = low nibble),
-    through the CVT unit in two instructions — fp4 to fp16 to fp8 — against the bit-build's ~8
-    integer ops per value. Both hops are exact: every E2M1 magnitude is representable in fp16
-    and in E4M3, so the pair is value-identical to ``_e2m1_code_to_e4m3_bits``."""
-    return tl.inline_asm_elementwise(
-        "{ .reg .b8 t; .reg .b32 f; cvt.u8.u16 t, $1; cvt.rn.f16x2.e2m1x2 f, t; "
-        "cvt.rn.satfinite.e4m3x2.f16x2 $0, f; }",
-        "=h,h",
-        [packed.to(tl.uint16)],
-        dtype=tl.uint16,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
 def e2m1_cols_to_bf16(packed):
     """Column-unpack packed E2M1 to bf16: ``(..., C) uint8 -> (..., 2C)``, low nibble first — the
     column-axis counterpart of the row-doubling ``e2m1_to_bf16``, for the swapped weight-only
     tile (output rows leading, K contiguous). Same sm_100 hardware decode; the pair lands in
     adjacent columns, so ``tl.interleave`` places it (no axis swap)."""
     if _E2M1_HW_CVT:
-        pair = _e2m1_pair_to_f16(packed)
+        pair = e2m1x2_to_f16x2(packed)
         lo = (pair & 0xFFFF).to(tl.uint16)
         hi = (pair >> 16).to(tl.uint16)
         f16 = tl.interleave(lo, hi).to(tl.float16, bitcast=True)
@@ -285,7 +246,7 @@ def e2m1_cols_to_f32(packed):
     15.4us on the gpt-oss decode tile for the bf16 round trip alone. Bit-identical to going via
     either: every E2M1 value is exact in f16, bf16, E4M3 and fp32."""
     if _E2M1_HW_CVT:
-        pair = _e2m1_pair_to_f16(packed)
+        pair = e2m1x2_to_f16x2(packed)
         lo = (pair & 0xFFFF).to(tl.uint16)
         hi = (pair >> 16).to(tl.uint16)
         f16 = tl.interleave(lo, hi).to(tl.float16, bitcast=True)
@@ -301,10 +262,10 @@ def e2m1_cols_to_e4m3(packed):
     """Column-unpack packed E2M1 (two nibbles per byte along the last dim, low nibble
     first) to E4M3: ``(..., C) uint8 -> (..., 2C)`` — the column-axis counterpart of the
     row-doubling ``e2m1_to_e4m3``; lossless (every E2M1 value is exact in E4M3). Blackwell
-    decodes through the CVT unit (``_e2m1_pair_to_e4m3``), elsewhere the integer bit-build;
+    decodes through the CVT unit (``ptx.e2m1x2_to_e4m3x2``), elsewhere the integer bit-build;
     either way the bytes are bitcast once. Only the taken arm compiles."""
     if _E2M1_HW_CVT:
-        pair = _e2m1_pair_to_e4m3(packed)
+        pair = e2m1x2_to_e4m3x2(packed)
         bits = tl.interleave(pair & 0xFF, pair >> 8)
     else:
         bits = tl.interleave(
@@ -319,7 +280,7 @@ def e2m1_to_f32(b_packed):
     non-swapped CUDA-core reduce. Skips the E4M3 hop ``e2m1_to_e4m3`` owes its ``tl.dot`` callers;
     bit-identical, since every E2M1 value is exact in E4M3, f16 and fp32."""
     if _E2M1_HW_CVT:
-        pair = _e2m1_pair_to_f16(b_packed)
+        pair = e2m1x2_to_f16x2(b_packed)
         lo = (pair & 0xFFFF).to(tl.uint16)
         hi = (pair >> 16).to(tl.uint16)
         unpacked = tl.trans(tl.interleave(tl.trans(lo), tl.trans(hi)))
@@ -337,9 +298,9 @@ def e2m1_to_e4m3(b_packed):
     E4M3, so this is lossless — it lets the FP8 ``tl.dot`` path stand in for
     ``tl.dot_scaled`` at decode (avoiding its M->128 pad). K order is the low nibble
     first: ``[byte0_lo, byte0_hi, byte1_lo, ...]``. sm_100 decodes through the CVT unit
-    (``_e2m1_pair_to_e4m3``); elsewhere the integer bit-build. Only the taken arm compiles."""
+    (``ptx.e2m1x2_to_e4m3x2``); elsewhere the integer bit-build. Only the taken arm compiles."""
     if _E2M1_HW_CVT:
-        pair = _e2m1_pair_to_e4m3(b_packed)
+        pair = e2m1x2_to_e4m3x2(b_packed)
         lo, hi = pair & 0xFF, pair >> 8
     else:
         lo = _e2m1_code_to_e4m3_bits(b_packed & 0xF)
@@ -1522,7 +1483,7 @@ def _permute_cols_kernel(X, Perm, Scale, QuantScale, UnitScale, Out, M, K, strid
     if Scale is not None:
         vals = (vals.to(tl.float32) * tl.load(Scale + src, mask=cols < K, other=0)[None, :]).to(X.dtype.element_ty)
     if QuantScale is not None:
-        vals = _quantize_modelopt_input(vals, tl.load(QuantScale), Out.dtype.element_ty)
+        vals = quantize_calibrated_act(vals, tl.load(QuantScale), Out.dtype.element_ty)
     tl.store(Out + rows64 * stride_o_m + cols[None, :], vals, mask=mask)
     if UnitScale is not None:
         if tl.program_id(0) == 0:
@@ -1589,7 +1550,7 @@ def _permute_routed_rows_kernel(
             vals = (vals.to(tl.float32) * scale).to(X.dtype.element_ty)
         if QuantScale is not None:
             denom = tl.load(QuantScale + e * stride_quant_e)
-            vals = _quantize_modelopt_input(vals, denom, Out.dtype.element_ty)
+            vals = quantize_calibrated_act(vals, denom, Out.dtype.element_ty)
         tl.store(Out + s.to(tl.int64) * K + cols, vals, mask=mask)
 
 

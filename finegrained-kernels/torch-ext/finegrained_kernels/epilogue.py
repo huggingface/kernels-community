@@ -101,6 +101,7 @@ def acc_init(
     BLOCK_SIZE_N: tl.constexpr,
     SWAP_AB: tl.constexpr,
     DTYPE: tl.constexpr = tl.float32,
+    K_SLICES: tl.constexpr = 1,
 ):
     """Zero accumulator shaped for the layout: swapped scalar reduces into ``[1, N]``; any other
     swapped mode keeps the ``[N, M]`` MMA acc (weight rows in M, act tile in N — padded up to
@@ -109,7 +110,9 @@ def acc_init(
     ``COMPUTE_MODE`` matters only under swap — kernels with no
     mode axis (fp8 ``tl.dot``) pass ``"dot"``. ``N`` is the weight-output tile (``BLOCK_SIZE_H``
     for the fp8 down projection). Single return: only the taken branch compiles."""
-    if SWAP_AB and COMPUTE_MODE == "scalar":
+    if K_SLICES > 1:  # the in-CTA K split (plain_dot)
+        acc = tl.zeros((K_SLICES, BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=DTYPE)
+    elif SWAP_AB and COMPUTE_MODE == "scalar":
         acc = tl.zeros((1, BLOCK_SIZE_N), dtype=DTYPE)
     elif SWAP_AB and BLOCK_SIZE_M < MMA_N_ATOM:
         acc = tl.zeros((BLOCK_SIZE_N, MMA_N_ATOM), dtype=DTYPE)

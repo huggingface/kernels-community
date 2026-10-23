@@ -313,6 +313,7 @@ def get_accelerator_autotuning_configs(
     swap_ab_prefill: bool = False,
     warp_spec: bool = False,
     packed_schedule: bool = False,
+    k_slices=None,
     compute_modes=None,
     a_memory_modes=None,
     b_memory_modes=None,
@@ -358,6 +359,10 @@ def get_accelerator_autotuning_configs(
       inf and self-prune; where it compiles it is both faster and (bd grouped gate_up)
       load-bearing for correctness. Off CUDA the axis collapses to the single value
       False (no warp specialization), but it is still emitted.
+    - ``k_slices``: the ``K_SLICES`` in-CTA K split of the plain dot (``plain_dot``): warps take K slices of
+      the whole output tile instead of corners of it, then sum the slices once after the K loop. Small output
+      tiles turn a few long dependent MMA chains per warp into many short ones (M=32 N=4096 K=8192 bf16,
+      BN32 BK256 4 warps: 2 chains of 16 MMAs -> 8 of 4, 18.3 -> 13.0us).
     - ``a_memory_modes``: the A_MEMORY_MODE activation-load axis (descriptor legal only
       without a gather — the tile's rows are the contiguous sorted positions; the pruner
       fences descriptor rows when GatherIdx is passed).
@@ -447,6 +452,10 @@ def get_accelerator_autotuning_configs(
         # The axis is always EMITTED, pinned to False where warp specialization does not exist
         ws_values = (False, True) if get_active_device_type() == "cuda" else (False,)
         blocks = [{**b, "WARP_SPEC": ws} for b in blocks for ws in ws_values]
+
+    if k_slices is not None:
+        # in-CTA K split (``plain_dot``): k_slices_pruner keeps S > 1 to the small non-swapped M tiles it serves
+        blocks = [{**b, "K_SLICES": s} for b in blocks for s in k_slices]
 
     if packed_schedule:
         # grouped M-tile resolution axis: packed-table loads vs the E-wide register-resident

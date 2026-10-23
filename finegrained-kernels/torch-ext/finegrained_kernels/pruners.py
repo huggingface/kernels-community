@@ -15,7 +15,7 @@
 import torch
 import triton
 
-from .compat import FP8_DTYPE, get_active_device_type, is_sm10x, is_sm90, sm_count, sm_shared_memory_limit, triton_version
+from .compat import FP8_DTYPE, is_nvidia, get_active_device_type, is_sm10x, is_sm90, sm_count, sm_shared_memory_limit, triton_version
 from .mma import MMA_N_ATOM_WIDTH
 
 # ── config pruners ────────────────────────────────────────────────────────────
@@ -184,6 +184,15 @@ def block_within_dim_pruner(dim_arg: str, block_key: str = "BLOCK_SIZE_K", when=
     return config_filter(ok, when=when, on_empty=raise_no_dividing_block)
 
 
+def activation_dtype(args):
+    """The activation dtype a kernel multiplies: ``A``'s, or the quantized form of a raw ``A`` it quantizes on load
+    (``ACT_QUANT``)."""
+    act_quant = args.get("ACT_QUANT")
+    if act_quant is None:
+        return args["A"].dtype
+    return torch.int8 if act_quant == "int8" else FP8_DTYPE
+
+
 def int_scale_group_tile_pruner(divides_k: bool = True):
     """``early_config_prune`` for the integer weight-only kernels' K tile: whole scale groups (each group's scale
     broadcasts over its columns of the dequantized tile) or a whole number of tiles per group (a group wider than the
@@ -193,11 +202,13 @@ def int_scale_group_tile_pruner(divides_k: bool = True):
     the existing group-128 grid; narrower tiles add K-loop and metadata traffic."""
 
     def ok(c, args):
-        # The packed scalar decode helpers support bf16/fp16 and INT8, not FP8 operands.
-        if args["A"].dtype == torch.float8_e4m3fn and c.kwargs.get("COMPUTE_MODE") == "scalar":
+        # The packed scalar decode helpers support bf16/fp16 and INT8; FP8 operands only against INT4 weights
+        # (int4_e4m3_scalar, the table lookup), on NVIDIA.
+        if (activation_dtype(args) == torch.float8_e4m3fn and c.kwargs.get("COMPUTE_MODE") == "scalar"
+                and not (args.get("INT_BITS") == 4 and is_nvidia())):
             return False
         # INT32 partials must stay integral through the final K sum; the split-K workspace is FP32.
-        if args["A"].dtype == torch.int8 and c.kwargs.get("SPLIT_K", 1) != 1:
+        if activation_dtype(args) == torch.int8 and c.kwargs.get("SPLIT_K", 1) != 1:
             return False
         bk, group = c.kwargs["BLOCK_SIZE_K"], args["SCALE_GROUP_K"]
         if group > bk:
@@ -375,7 +386,7 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None, block_within_k: bool 
     - MXFP4 ``scalar`` configs are KEPT. They used to be dropped on sm_10x: fp4 scalar decode
       was ALU-bound in the E2M1 unpack and measured 1.8x slower than dot_scaled. That verdict
       was against the INTEGER unpack. Decoding E2M1 through the sm_100 CVT unit
-      (``_e2m1_pair_to_e4m3``) inverts it — on the dsv4 W4A8 decode, scalar+swap beats the
+      (``ptx.e2m1x2_to_e4m3x2``) inverts it — on the dsv4 W4A8 decode, scalar+swap beats the
       dot_scaled crown 20.7 vs 41.8us (gate_up) and 11.3 vs 22.0us (down), bit-identical —
       because at BM=1 dot_scaled cannot reach the native microscaled MMA either (it needs an
       M=128 operand) and emulates through the same upcast, while scalar skips the MMA
@@ -1291,6 +1302,25 @@ def scalar_max_m_pruner(m_arg: str, max_m: int = 64):
         return c.kwargs.get("COMPUTE_MODE") != "scalar"
 
     return config_filter(ok, when=lambda args: args[m_arg] > max_m)
+
+
+def k_slices_pruner(max_bm: int = 32, max_bn: int = 64):
+    """``early_config_prune`` keeping ``K_SLICES > 1`` (the in-CTA K split of ``plain_dot``) to the tiles it serves:
+    non-swapped, ``BLOCK_SIZE_M <= max_bm`` (from M=64 the tile already holds enough independent MMA chains: no gain
+    measured), ``BLOCK_SIZE_N <= max_bn`` (every K-split winner measured was BN32; the wider tiles only dilute the
+    trial budget: FP8 W8A16 M=32 crowned a 11% slower unsplit tile with them in the grid), no warp specialization, and
+    a K slice of at least one 16-deep MMA step."""
+
+    def ok(c, args):
+        s = c.kwargs.get("K_SLICES", 1)
+        if s == 1:
+            return True
+        bk = config_dim(c, args, "BLOCK_SIZE_K")
+        return (c.kwargs.get("COMPUTE_MODE", "dot") == "dot" and not c.kwargs.get("SWAP_AB") and not c.kwargs.get("WARP_SPEC")
+                and c.kwargs.get("BLOCK_SIZE_M", 16) <= max_bm and config_dim(c, args, "BLOCK_SIZE_N") <= max_bn
+                and bk // s >= 16)
+
+    return config_filter(ok)
 
 
 def swap_max_m_pruner(m_arg: str, max_m: int):
