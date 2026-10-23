@@ -44,6 +44,7 @@ from utils import (  # type: ignore
     dq_scale,
     DTYPE_TO_TOL,
     finegrained_kernels,
+    IS_SM89,
     internals,
     make_gate_up,
     make_static_activation_scale,
@@ -623,6 +624,8 @@ def _check(problem: Problem, dq_out, ref_cmp, expert_ids, op):
     )
     if not problem.quantize_output:
         atol, rtol = DTYPE_TO_TOL[problem.dtype]
+        if IS_SM89:
+            atol = max(atol, 1e-2 * ref_cmp[keep].abs().max().item())
         torch.testing.assert_close(
             dq_out[keep], ref_cmp[keep].to(problem.dtype).float(), atol=atol, rtol=rtol
         )

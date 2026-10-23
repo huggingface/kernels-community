@@ -18,6 +18,7 @@ carries its incident."""
 
 import itertools
 import logging
+import os
 import subprocess
 import sys
 
@@ -284,7 +285,8 @@ def test_cross_process_determinism_block_dynamic_grouped():
     within one process agree, fresh processes can disagree. Compare an output checksum
     across subprocesses — a cheap CI approximation of the 15-process flake harness."""
     script = (
-        "import sys; sys.path.insert(0,'tests');\n"
+        # the tests' own directory, as CI runs them from elsewhere
+        f"import sys; sys.path.insert(0, {os.path.dirname(os.path.abspath(__file__))!r});\n"
         "import torch; from utils import TEST_DEVICE, make_weights, finegrained_kernels as fg, internals\n"
         "torch.manual_seed(0)\n"
         "E,N,K,S=8,512,1024,256\n"

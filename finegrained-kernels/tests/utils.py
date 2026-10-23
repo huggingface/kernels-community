@@ -45,6 +45,9 @@ SUPPORTS_FP8 = TEST_DEVICE == "xpu" or (
 # SM90 (Hopper, e.g. H100) is the only architecture the benchmark baselines
 # are calibrated against — every other SM has its own latency profile.
 IS_SM90 = TEST_DEVICE == "cuda" and torch.cuda.get_device_capability() == (9, 0)
+# Ada's FP8 tensor cores accumulate with less precision than fp32, so an output element can miss the
+# fixed tolerance by a few bf16 ulps where the sum cancels. The tests bound such errors by the output's scale.
+IS_SM89 = TEST_DEVICE == "cuda" and torch.cuda.get_device_capability() == (8, 9)
 # The SWIZZLE_32_4_4 scale layout exists to feed tcgen05, so the ops only grow a
 # swizzled arm where that instruction is: sm_10x. Elsewhere the scales stay row-major
 # (affine) and the pre-swizzled variants of each problem are skipped rather than run
