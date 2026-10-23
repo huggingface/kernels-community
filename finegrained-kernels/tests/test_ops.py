@@ -700,7 +700,6 @@ def test_op_scenarios(problem: Problem, op):
     _run_ref_vs_op(problem, op, A, expert_ids, B, Bs, Bs_global)
 
 
-@pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 @pytest.mark.parametrize("row_stride", [3 * 256, 256 + 1], ids=["aligned", "unaligned"])
 @pytest.mark.parametrize(
