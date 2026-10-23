@@ -707,6 +707,8 @@ def _mx_matmul_configs():
               and not c.kwargs["SWAP_AB"] and c.kwargs["WARP_SPEC"] and c.num_warps in (4, 8)]
     persistent = [triton.Config(dict(c.kwargs, PERSISTENT=True), num_warps=c.num_warps,
                                 num_stages=c.num_stages, pre_hook=c.pre_hook) for c in native]
+    # the persistent tiles also warp-specialize the tile loop (one tile's epilogue overlaps the next tile's MMA)
+    persistent += pipeline_autotuning_configs(persistent, ("tile_loop", "flattened"))
     # the single-token scalar reduce, split along K: its BM=1 GEVM leaves most SMs idle on a deep K
     scalar = [c for c in configs if c.kwargs["COMPUTE_MODE"] == "scalar" and c.kwargs["BLOCK_SIZE_M"] == 1
               and c.kwargs["A_MEMORY_MODE"] == c.kwargs["B_MEMORY_MODE"] == "pointer"
@@ -837,6 +839,7 @@ def mx_dynamic_matmul_kernel(
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
     WARP_SPEC: tl.constexpr = False,  # tuner axis; +4% at prefill (guard: num_warps%4, BM>=64)
+    PIPELINE: tl.constexpr = "k_loop",  # tuner axis: warp-specialize the K loop, or the persistent tile loop ("tile_loop"/"flattened")
     SWAP_AB: tl.constexpr = False,  # swapped decode orientation (BM=1); scoped by mx_2d_swap_scope_pruner
     PDL: tl.constexpr = False,
 ):
@@ -856,7 +859,12 @@ def mx_dynamic_matmul_kernel(
     if PDL:
         gdc_wait()
     tile_start, tile_end, tile_step = output_tile_range(M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, PERSISTENT)
-    for tile_id in range(tile_start, tile_end, tile_step):
+    # Two accumulators of a 256-wide tile and the block scales overflow the 512 tensor-memory columns.
+    for tile_id in tl.range(
+        tile_start, tile_end, tile_step,
+        flatten=PIPELINE == "flattened", warp_specialize=WARP_SPEC and PIPELINE != "k_loop",
+        disallow_acc_multi_buffer=PIPELINE != "k_loop" and (2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N) >= 256,
+    ):
         # uint8 A = packed-E2M1 activations (W4A4 — the dtype IS the activation format)
         ACT_VALUES_PER_BYTE: tl.constexpr = 2 if A.dtype.element_ty == tl.uint8 else 1
         WEIGHT_VALUES_PER_BYTE: tl.constexpr = 2 if B.dtype.element_ty == tl.uint8 else 1
@@ -894,7 +902,7 @@ def mx_dynamic_matmul_kernel(
             as_ptrs += split * (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_as_k
             bs_ptrs += split * (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
         accumulator = acc_init(COMPUTE_MODE if SWAP_AB else "dot", BLOCK_SIZE_M, n_width, SWAP_AB)
-        for k in tl.range(split, tl.cdiv(K, BLOCK_SIZE_K), SPLIT_K, warp_specialize=WARP_SPEC):
+        for k in tl.range(split, tl.cdiv(K, BLOCK_SIZE_K), SPLIT_K, warp_specialize=WARP_SPEC and PIPELINE == "k_loop"):
             a, a_s = load_act_mx(
                 a_ptrs, as_ptrs, AsGlobal, 0, None, as_mask, ADescriptor, pid_m * BLOCK_SIZE_M,
                 k * (BLOCK_SIZE_K // ACT_VALUES_PER_BYTE), ASDescriptor, As, 0, 0, pid_m, k, M, K,

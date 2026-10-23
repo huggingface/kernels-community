@@ -76,6 +76,29 @@ def with_tile_order_axis(configs):
     return configs + ordered
 
 
+def _mx_grouped_configs():
+    configs = get_accelerator_autotuning_configs(
+        packed_schedule=True,
+        mx=True,
+        tune_block_nk=True,
+        tune_block_m=True,
+        compute_modes=("dot_scaled", "dot"),
+        a_memory_modes=("descriptor", "pointer"),
+        b_memory_modes=("descriptor", "pointer"),
+        pre_hook=grouped_mx_pre_hook,
+        warp_spec=True,  # dot_scaled+WS+TMA compiles+wins on a clean context (was a num_warps=2 misread)
+    )  # prefill: no scalar branch; TMA descriptor vs pointer loads on both operands
+    for config in configs:
+        config.kwargs["PIPELINE"] = "k_loop"
+    seeds = [
+        c for c in configs
+        if c.kwargs["WARP_SPEC"] and c.kwargs["COMPUTE_MODE"] == "dot_scaled" and c.kwargs["BLOCK_SIZE_M"] == 128
+        and c.kwargs["A_MEMORY_MODE"] == c.kwargs["B_MEMORY_MODE"] == "host_descriptor"
+        and c.kwargs["BLOCK_SIZE_N"] >= 128 and c.kwargs["BLOCK_SIZE_K"] in (128, 256) and c.num_warps == 4
+    ] if is_sm10x() else []
+    return configs + pipeline_autotuning_configs(seeds, ("tile_loop", "flattened"))
+
+
 def _grouped_dot_configs():
     return get_accelerator_autotuning_configs(
         packed_schedule=True,
@@ -717,21 +740,9 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
 
 
 @bayesian_autotune(
-    get_accelerator_autotuning_configs(
-        packed_schedule=True,
-        mx=True,
-        tune_block_nk=True,
-        tune_block_m=True,
-        compute_modes=("dot_scaled", "dot"),
-        a_memory_modes=("descriptor", "pointer"),
-        b_memory_modes=("descriptor", "pointer"),
-        pre_hook=grouped_mx_pre_hook,
-        warp_spec=True,  # dot_scaled+WS+TMA compiles+wins on a clean context (was a num_warps=2 misread)
-    ),  # prefill: no scalar branch; TMA descriptor vs pointer loads on both operands
-    # No output-tile PIPELINE axis (the tensor/weight-only kernels' one): it double-buffers the
-    # accumulator in tensor memory, so a 256-column dot_scaled accumulator (GATE, or BN=256) needs
-    # 576 of 512 columns, and the BN=128 down tiles that fit never beat the tuned BN=256 k_loop
-    # crown (B200, DeepSeek-V4 MXFP4 / GLM NVFP4 / MiniMax MXFP8 at T=2048/8192: 0.98-1.01x).
+    # the native tiles and their output-tile PIPELINE variants (a 256-column accumulator stays single-buffered:
+    # double-buffered with its scales it needs 576 of the 512 TMEM columns)
+    _mx_grouped_configs(),
     # the MXFP4/MXFP8 (and packed-activation) splits key themselves — the tuner appends
     # every tensor arg's dtype to its cache key (memory and disk);
     # GATE keys the gate|up arm separately (its stacked dot is 2*BN wide, a different tile optimum).
@@ -833,6 +844,7 @@ def mx_dynamic_matmul_grouped_kernel(
     # E-wide register-resident layout — register relief, bit-identical tiles; scope pruner
     # admits it at BM>=128 only (see packed_schedule_scope_pruner)
     PACKED_SCHEDULE: tl.constexpr = False,
+    PIPELINE: tl.constexpr = "k_loop",  # tuner axis: warp-specialize the K loop, or the tile loop ("tile_loop"/"flattened")
 ):
     """Unified grouped microscaled expert matmul (MXFP8/MXFP4/NVFP4; a ``uint8`` ``A``
     is caller-packed E2M1 — W4A4 on the native fp4 MMA) — persistent grid-stride.
@@ -849,9 +861,10 @@ def mx_dynamic_matmul_grouped_kernel(
     start_pid = tl.program_id(axis=0)
     if PACKED_SCHEDULE:
         total_m_tiles = load_packed_schedule(Schedule, BLOCK_SIZE_M)
-        prefetched = prefetch_packed_entry(
-            Schedule, start_pid // tl.cdiv(N, BLOCK_SIZE_N), total_m_tiles
-        )
+        if PIPELINE == "k_loop":
+            prefetched = prefetch_packed_entry(
+                Schedule, start_pid // tl.cdiv(N, BLOCK_SIZE_N), total_m_tiles
+            )
     else:
         exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = build_tile_layout(
             ExpertStart, NUM_EXPERTS_POW2, BLOCK_SIZE_M
@@ -874,7 +887,16 @@ def mx_dynamic_matmul_grouped_kernel(
     offs_ka = tl.arange(0, BLOCK_SIZE_K // ACT_VALUES_PER_BYTE)
     offs_kb = tl.arange(0, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE)
 
-    for tile_id in tl.range(start_pid, total_m_tiles * num_n_tiles, NUM_PROGRAMS):
+    # PIPELINE != "k_loop" warp-specializes the tile loop instead of the K loop, so the next tile's loads
+    # stream while this one's MMAs run. A double-buffered 256-column accumulator plus its scales would need
+    # 576 of the 512 TMEM columns, so a wide accumulator stays single-buffered (the epilogue then waits).
+    for tile_id in tl.range(
+        start_pid, total_m_tiles * num_n_tiles, NUM_PROGRAMS,
+        flatten=PIPELINE == "flattened", warp_specialize=WARP_SPEC and PIPELINE != "k_loop",
+        disallow_acc_multi_buffer=PIPELINE != "k_loop" and (2 if GATE else 1) * BLOCK_SIZE_N > 128,
+    ):
+        if PACKED_SCHEDULE and PIPELINE != "k_loop":
+            prefetched = prefetch_packed_entry(Schedule, tile_id // num_n_tiles, total_m_tiles)
         pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start = (
             resolve_grouped_tile_packed(
                 tile_id, num_n_tiles, prefetched,
@@ -893,7 +915,7 @@ def mx_dynamic_matmul_grouped_kernel(
                 GATE,
             )
         )
-        if PACKED_SCHEDULE:
+        if PACKED_SCHEDULE and PIPELINE == "k_loop":
             prefetched = prefetch_packed_entry(
                 Schedule, (tile_id + NUM_PROGRAMS) // num_n_tiles, total_m_tiles
             )
@@ -925,7 +947,7 @@ def mx_dynamic_matmul_grouped_kernel(
         # slab is num_n_tiles REP-blocks (REP=2 under GATE, whose tile spans both).
         pid_m = tile_id // num_n_tiles
         weight_blk = (expert_id64 * num_n_tiles + pid_n).to(tl.int32)
-        for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
+        for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC and PIPELINE == "k_loop"):
             a, a_s = load_act_mx(
                 a_ptrs, As, None, 0, row_mask, row_mask, ADescriptor, m_start, ka_off,
                 ASDescriptor, As, in_row, stride_as_m, pid_m, k, 0, K,
