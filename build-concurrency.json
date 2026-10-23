@@ -10,5 +10,11 @@
       "max-jobs": 2,
       "cores": 16
     }
+  },
+  "sgl-flash-attn3": {
+    "cuda": {
+      "max-jobs": 1,
+      "cores": 12
+    }
   }
 }

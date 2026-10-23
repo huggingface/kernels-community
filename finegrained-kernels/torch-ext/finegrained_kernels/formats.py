@@ -153,8 +153,12 @@ def validate_dense_operands(A: torch.Tensor, B: torch.Tensor) -> None:
 
 def validate_dense_2d_operands(A: torch.Tensor, B: torch.Tensor) -> None:
     """Shared (rows, K) x (N, K) operand checks for the 2D dense unpacked-fp8 wrappers — matching
-    K, contiguous A, 2D B. The packed-E2M1 (MX) 2D op does its own (K is two values per
+    K, unit-stride A rows, 2D B. The packed-E2M1 (MX) 2D op does its own (K is two values per
     stored byte, so B is (N, K // 2)).
+
+    A's rows may sit any distance apart, e.g. the last position of each sequence that
+    ``generate`` hands the LM head (``hidden[:, -1:]``). The wrappers flatten A with ``view``, so a
+    layout without a fixed row stride raises instead of being copied, and read its row stride.
 
     B may be row-major or a transposed view of a row-major tensor. The kernels read both of B's
     strides, and ``descriptor_box_pruner`` keeps the TMA arms — which require a unit-stride
@@ -163,7 +167,7 @@ def validate_dense_2d_operands(A: torch.Tensor, B: torch.Tensor) -> None:
     assert A.shape[-1] == B.shape[-1], (
         f"K mismatch: A has K={A.shape[-1]}, B has K={B.shape[-1]}"
     )
-    assert A.is_contiguous(), "A must be contiguous"
+    assert A.stride(-1) == 1, f"A's rows must be contiguous, got strides {tuple(A.stride())}"
     assert B.ndim == 2, f"B must be 2D (N, K), got ndim={B.ndim}"
     assert B.is_contiguous() or B.t().is_contiguous(), (
         "B must be contiguous or a transposed view of a contiguous tensor, got strides "
