@@ -52,6 +52,8 @@ from .compat import (
     NVFP4_SCALE_GROUP_K,
     ScalingType,
     SwizzleType,
+    add_op_namespace_prefix,
+    compile_time_only_triton_op,
     compile_time_only_triton_wrap,
     device_context,
     pdl_launch_kwargs,
@@ -146,6 +148,8 @@ def weighted_reduce_kernel(
 
 
 
+# opaque, so torch.compile never reads the PDL inline asm, which its kernel analysis cannot parse
+@compile_time_only_triton_op(add_op_namespace_prefix("weighted_reduce"), mutates_args=(), opaque=True)
 def weighted_reduce(
     rows: torch.Tensor,
     top_k_index: torch.Tensor,
