@@ -23,7 +23,8 @@ import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .bayesian_autotuner import bayesian_autotune
-from .compat import add_op_namespace_prefix, FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, persistent_program_count, sm_count, tl_dtype
+from .bench import gemm_cold_banks
+from .compat import add_op_namespace_prefix, FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, persistent_program_count, tl_dtype
 from .descriptors import build_grouped_operand_descriptors, rebind_grouped_descriptors, rebind_grouped_mx_descriptors
 from .formats import check_activation_format, global_scale_stride, gate_out_cols, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
 from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, mx_act_quant_grouped, mx_act_quant_routed_rows, quantize_routed_rows_per_expert, static_expert_act_operands, swizzle_grouped_mx_scales, tensor_wide_act_operands
@@ -66,6 +67,7 @@ from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, raw_activation_point
     # descriptor-box legality, so checkpoints with different blocks must not share a winner.
     ["N", "K", "tokens_per_expert_bit_length", "GATE", "BLOCK_SIZE_N", "BLOCK_SIZE_K"],
     n_trials=100,
+    cold_banks=gemm_cold_banks,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # Pipeliner-race guard: per launch-BM, WS-only at BM >= 64 and non-WS below (see the pruner).
     prune_configs_by={
@@ -270,6 +272,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     ),
     ["N", "K", "tokens_per_expert_bit_length", "GATE", "BLOCK_SIZE_N", "BLOCK_SIZE_K"],
     n_trials=100,
+    cold_banks=gemm_cold_banks,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # Pipeliner-race WS guard (per launch-BM: forces WS where the default pipeliner races at
     # BM>=64, keeps non-WS below) + descriptor-box limits.
@@ -460,6 +463,7 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
     # GATE keys the gate|up arm separately (its dot is 2*BN wide, a different tile optimum).
     ["N", "K", "tokens_per_expert_bit_length", "GATE"],
     n_trials=100,
+    cold_banks=gemm_cold_banks,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # BLOCK_SIZE_K/N are tuned axes; the K-loop is maskless and the N-tile store is
     # row-masked only — veto non-dividing tiles on both. WS is a pure perf axis here
@@ -664,6 +668,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     # splits them incidentally today; a descriptor Cs has no dtype token).
     ["N", "K", "tokens_per_expert_bit_length", "GATE", "SWIZZLED_SCALES", "OUTPUT_FORMAT", "SWIZZLED_OUT"],
     n_trials=100,
+    cold_banks=gemm_cold_banks,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # BK-within-K veto + the sm_10x dot_scaled shape/trap gates (this kernel had no
     # pruner while its BK span was {128,256} — the union span's BK=64 rows made the
@@ -929,6 +934,7 @@ def mx_dynamic_matmul_grouped_kernel(
     ),
     ["N", "K", "tokens_per_expert_bit_length", "GATE"],
     n_trials=100,
+    cold_banks=gemm_cold_banks,
     path_anchor_axes=PATH_ANCHOR_AXES,
     prune_configs_by={
         "early_config_prune": compose_pruners(
@@ -1098,6 +1104,7 @@ def mx_weight_only_matmul_grouped_kernel(
     # GATE keys the gate|up arm separately (its dot is 2*BN wide, a different tile optimum).
     ["N", "K", "tokens_per_expert_bit_length", "GATE"],
     n_trials=100,
+    cold_banks=gemm_cold_banks,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # BLOCK_SIZE_K is a tuned axis and the K-loop is maskless — veto non-dividing BKs.
     prune_configs_by={
