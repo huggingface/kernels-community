@@ -111,8 +111,15 @@ _parser.add_argument("--no-preswizzle", dest="preswizzle", action="store_false",
 _parser.add_argument("--suffix", default=None,
                      help="output-name suffix (bench_moe<suffix>.csv/png) so filtered rows can run "
                           "concurrently on separate GPUs without racing for the same partial files")
+_parser.add_argument("--regimes", default=None,
+                     help="comma-separated regimes to run (decode, batch, prefill); a new regime can be added "
+                          "to an existing CSV without rerunning the others")
+_parser.add_argument("--arms", default=None,
+                     help="comma-separated arms to run (e.g. finegrained-kernels); the rest are skipped, so one arm "
+                          "can be rerun into an existing CSV without rerunning or retuning the others")
 ARGS = _parser.parse_args()
 FILTERS = ARGS.filters
+ONLY_ARMS = None if ARGS.arms is None else tuple(a.strip() for a in ARGS.arms.split(","))
 GPUS = ARGS.gpus
 SMOKE = ARGS.smoke
 MOCK = ARGS.mock
@@ -349,7 +356,16 @@ if DEVICE not in ("cuda", "xpu"):
 DEVICE_MASK_ENV = {"cuda": "CUDA_VISIBLE_DEVICES", "xpu": "ZE_AFFINITY_MASK"}[DEVICE]
 ACCELERATOR = torch.get_device_module(DEVICE)
 DECODE_TOKENS = 1
+BATCH_TOKENS = 64
 PREFILL_TOKENS = 256 if SMOKE else 8192
+# (regime, tokens, MoE through the grouped kernels). "batch" is serving decode at a batch of 64: a few
+# routed rows per expert, where re-reading an expert's weights per row (the batched kernels) loses
+# to tiling its rows together.
+REGIMES = tuple(
+    r for r in (("decode", DECODE_TOKENS, False), ("batch", BATCH_TOKENS, True), ("prefill", PREFILL_TOKENS, True))
+    if ARGS.regimes is None or r[0] in ARGS.regimes.split(",")
+)
+REGIME_TOKENS = {"decode": DECODE_TOKENS, "batch": BATCH_TOKENS, "prefill": PREFILL_TOKENS}
 
 # fixed left-to-right model order for every figure row (matched by base-model prefix,
 # so GLM-5.2-NVFP4 and GLM-5.2 both land in the GLM-5.2 slot). Roughly most-baseline-
@@ -1455,7 +1471,7 @@ def _mock_rows(row, pname, arms, rows_out):
     exact plotting path — decode vs prefill scales, a crashed finegrained-fp8 prefill-compile
     cell (red X), and one wild parity (hatched bar) per row."""
     rng = random.Random(hash((row, pname)) & 0xFFFF)
-    for regime, scale in (("decode", 100.0), ("prefill", 2000.0)):
+    for regime, scale in (("decode", 100.0), ("batch", 300.0), ("prefill", 2000.0)):
         for i, name in enumerate(arms):
             res = {m: scale * rng.uniform(0.5, 3.0) for m in MODES}
             if "finegrained-fp8" in name and regime == "prefill":
@@ -1474,8 +1490,7 @@ def bench_problem_row(row, pname, cfg, arms, weights, rows_out):
     # state so shapes don't go automatic-dynamic across problems and the shared
     # frames can't hit the fullgraph recompile limit
     torch._dynamo.reset()
-    for regime, tokens, grouped in (("decode", DECODE_TOKENS, False),
-                                    ("prefill", PREFILL_TOKENS, True)):
+    for regime, tokens, grouped in REGIMES:
         print(f"   -- {regime}")
         hidden, idx, w, logits = routing(cfg, tokens)
         inputs = _routing_banks(cfg, weights, hidden, idx, w, logits)
@@ -1674,13 +1689,15 @@ def bench_attn_row(row, pname, cfg, rows_out):
     _mark_static(W, Ws)
     weights = (W, Ws, W_g)
 
-    for regime, tokens in (("decode", DECODE_TOKENS), ("prefill", PREFILL_TOKENS)):
+    for regime, tokens, _ in REGIMES:
         print(f"   -- {regime}")
         torch.manual_seed(0)
         x = torch.randn(tokens, K, device=DEVICE, dtype=torch.bfloat16)
         banks = _weight_banks(weights)
         inputs = [x] + [x.clone() for _ in banks[1:]]
         bank_arms = [_attn_arms(cfg, hidden, bank) for bank, hidden in zip(banks, inputs)]
+        if ONLY_ARMS is not None:
+            bank_arms = [{k: v for k, v in arms.items() if k in ONLY_ARMS} for arms in bank_arms]
         anchor_res, anchor_out = None, None
         for name in bank_arms[0]:
             runs = [arms[name] for arms in bank_arms]
@@ -1831,7 +1848,9 @@ def _run_task(kind, pname, cfg, rows_out):
         _TRAP_RISK = ("finegrained-fp8",)
         quant_arms = (tuple(a for a in quant_arms if a not in _TRAP_RISK)
                       + tuple(a for a in quant_arms if a in _TRAP_RISK))
-        if wanted("quantized", pname):
+        if ONLY_ARMS is not None:
+            quant_arms = tuple(a for a in quant_arms if a in ONLY_ARMS)
+        if wanted("quantized", pname) and quant_arms:
             bench_problem_row("quantized", pname, cfg, quant_arms, weights, rows_out)
     elif kind == "bf16":
         # sonic's kernel computes plain SwiGLU only — its integration raises on the clamped/scaled
@@ -1844,8 +1863,11 @@ def _run_task(kind, pname, cfg, rows_out):
         # megablocks is bf16-only (no quantized path), so it belongs on this row and nowhere else
         if _megablocks is not None and plain_glu:
             arms = arms + ("megablocks",)
-        bench_problem_row("unquantized", pname, cfg, ("finegrained-kernels",) + arms,
-                          weights, rows_out)
+        arms = ("finegrained-kernels",) + arms
+        if ONLY_ARMS is not None:
+            arms = tuple(a for a in arms if a in ONLY_ARMS)
+        if arms:
+            bench_problem_row("unquantized", pname, cfg, arms, weights, rows_out)
     else:  # attn
         bench_attn_row("linear quantized", pname, cfg, rows_out)
 
@@ -1855,6 +1877,9 @@ TASKS = ([("moe", p, c) for p, c in MOE_PROBLEMS.items()
           if wanted("quantized", p)]
          + [("bf16", p, c) for p, c in BF16_PROBLEMS.items() if wanted("unquantized", p)]
          + [("attn", p, c) for p, c in ATTN_PROBLEMS.items() if wanted("linear quantized", p)])
+if ONLY_ARMS is not None:  # only the rows that enlist a requested arm
+    TASKS = [t for t in TASKS if set(ONLY_ARMS) & ({"finegrained-kernels"} | set(t[2].get("baselines", ()))
+                                                   | set(t[2].get("fused_extra", ())))]
 
 rows = []
 if REPLOT:
@@ -1862,7 +1887,7 @@ if REPLOT:
 elif GPUS > 1 and _SHARD is None and not MOCK:
     # COORDINATOR: fan the tasks across GPUS subprocesses (one device each), merge, then plot.
 
-    shard_paths = [os.path.join(_HERE, f"bench_moe.shard{g}.csv") for g in range(GPUS)]
+    shard_paths = [os.path.join(_HERE, f"bench_moe{ARGS.suffix or ''}.shard{g}.csv") for g in range(GPUS)]
     for sp in shard_paths:  # a leftover shard from a prior run must never merge as fresh data
         if os.path.exists(sp):
             os.unlink(sp)
@@ -1872,6 +1897,12 @@ elif GPUS > 1 and _SHARD is None and not MOCK:
     if devices and len(devices) != GPUS:
         raise SystemExit(f"--devices lists {len(devices)} device(s) but --gpus is {GPUS}")
     worker_flags = (["--smoke"] if SMOKE else []) + ([] if PRESWIZZLE else ["--no-preswizzle"])
+    if ARGS.arms is not None:
+        worker_flags += ["--arms", ARGS.arms]
+    if ARGS.regimes is not None:
+        worker_flags += ["--regimes", ARGS.regimes]
+    if ARGS.suffix is not None:  # shard files carry the suffix, so filtered reruns never overwrite a full run's
+        worker_flags += ["--suffix", ARGS.suffix]
     procs = [subprocess.Popen(
         [sys.executable, os.path.abspath(__file__), "--gpus", "1", *worker_flags, *FILTERS],
         env={**os.environ, DEVICE_MASK_ENV: devices[g] if devices else str(g),
@@ -1897,7 +1928,7 @@ else:
         if i % nshards == shard:
             _run_task(kind, pname, cfg, rows)
     if _SHARD is not None:  # WORKER: write only this shard, then exit (coordinator merges+plots)
-        _write_rows_csv(os.path.join(_HERE, f"bench_moe.shard{shard}.csv"), rows)
+        _write_rows_csv(os.path.join(_HERE, f"bench_moe{ARGS.suffix or ''}.shard{shard}.csv"), rows)
         sys.exit(0)
 
 
@@ -1913,18 +1944,20 @@ import matplotlib.pyplot as plt  # noqa: E402
 # figure — it is an internal distinction of ours that most baselines do not have.
 ROW_ORDER = ["quantized", "linear quantized", "unquantized"]
 present_rows = [r for r in ROW_ORDER if any(rr == r for rr, *_ in rows)]
+# one column per regime the CSV holds, in decode -> batch -> prefill order
+PLOT_REGIMES = [reg for reg in REGIME_TOKENS if any(reg == r[2] for r in rows)]
 
 # bars must be PHYSICALLY identical across every subplot of every figure: one slot
 # width (sized by the fullest impl set) and one x data-range on every axis (sparse
 # rows centered) — a data-unit width on a stretched sparse axis renders fat bars
 GLOBAL_WIDTH = 0.9 / max(
     (len({i for rr, _, reg, i, *_ in rows if rr == r and reg == reg2})
-     for r in present_rows for reg2 in ("decode", "prefill")),
+     for r in present_rows for reg2 in PLOT_REGIMES),
     default=1,
 )
 GLOBAL_SPAN = max(
     (len({p for rr, p, reg, *_ in rows if rr == r and reg == reg2})
-     for r in present_rows for reg2 in ("decode", "prefill")),
+     for r in present_rows for reg2 in PLOT_REGIMES),
     default=1,
 ) - 1
 
@@ -1951,12 +1984,12 @@ if not REPLOT and _SHARD is None and not _via_coordinator:
 import matplotlib.patches as mpatches  # noqa: E402
 
 # (solid_mode, overlay_mode) per regime
-REGIME_MODES = {"decode": ("cudagraph", "compile"), "prefill": ("eager", None)}
-fig, axes = plt.subplots(max(len(present_rows), 1), 2,
-                         figsize=(18, 4.6 * max(len(present_rows), 1)),
+REGIME_MODES = {"decode": ("cudagraph", "compile"), "batch": ("cudagraph", "compile"), "prefill": ("eager", None)}
+fig, axes = plt.subplots(max(len(present_rows), 1), len(PLOT_REGIMES),
+                         figsize=(9 * len(PLOT_REGIMES), 4.6 * max(len(present_rows), 1)),
                          squeeze=False)
 for ri, row in enumerate(present_rows):
-    for ci, regime in enumerate(("decode", "prefill")):
+    for ci, regime in enumerate(PLOT_REGIMES):
         ax = axes[ri][ci]
         solid_mode, overlay_mode = REGIME_MODES[regime]
         cells = [(p, i, r, par) for (rr, p, reg, i, r, par) in rows
@@ -1995,13 +2028,13 @@ for ri, row in enumerate(present_rows):
                 its eager number. An impl that cannot be graph-captured still HAS a latency,
                 and a red X hides it behind something that reads as total failure."""
                 v = res.get(solid_mode)
-                return v if v is not None else (res.get("eager") if regime == "decode" else None)
+                return v if v is not None else (res.get("eager") if solid_mode == "cudagraph" else None)
 
             group.sort(key=lambda t: (_drawn(t[1]) is None, _drawn(t[1]) or 0.0))
             for slot, (impl, res) in enumerate(group):
                 off = (slot - (len(group) - 1) / 2) * GLOBAL_WIDTH
                 sval = res.get(solid_mode)
-                eager_fb = (res.get("eager") if sval is None and regime == "decode" else None)
+                eager_fb = (res.get("eager") if sval is None and solid_mode == "cudagraph" else None)
                 if sval is not None:
                     ax.bar(gi + off, sval, GLOBAL_WIDTH, color=IMPL_COLORS[impl],
                            label=impl if impl not in labeled else None, zorder=2)
@@ -2040,7 +2073,7 @@ for ri, row in enumerate(present_rows):
         ax.set_xticks(ticks)
         ax.set_xticklabels(ticklabels, fontsize=7)
         ax.set_ylabel("latency (us)")
-        tok = DECODE_TOKENS if regime == "decode" else PREFILL_TOKENS
+        tok = REGIME_TOKENS[regime]
         mode_note = ("solid=cudagraph, hatch=compile-if-faster" if overlay_drawn
                      else (solid_mode if not overlay_mode else "cudagraph"))
         ax.set_title(f"{row} — {regime} (T={tok}; {mode_note})")
