@@ -15,7 +15,7 @@ single self-contained package — the same exercise we apply to
 for the Liger-Kernel project.
 
 Flash Attention is intentionally **not** included here — it lives in
-[`kernels-community/aiter-flash-attn`](https://huggingface.co/kernels-community/aiter-flash-attn)
+[`amd/aiter-flash-attn`](https://huggingface.co/kernels/amd/aiter-flash-attn)
 and is synced separately.
 
 ## What's included
@@ -62,7 +62,7 @@ Some ops also carry per-arch fast paths for `gfx1250` (Gluon) and `gfx1151`.
 import torch
 from kernels import get_kernel
 
-aiter = get_kernel("kernels-community/aiter-kernels")
+aiter = get_kernel("amd/aiter-kernels", version=2)
 
 # Example: rotary
 B, H, S, D = 2, 8, 32, 64

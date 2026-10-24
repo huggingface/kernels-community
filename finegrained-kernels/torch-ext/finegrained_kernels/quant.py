@@ -1204,7 +1204,7 @@ def fp8_act_quant_block_dynamic(
 
 @triton.jit
 def _fp8_act_quant_kernel(
-    x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr, PADDED_BLOCK: tl.constexpr,
+    x_ptr, y_ptr, s_ptr, stride_xm, blocks_per_row, BLOCK_SIZE: tl.constexpr, PADDED_BLOCK: tl.constexpr,
     AMAX_UPPER_BOUND: tl.constexpr = None,
     PDL: tl.constexpr = False,
 ):
@@ -1217,7 +1217,9 @@ def _fp8_act_quant_kernel(
     cols = tl.arange(0, PADDED_BLOCK)
     mask = cols < BLOCK_SIZE
     offs = pid * BLOCK_SIZE + cols
-    x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    # x's rows may sit apart (a row-strided view), so its offsets can pass int32; y and s are written dense
+    x_offs = (pid // blocks_per_row).to(tl.int64) * stride_xm + (pid % blocks_per_row) * BLOCK_SIZE + cols
+    x = tl.load(x_ptr + x_offs, mask=mask, other=0.0).to(tl.float32)
     amax = tl.max(tl.abs(x))
     if AMAX_UPPER_BOUND is not None:
         # the amax is capped, and the values past it saturate
@@ -1361,20 +1363,23 @@ def fp8_act_quant_tensor_wide(
     row_multiple: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """E4M3 + one ``amax / 448`` fp32 scale per ``block_size`` span (``block_size = K``: per
-    token). ``amax_upper_bound`` caps the amax (values past it saturate); ``None`` leaves it
-    uncapped. ``row_multiple`` backs the E4M3 rows with storage rounded up to that many rows
-    (left unwritten), so a TMA box over the padded extent reads in bounds."""
-    assert x.is_contiguous()
+    token). ``x``'s rows may be strided (unit stride within a row). ``amax_upper_bound`` caps the amax (values
+    past it saturate); ``None`` leaves it uncapped. ``row_multiple`` backs the E4M3 rows with storage rounded up
+    to that many rows (left unwritten), so a TMA box over the padded extent reads in bounds."""
+    assert x.stride(-1) == 1, f"x's rows must be contiguous, got strides {tuple(x.stride())}"
     assert x.shape[-1] % block_size == 0
-    y = row_padded_empty(x.numel() // x.shape[-1], x.shape[-1], row_multiple, FP8_DTYPE, x.device).view(x.shape)
+    rows = x.view(-1, x.shape[-1])
+    y = row_padded_empty(rows.shape[0], x.shape[-1], row_multiple, FP8_DTYPE, x.device).view(x.shape)
     grid = (triton.cdiv(x.numel(), block_size),)
     s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
 
     with device_context(x.device):
         compile_time_only_triton_wrap(_fp8_act_quant_kernel)[grid](
-            x,
+            rows,
             y,
             s,
+            rows.stride(0),
+            x.shape[-1] // block_size,
             BLOCK_SIZE=block_size,
             PADDED_BLOCK=triton.next_power_of_2(block_size),
             AMAX_UPPER_BOUND=amax_upper_bound,

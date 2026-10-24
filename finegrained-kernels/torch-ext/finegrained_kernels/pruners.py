@@ -1459,6 +1459,7 @@ def descriptor_box_pruner(k_dim="BLOCK_SIZE_K"):
             if "BDescriptor" in args and args["BDescriptor"] is None:
                 return False
         if c.kwargs.get("A_MEMORY_MODE", "pointer") != "pointer":
+            # an A layout no descriptor can back (see `maybe_descriptor`) leaves the pointer arm
             if "ADescriptor" in args and args["ADescriptor"] is None:
                 return False
             # descriptor A, both arms tuner-routed per the tokens-per-expert key:

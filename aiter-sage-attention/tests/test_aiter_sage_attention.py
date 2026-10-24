@@ -3,7 +3,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-sage = kernels.get_kernel("kernels-community/aiter-sage-attention", version=1)
+sage = kernels.get_kernel("amd/aiter-sage-attention", version=1)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()

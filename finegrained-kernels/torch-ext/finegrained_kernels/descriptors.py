@@ -34,11 +34,17 @@ def rebind_operand_box(nargs, mode_key, desc_key, rows, cols):
 
 def maybe_descriptor(t: torch.Tensor, box: list[int]) -> TensorDescriptor | None:
     """A host-TMA descriptor over ``t``, or None when the layout cannot back one — a TMA box
-    needs a 16-byte-aligned base and unit-stride innermost dim, which a transposed view (as a
-    backward pass hands in to contract over the other axis) does not have. ``None`` is the same
-    signal the pointer arms already take for an unused descriptor; ``descriptor_box_pruner`` drops
-    the configs that would read it, leaving the stride-general pointer arms."""
-    if t is None or (t.ndim >= 2 and t.stride(-1) != 1) or (t.storage_offset() * t.element_size()) % 16:
+    needs a unit-stride innermost dim, which a transposed view (as a backward pass hands in to
+    contract over the other axis) does not have, and its base and other strides on the 16-byte
+    grid, which a row-strided view (e.g. one position per sequence) may not have. ``None`` is the same
+    signal the pointer arms already take for an unused descriptor, and ``descriptor_box_pruner``
+    drops the configs that would read it, so the tuner is left with the pointer arms the kernel
+    serves stride-generally."""
+    if t is None or (t.ndim >= 2 and t.stride(-1) != 1):
+        return None
+    # the allocator aligns storage, so a view's base is aligned when its offset is (fake tensors have no data pointer)
+    offsets = (t.storage_offset(), *t.stride()[:-1])
+    if any(offset * t.element_size() % 16 for offset in offsets):
         return None
     return TensorDescriptor.from_tensor(t, box)
 

@@ -58,6 +58,25 @@ or merging old CSVs without matching cache metadata requires rerunning the bench
 retains its existing backend timing behavior and is labeled `backend_default`, not CUDA cold.
 The committed figure uses this cold-weight policy.
 
+On CUDA, every mode cycles through banks whose **active** weights exceed **twice the device's
+L2 cache**. For MoE, active bytes count only the routed experts, including weight scales, and
+a bank swaps the routed experts with unrouted ones of the same stack (routing logits permuted
+alike), so every arm keeps one checkpoint; a stack too small for disjoint expert sets rotates
+copies instead. Dense layers count the whole matrix and rotate copies. Each bank has
+independent copies of the inputs, so compilation cannot share activation quantization or
+routing across invocations. The timed callback returns every bank's output;
+reported latency is its elapsed time divided by the bank count. Reuse inside one forward is
+preserved. Prepared weight views and scales keep static addresses so compiled replay does not
+warm them with staging copies. No cache-flush kernel or profiler time is included in graph latency.
+Under eager timing, consecutive banks also overlap one launch's host overhead with the previous
+bank's GPU work, so eager latency is a steady-state per-call figure, not a cold single call.
+
+CSV rows record `cache_policy`; logs show bank counts, active bytes and checkpoint
+storage. Insufficient memory fails explicitly; it never falls back to warm weights. Replotting
+or merging old CSVs without matching cache metadata requires rerunning the benchmark. XPU
+retains its existing backend timing behavior and is labeled `backend_default`, not CUDA cold.
+Previously generated figures used warm CUDA graph timing; regenerate them for cold-weight comparisons.
+
 ## The pre-swizzled fast path
 
 By default the finegrained-kernels arm feeds **pre-swizzled** (`SWIZZLE_32_4_4`) MX weight scales,

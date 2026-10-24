@@ -13,7 +13,7 @@ import torch
 if torch.version.hip is None or not torch.cuda.is_available():
     pytest.skip("AITER kernels need a ROCm GPU", allow_module_level=True)
 
-aiter_flash_attn = kernels.get_kernel("kernels-community/aiter-flash-attn", version=2)
+aiter_flash_attn = kernels.get_kernel("amd/aiter-flash-attn", version=2)
 
 
 def _sdpa_reference(q, k, v, causal=False, scale=None, window_size=(-1, -1), sink=None):

@@ -7,7 +7,7 @@
 
 import torch
 
-from ...modules.l2norm import l2norm_bwd, l2norm_fwd
+from ...modules.norm.l2norm import l2norm_bwd, l2norm_fwd
 from ...ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
 from ...ops.common.chunk_o import chunk_bwd_dqkwg, chunk_bwd_dv_local, chunk_fwd_o
 from ...ops.delta_rule.wy_fast import prepare_wy_repr_bwd, prepare_wy_repr_fwd, recompute_w_u_fwd
@@ -275,7 +275,7 @@ def chunk_delta_rule(
         >>> import torch
         >>> import torch.nn.functional as F
         >>> from einops import rearrange
-        >>> from ...ops.delta_rule import chunk_delta_rule
+        >>> from fla.ops.delta_rule import chunk_delta_rule
         # inputs with equal lengths
         >>> B, T, H, K, V = 4, 2048, 4, 512, 512
         >>> q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device='cuda')
