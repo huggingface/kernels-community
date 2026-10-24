@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import filecmp
+import hashlib
 import os
 import re
 import shlex
@@ -12,6 +13,9 @@ from pathlib import Path
 # Extract source arguments; kernel-port validates them.
 SOURCE_RE = re.compile(
     r"^source\b(?P<body>(?:[^\n\\]|\\\s*\n)*)", re.MULTILINE
+)
+VENDOR_RE = re.compile(
+    r"^vendor\b(?P<body>(?:[^\n\\]|\\\s*\n)*)", re.MULTILINE
 )
 ARG_RE = re.compile(r'(\w+)="([^"]*)"')
 
@@ -66,11 +70,34 @@ def checkout(repo: str, commit: str, dest: Path) -> None:
     subprocess.run(["git", "-C", str(dest), "checkout", "--quiet", commit], check=True)
 
 
+def parse_vendors(recipe: Path) -> list:
+    vendors = []
+    for match in VENDOR_RE.finditer(recipe.read_text()):
+        args = dict(ARG_RE.findall(match.group("body").replace("\\\n", " ")))
+        try:
+            vendors.append((args["name"], args["repo"], args["commit"]))
+        except KeyError as exc:
+            raise SystemExit(f"{recipe}: vendor is missing {exc}") from exc
+    return vendors
+
+
+def source_checkout(repo: str, commit: str, workdir: Path) -> Path:
+    # Include the repository as well as the revision in the cache key.
+    key = hashlib.sha256(f"{repo}\n{commit}".encode()).hexdigest()
+    src = workdir / f"upstream-{key}"
+    if not src.exists():
+        checkout(repo, commit, src)
+    return src
+
+
 def tree_files(root: Path) -> set:
     return {
         p.relative_to(root).as_posix()
         for p in root.rglob("*")
-        if p.is_file() and "__pycache__" not in p.parts
+        if p.is_file()
+        and not any(part in {"__pycache__", ".pytest_cache", ".ruff_cache"}
+                    for part in p.relative_to(root).parts)
+        and p.suffix != ".pyc"
     }
 
 
@@ -93,20 +120,22 @@ def check(kernel: str, root: Path, workdir: Path) -> list:
     print(f"  {kernel}: {repo} @ {commit[:12]}")
 
     # Reuse checkouts for kernels sharing an upstream commit.
-    src = workdir / f"upstream-{commit[:12]}"
-    if not src.exists():
-        checkout(repo, commit, src)
+    src = source_checkout(repo, commit, workdir)
+    vendors = []
+    for name, vendor_repo, vendor_commit in parse_vendors(recipe):
+        vendor_src = source_checkout(vendor_repo, vendor_commit, workdir)
+        vendors.extend(["--vendor", f"{name}={vendor_src}"])
 
     out = workdir / f"out-{kernel}"
     shutil.rmtree(out, ignore_errors=True)
     proc = subprocess.run(
-        [*runner_cmd(), str(recipe), "--dir", str(src), "--out", str(out)],
+        [*runner_cmd(), str(recipe), "--dir", str(src), *vendors, "--out", str(out)],
         capture_output=True,
         text=True,
     )
     if proc.returncode != 0:
         tail = (proc.stderr or proc.stdout).strip().splitlines()[-8:]
-        return [f"kernel-port failed:\n    " + "\n    ".join(tail)]
+        return ["kernel-port failed:\n    " + "\n    ".join(tail)]
 
     return compare(out, root / kernel / "src")
 
@@ -149,8 +178,10 @@ def main() -> int:
                 print(f"    - {p}", file=sys.stderr)
         print(
             "\nRegenerate with:\n"
-            "  kernel-port <kernel>/port/port.kdl --dir <upstream> --out <kernel>/src\n"
-            "If an overlay file went stale, refresh it from <kernel>/src first.\n"
+            "  kernel-port <kernel>/port/port.kdl --dir <upstream> "
+            "[--vendor name=<checkout> ...] --out <temporary-output>\n"
+            "Compare with <kernel>/src.\n"
+            "See the kernel's port documentation for regeneration instructions.\n"
             "If only port-provenance.json differs, the recipe changed and the\n"
             "port was not rerun.",
             file=sys.stderr,
