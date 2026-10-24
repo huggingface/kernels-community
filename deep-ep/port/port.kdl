@@ -1,0 +1,1365 @@
+recipe version=1
+
+// DeepEP 2.5.0 and its exact DeepJIT dependency.
+source repo="https://github.com/deepseek-ai/DeepEP.git" commit="def865146e95aa9ea223e277c0a8a4c6b81e5ac7"
+prune keep=".clang-format,.editorconfig,.gitignore,.gitmodules,.github/workflows/format.yml,third-party/tilelang_ops/**,LICENSE,README.md,format.sh,requirements-lint.txt,csrc/**,deep_ep/**,tests/**,figures/**"
+// Retain the upstream layout, and derive the Hub Python package from the same pin.
+vendor name="python" repo="https://github.com/deepseek-ai/DeepEP.git" commit="def865146e95aa9ea223e277c0a8a4c6b81e5ac7" path="deep_ep" to="torch-ext/deep_ep"
+vendor name="deepjit" repo="https://github.com/deepseek-ai/DeepJIT.git" commit="cba802df081985141eeee36803685775c183a047" path="." to="third-party/deep_jit"
+
+// Header-only NCCL dependency; reproduce the public headers from pinned source.
+vendor name="nccl" repo="https://github.com/NVIDIA/nccl.git" commit="12df1a11afad322be5a204a2db890161cbf8131d" path="." to="third-party/nccl-source"
+move from="third-party/nccl-source/src/nccl.h.in" to="third-party/nccl/include/nccl.h"
+move from="third-party/nccl-source/src/include/nccl_device.h" to="third-party/nccl/include/nccl_device.h"
+move from="third-party/nccl-source/src/include/nccl_device" to="third-party/nccl/include/nccl_device"
+move from="third-party/nccl-source/bindings/ir/nccl_device_wrapper.h" to="third-party/nccl/include/nccl_device_wrapper.h"
+move from="third-party/nccl-source/LICENSE.txt" to="third-party/nccl/LICENSE.txt"
+move from="third-party/nccl-source/src/transport/net_ib/gdaki/doca-gpunetio/include/common" to="third-party/nccl/include/nccl_device/gin/gdaki/doca_gpunetio/common"
+move from="third-party/nccl-source/src/transport/net_ib/gdaki/doca-gpunetio/include/device" to="third-party/nccl/include/nccl_device/gin/gdaki/doca_gpunetio/device"
+move from="third-party/nccl-source/src/transport/net_ib/gdaki/doca-gpunetio/include/doca_gpunetio_device.h" to="third-party/nccl/include/nccl_device/gin/gdaki/doca_gpunetio/doca_gpunetio_device.h"
+move from="third-party/nccl-source/src/transport/net_efa_gda/efa-dp-direct/include/common" to="third-party/nccl/include/nccl_device/transport/net_efa_gda/efa-dp-direct/include/common"
+move from="third-party/nccl-source/src/transport/net_efa_gda/efa-dp-direct/include/device" to="third-party/nccl/include/nccl_device/transport/net_efa_gda/efa-dp-direct/include/device"
+delete in="third-party/nccl/include/nccl_device/README.md"
+replace in="third-party/nccl/include/nccl.h" find="${nccl:Major}" with="2" count=1
+replace in="third-party/nccl/include/nccl.h" find="${nccl:Minor}" with="32" count=1
+replace in="third-party/nccl/include/nccl.h" find="${nccl:Patch}" with="3" count=1
+replace in="third-party/nccl/include/nccl.h" find="${nccl:Suffix}" with="" count=1
+replace in="third-party/nccl/include/nccl.h" find="${nccl:Version}" with="23203" count=1
+
+prune keep=".clang-format,.editorconfig,.gitignore,.gitmodules,.github/workflows/format.yml,third-party/tilelang_ops/**,LICENSE,README.md,format.sh,requirements-lint.txt,csrc/**,deep_ep/**,tests/**,figures/**,torch-ext/**,third-party/deep_jit/**,third-party/nccl/include/**,third-party/nccl/LICENSE.txt"
+
+// The Hub loader imports under a generated module name.
+convert_import in="torch-ext/deep_ep/**/*.py" prefix="deep_ep" changes=10
+relativize_imports in="torch-ext/deep_ep/**/*.py" package_root="torch-ext/deep_ep" changes=13
+
+
+// Guard every change to upstream code; do not hide vendored edits in overlays.
+
+// csrc/buffers/base.hpp
+replace in="csrc/buffers/base.hpp" count=1 \
+    find=#"""
+namespace deep_ep::base {
+
+static void register_apis(pybind11::module_& m) {
+    pybind11::class_<BufferBase>(m, "BufferBase")
+
+"""# \
+    with=#"""
+namespace deep_ep::base {
+
+#ifndef DEEP_EP_KERNELS
+static void register_apis(pybind11::module_& m) {
+    pybind11::class_<BufferBase>(m, "BufferBase")
+
+"""#
+replace in="csrc/buffers/base.hpp" count=1 \
+    find=#"""
+        .def("destroy", &BufferBase::destroy);
+}
+
+}  // namespace deep_ep::base
+
+"""# \
+    with=#"""
+        .def("destroy", &BufferBase::destroy);
+}
+#endif
+
+}  // namespace deep_ep::base
+
+"""#
+
+// csrc/buffers/bucket.hpp
+replace in="csrc/buffers/bucket.hpp" count=1 \
+    find=#"""
+};
+
+static void register_apis(pybind11::module_& m) {
+    pybind11::class_<BucketBuffer, BufferBase>(m, "BucketBuffer")
+
+"""# \
+    with=#"""
+};
+
+#ifndef DEEP_EP_KERNELS
+static void register_apis(pybind11::module_& m) {
+    pybind11::class_<BucketBuffer, BufferBase>(m, "BucketBuffer")
+
+"""#
+replace in="csrc/buffers/bucket.hpp" count=1 \
+    find=#"""
+             py::arg("num_sms") = 0);
+}
+
+}  // namespace deep_ep::bucket
+
+"""# \
+    with=#"""
+             py::arg("num_sms") = 0);
+}
+#endif
+
+}  // namespace deep_ep::bucket
+
+"""#
+
+// csrc/buffers/engram.hpp
+replace in="csrc/buffers/engram.hpp" count=1 \
+    find=#"""
+};
+
+static void register_apis(pybind11::module_& m) {
+    pybind11::class_<EngramBuffer, BufferBase>(m, "EngramBuffer")
+
+"""# \
+    with=#"""
+};
+
+#ifndef DEEP_EP_KERNELS
+static void register_apis(pybind11::module_& m) {
+    pybind11::class_<EngramBuffer, BufferBase>(m, "EngramBuffer")
+
+"""#
+replace in="csrc/buffers/engram.hpp" count=1 \
+    find=#"""
+        .def_static("get_theoretical_config", &EngramBuffer::get_theoretical_config);
+}
+
+}  // namespace deep_ep::engram
+
+"""# \
+    with=#"""
+        .def_static("get_theoretical_config", &EngramBuffer::get_theoretical_config);
+}
+#endif
+
+}  // namespace deep_ep::engram
+
+"""#
+
+// csrc/buffers/ep.hpp
+replace in="csrc/buffers/ep.hpp" count=1 \
+    find=#"""
+};
+
+static void register_apis(pybind11::module_& m) {
+    pybind11::class_<EPBuffer, BufferBase>(m, "EPBuffer")
+
+"""# \
+    with=#"""
+};
+
+#ifndef DEEP_EP_KERNELS
+static void register_apis(pybind11::module_& m) {
+    pybind11::class_<EPBuffer, BufferBase>(m, "EPBuffer")
+
+"""#
+replace in="csrc/buffers/ep.hpp" count=1 \
+    find=#"""
+
+}
+
+}  // namespace deep_ep::ep
+
+"""# \
+    with=#"""
+
+}
+#endif
+
+}  // namespace deep_ep::ep
+
+"""#
+
+// csrc/buffers/pp.hpp
+replace in="csrc/buffers/pp.hpp" count=1 \
+    find=#"""
+};
+
+static void register_apis(pybind11::module_& m) {
+    pybind11::class_<PPBuffer, BufferBase>(m, "PPBuffer")
+
+"""# \
+    with=#"""
+};
+
+#ifndef DEEP_EP_KERNELS
+static void register_apis(pybind11::module_& m) {
+    pybind11::class_<PPBuffer, BufferBase>(m, "PPBuffer")
+
+"""#
+replace in="csrc/buffers/pp.hpp" count=1 \
+    find=#"""
+             py::arg("num_sms") = 0);
+}
+
+}  // namespace deep_ep::pp
+
+"""# \
+    with=#"""
+             py::arg("num_sms") = 0);
+}
+#endif
+
+}  // namespace deep_ep::pp
+
+"""#
+
+// csrc/comm/handle.hpp
+replace in="csrc/comm/handle.hpp" count=1 \
+    find=#"""
+namespace deep_ep::comm {
+
+static void register_apis(pybind11::module_& m) {
+    pybind11::class_<Context, std::shared_ptr<Context>>(m, "Context")
+
+"""# \
+    with=#"""
+namespace deep_ep::comm {
+
+#ifndef DEEP_EP_KERNELS
+static void register_apis(pybind11::module_& m) {
+    pybind11::class_<Context, std::shared_ptr<Context>>(m, "Context")
+
+"""#
+replace in="csrc/comm/handle.hpp" count=1 \
+    find=#"""
+    m.def("get_comm_stream", []() -> torch::Stream { return get_comm_stream(); });
+}
+
+}  // namespace deep_ep::comm
+
+"""# \
+    with=#"""
+    m.def("get_comm_stream", []() -> torch::Stream { return get_comm_stream(); });
+}
+#endif
+
+}  // namespace deep_ep::comm
+
+"""#
+
+// csrc/kernels/comm/symmetric.hpp
+replace in="csrc/kernels/comm/symmetric.hpp" count=1 \
+    find=#"""
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <deep_ep/common/compiled.cuh>
+#include <deep_ep/common/exception.cuh>
+
+"""# \
+    with=#"""
+#include <unistd.h>
+#include <sys/syscall.h>
+#ifdef DEEP_EP_KERNELS
+// kernels-community: the manylinux_2_28 kernel headers predate pidfd (Linux 5.3/5.6), whose
+// syscall numbers are the same on all architectures
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
+#ifndef SYS_pidfd_getfd
+#define SYS_pidfd_getfd 438
+#endif
+#endif
+#include <deep_ep/common/compiled.cuh>
+#include <deep_ep/common/exception.cuh>
+
+"""#
+
+// csrc/runtime/jit.hpp
+replace in="csrc/runtime/jit.hpp" count=1 \
+    find=#"""
+#include <deep_ep/common/compiled.cuh>
+#include <deep_jit/backend/cuda/backend.hpp>
+#include <deep_jit/python_api.hpp>
+
+#include "../utils/system.hpp"
+
+"""# \
+    with=#"""
+#include <deep_ep/common/compiled.cuh>
+#include <deep_jit/backend/cuda/backend.hpp>
+#ifndef DEEP_EP_KERNELS
+#include <deep_jit/python_api.hpp>
+#endif
+
+#include "../utils/system.hpp"
+
+"""#
+replace in="csrc/runtime/jit.hpp" count=1 \
+    find=#"""
+}
+
+inline void register_apis(pybind11::module_& module) {
+    deep_jit::register_python_api(module, jit);
+    module.def("init_jit", &init_jit);
+}
+
+}  // namespace deep_ep
+
+"""# \
+    with=#"""
+}
+
+#ifndef DEEP_EP_KERNELS
+inline void register_apis(pybind11::module_& module) {
+    deep_jit::register_python_api(module, jit);
+    module.def("init_jit", &init_jit);
+}
+#endif
+
+}  // namespace deep_ep
+
+"""#
+
+// csrc/utils/event.hpp
+replace in="csrc/utils/event.hpp" count=1 \
+    find=#"""
+};
+
+static void register_event_apis(pybind11::module_& m) {
+    pybind11::class_<EventHandle>(m, "EventHandle")
+
+"""# \
+    with=#"""
+};
+
+#ifndef DEEP_EP_KERNELS
+static void register_event_apis(pybind11::module_& m) {
+    pybind11::class_<EventHandle>(m, "EventHandle")
+
+"""#
+replace in="csrc/utils/event.hpp" count=1 \
+    find=#"""
+        .def("current_stream_wait", &EventHandle::current_stream_wait);
+}
+
+}  // namespace deep_ep
+
+"""# \
+    with=#"""
+        .def("current_stream_wait", &EventHandle::current_stream_wait);
+}
+#endif
+
+}  // namespace deep_ep
+
+"""#
+
+// tests/bucket/test_all_gather.py
+replace in="tests/bucket/test_all_gather.py" count=1 \
+    find=#"""
+import os
+
+
+"""# \
+    with=#"""
+import importlib
+import os
+
+
+"""#
+replace in="tests/bucket/test_all_gather.py" count=1 \
+    find=#"""
+
+import argparse
+import torch
+import torch.distributed as dist
+
+import deep_ep
+from deep_ep.utils.envs import dist_print, init_dist
+from deep_ep.utils.testing import bench, bench_kineto, parse_num_bytes
+
+
+
+"""# \
+    with=#"""
+
+import argparse
+import kernels
+import torch
+import torch.distributed as dist
+
+deep_ep = kernels.get_kernel("kernels-community/deep-ep", version=1)
+deep_ep_envs = importlib.import_module(f"{deep_ep.__name__}.utils.envs")
+deep_ep_testing = importlib.import_module(f"{deep_ep.__name__}.utils.testing")
+dist_print, init_dist = deep_ep_envs.dist_print, deep_ep_envs.init_dist
+bench, bench_kineto = deep_ep_testing.bench, deep_ep_testing.bench_kineto
+parse_num_bytes = deep_ep_testing.parse_num_bytes
+
+
+
+"""#
+
+// tests/bucket/test_all_reduce.py
+replace in="tests/bucket/test_all_reduce.py" count=1 \
+    find=#"""
+import os
+
+
+"""# \
+    with=#"""
+import importlib
+import os
+
+
+"""#
+replace in="tests/bucket/test_all_reduce.py" count=1 \
+    find=#"""
+
+import argparse
+import torch
+import torch.distributed as dist
+
+import deep_ep
+from deep_ep.utils.envs import dist_print, init_dist
+from deep_ep.utils.testing import bench_kineto, parse_num_bytes
+from deep_ep.utils.math import calc_diff
+
+
+
+"""# \
+    with=#"""
+
+import argparse
+import kernels
+import torch
+import torch.distributed as dist
+
+deep_ep = kernels.get_kernel("kernels-community/deep-ep", version=1)
+deep_ep_envs = importlib.import_module(f"{deep_ep.__name__}.utils.envs")
+dist_print = deep_ep_envs.dist_print
+init_dist = deep_ep_envs.init_dist
+deep_ep_testing = importlib.import_module(f"{deep_ep.__name__}.utils.testing")
+bench_kineto = deep_ep_testing.bench_kineto
+parse_num_bytes = deep_ep_testing.parse_num_bytes
+deep_ep_math = importlib.import_module(f"{deep_ep.__name__}.utils.math")
+calc_diff = deep_ep_math.calc_diff
+
+
+
+"""#
+
+// tests/bucket/test_mixed.py
+replace in="tests/bucket/test_mixed.py" count=1 \
+    find=#"""
+import os
+
+
+"""# \
+    with=#"""
+import importlib
+import os
+
+
+"""#
+replace in="tests/bucket/test_mixed.py" count=1 \
+    find=#"""
+from typing import List, Tuple
+
+import torch
+import torch.distributed as dist
+
+import deep_ep
+from deep_ep.utils.envs import dist_print, init_dist
+from deep_ep.utils.math import align
+from deep_ep.utils.testing import parse_num_bytes
+
+OPS = ('all_reduce', 'reduce_scatter', 'all_gather', 'rs_ag')
+
+"""# \
+    with=#"""
+from typing import List, Tuple
+
+import kernels
+import torch
+import torch.distributed as dist
+
+deep_ep = kernels.get_kernel("kernels-community/deep-ep", version=1)
+deep_ep_envs = importlib.import_module(f"{deep_ep.__name__}.utils.envs")
+dist_print = deep_ep_envs.dist_print
+init_dist = deep_ep_envs.init_dist
+deep_ep_math = importlib.import_module(f"{deep_ep.__name__}.utils.math")
+align = deep_ep_math.align
+deep_ep_testing = importlib.import_module(f"{deep_ep.__name__}.utils.testing")
+parse_num_bytes = deep_ep_testing.parse_num_bytes
+
+OPS = ('all_reduce', 'reduce_scatter', 'all_gather', 'rs_ag')
+
+"""#
+
+// tests/bucket/test_perf.py
+replace in="tests/bucket/test_perf.py" count=1 \
+    find=#"""
+import os
+
+
+"""# \
+    with=#"""
+import importlib
+import os
+
+
+"""#
+replace in="tests/bucket/test_perf.py" count=1 \
+    find=#"""
+from typing import Any, Callable, List, Optional
+
+import torch
+import torch.distributed as dist
+
+import deep_ep
+from deep_ep.utils.envs import dist_print, init_dist
+from deep_ep.utils.math import align
+from deep_ep.utils.testing import parse_num_bytes
+
+OPS = ('all_reduce', 'reduce_scatter', 'all_gather')
+
+"""# \
+    with=#"""
+from typing import Any, Callable, List, Optional
+
+import kernels
+import torch
+import torch.distributed as dist
+
+deep_ep = kernels.get_kernel("kernels-community/deep-ep", version=1)
+deep_ep_envs = importlib.import_module(f"{deep_ep.__name__}.utils.envs")
+dist_print = deep_ep_envs.dist_print
+init_dist = deep_ep_envs.init_dist
+deep_ep_math = importlib.import_module(f"{deep_ep.__name__}.utils.math")
+align = deep_ep_math.align
+deep_ep_testing = importlib.import_module(f"{deep_ep.__name__}.utils.testing")
+parse_num_bytes = deep_ep_testing.parse_num_bytes
+
+OPS = ('all_reduce', 'reduce_scatter', 'all_gather')
+
+"""#
+
+// tests/bucket/test_reduce_scatter.py
+replace in="tests/bucket/test_reduce_scatter.py" count=1 \
+    find=#"""
+import os
+import sys
+
+"""# \
+    with=#"""
+import importlib
+import os
+import sys
+
+"""#
+replace in="tests/bucket/test_reduce_scatter.py" count=1 \
+    find=#"""
+
+import argparse
+import torch
+import torch.distributed as dist
+
+import deep_ep
+from deep_ep.utils.envs import dist_print, init_dist
+from deep_ep.utils.math import align
+from deep_ep.utils.testing import bench_kineto, parse_num_bytes
+
+
+
+"""# \
+    with=#"""
+
+import argparse
+import kernels
+import torch
+import torch.distributed as dist
+
+deep_ep = kernels.get_kernel("kernels-community/deep-ep", version=1)
+deep_ep_envs = importlib.import_module(f"{deep_ep.__name__}.utils.envs")
+dist_print = deep_ep_envs.dist_print
+init_dist = deep_ep_envs.init_dist
+deep_ep_math = importlib.import_module(f"{deep_ep.__name__}.utils.math")
+align = deep_ep_math.align
+deep_ep_testing = importlib.import_module(f"{deep_ep.__name__}.utils.testing")
+bench_kineto = deep_ep_testing.bench_kineto
+parse_num_bytes = deep_ep_testing.parse_num_bytes
+
+
+
+"""#
+
+// tests/bucket/test_session.py
+replace in="tests/bucket/test_session.py" count=1 \
+    find=#"""
+import os
+
+
+"""# \
+    with=#"""
+import importlib
+import os
+
+
+"""#
+replace in="tests/bucket/test_session.py" count=1 \
+    find=#"""
+
+import argparse
+import torch
+import torch.distributed as dist
+
+import deep_ep
+from deep_ep.utils.envs import dist_print, init_dist
+from deep_ep.utils.math import align
+from deep_ep.utils.testing import parse_num_bytes
+
+
+
+"""# \
+    with=#"""
+
+import argparse
+import kernels
+import torch
+import torch.distributed as dist
+
+deep_ep = kernels.get_kernel("kernels-community/deep-ep", version=1)
+deep_ep_envs = importlib.import_module(f"{deep_ep.__name__}.utils.envs")
+dist_print = deep_ep_envs.dist_print
+init_dist = deep_ep_envs.init_dist
+deep_ep_math = importlib.import_module(f"{deep_ep.__name__}.utils.math")
+align = deep_ep_math.align
+deep_ep_testing = importlib.import_module(f"{deep_ep.__name__}.utils.testing")
+parse_num_bytes = deep_ep_testing.parse_num_bytes
+
+
+
+"""#
+
+// tests/buffer/test_allocation.py
+replace in="tests/buffer/test_allocation.py" count=1 \
+    find=#"""
+import argparse
+
+import torch
+import torch.distributed as dist
+
+import deep_ep
+from deep_ep.utils.envs import dist_print, init_dist
+
+
+
+"""# \
+    with=#"""
+import importlib
+import argparse
+
+import kernels
+import torch
+import torch.distributed as dist
+
+deep_ep = kernels.get_kernel("kernels-community/deep-ep", version=1)
+deep_ep_envs = importlib.import_module(f"{deep_ep.__name__}.utils.envs")
+dist_print = deep_ep_envs.dist_print
+init_dist = deep_ep_envs.init_dist
+
+
+
+"""#
+
+// tests/comm/test_barrier.py
+replace in="tests/comm/test_barrier.py" count=1 \
+    find=#"""
+import argparse
+import torch
+import torch.distributed as dist
+
+import deep_ep
+from deep_ep.utils.envs import init_dist, dist_print
+from deep_ep.utils.testing import bench_kineto
+
+
+
+"""# \
+    with=#"""
+import importlib
+import argparse
+import kernels
+import torch
+import torch.distributed as dist
+
+deep_ep = kernels.get_kernel("kernels-community/deep-ep", version=1)
+deep_ep_envs = importlib.import_module(f"{deep_ep.__name__}.utils.envs")
+init_dist = deep_ep_envs.init_dist
+dist_print = deep_ep_envs.dist_print
+deep_ep_testing = importlib.import_module(f"{deep_ep.__name__}.utils.testing")
+bench_kineto = deep_ep_testing.bench_kineto
+
+
+
+"""#
+
+// tests/engram/test_engram.py
+replace in="tests/engram/test_engram.py" count=1 \
+    find=#"""
+import argparse
+import os
+import torch
+import torch.distributed as dist
+
+import deep_ep
+from deep_ep.utils.envs import init_dist, dist_print
+from deep_ep.utils.math import ceil_div, per_token_cast_to_fp8
+from deep_ep.utils.testing import bench_kineto
+
+
+
+"""# \
+    with=#"""
+import importlib
+import argparse
+import os
+import kernels
+import torch
+import torch.distributed as dist
+
+deep_ep = kernels.get_kernel("kernels-community/deep-ep", version=1)
+deep_ep_envs = importlib.import_module(f"{deep_ep.__name__}.utils.envs")
+init_dist = deep_ep_envs.init_dist
+dist_print = deep_ep_envs.dist_print
+deep_ep_math = importlib.import_module(f"{deep_ep.__name__}.utils.math")
+ceil_div = deep_ep_math.ceil_div
+per_token_cast_to_fp8 = deep_ep_math.per_token_cast_to_fp8
+deep_ep_testing = importlib.import_module(f"{deep_ep.__name__}.utils.testing")
+bench_kineto = deep_ep_testing.bench_kineto
+
+
+
+"""#
+
+// tests/ep/test_ep.py
+replace in="tests/ep/test_ep.py" count=1 \
+    find=#"""
+import argparse
+import os
+import torch
+import torch.distributed as dist
+from typing import Union, Tuple, Optional
+
+import deep_ep
+from deep_ep.utils.math import (
+    align, count_bytes, calc_diff,
+    per_token_cast_back, per_token_cast_to_fp8,
+    safe_div
+)
+from deep_ep.utils.gate import get_unbalanced_scores
+from deep_ep.utils.envs import init_dist, init_seed, dist_print
+from deep_ep.utils.refs import dispatch as ref_dispatch
+from deep_ep.utils.refs import combine as ref_combine
+from deep_ep.utils.refs import generate_pre_combine_data, ordered_accumulate
+from deep_ep.utils.testing import bench_kineto
+
+
+
+"""# \
+    with=#"""
+import importlib
+import argparse
+import os
+import kernels
+import torch
+import torch.distributed as dist
+from typing import Union, Tuple, Optional
+
+deep_ep = kernels.get_kernel("kernels-community/deep-ep", version=1)
+deep_ep_math = importlib.import_module(f"{deep_ep.__name__}.utils.math")
+align = deep_ep_math.align
+count_bytes = deep_ep_math.count_bytes
+calc_diff = deep_ep_math.calc_diff
+per_token_cast_back = deep_ep_math.per_token_cast_back
+per_token_cast_to_fp8 = deep_ep_math.per_token_cast_to_fp8
+safe_div = deep_ep_math.safe_div
+deep_ep_gate = importlib.import_module(f"{deep_ep.__name__}.utils.gate")
+get_unbalanced_scores = deep_ep_gate.get_unbalanced_scores
+deep_ep_envs = importlib.import_module(f"{deep_ep.__name__}.utils.envs")
+init_dist = deep_ep_envs.init_dist
+init_seed = deep_ep_envs.init_seed
+dist_print = deep_ep_envs.dist_print
+deep_ep_refs = importlib.import_module(f"{deep_ep.__name__}.utils.refs")
+ref_dispatch = deep_ep_refs.dispatch
+ref_combine = deep_ep_refs.combine
+generate_pre_combine_data = deep_ep_refs.generate_pre_combine_data
+ordered_accumulate = deep_ep_refs.ordered_accumulate
+deep_ep_testing = importlib.import_module(f"{deep_ep.__name__}.utils.testing")
+bench_kineto = deep_ep_testing.bench_kineto
+
+
+
+"""#
+
+// tests/ep/test_prefetch_weights.py
+replace in="tests/ep/test_prefetch_weights.py" count=1 \
+    find=#"""
+import os
+
+
+"""# \
+    with=#"""
+import importlib
+import os
+
+
+"""#
+replace in="tests/ep/test_prefetch_weights.py" count=1 \
+    find=#"""
+
+import argparse
+import torch
+import torch.distributed as dist
+
+import deep_ep
+from deep_ep.utils.envs import dist_print, get_nvlink_gbs, get_physical_domain_size, init_dist
+from deep_ep.utils.testing import bench, parse_num_bytes
+
+# Written into every redundant expert slot before a push. Slots whose expert index is `-1`
+
+"""# \
+    with=#"""
+
+import argparse
+import kernels
+import torch
+import torch.distributed as dist
+
+deep_ep = kernels.get_kernel("kernels-community/deep-ep", version=1)
+deep_ep_envs = importlib.import_module(f"{deep_ep.__name__}.utils.envs")
+dist_print = deep_ep_envs.dist_print
+get_nvlink_gbs = deep_ep_envs.get_nvlink_gbs
+get_physical_domain_size = deep_ep_envs.get_physical_domain_size
+init_dist = deep_ep_envs.init_dist
+deep_ep_testing = importlib.import_module(f"{deep_ep.__name__}.utils.testing")
+bench = deep_ep_testing.bench
+parse_num_bytes = deep_ep_testing.parse_num_bytes
+
+# Written into every redundant expert slot before a push. Slots whose expert index is `-1`
+
+"""#
+
+// tests/ep/test_reduce_grads.py
+replace in="tests/ep/test_reduce_grads.py" count=1 \
+    find=#"""
+import os
+
+
+"""# \
+    with=#"""
+import importlib
+import os
+
+
+"""#
+replace in="tests/ep/test_reduce_grads.py" count=1 \
+    find=#"""
+
+import argparse
+import torch
+import torch.distributed as dist
+
+import deep_ep
+from deep_ep.utils.envs import dist_print, get_nvlink_gbs, get_physical_domain_size, init_dist
+from deep_ep.utils.testing import bench, parse_num_bytes
+
+# Period of `make_pattern`'s ramp, chosen so adjacent 12 KiB chunks have different contents
+
+"""# \
+    with=#"""
+
+import argparse
+import kernels
+import torch
+import torch.distributed as dist
+
+deep_ep = kernels.get_kernel("kernels-community/deep-ep", version=1)
+deep_ep_envs = importlib.import_module(f"{deep_ep.__name__}.utils.envs")
+dist_print = deep_ep_envs.dist_print
+get_nvlink_gbs = deep_ep_envs.get_nvlink_gbs
+get_physical_domain_size = deep_ep_envs.get_physical_domain_size
+init_dist = deep_ep_envs.init_dist
+deep_ep_testing = importlib.import_module(f"{deep_ep.__name__}.utils.testing")
+bench = deep_ep_testing.bench
+parse_num_bytes = deep_ep_testing.parse_num_bytes
+
+# Period of `make_pattern`'s ramp, chosen so adjacent 12 KiB chunks have different contents
+
+"""#
+
+// tests/pp/test_pp.py
+replace in="tests/pp/test_pp.py" count=1 \
+    find=#"""
+import os
+
+
+"""# \
+    with=#"""
+import importlib
+import os
+
+
+"""#
+replace in="tests/pp/test_pp.py" count=1 \
+    find=#"""
+import math
+import random
+import torch
+import torch.distributed as dist
+
+import deep_ep
+from deep_ep.utils.envs import init_dist, dist_print, get_rdma_gbs
+from deep_ep.utils.testing import bench_kineto
+
+
+
+"""# \
+    with=#"""
+import math
+import random
+import kernels
+import torch
+import torch.distributed as dist
+
+deep_ep = kernels.get_kernel("kernels-community/deep-ep", version=1)
+deep_ep_envs = importlib.import_module(f"{deep_ep.__name__}.utils.envs")
+init_dist = deep_ep_envs.init_dist
+dist_print = deep_ep_envs.dist_print
+get_rdma_gbs = deep_ep_envs.get_rdma_gbs
+deep_ep_testing = importlib.import_module(f"{deep_ep.__name__}.utils.testing")
+bench_kineto = deep_ep_testing.bench_kineto
+
+
+
+"""#
+
+// tests/utils/test_gate.py
+replace in="tests/utils/test_gate.py" count=1 \
+    find=#"""
+import torch
+
+from deep_ep.utils.math import ceil_div
+from deep_ep.utils.gate import get_unbalanced_scores
+
+
+
+"""# \
+    with=#"""
+import importlib
+import kernels
+import torch
+
+deep_ep = kernels.get_kernel("kernels-community/deep-ep", version=1)
+deep_ep_math = importlib.import_module(f"{deep_ep.__name__}.utils.math")
+ceil_div = deep_ep_math.ceil_div
+deep_ep_gate = importlib.import_module(f"{deep_ep.__name__}.utils.gate")
+get_unbalanced_scores = deep_ep_gate.get_unbalanced_scores
+
+
+
+"""#
+
+// third-party/deep_jit/include/deep_jit/utils/exception.hpp
+replace in="third-party/deep_jit/include/deep_jit/utils/exception.hpp" count=1 \
+    find=#"""
+#pragma once
+
+#include <elfutils/libdwfl.h>
+
+#include <array>
+
+"""# \
+    with=#"""
+#pragma once
+
+#if __has_include(<elfutils/libdwfl.h>)
+#include <elfutils/libdwfl.h>
+#define DJ_HAS_LIBDWFL 1
+#else
+// kernels-community: without the elfutils headers, backtraces omit source lines
+#define DJ_HAS_LIBDWFL 0
+#endif
+
+#include <array>
+
+"""#
+replace in="third-party/deep_jit/include/deep_jit/utils/exception.hpp" count=1 \
+    find=#"""
+namespace detail {
+
+struct DwflApi {
+    struct FrameInfo {
+
+"""# \
+    with=#"""
+namespace detail {
+
+#if DJ_HAS_LIBDWFL
+struct DwflApi {
+    struct FrameInfo {
+
+"""#
+replace in="third-party/deep_jit/include/deep_jit/utils/exception.hpp" count=1 \
+    find=#"""
+    }
+};
+
+inline bool is_python_frame(const Dl_info& info) {
+
+"""# \
+    with=#"""
+    }
+};
+#else
+struct DwflApi {
+    struct FrameInfo {
+        const char* function = nullptr;
+        std::string file_line = "??:0";
+    };
+
+    void refresh() const {}
+    FrameInfo find(const std::uintptr_t) const { return {}; }
+};
+#endif
+
+inline bool is_python_frame(const Dl_info& info) {
+
+"""#
+
+// third-party/deep_jit/include/deep_jit/utils/gil.hpp
+replace in="third-party/deep_jit/include/deep_jit/utils/gil.hpp" count=1 \
+    find=#"""
+#include <optional>
+
+#include <pybind11/pybind11.h>
+
+namespace deep_jit {
+
+"""# \
+    with=#"""
+#include <optional>
+
+#ifndef DEEP_EP_KERNELS
+#include <pybind11/pybind11.h>
+#endif
+
+namespace deep_jit {
+
+"""#
+replace in="third-party/deep_jit/include/deep_jit/utils/gil.hpp" count=1 \
+    find=#"""
+class GilScopedRelease {
+public:
+    std::optional<pybind11::gil_scoped_release> release;
+
+
+"""# \
+    with=#"""
+class GilScopedRelease {
+public:
+#ifndef DEEP_EP_KERNELS
+    std::optional<pybind11::gil_scoped_release> release;
+
+
+"""#
+replace in="third-party/deep_jit/include/deep_jit/utils/gil.hpp" count=1 \
+    find=#"""
+            release.emplace();
+    }
+
+    GilScopedRelease(const GilScopedRelease&) = delete;
+
+"""# \
+    with=#"""
+            release.emplace();
+    }
+#else
+    // kernels-community: Torch already releases the GIL before running custom ops and custom class methods
+    GilScopedRelease() = default;
+#endif
+
+    GilScopedRelease(const GilScopedRelease&) = delete;
+
+"""#
+
+// torch-ext/deep_ep/__init__.py
+replace in="torch-ext/deep_ep/__init__.py" count=1 \
+    find=#"""
+import filecmp
+import glob
+import os
+import torch
+
+from .utils.find_pkgs import find_nccl_root
+
+# Set some default environment provided at setup
+
+"""# \
+    with=#"""
+import os
+import torch
+
+# kernels-community: must run before the extension is loaded, see `_nccl_symbols.py`
+from . import _nccl_symbols  # noqa: F401
+from ._runtime import find_nccl_root
+
+# Set some default environment provided at setup
+
+"""#
+replace in="torch-ext/deep_ep/__init__.py" count=1 \
+    find=#"""
+
+
+def check_nccl_so():
+    """
+    Verify that the NCCL library loaded at runtime matches the linked version.
+    Aborts if duplicate NCCL libraries are found or if versions mismatch.
+    """
+    if int(os.environ.get('EP_SUPPRESS_NCCL_CHECK', 0)):
+        return
+
+    # PyTorch may load another NCCL library, which is different to the linked one
+    with open('/proc/self/maps', 'r') as f:
+        loaded_nccl_so = None
+        for so in [line.strip().split(' ')[-1] for line in f if 'libnccl' in line]:
+            loaded_nccl_so = so if loaded_nccl_so is None else loaded_nccl_so
+            assert so == loaded_nccl_so, f'Duplicate NCCL runtime found in the current system: {so} and {loaded_nccl_so}'
+    linked_nccl_so_candidates = sorted(glob.glob(f'{find_nccl_root()}/lib/libnccl.so*'))
+    assert linked_nccl_so_candidates, f'No libnccl.so found in {find_nccl_root()}/lib/'
+    linked_nccl_so = linked_nccl_so_candidates[0]
+
+    # So checking binary-level equalness is necessary
+    # noinspection PyTypeChecker
+    assert filecmp.cmp(loaded_nccl_so, linked_nccl_so, shallow=False), \
+        (f'Invalid NCCL versions: {loaded_nccl_so} (loaded) v.s. {linked_nccl_so} (expected), '
+         f'please contact Chenggang or Shangyan to upgrade PyTorch NCCL version')
+
+
+def init_jit():
+    """
+    Initialize the JIT compilation runtime.
+    """
+    # noinspection PyUnresolvedReferences
+    from . import _C as _C
+    library_root_path = os.path.dirname(os.path.abspath(__file__))
+    _C.init_jit(library_root_path, find_nccl_root())
+
+
+# Run initialization
+check_nccl_so()
+init_jit()
+
+
+
+"""# \
+    with=#"""
+
+
+# kernels-community: upstream checks NCCL and initializes the JIT here, at import time. The Hub kernel
+# defers both to the first buffer construction (see `_runtime.py`), so that importing never needs a GPU,
+# a CUDA toolkit or a particular NCCL version.
+from ._runtime import check_nccl as check_nccl_so, ensure_initialized as init_jit
+
+
+
+"""#
+
+// torch-ext/deep_ep/buffers/allocator.py
+replace in="torch-ext/deep_ep/buffers/allocator.py" count=1 \
+    find=#"""
+
+# noinspection PyUnresolvedReferences
+from .. import _C as _C
+
+from ..utils.math import align
+
+"""# \
+    with=#"""
+
+# noinspection PyUnresolvedReferences
+from .. import _C
+
+from ..utils.math import align
+
+"""#
+
+// torch-ext/deep_ep/buffers/bucket.py
+replace in="torch-ext/deep_ep/buffers/bucket.py" count=1 \
+    find=#"""
+
+# noinspection PyUnresolvedReferences
+from .. import _C as _C
+
+from .allocator import BufferAllocator
+
+"""# \
+    with=#"""
+
+# noinspection PyUnresolvedReferences
+from .. import _C
+
+from .allocator import BufferAllocator
+
+"""#
+
+// torch-ext/deep_ep/buffers/engram.py
+replace in="torch-ext/deep_ep/buffers/engram.py" count=1 \
+    find=#"""
+
+# noinspection PyUnresolvedReferences
+from .. import _C as _C
+
+from .base import BufferBase
+
+"""# \
+    with=#"""
+
+# noinspection PyUnresolvedReferences
+from .. import _C
+
+from .base import BufferBase
+
+"""#
+
+// torch-ext/deep_ep/buffers/ep.py
+replace in="torch-ext/deep_ep/buffers/ep.py" count=1 \
+    find=#"""
+
+# noinspection PyUnresolvedReferences
+from .. import _C as _C
+# noinspection PyUnresolvedReferences
+from .._C import EventHandle
+
+"""# \
+    with=#"""
+
+# noinspection PyUnresolvedReferences
+from .. import _C
+# noinspection PyUnresolvedReferences
+from .._C import EventHandle
+
+"""#
+
+// torch-ext/deep_ep/buffers/pp.py
+replace in="torch-ext/deep_ep/buffers/pp.py" count=1 \
+    find=#"""
+
+# noinspection PyUnresolvedReferences
+from .. import _C as _C
+
+from .base import BufferBase
+
+"""# \
+    with=#"""
+
+# noinspection PyUnresolvedReferences
+from .. import _C
+
+from .base import BufferBase
+
+"""#
+
+// torch-ext/deep_ep/comm/barrier.py
+replace in="torch-ext/deep_ep/comm/barrier.py" count=1 \
+    find=#"""
+from typing import Any, Optional
+
+from .. import _C as _C
+
+
+
+"""# \
+    with=#"""
+from typing import Any, Optional
+
+from .. import _C
+
+
+
+"""#
+
+// torch-ext/deep_ep/comm/handle.py
+replace in="torch-ext/deep_ep/comm/handle.py" count=1 \
+    find=#"""
+
+# noinspection PyUnresolvedReferences
+from .. import _C as _C
+
+
+
+"""# \
+    with=#"""
+
+# noinspection PyUnresolvedReferences
+from .. import _C
+
+
+
+"""#
+
+// torch-ext/deep_ep/comm/stream.py
+replace in="torch-ext/deep_ep/comm/stream.py" count=1 \
+    find=#"""
+
+# noinspection PyUnresolvedReferences
+from .. import _C as _C
+
+
+
+"""# \
+    with=#"""
+
+# noinspection PyUnresolvedReferences
+from .. import _C
+
+
+
+"""#
+
+// torch-ext/deep_ep/utils/envs.py
+replace in="torch-ext/deep_ep/utils/envs.py" count=1 \
+    find=#"""
+
+# noinspection PyUnresolvedReferences
+from .. import _C as _C
+
+from .. import comm
+
+"""# \
+    with=#"""
+
+# noinspection PyUnresolvedReferences
+from .. import _C
+
+from .. import comm
+
+"""#
+
+// Handwritten Torch bindings, runtime checks, CI subset and docs.
+overlay from="overlay"
+
+// Only the three host translation units compile; GPU kernels retain runtime JIT.
+kernel name="deep_ep" backend="cuda" src="csrc/**/*.hpp,csrc/kernels/comm/context.cpp,csrc/kernels/driver/driver.cpp,deep_ep/include/**,third-party/deep_jit/include/deep_jit/{backend/cuda,cache,runtime,utils}/**,third-party/nccl/include/**,torch-ext/compat/**/*.h" \
+    capabilities="9.0a,10.0a" depends="torch" \
+    include="torch-ext/compat,csrc,deep_ep/include,third-party/deep_jit/include,third-party/nccl/include" \
+    cxx_flags="-std=c++20,-O3,-DDEEP_EP_KERNELS,-Wno-deprecated-declarations,-Wno-unused-variable,-Wno-sign-compare,-Wno-reorder,-Wno-attributes"
+
+manifest name="deep-ep" version=1 edition=6 license="MIT" \
+    upstream="https://github.com/deepseek-ai/DeepEP" backends="cuda" \
+    repo_id="kernels-community/deep-ep" cuda_minver="13.0" \
+    torch_src="torch-ext/*.{cpp,hpp}" torch_pyext="py,cuh" \
+    torch_include="torch-ext,torch-ext/compat,csrc,deep_ep/include,third-party/deep_jit/include,third-party/nccl/include"
+
+// The experimental manifest op does not expose Torch binding flags directly.
+// Preserve the existing binding flags through a guarded generated-table edit.
+replace in="build.toml" count=1 find="[torch]\n" with=#"""
+[torch]
+cxx-flags = ["-std=c++20", "-DDEEP_EP_KERNELS", "-Wno-deprecated-declarations", "-Wno-unused-variable", "-Wno-sign-compare", "-Wno-reorder", "-Wno-attributes"]
+
+"""#
+
+expect in="torch-ext/deep_ep/**/*.py" find="import deep_ep" count=0
+expect in="build.toml" find="stable-abi" count=0
