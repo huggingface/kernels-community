@@ -13,7 +13,17 @@
 #include <algorithm>
 #include <cstring>
 
+#ifdef USE_ROCM
+#include <hip/hip_runtime.h>
+// Only the .cu file gets hipified, so map the runtime names used in this header.
+#define cudaError_t hipError_t
+#define cudaGetErrorString hipGetErrorString
+#define cudaGetLastError hipGetLastError
+#define cudaStream_t hipStream_t
+#define cudaSuccess hipSuccess
+#else
 #include <cuda_runtime.h>
+#endif
 
 #include "deformable_detr/atomics.cuh"
 

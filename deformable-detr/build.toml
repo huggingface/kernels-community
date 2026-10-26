@@ -3,7 +3,10 @@ name = "deformable-detr"
 version = 2
 edition = 6
 license = "Apache-2.0"
-backends = ["cuda"]
+backends = [
+    "cuda",
+    "rocm",
+]
 
 [general.hub]
 repo-id = "kernels-community/deformable-detr"
@@ -16,10 +19,37 @@ src = [
 
 [torch.stable-abi]
 cuda = "2.10"
+rocm = "2.10"
 
 [kernel.deformable_detr]
 language = "cpp-cuda"
 depends = ["torch"]
+include = ["."]
+src = [
+    "deformable_detr/atomics.cuh",
+    "deformable_detr/ms_deform_attn_cuda.cu",
+    "deformable_detr/ms_deform_im2col_cuda.cuh",
+]
+
+[kernel.deformable_detr_rocm]
+language = "cpp-rocm"
+depends = ["torch"]
+rocm-archs = [
+    "gfx906",
+    "gfx908",
+    "gfx90a",
+    "gfx942",
+    "gfx950",
+    "gfx1030",
+    "gfx1100",
+    "gfx1101",
+    "gfx1102",
+    "gfx1103",
+    "gfx1150",
+    "gfx1151",
+    "gfx1200",
+    "gfx1201",
+]
 include = ["."]
 src = [
     "deformable_detr/atomics.cuh",
