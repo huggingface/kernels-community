@@ -86,6 +86,11 @@ jobs:
       config: ${{ steps.validate.outputs.config }}
       matrix: ${{ steps.matrix.outputs.matrix }}
       tpu-kernel: ${{ steps.matrix.outputs.tpu-kernel }}
+      minimum-torch-enabled: ${{ steps.minimum-torch.outputs.enabled }}
+      minimum-torch-version: ${{ steps.minimum-torch.outputs.torch }}
+      minimum-torch-python: ${{ steps.minimum-torch.outputs.python }}
+      minimum-torch-index: ${{ steps.minimum-torch.outputs.index }}
+      minimum-torch-variant: ${{ steps.minimum-torch.outputs.variant }}
     steps:
       # Reject kernel names outside the safe charset before any step uses them.
       # Accepts e.g.: flash-attn3, rejects: $(myevilcommand).
@@ -207,6 +212,15 @@ jobs:
           if [ "$TPU_KERNEL" = "true" ]; then
             echo "TPU support is build-only: hardware tests are not run and test closures are not uploaded." >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Plan minimum-Torch tests for Stable ABI
+        if: steps.validate.outputs.skip == 'false' && steps.matrix.outputs.tpu-kernel != 'true' && inputs.skip_build != true && (inputs.mode == 'pr' || inputs.mode == 'stage')
+        id: minimum-torch
+        env:
+          KERNEL: ${{ steps.validate.outputs.kernel }}
+          BACKENDS_FILTER: ${{ inputs.backends }}
+        run: |
+          python3 .github/scripts/stable_abi_ci.py plan "$KERNEL" --backends "$BACKENDS_FILTER"
 
   # Compile the kernel for each (backend, arch) pair; release mode also uploads to the Hub.
   build-kernel:
@@ -462,6 +476,27 @@ jobs:
           path: ci-test-closure.nar.zst
           retention-days: 1
 
+      # Build the current redistributable, not a kernel rebuilt with old Torch.
+      # Unlike the Nix extension used by ci-test, this has relocatable library
+      # paths and can load against the minimum Torch wheel outside Nix.
+      - name: Build redistributable kernel for minimum-Torch testing
+        if: needs.setup.outputs.minimum-torch-enabled == 'true'
+        env:
+          KERNEL: ${{ needs.setup.outputs.kernel }}
+          VARIANT: ${{ needs.setup.outputs.minimum-torch-variant }}
+        run: |
+          KERNEL_BUILD_PATH=$(cd "$KERNEL" && nix build -L --no-link --print-out-paths ".#redistributable.$VARIANT")
+          tar -chf minimum-torch-kernel.tar -C "$KERNEL_BUILD_PATH" .
+
+      - name: Upload minimum-Torch test artifact
+        if: needs.setup.outputs.minimum-torch-enabled == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: minimum-torch-kernel
+          path: minimum-torch-kernel.tar
+          if-no-files-found: error
+          retention-days: 1
+
   # Import the ci-test closure onto a GPU runner and execute the test suite.
   # Runs after both build-kernel and build-ci-test complete.
   test-kernel-gpu:
@@ -509,96 +544,13 @@ jobs:
           CI_TEST_PATH="${{ needs.build-ci-test.outputs.ci-test-path }}"
           "$CI_TEST_PATH/bin/ci-test"
 
-  # Stable-ABI planning and builds have their own jobs so their failures cannot
-  # prevent the normal build matrix or current-Torch tests from running.
-  plan-minimum-torch-test-stable-abi:
-    permissions:
-      contents: read
-    needs: setup
-    if: needs.setup.outputs.skip == 'false' && needs.setup.outputs.tpu-kernel != 'true' && inputs.skip_build != true && (inputs.mode == 'pr' || inputs.mode == 'stage')
-    runs-on: ubuntu-latest
-    outputs:
-      enabled: ${{ steps.minimum-torch.outputs.enabled }}
-      torch: ${{ steps.minimum-torch.outputs.torch }}
-      python: ${{ steps.minimum-torch.outputs.python }}
-      index: ${{ steps.minimum-torch.outputs.index }}
-      variant: ${{ steps.minimum-torch.outputs.variant }}
-    steps:
-      - name: Checkout kernel
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ inputs.pr_number != '' && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
-
-      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
-        with:
-          extra-conf: |
-            max-jobs = 2
-            cores = 4
-            sandbox-fallback = false
-      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
-        with:
-          name: huggingface
-        env:
-          USER: runner
-
-      - name: Plan minimum-Torch tests for Stable ABI
-        id: minimum-torch
-        env:
-          KERNEL: ${{ needs.setup.outputs.kernel }}
-          BACKENDS_FILTER: ${{ inputs.backends }}
-        run: |
-          python3 .github/scripts/stable_abi_ci.py plan "$KERNEL" --backends "$BACKENDS_FILTER"
-
-  build-minimum-torch-test:
-    permissions:
-      contents: read
-    needs: [setup, plan-minimum-torch-test-stable-abi]
-    if: needs.plan-minimum-torch-test-stable-abi.outputs.enabled == 'true'
-    runs-on:
-      group: aws-highmemory-32-plus-nix
-    timeout-minutes: 600 # 10h
-    steps:
-      - name: Checkout kernel
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ inputs.pr_number != '' && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
-
-      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
-        with:
-          extra-conf: |
-            max-jobs = 2
-            cores = 12
-            sandbox-fallback = false
-      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
-        with:
-          name: huggingface
-        env:
-          USER: runner
-
-      # This current-built redistributable can load against the minimum Torch
-      # wheel without library paths pointing back into the Nix build environment.
-      - name: Build redistributable kernel for minimum-Torch testing
-        env:
-          KERNEL: ${{ needs.setup.outputs.kernel }}
-          VARIANT: ${{ needs.plan-minimum-torch-test-stable-abi.outputs.variant }}
-        run: |
-          KERNEL_BUILD_PATH=$(cd "$KERNEL" && nix build -L --no-link --print-out-paths ".#redistributable.$VARIANT")
-          tar -chf minimum-torch-kernel.tar -C "$KERNEL_BUILD_PATH" .
-
-      - name: Upload minimum-Torch test artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: minimum-torch-kernel
-          path: minimum-torch-kernel.tar
-          if-no-files-found: error
-          retention-days: 1
-
-  # Run the Stable-ABI branch independently of the normal builds and tests.
+  # Test the same stable-ABI binary on its declared floor in an isolated wheel
+  # environment. Keeping this separate also runs it when current-Torch tests fail.
   test-kernel-minimum-torch:
     permissions:
       contents: read
-    needs: [setup, plan-minimum-torch-test-stable-abi, build-minimum-torch-test]
-    if: needs.plan-minimum-torch-test-stable-abi.outputs.enabled == 'true'
+    needs: [setup, build-kernel, build-ci-test]
+    if: needs.setup.outputs.minimum-torch-enabled == 'true'
     runs-on:
       group: aws-g6-12xlarge-plus
     timeout-minutes: 30
@@ -646,9 +598,9 @@ jobs:
 
       - name: Install minimum Torch and test dependencies
         env:
-          TORCH_VERSION: ${{ needs.plan-minimum-torch-test-stable-abi.outputs.torch }}
-          TORCH_INDEX: ${{ needs.plan-minimum-torch-test-stable-abi.outputs.index }}
-          PYTHON_VERSION: ${{ needs.plan-minimum-torch-test-stable-abi.outputs.python }}
+          TORCH_VERSION: ${{ needs.setup.outputs.minimum-torch-version }}
+          TORCH_INDEX: ${{ needs.setup.outputs.minimum-torch-index }}
+          PYTHON_VERSION: ${{ needs.setup.outputs.minimum-torch-python }}
         run: |
           uv venv --python "$PYTHON_VERSION" "$RUNNER_TEMP/minimum-torch-venv"
           echo "torch==$TORCH_VERSION" > "$RUNNER_TEMP/torch-constraint.txt"
@@ -662,7 +614,7 @@ jobs:
       - name: Run minimum-Torch tests
         env:
           KERNEL: ${{ needs.setup.outputs.kernel }}
-          TORCH_VERSION: ${{ needs.plan-minimum-torch-test-stable-abi.outputs.torch }}
+          TORCH_VERSION: ${{ needs.setup.outputs.minimum-torch-version }}
         run: |
           mkdir "$RUNNER_TEMP/minimum-torch-build"
           tar -xf minimum-torch-kernel.tar -C "$RUNNER_TEMP/minimum-torch-build"
@@ -674,14 +626,7 @@ jobs:
   # Report the final build/test outcome as a commit status on the PR head SHA.
   report-status:
     if: always() && inputs.head_sha != ''
-    needs:
-      - setup
-      - build-kernel
-      - build-ci-test
-      - test-kernel-gpu
-      - plan-minimum-torch-test-stable-abi
-      - build-minimum-torch-test
-      - test-kernel-minimum-torch
+    needs: [setup, build-kernel, build-ci-test, test-kernel-gpu, test-kernel-minimum-torch]
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -700,16 +645,22 @@ jobs:
           STATUS_CONTEXT: ${{ github.workflow }} / ${{ inputs.kernel_name }}
         run: |
           BUILD="${{ needs.build-kernel.result }}"
+          TEST="${{ needs.test-kernel-gpu.result }}"
+          TEST_BUILD="${{ needs.build-ci-test.result }}"
+          MINIMUM_TEST="${{ needs.test-kernel-minimum-torch.result }}"
 
-          if [ "${{ contains(needs.*.result, 'failure') }}" = "true" ]; then
+          if [ "$BUILD" = "failure" ] || [ "$TEST_BUILD" = "failure" ] || [ "$TEST" = "failure" ] || [ "$MINIMUM_TEST" = "failure" ]; then
             STATE="failure"
-            DESC="Build or tests failed"
-          elif [ "$BUILD" = "success" ] && [ "${{ contains(needs.*.result, 'cancelled') }}" != "true" ]; then
+            DESC="Build or tests failed (current: ${TEST}, minimum: ${MINIMUM_TEST})"
+          elif [ "$BUILD" = "success" ] && \
+            { [ "$TEST_BUILD" = "success" ] || [ "$TEST_BUILD" = "skipped" ]; } && \
+            { [ "$TEST" = "success" ] || [ "$TEST" = "skipped" ]; } && \
+            { [ "$MINIMUM_TEST" = "success" ] || [ "$MINIMUM_TEST" = "skipped" ]; }; then
             STATE="success"
             DESC="Build passed"
           else
             STATE="error"
-            DESC="Build or tests did not complete"
+            DESC="Build did not complete (build: ${BUILD}, test: ${TEST})"
           fi
 
           gh api "repos/$REPO/statuses/$HEAD_SHA" \
