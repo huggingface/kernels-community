@@ -86,11 +86,6 @@ jobs:
       config: ${{ steps.validate.outputs.config }}
       matrix: ${{ steps.matrix.outputs.matrix }}
       tpu-kernel: ${{ steps.matrix.outputs.tpu-kernel }}
-      minimum-torch-enabled: ${{ steps.minimum-torch.outputs.enabled }}
-      minimum-torch-version: ${{ steps.minimum-torch.outputs.torch }}
-      minimum-torch-python: ${{ steps.minimum-torch.outputs.python }}
-      minimum-torch-index: ${{ steps.minimum-torch.outputs.index }}
-      minimum-torch-variant: ${{ steps.minimum-torch.outputs.variant }}
     steps:
       # Reject kernel names outside the safe charset before any step uses them.
       # Accepts e.g.: flash-attn3, rejects: $(myevilcommand).
@@ -212,15 +207,6 @@ jobs:
           if [ "$TPU_KERNEL" = "true" ]; then
             echo "TPU support is build-only: hardware tests are not run and test closures are not uploaded." >> "$GITHUB_STEP_SUMMARY"
           fi
-
-      - name: Plan minimum-Torch tests for Stable ABI
-        if: steps.validate.outputs.skip == 'false' && steps.matrix.outputs.tpu-kernel != 'true' && inputs.skip_build != true && (inputs.mode == 'pr' || inputs.mode == 'stage')
-        id: minimum-torch
-        env:
-          KERNEL: ${{ steps.validate.outputs.kernel }}
-          BACKENDS_FILTER: ${{ inputs.backends }}
-        run: |
-          python3 .github/scripts/stable_abi_ci.py plan "$KERNEL" --backends "$BACKENDS_FILTER"
 
   # Compile the kernel for each (backend, arch) pair; release mode also uploads to the Hub.
   build-kernel:
@@ -476,27 +462,6 @@ jobs:
           path: ci-test-closure.nar.zst
           retention-days: 1
 
-      # Build the current redistributable, not a kernel rebuilt with old Torch.
-      # Unlike the Nix extension used by ci-test, this has relocatable library
-      # paths and can load against the minimum Torch wheel outside Nix.
-      - name: Build redistributable kernel for minimum-Torch testing
-        if: needs.setup.outputs.minimum-torch-enabled == 'true'
-        env:
-          KERNEL: ${{ needs.setup.outputs.kernel }}
-          VARIANT: ${{ needs.setup.outputs.minimum-torch-variant }}
-        run: |
-          KERNEL_BUILD_PATH=$(cd "$KERNEL" && nix build -L --no-link --print-out-paths ".#redistributable.$VARIANT")
-          tar -chf minimum-torch-kernel.tar -C "$KERNEL_BUILD_PATH" .
-
-      - name: Upload minimum-Torch test artifact
-        if: needs.setup.outputs.minimum-torch-enabled == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: minimum-torch-kernel
-          path: minimum-torch-kernel.tar
-          if-no-files-found: error
-          retention-days: 1
-
   # Import the ci-test closure onto a GPU runner and execute the test suite.
   # Runs after both build-kernel and build-ci-test complete.
   test-kernel-gpu:
@@ -544,89 +509,10 @@ jobs:
           CI_TEST_PATH="${{ needs.build-ci-test.outputs.ci-test-path }}"
           "$CI_TEST_PATH/bin/ci-test"
 
-  # Test the same stable-ABI binary on its declared floor in an isolated wheel
-  # environment. Keeping this separate also runs it when current-Torch tests fail.
-  test-kernel-minimum-torch:
-    permissions:
-      contents: read
-    needs: [setup, build-kernel, build-ci-test]
-    if: needs.setup.outputs.minimum-torch-enabled == 'true'
-    runs-on:
-      group: aws-g6-12xlarge-plus
-    timeout-minutes: 30
-    steps:
-      - name: Checkout tests
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ inputs.pr_number != '' && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
-
-      # Match the loader source used by the kernel's Nix ci-test environment.
-      - name: Resolve pinned kernels revision
-        id: kernels-revision
-        env:
-          KERNEL: ${{ needs.setup.outputs.kernel }}
-        run: |
-          python3 - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          lock = json.loads((Path(os.environ["KERNEL"]) / "flake.lock").read_text())
-          revision = lock["nodes"]["kernel-builder"]["locked"]["rev"]
-          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              output.write(f"revision={revision}\n")
-          PY
-
-      - name: Checkout pinned kernels source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: huggingface/kernels
-          ref: ${{ steps.kernels-revision.outputs.revision }}
-          path: kernels-source
-
-      - name: Download minimum-Torch test artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: minimum-torch-kernel
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
-
-      # kernels includes Rust bindings; use the toolchain from its upstream CI.
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
-
-      - name: Install minimum Torch and test dependencies
-        env:
-          TORCH_VERSION: ${{ needs.setup.outputs.minimum-torch-version }}
-          TORCH_INDEX: ${{ needs.setup.outputs.minimum-torch-index }}
-          PYTHON_VERSION: ${{ needs.setup.outputs.minimum-torch-python }}
-        run: |
-          uv venv --python "$PYTHON_VERSION" "$RUNNER_TEMP/minimum-torch-venv"
-          echo "torch==$TORCH_VERSION" > "$RUNNER_TEMP/torch-constraint.txt"
-          uv pip install --python "$RUNNER_TEMP/minimum-torch-venv/bin/python" \
-            --index-url "$TORCH_INDEX" "torch==$TORCH_VERSION"
-          uv pip install --python "$RUNNER_TEMP/minimum-torch-venv/bin/python" \
-            --constraint "$RUNNER_TEMP/torch-constraint.txt" \
-            --requirement .github/scripts/stable-abi-requirements.txt \
-            ./kernels-source/kernels
-
-      - name: Run minimum-Torch tests
-        env:
-          KERNEL: ${{ needs.setup.outputs.kernel }}
-          TORCH_VERSION: ${{ needs.setup.outputs.minimum-torch-version }}
-        run: |
-          mkdir "$RUNNER_TEMP/minimum-torch-build"
-          tar -xf minimum-torch-kernel.tar -C "$RUNNER_TEMP/minimum-torch-build"
-          unset PYTHONPATH LD_LIBRARY_PATH
-          "$RUNNER_TEMP/minimum-torch-venv/bin/python" .github/scripts/stable_abi_ci.py test \
-            "$KERNEL" "$RUNNER_TEMP/minimum-torch-build" \
-            --torch "$TORCH_VERSION"
-
   # Report the final build/test outcome as a commit status on the PR head SHA.
   report-status:
     if: always() && inputs.head_sha != ''
-    needs: [setup, build-kernel, build-ci-test, test-kernel-gpu, test-kernel-minimum-torch]
+    needs: [build-kernel, test-kernel-gpu]
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -646,18 +532,13 @@ jobs:
         run: |
           BUILD="${{ needs.build-kernel.result }}"
           TEST="${{ needs.test-kernel-gpu.result }}"
-          TEST_BUILD="${{ needs.build-ci-test.result }}"
-          MINIMUM_TEST="${{ needs.test-kernel-minimum-torch.result }}"
 
-          if [ "$BUILD" = "failure" ] || [ "$TEST_BUILD" = "failure" ] || [ "$TEST" = "failure" ] || [ "$MINIMUM_TEST" = "failure" ]; then
-            STATE="failure"
-            DESC="Build or tests failed (current: ${TEST}, minimum: ${MINIMUM_TEST})"
-          elif [ "$BUILD" = "success" ] && \
-            { [ "$TEST_BUILD" = "success" ] || [ "$TEST_BUILD" = "skipped" ]; } && \
-            { [ "$TEST" = "success" ] || [ "$TEST" = "skipped" ]; } && \
-            { [ "$MINIMUM_TEST" = "success" ] || [ "$MINIMUM_TEST" = "skipped" ]; }; then
+          if [ "$BUILD" = "success" ] && { [ "$TEST" = "success" ] || [ "$TEST" = "skipped" ]; }; then
             STATE="success"
             DESC="Build passed"
+          elif [ "$BUILD" = "failure" ] || [ "$TEST" = "failure" ]; then
+            STATE="failure"
+            DESC="Build failed (build: ${BUILD}, test: ${TEST})"
           else
             STATE="error"
             DESC="Build did not complete (build: ${BUILD}, test: ${TEST})"

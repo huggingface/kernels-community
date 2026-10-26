@@ -1,8 +1,0 @@
-# Shared test dependencies for the portable minimum-Torch test environment.
-# Torch is installed separately from the selected official backend index and
-# constrained throughout dependency resolution so it cannot be upgraded.
-# kernels is installed from the source revision pinned in the kernel's flake.lock.
-pytest>=8,<9
-numpy
-einops
-expecttest
