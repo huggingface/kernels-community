@@ -5,11 +5,11 @@ use std::ffi::c_void;
 use tvm_ffi::Tensor;
 use tvm_ffi::error::{RUNTIME_ERROR, Result, TYPE_ERROR, VALUE_ERROR};
 use tvm_ffi_sys::TVMFFIEnvGetStream;
-use tvm_ffi_sys::dlpack::{DLDataTypeCode, DLDeviceType};
+use tvm_ffi_sys::dlpack::{DLDataType, DLDataTypeCode, DLDevice, DLDeviceType};
 
-use crate::cuda::launch_kernel;
-use crate::runtime::runtime;
-use crate::{alloc_tensor, err};
+use crate::host::cuda::launch_kernel;
+use crate::host::runtime::runtime;
+use crate::host::{alloc_tensor, err};
 
 #[derive(Clone, Copy)]
 pub(super) struct Strides {
@@ -508,4 +508,20 @@ pub(super) fn copy_layout(src: &Tensor, dst: &Tensor) -> Result<()> {
         )
     }
     .map_err(|e| err(RUNTIME_ERROR, &format!("copy attention layout: {e:?}")))
+}
+
+/// Varlen metadata vectors (cu_seqlens, lengths, indices) must be contiguous int32 on q's device.
+pub(super) fn metadata(name: &str, tensor: &Tensor, shape: &[i64], device: DLDevice) -> Result<()> {
+    if tensor.device() != device
+        || tensor.dtype() != DLDataType::new(DLDataTypeCode::kDLInt, 32, 1)
+        || tensor.shape() != shape
+        || !tensor.is_contiguous()
+        || tensor.data_ptr() as u64 % 4 != 0
+    {
+        return Err(err(
+            VALUE_ERROR,
+            &format!("{name} must be contiguous CUDA int32 {shape:?} on q's device"),
+        ));
+    }
+    Ok(())
 }

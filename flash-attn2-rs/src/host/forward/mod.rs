@@ -8,15 +8,15 @@ use tvm_ffi::any::TryFromTemp;
 use tvm_ffi::error::{Error, RUNTIME_ERROR, Result, TYPE_ERROR, VALUE_ERROR};
 use tvm_ffi::{Any, AnyView, Function, Shape, Tensor};
 use tvm_ffi_sys::TVMFFIEnvGetStream;
-use tvm_ffi_sys::dlpack::{DLDataType, DLDataTypeCode, DLDevice, DLDeviceType};
+use tvm_ffi_sys::dlpack::{DLDataType, DLDataTypeCode, DLDeviceType};
 
-use self::dispatch::{ForwardPlan, plan_forward, select_kernel};
-use crate::cuda::{launch_kernel, sys};
-use crate::layout::{Strides, copy_layout, nonoverlapping_layout, overlaps, prepare_qkv};
-use crate::rng::resolve_rng_descriptor;
-use crate::runtime::runtime;
-use crate::tiles::{HEAD_DIMS, flash_smem_bytes, split_smem_bytes};
-use crate::{EMPTY_SLICE, MAX_GRID_YZ, alloc_tensor, any_into_raw_owned, arg, err};
+use self::dispatch::{ForwardPlan, PreparedForward, plan_forward, select_kernel};
+use crate::host::cuda::{launch_kernel, sys};
+use crate::host::layout::{Strides, copy_layout, nonoverlapping_layout, overlaps, prepare_qkv};
+use crate::host::rng::resolve_rng_descriptor;
+use crate::host::runtime::runtime;
+use crate::host::tiles::{HEAD_DIMS, flash_smem_bytes, split_smem_bytes};
+use crate::host::{EMPTY_SLICE, MAX_GRID_YZ, alloc_tensor, any_into_raw_owned, arg, err};
 
 fn finish_fwd(
     out: Tensor,
@@ -42,54 +42,6 @@ fn finish_fwd(
 
 fn fwd(args: &[AnyView]) -> Result<Any> {
     fwd_impl(args, false)
-}
-
-/// Validated forward inputs and buffers, kept until all launches finish.
-struct PreparedForward {
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    _alibi: Option<Tensor>,
-    q_str: Strides,
-    k_str: Strides,
-    v_str: Strides,
-    is_bf16: bool,
-    b: i64,
-    h: i64,
-    d: i64,
-    seqlen_q: i64,
-    seqlen_k: i64,
-    hk: i64,
-    bh: i64,
-    device: DLDevice,
-    has_alibi: u32,
-    alibi_data: u64,
-    alibi_numel: u64,
-    alibi_bs: u32,
-    scale: f64,
-    scale_eff: f64,
-    tanh_scale: f64,
-    softcap: f64,
-    wl: i64,
-    wr: i64,
-    alibi_causal: u32,
-    supplied_out: Option<Tensor>,
-    copy_out: bool,
-    out: Tensor,
-    lse: Tensor,
-    probabilities: Option<Tensor>,
-    rng_state: Option<Tensor>,
-    dropout: bool,
-    dropout_seed: u64,
-    dropout_offset: u64,
-    dropout_keep: f32,
-    native_reservation: bool,
-    return_softmax: bool,
-    descriptor_mode: bool,
-    descriptor: [u64; 3],
-    descriptor_captured: u32,
-    bucket: i64,
-    lse_only: bool,
 }
 
 fn fwd_impl(args: &[AnyView], lse_only: bool) -> Result<Any> {

@@ -1,11 +1,11 @@
 use crate::device::backward::{
     ReduceSpec, bf16_8, bf16_16, bf16_32, copy_rows, f16_8, f16_16, f16_32, probability_gradient,
-    query_fragments, transposed_paired_words, transposed_word_mask, unpack,
+    query_fragments, transposed_paired_words, transposed_word_mask,
 };
 use crate::device::config::{FwdConfig, GRID_PLAIN, KvRange, LaunchTile, Strides, TensorBases};
 use crate::device::dropout::Dropout;
 use crate::device::forward::{SmemLayout, accumulate_values, compute_qk};
-use crate::device::inlined::cvt;
+use crate::device::inlined::{cvt, unpack};
 use cuda_device::shared::DynamicSharedArray;
 use cuda_device::warp::shuffle_xor_f32;
 use cuda_device::{DisjointSlice, kernel, launch_bounds, ptx_asm, thread};

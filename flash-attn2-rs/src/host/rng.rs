@@ -5,9 +5,9 @@ use tvm_ffi::{Any, AnyView, Tensor};
 use tvm_ffi_sys::TVMFFIEnvGetStream;
 use tvm_ffi_sys::dlpack::{DLDataType, DLDataTypeCode, DLDeviceType};
 
-use crate::cuda::launch_kernel;
-use crate::runtime::{Runtime, runtime};
-use crate::{alloc_tensor, any_into_raw_owned, arg, err};
+use crate::host::cuda::launch_kernel;
+use crate::host::runtime::{Runtime, runtime};
+use crate::host::{alloc_tensor, any_into_raw_owned, arg, err};
 
 // Philox values may be CUDA pointers during graph capture.
 pub(super) fn resolve_rng_descriptor(

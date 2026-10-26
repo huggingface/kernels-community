@@ -1,6 +1,5 @@
 // Writable caches are never replaced with an aligned copy.
-use crate::device::backward::unpack;
-use crate::device::inlined::cvt;
+use crate::device::inlined::{cvt, unpack};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, thread};
 
 pub trait Spec {

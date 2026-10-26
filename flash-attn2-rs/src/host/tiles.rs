@@ -125,3 +125,8 @@ pub(super) fn flash_kernel_name(bucket: i64, alternate: bool, bf16: bool) -> Str
         if bf16 { "_bf16" } else { "" }
     )
 }
+
+/// Dynamic shared memory of the combined dK/dV backward kernels.
+pub(super) const fn combined_smem(dropout: bool, masked: bool) -> u32 {
+    if dropout || masked { 50176 } else { 17408 }
+}

@@ -126,3 +126,18 @@ pub fn optional_ptr<T>(slice: &[T]) -> *const T {
         slice.as_ptr()
     }
 }
+
+/// Low half of a packed f16/bf16 pair as f32.
+#[inline(always)]
+pub fn unpack<const BF16: bool>(bits: u32) -> f32 {
+    if BF16 {
+        f32::from_bits((bits & 0xffff) << 16)
+    } else {
+        let value: f32;
+        unsafe {
+            ptx_asm!("{ .reg .b16 h; cvt.u16.u32 h, %1; cvt.f32.f16 %0, h; }",
+                out("=f") value, in("r") bits, options(register_only));
+        }
+        value
+    }
+}

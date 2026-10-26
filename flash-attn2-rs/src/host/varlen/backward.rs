@@ -5,12 +5,12 @@ use tvm_ffi::{Any, AnyView, Function, Tensor};
 use tvm_ffi_sys::TVMFFIEnvGetStream;
 use tvm_ffi_sys::dlpack::{DLDataType, DLDataTypeCode, DLDeviceType};
 
-use crate::cuda::{launch_kernel, sys};
-use crate::layout::{attention_shape, prepare_packed_qkv, tensor_span};
-use crate::runtime::runtime;
-use crate::tiles::HEAD_DIMS;
-use crate::varlen::metadata;
-use crate::{EMPTY_SLICE, MAX_GRID_YZ, alloc_tensor, any_into_raw_owned, arg, err};
+use crate::host::cuda::{launch_kernel, sys};
+use crate::host::layout::{attention_shape, prepare_packed_qkv, tensor_span};
+use crate::host::runtime::runtime;
+use crate::host::tiles::HEAD_DIMS;
+use crate::host::layout::metadata;
+use crate::host::{EMPTY_SLICE, MAX_GRID_YZ, alloc_tensor, any_into_raw_owned, arg, err};
 
 fn varlen_bwd(args: &[AnyView]) -> Result<Any> {
     if args.len() != 19 {

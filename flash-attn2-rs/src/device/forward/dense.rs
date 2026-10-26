@@ -143,6 +143,10 @@ impl<
         dropout: Dropout,
     ) {
         unsafe {
+            if HD == 192 && BLOCK_ROWS == 128 && KEYS == 64 {
+                super::dense192::run::<BF16>(q, k, v, o, lse, scale, seqlen_q, seqlen_k, h);
+                return;
+            }
             flash_attn_core::<
                 BF16,
                 HD,

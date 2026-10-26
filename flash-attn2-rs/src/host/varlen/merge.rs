@@ -5,9 +5,9 @@ use tvm_ffi::{Any, AnyView, Function, Tensor};
 use tvm_ffi_sys::dlpack::{DLDataType, DLDataTypeCode, DLDeviceType};
 use tvm_ffi_sys::{TVMFFIAny, TVMFFIEnvGetStream};
 
-use crate::cuda::launch_kernel;
-use crate::runtime::runtime;
-use crate::{EMPTY_SLICE, alloc_tensor, any_into_raw_owned, arg, err};
+use crate::host::cuda::launch_kernel;
+use crate::host::runtime::runtime;
+use crate::host::{EMPTY_SLICE, alloc_tensor, any_into_raw_owned, arg, err};
 
 // Partial layout [B,splits,H,Sq,D], with [B,splits,H,Sq] natural-log LSE.
 pub(super) fn merge(partial: &Tensor, stats: &Tensor, bf16: bool) -> Result<(Tensor, Tensor)> {
@@ -92,7 +92,7 @@ fn merge_impl(
         return Err(err(VALUE_ERROR, "unsupported cached merge dimensions"));
     }
     if let Some((cuq, total_q)) = varlen {
-        crate::varlen::metadata("cu_seqlens_q", cuq, &[b + 1], partial.device())?;
+        crate::host::layout::metadata("cu_seqlens_q", cuq, &[b + 1], partial.device())?;
         if sq <= 0 || total_q < 0 || total_q > i32::MAX as i64 {
             return Err(err(VALUE_ERROR, "unsupported packed merge dimensions"));
         }

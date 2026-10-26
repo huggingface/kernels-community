@@ -2,7 +2,7 @@
 
 use tvm_ffi::Tensor;
 
-use crate::layout::{
+use crate::host::layout::{
     layout_rectangle_count, nonoverlapping_bounded_differences, nonoverlapping_small_layout,
     overlaps, tensor_span,
 };

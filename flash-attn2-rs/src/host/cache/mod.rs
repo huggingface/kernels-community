@@ -8,10 +8,10 @@ use tvm_ffi_sys::dlpack::{DLDataType, DLDataTypeCode, DLDeviceType};
 use tvm_ffi_sys::{TVMFFIAny, TVMFFIEnvGetStream};
 
 use self::alias::{disjoint_auxiliary, disjoint_views};
-use crate::cuda::launch_kernel;
-use crate::layout::{copy_layout, nonoverlapping_layout, tensor_span};
-use crate::runtime::runtime;
-use crate::{EMPTY_SLICE, alloc_tensor, any_into_raw_owned, arg, err};
+use crate::host::cuda::launch_kernel;
+use crate::host::layout::{copy_layout, nonoverlapping_layout, tensor_span};
+use crate::host::runtime::runtime;
+use crate::host::{EMPTY_SLICE, alloc_tensor, any_into_raw_owned, arg, err};
 
 fn tensor(name: &str, t: &Tensor, q: &Tensor, writable: bool) -> Result<()> {
     if t.ndim() != 4
@@ -108,9 +108,9 @@ fn update(args: &[AnyView]) -> Result<Any> {
             ));
         }
     }
-    super::varlen::metadata("lengths", &lengths, &[batch], q.device())?;
+    crate::host::layout::metadata("lengths", &lengths, &[batch], q.device())?;
     if let Some(t) = &indices {
-        super::varlen::metadata("indices", t, &[batch], q.device())?;
+        crate::host::layout::metadata("indices", t, &[batch], q.device())?;
     }
     let mut page_size = 0i64;
     let mut table_stride = 0i64;

@@ -1,4 +1,12 @@
-use super::*;
+use super::common::{
+    copy_rows, copy_rows_swizzled, probability_gradient, query_fragments, query_fragments_swizzled,
+};
+use crate::device::config::{FwdConfig, GRID_PLAIN, KvRange, LaunchTile, Strides, TensorBases};
+use crate::device::dropout::Dropout;
+use crate::device::forward::{SmemLayout, accumulate_values, compute_qk};
+use crate::device::inlined::cvt;
+use cuda_device::shared::DynamicSharedArray;
+use cuda_device::{DisjointSlice, kernel, launch_bounds, ptx_asm, thread};
 
 #[inline(always)]
 unsafe fn dq_core<

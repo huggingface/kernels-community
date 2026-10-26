@@ -1,31 +1,19 @@
+mod backward;
+mod merge;
+
 use std::ffi::c_void;
 
 use tvm_ffi::error::{Error, RUNTIME_ERROR, Result, VALUE_ERROR};
 use tvm_ffi::{Any, AnyView, Function, Tensor};
 use tvm_ffi_sys::TVMFFIEnvGetStream;
-use tvm_ffi_sys::dlpack::{DLDataType, DLDataTypeCode, DLDevice, DLDeviceType};
+use tvm_ffi_sys::dlpack::{DLDataType, DLDataTypeCode, DLDeviceType};
 
-use crate::cuda::{launch_kernel, sys};
-use crate::layout::{attention_shape, prepare_packed_qkv, prepare_qkv, tensor_span};
-use crate::rng::resolve_rng_descriptor;
-use crate::runtime::runtime;
-use crate::tiles::{HEAD_DIMS, dropout_tile, flash_smem_bytes};
-use crate::{EMPTY_SLICE, MAX_GRID_YZ, alloc_tensor, any_into_raw_owned, arg, err};
-
-pub(super) fn metadata(name: &str, tensor: &Tensor, shape: &[i64], device: DLDevice) -> Result<()> {
-    if tensor.device() != device
-        || tensor.dtype() != DLDataType::new(DLDataTypeCode::kDLInt, 32, 1)
-        || tensor.shape() != shape
-        || !tensor.is_contiguous()
-        || tensor.data_ptr() as u64 % 4 != 0
-    {
-        return Err(err(
-            VALUE_ERROR,
-            &format!("{name} must be contiguous CUDA int32 {shape:?} on q's device"),
-        ));
-    }
-    Ok(())
-}
+use crate::host::cuda::{launch_kernel, sys};
+use crate::host::layout::{attention_shape, metadata, prepare_packed_qkv, prepare_qkv, tensor_span};
+use crate::host::rng::resolve_rng_descriptor;
+use crate::host::runtime::runtime;
+use crate::host::tiles::{HEAD_DIMS, dropout_tile, flash_smem_bytes};
+use crate::host::{EMPTY_SLICE, MAX_GRID_YZ, alloc_tensor, any_into_raw_owned, arg, err};
 
 // Packed rank-three inputs share stride preparation with dense/cache inputs.
 fn varlen_fwd(args: &[AnyView], descriptor_mode: bool) -> Result<Any> {
@@ -611,7 +599,7 @@ fn varlen_fwd(args: &[AnyView], descriptor_mode: bool) -> Result<Any> {
         .map_err(|e| err(RUNTIME_ERROR, &format!("launch varlen forward: {e:?}")))?;
     }
     let (out, lse) = if packed_multi && splits > 1 {
-        crate::cache_merge::merge_varlen(
+        crate::host::varlen::merge::merge_varlen(
             &out,
             &lse,
             bf16,
@@ -620,9 +608,9 @@ fn varlen_fwd(args: &[AnyView], descriptor_mode: bool) -> Result<Any> {
             q.ndim() == 3,
         )?
     } else if split_varlen {
-        crate::cache_merge::merge_packed_decode(&out, &lse, bf16, packed_grouped, q.ndim() == 3)?
+        crate::host::varlen::merge::merge_packed_decode(&out, &lse, bf16, packed_grouped, q.ndim() == 3)?
     } else if partial_output {
-        crate::cache_merge::merge_layout(&out, &lse, bf16, grouped)?
+        crate::host::varlen::merge::merge_layout(&out, &lse, bf16, grouped)?
     } else {
         (out, lse)
     };

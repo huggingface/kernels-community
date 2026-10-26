@@ -5,15 +5,11 @@ use tvm_ffi::{Any, AnyView, Function, Tensor};
 use tvm_ffi_sys::TVMFFIEnvGetStream;
 use tvm_ffi_sys::dlpack::{DLDataType, DLDataTypeCode, DLDeviceType};
 
-use crate::cuda::{launch_kernel, sys};
-use crate::layout::{prepare_qkv, tensor_span};
-use crate::runtime::runtime;
-use crate::tiles::HEAD_DIMS;
-use crate::{EMPTY_SLICE, MAX_GRID_YZ, alloc_tensor, any_into_raw_owned, arg, err};
-
-pub(super) const fn combined_smem(dropout: bool, masked: bool) -> u32 {
-    if dropout || masked { 50176 } else { 17408 }
-}
+use crate::host::cuda::{launch_kernel, sys};
+use crate::host::layout::{prepare_qkv, tensor_span};
+use crate::host::runtime::runtime;
+use crate::host::tiles::{HEAD_DIMS, combined_smem};
+use crate::host::{EMPTY_SLICE, MAX_GRID_YZ, alloc_tensor, any_into_raw_owned, arg, err};
 
 fn backward_component(args: &[AnyView], kv: bool, all: bool) -> Result<Vec<Tensor>> {
     if args.len() != 14 {

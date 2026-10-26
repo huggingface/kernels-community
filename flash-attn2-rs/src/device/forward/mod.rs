@@ -1,4 +1,8 @@
+//! Shared forward core: smem layout, QK^T, online softmax and PV accumulation.
 // Helpers stay inlined: #[device] calls force fragments to local memory.
+
+mod dense;
+mod dense192;
 
 use crate::device::config::{FwdConfig, KvRange, LaunchTile, TensorBases};
 use crate::device::dropout::Dropout;
@@ -1209,10 +1213,6 @@ pub unsafe fn flash_attn_core<
     dropout: Dropout,
 ) {
     unsafe {
-        if HD == 192 && BLOCK_ROWS == 128 && KEYS == 64 {
-            crate::device::dense192::run::<BF16>(q, k, v, o, lse, scale, seqlen_q, seqlen_k, h);
-            return;
-        }
         let mut layout = SmemLayout::new::<HD, KEYS, BLOCK_ROWS>();
         if PARTIAL {
             layout.double = false;

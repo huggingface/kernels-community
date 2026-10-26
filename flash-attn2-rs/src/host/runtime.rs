@@ -5,11 +5,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use tvm_ffi::error::{RUNTIME_ERROR, Result};
 
-use crate::backward;
-use crate::cuda::{self, CudaContext, CudaFunction, CudaModule, sys};
-use crate::err;
-use crate::tiles::{
-    ALTERNATE_BUCKETS, HEAD_DIMS, Tile, alternate_tile, default_tile, dropout_tile,
+use crate::host::cuda::{self, CudaContext, CudaFunction, CudaModule, sys};
+use crate::host::err;
+use crate::host::tiles::{
+    ALTERNATE_BUCKETS, HEAD_DIMS, Tile, alternate_tile, combined_smem, default_tile, dropout_tile,
     flash_kernel_name, flash_smem_bytes, split_smem_bytes, split_tile,
 };
 
@@ -432,7 +431,7 @@ pub(super) fn runtime(device: i32) -> Result<&'static Runtime> {
                     );
                     bwd_dkv_both_fns.insert(
                         (bf16, partial, dropout, masked),
-                        load_flash(&name, backward::combined_smem(dropout, masked))?,
+                        load_flash(&name, combined_smem(dropout, masked))?,
                     );
                 }
             }

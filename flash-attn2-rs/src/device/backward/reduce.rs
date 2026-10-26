@@ -1,4 +1,19 @@
-use super::*;
+use crate::device::inlined::{cvt, unpack};
+use cuda_device::warp::shuffle_xor_f32;
+use cuda_device::{DisjointSlice, kernel, launch_bounds, thread};
+
+/// Output precision of the fixed-order partial-sum merges.
+pub trait MergeSpec {
+    const BF16: bool;
+}
+pub struct Merge<const BF16: bool>;
+impl<const BF16: bool> MergeSpec for Merge<BF16> {
+    const BF16: bool = BF16;
+}
+#[allow(non_camel_case_types)]
+pub type f16 = Merge<false>;
+#[allow(non_camel_case_types)]
+pub type bf16 = Merge<true>;
 
 pub trait ReduceSpec {
     const BF16: bool;
@@ -93,9 +108,9 @@ pub fn bwd_preprocess<S: ReduceSpec>(
 }
 
 // Fixed-order FP32 sum over heads, rounded once for determinism.
-#[kernel(crate::device::cache_merge::f16, crate::device::cache_merge::bf16)]
+#[kernel(f16, bf16)]
 #[launch_bounds(256)]
-pub fn backward_kv_merge<S: crate::device::cache_merge::Spec>(
+pub fn backward_kv_merge<S: MergeSpec>(
     partial_k: &[f32],
     partial_v: &[f32],
     dk: DisjointSlice<u32>,
@@ -146,9 +161,9 @@ pub fn backward_kv_merge<S: crate::device::cache_merge::Spec>(
 }
 
 // Increasing split order, rounded once, so the result is deterministic.
-#[kernel(crate::device::cache_merge::f16, crate::device::cache_merge::bf16)]
+#[kernel(f16, bf16)]
 #[launch_bounds(256)]
-pub fn backward_dq_merge<S: crate::device::cache_merge::Spec>(
+pub fn backward_dq_merge<S: MergeSpec>(
     partial: &[f32],
     dq: DisjointSlice<u32>,
     pairs: u64,

@@ -1,12 +1,62 @@
 //! Measured tile/split heuristics and CUDA specialization selection.
 
+use tvm_ffi::Tensor;
 use tvm_ffi::error::{RUNTIME_ERROR, Result};
+use tvm_ffi_sys::dlpack::DLDevice;
 
-use super::PreparedForward;
-use crate::cuda::CudaFunction;
-use crate::err;
-use crate::runtime::Runtime;
-use crate::tiles::{Tile, alternate_tile, default_tile, dropout_tile, flash_tile, split_tile};
+use crate::host::cuda::CudaFunction;
+use crate::host::layout::Strides;
+use crate::host::err;
+use crate::host::runtime::Runtime;
+use crate::host::tiles::{Tile, alternate_tile, default_tile, dropout_tile, flash_tile, split_tile};
+
+/// Validated forward inputs and buffers, kept until all launches finish.
+pub(super) struct PreparedForward {
+    pub(super) q: Tensor,
+    pub(super) k: Tensor,
+    pub(super) v: Tensor,
+    pub(super) _alibi: Option<Tensor>,
+    pub(super) q_str: Strides,
+    pub(super) k_str: Strides,
+    pub(super) v_str: Strides,
+    pub(super) is_bf16: bool,
+    pub(super) b: i64,
+    pub(super) h: i64,
+    pub(super) d: i64,
+    pub(super) seqlen_q: i64,
+    pub(super) seqlen_k: i64,
+    pub(super) hk: i64,
+    pub(super) bh: i64,
+    pub(super) device: DLDevice,
+    pub(super) has_alibi: u32,
+    pub(super) alibi_data: u64,
+    pub(super) alibi_numel: u64,
+    pub(super) alibi_bs: u32,
+    pub(super) scale: f64,
+    pub(super) scale_eff: f64,
+    pub(super) tanh_scale: f64,
+    pub(super) softcap: f64,
+    pub(super) wl: i64,
+    pub(super) wr: i64,
+    pub(super) alibi_causal: u32,
+    pub(super) supplied_out: Option<Tensor>,
+    pub(super) copy_out: bool,
+    pub(super) out: Tensor,
+    pub(super) lse: Tensor,
+    pub(super) probabilities: Option<Tensor>,
+    pub(super) rng_state: Option<Tensor>,
+    pub(super) dropout: bool,
+    pub(super) dropout_seed: u64,
+    pub(super) dropout_offset: u64,
+    pub(super) dropout_keep: f32,
+    pub(super) native_reservation: bool,
+    pub(super) return_softmax: bool,
+    pub(super) descriptor_mode: bool,
+    pub(super) descriptor: [u64; 3],
+    pub(super) descriptor_captured: u32,
+    pub(super) bucket: i64,
+    pub(super) lse_only: bool,
+}
 
 pub(super) struct ForwardPlan {
     pub(super) tile: Tile,

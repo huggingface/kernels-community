@@ -1,8 +1,12 @@
+mod backward;
+mod merge;
+mod paged;
+
 use crate::device::config::{FwdConfig, GRID_PLAIN, KvRange, LaunchTile, TensorBases};
 use crate::device::dropout::Dropout;
 use crate::device::forward::*;
 use crate::device::inlined::{cvt, lg2_approx};
-use crate::device::paged::Pages;
+use crate::device::varlen::paged::Pages;
 use cuda_device::warp::shuffle_xor_f32;
 use cuda_device::{DisjointSlice, kernel, launch_bounds, ptx_asm, thread};
 
@@ -194,7 +198,7 @@ unsafe fn core<
         }
         let reverse = false;
         if PAGED {
-            crate::device::paged::prefetch_first_kv::<HD, KEYS, 128, false, false>(
+            crate::device::varlen::paged::prefetch_first_kv::<HD, KEYS, 128, false, false>(
                 k, v, &cfg, &tile, &bases, kv_range, smem, layout, reverse, pages,
             );
         } else {
@@ -207,7 +211,7 @@ unsafe fn core<
         while j < kv_range.num_tiles {
             let kv_base = j * KEYS;
             let (k_smem_base, v_smem_base) = if PAGED {
-                crate::device::paged::stage_kv_tile::<HD, KEYS, 128, false, false>(
+                crate::device::varlen::paged::stage_kv_tile::<HD, KEYS, 128, false, false>(
                     k, v, &cfg, &tile, &bases, kv_range, smem, layout, j, reverse, pages,
                 )
             } else {
@@ -225,7 +229,7 @@ unsafe fn core<
                 thread::sync_threads();
                 if j + 1 < kv_range.num_tiles {
                     if PAGED {
-                        crate::device::paged::stage_tile::<HD, KEYS, 128>(
+                        crate::device::varlen::paged::stage_tile::<HD, KEYS, 128>(
                             smem.k0,
                             k,
                             (j + 1) * KEYS,
