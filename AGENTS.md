@@ -115,7 +115,9 @@ starts calling `b` then fails on those Torch versions with a symbol that
 cannot be found. Bumping to version 2 instead means `kernels` simply reports
 that no build variant exists for the user's system.
 
-No bump is needed where every published variant gets refreshed anyway:
+Appending optional positional parameters while preserving the existing parameters,
+defaults, and return types does not require a bump. Other additive changes need
+no bump where every published variant gets refreshed anyway:
 
 - No-arch kernels (a `[torch-noarch]` build).
 - Torch stable-ABI kernels, as long as the CUDA versions built overlap with
@@ -123,10 +125,7 @@ No bump is needed where every published variant gets refreshed anyway:
 - AoT-compiled kernels where a build replaces all variants.
 - Brand-new kernels, which only have builds for the latest two Torch versions.
 
-The `Check Public API` workflow enforces this via
-`scripts/check_public_api.py`, which recognises the no-arch, stable-ABI, and
-brand-new cases on its own. The AoT case is not visible from the repo, so bump
-the version there anyway - a bump is never wrong.
+Refer to the [documentation](https://huggingface.co/docs/kernels/main/en/kernel-requirements#versioning) for more details.
 
 ## Torch Stable ABI
 
