@@ -6,7 +6,7 @@ license = "MIT"
 backends = ["rocm"]
 
 [general.hub]
-repo-id = "kernels-community/aiter-rope"
+repo-id = "amd/aiter-rope"
 
 [torch-noarch]
 

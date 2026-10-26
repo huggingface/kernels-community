@@ -2,8 +2,12 @@ from typing import List, Optional
 
 import torch
 
+from . import flash_attn_interface
 from ._ops import ops as flash_attn_ops
 from .flash_attn_interface import (
+    # helper to set up the Philox random number generator for dropout
+    _philox_generator,
+    # reexported for convenience to be used in the high-level API functions
     flash_attn_func,
     flash_attn_kvpacked_func,
     flash_attn_qkvpacked_func,
@@ -22,6 +26,12 @@ __all__ = [
     "flash_attn_varlen_kvpacked_func",
     "flash_attn_varlen_qkvpacked_func",
     "flash_attn_with_kvcache",
+    # Upstream interface module. Its `_flash_attn_forward`, `_flash_attn_backward`,
+    # `_flash_attn_varlen_forward` and `_flash_attn_varlen_backward` are supported
+    # low-level entry points with upstream's signatures: Torch custom ops without
+    # autograd that return the LSE and are traceable by torch.compile. The autograd
+    # Functions above are built on top of them.
+    "flash_attn_interface",
     # Low-level ops (no autograd)
     "fwd",
     "varlen_fwd",
@@ -71,6 +81,7 @@ def fwd(
         attention_head_dim = q.shape[-1]
         softmax_scale = 1.0 / (attention_head_dim**0.5)
 
+    gen = _philox_generator(q, p_dropout, gen)
     return flash_attn_ops.fwd(
         q,
         k,
@@ -144,6 +155,7 @@ def varlen_fwd(
         attention_head_dim = q.shape[-1]
         softmax_scale = 1.0 / (attention_head_dim**0.5)
 
+    gen = _philox_generator(q, p_dropout, gen)
     return flash_attn_ops.varlen_fwd(
         q,
         k,
