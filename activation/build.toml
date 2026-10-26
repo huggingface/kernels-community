@@ -1,7 +1,7 @@
 [general]
 name = "activation"
 version = 1
-edition = 5
+edition = 6
 license = "Apache-2.0"
 backends = [
     "cuda",
@@ -24,55 +24,8 @@ src = [
 cuda = "2.10"
 rocm = "2.10"
 
-[kernel.activation_metal]
-backend = "metal"
-depends = ["torch"]
-src = [
-    "activation_metal/activation.mm",
-    "activation_metal/activation.metal",
-]
-
-[kernel.activation_xpu]
-backend = "xpu"
-depends = ["torch"]
-include = ["activation_xpu"]
-src = [
-    "activation_xpu/activation_kernels.cpp",
-    "activation_xpu/activation_xpu_torch.cpp",
-    "activation_xpu/activation_xpu.hpp",
-]
-
-[kernel.activation]
-backend = "cuda"
-depends = ["torch"]
-src = [
-    "activation/activation_kernels.cu",
-    "activation/cuda_compat.h",
-    "activation/dispatch_utils.h",
-]
-
-[kernel.activation_rocm]
-backend = "rocm"
-depends = ["torch"]
-rocm-archs = [
-    "gfx906",
-    "gfx908",
-    "gfx90a",
-    "gfx940",
-    "gfx941",
-    "gfx942",
-    "gfx1030",
-    "gfx1100",
-    "gfx1101",
-]
-src = [
-    "activation/activation_kernels.cu",
-    "activation/cuda_compat.h",
-    "activation/dispatch_utils.h",
-]
-
 [kernel.activation_cpu]
-backend = "cpu"
+language = "cpp-cpu"
 depends = ["torch"]
 include = ["activation_cpu"]
 src = [
@@ -82,8 +35,25 @@ src = [
     "activation_cpu/cpu_features.hpp",
 ]
 
+[kernel.activation]
+language = "cpp-cuda"
+depends = ["torch"]
+src = [
+    "activation/activation_kernels.cu",
+    "activation/cuda_compat.h",
+    "activation/dispatch_utils.h",
+]
+
+[kernel.activation_metal]
+language = "cpp-metal"
+depends = ["torch"]
+src = [
+    "activation_metal/activation.mm",
+    "activation_metal/activation.metal",
+]
+
 [kernel.activation_cpu_avx512]
-backend = "cpu"
+language = "cpp-cpu"
 cxx-flags = [
     "-O3",
     "-fopenmp",
@@ -101,4 +71,41 @@ include = ["activation_cpu"]
 src = [
     "activation_cpu/silu_and_mul_avx512.cpp",
     "activation_cpu/silu_and_mul_avx512.hpp",
+]
+
+[kernel.activation_rocm]
+language = "cpp-rocm"
+depends = ["torch"]
+rocm-archs = [
+    "gfx906",
+    "gfx908",
+    "gfx90a",
+    "gfx940",
+    "gfx941",
+    "gfx942",
+    "gfx950",
+    "gfx1030",
+    "gfx1100",
+    "gfx1101",
+    "gfx1102",
+    "gfx1103",
+    "gfx1150",
+    "gfx1151",
+    "gfx1200",
+    "gfx1201",
+]
+src = [
+    "activation/activation_kernels.cu",
+    "activation/cuda_compat.h",
+    "activation/dispatch_utils.h",
+]
+
+[kernel.activation_xpu]
+language = "cpp-xpu"
+depends = ["torch"]
+include = ["activation_xpu"]
+src = [
+    "activation_xpu/activation_kernels.cpp",
+    "activation_xpu/activation_xpu_torch.cpp",
+    "activation_xpu/activation_xpu.hpp",
 ]

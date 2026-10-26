@@ -31,25 +31,25 @@ quantized weight takes no gradient, because an fp8/fp4 tensor cannot be an autog
 
 import pytest
 import torch
-from utils import (
+from utils import (  # type: ignore
+    dequantize_weight,
+    finegrained_kernels,
+    internals,
+    make_weights,
+    quant_dequant_a,
     SUPPORTS_FP8,
     TEST_DEVICE,
     WEIGHTS,
-    dequantize_weight,
-    make_weights,
-    quant_dequant_a,
 )
 
-import finegrained_kernels as fg
-from finegrained_kernels.backward import (
-    dgrad_matmul_2d,
-    dgrad_matmul_batched,
-    dgrad_matmul_grouped,
-    glu_backward,
-)
+fg = finegrained_kernels
+dgrad_matmul_2d = internals.backward.dgrad_matmul_2d
+dgrad_matmul_batched = internals.backward.dgrad_matmul_batched
+dgrad_matmul_grouped = internals.backward.dgrad_matmul_grouped
+glu_backward = internals.backward.glu_backward
 
 
-pytestmark = pytest.mark.skipif(not SUPPORTS_FP8, reason="FP8 kernels require SM90+")
+pytestmark = pytest.mark.skipif(not SUPPORTS_FP8, reason="FP8 kernels require SM89+")
 
 M, N, K = 512, 1024, 768  # 128-aligned on every axis so every format's blocks divide evenly
 
@@ -321,7 +321,7 @@ def test_dgrad_grouped_accumulates_over_top_k():
     row is written exactly once, so a kernel that STORES and one that ACCUMULATES are
     indistinguishable — which is how a store survived the suite while silently dropping all but
     one expert's contribution per token on any real MoE."""
-    from finegrained_kernels.backward import dgrad_matmul_grouped
+    dgrad_matmul_grouped = internals.backward.dgrad_matmul_grouped
 
     torch.manual_seed(0)
     T, tk, E, Ne, Ke = 8, 2, 4, 256, 256
@@ -365,8 +365,8 @@ def test_dgrad_grouped_every_admitted_config_accumulates():
     benches configs by speed, so an arm that is wrong ONLY under these launch semantics gets
     crowned whenever it wins a near-tied tune — the descriptor-anchor bug this guards against
     read the wrong dY rows on exactly this launch while passing every identity-gather test."""
-    from finegrained_kernels import backward as backward_module
-    from finegrained_kernels.backward import dgrad_matmul_grouped
+    backward_module = internals.backward
+    dgrad_matmul_grouped = internals.backward.dgrad_matmul_grouped
 
     torch.manual_seed(0)
     T, tk, E, Ne, Ke = 8, 2, 4, 256, 256

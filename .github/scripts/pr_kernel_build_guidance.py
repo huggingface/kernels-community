@@ -43,7 +43,10 @@ def paginate(url: str, token: str) -> list[dict]:
 
 
 def kernel_directories(root: Path) -> set[str]:
-    return {manifest.parent.name for manifest in root.glob("*/build.toml")}
+    # Ported kernels keep build.toml in <kernel>/src.
+    return {manifest.parent.name for manifest in root.glob("*/build.toml")} | {
+        manifest.parent.parent.name for manifest in root.glob("*/src/build.toml")
+    }
 
 
 def is_documentation(path: PurePosixPath) -> bool:
@@ -55,7 +58,8 @@ def touched_source_kernels(files: list[dict], existing_kernels: set[str]) -> lis
     new_kernels = {
         path.parts[0]
         for path in paths
-        if len(path.parts) == 2 and path.name == "build.toml"
+        if path.name == "build.toml"
+        and (len(path.parts) == 2 or (len(path.parts) == 3 and path.parts[1] == "src"))
     }
     kernels = existing_kernels | new_kernels
     touched = set(new_kernels)

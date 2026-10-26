@@ -40,7 +40,11 @@ jobs:
           KERNEL: ${{ inputs.kernel_name }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            if [ -d "$KERNEL" ] && [ -f "$KERNEL/flake.nix" ] && [ -f "$KERNEL/build.toml" ]; then
+            # Ported kernels keep build.toml in <kernel>/src; the flake stays at
+            # <kernel> and points nix at it.
+            CONFIG="$KERNEL"
+            [ -f "$KERNEL/src/build.toml" ] && CONFIG="$KERNEL/src"
+            if [ -d "$KERNEL" ] && [ -f "$KERNEL/flake.nix" ] && [ -f "$CONFIG/build.toml" ]; then
               echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
               echo "skip=false" >> $GITHUB_OUTPUT
             else

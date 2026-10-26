@@ -23,15 +23,13 @@ else:
     # A packaged build, resolved through `kernels` -- which is what a consumer does, so the tests
     # exercise the same loading path rather than a layout detail. A variant directory is not a
     # package, so a bare `import` cannot find it.
-    from pathlib import Path
-
     try:
-        from kernels import get_local_kernel
+        import kernels
 
-        ops = get_local_kernel(Path(__file__).resolve().parent.parent, "metal")
+        # resolves to the local build when LOCAL_KERNELS points at it, as in kernels-community CI
+        ops = kernels.get_kernel("ggml-org/ggml-gated-delta-net", version=1)
     except Exception as error:  # pragma: no cover
-        pytest.skip(f"no kernel to test ({error}); set GGML_ATTN_LOCAL_LIB or build one",
-                    allow_module_level=True)
+        pytest.skip(f"no kernel to test ({error})", allow_module_level=True)
 
 pytestmark = pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs MPS")
 

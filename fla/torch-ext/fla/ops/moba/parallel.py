@@ -365,7 +365,7 @@ def parallel_moba(
         into 128-token blocks with each query attending to 4 blocks:
 
         >>> import torch
-        >>> from ...ops.moba import parallel_moba
+        >>> from fla.ops.moba import parallel_moba
         >>> B, T, H, D = 1, 1024, 4, 64
         >>> q = torch.randn(B, T, H, D, dtype=torch.float16, device='cuda')
         >>> k = torch.randn(B, T, H, D, dtype=torch.float16, device='cuda')

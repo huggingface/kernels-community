@@ -33,6 +33,8 @@ def _bf16(t):
 
 
 class ESMFold2TriangleMultiplication(nn.Module):
+    can_torch_compile = True
+
     def forward(self, pair_grid: torch.Tensor, visibility: torch.Tensor | None = None) -> torch.Tensor:
         lat = self.dim
         pb = self.proj_bundle.weight

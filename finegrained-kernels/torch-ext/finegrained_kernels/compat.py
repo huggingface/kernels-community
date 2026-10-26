@@ -39,8 +39,18 @@ def decode_pdl() -> bool:
     access analysis cannot read the ``griddepcontrol`` inline asm and would mark every input mutated
     (extra copies, no fusion). Deployment decode runs eager launches under cudagraphs, where PDL
     applies. ``griddepcontrol`` is an NVIDIA primitive, so every other backend reads False and the
-    ``gdc_*`` intrinsics stay behind their ``PDL`` constexpr."""
-    return DECODE_PDL and not torch.compiler.is_compiling() and get_active_device_type() == "cuda"
+    ``gdc_*`` intrinsics stay behind their ``PDL`` constexpr. ``griddepcontrol`` also needs sm_90."""
+    return (
+        DECODE_PDL
+        and not torch.compiler.is_compiling()
+        and get_active_device_type() == "cuda"
+        and _griddepcontrol_supported()
+    )
+
+
+@functools.cache
+def _griddepcontrol_supported() -> bool:
+    return torch.version.hip is None and torch.cuda.get_device_capability() >= (9, 0)
 
 
 def pdl_launch_kwargs() -> dict:
@@ -73,6 +83,11 @@ except ImportError:
 
 # FP8 (E4M3) is the main format for weights and activations;
 FP8_DTYPE = torch.float8_e4m3fn
+
+# UE8M0 MX scales are a torch dtype (``float8_e8m0fnu``) only from torch 2.7. Older torch carries
+# them as raw ``uint8`` exponent bytes, which the kernels decode the same way, so this is ``None``
+# there and the format checks accept ``uint8`` alone.
+UE8M0_DTYPE = torch.float8_e8m0fnu if torch.__version__ >= "2.7" else None
 
 # FP4 (E2M1) packs two 4-bit nibbles per byte. MX formats (MXFP4 weights, MXFP8
 # E4M3 weights/activations) share one UE8M0 scale per 32-element K-group — the OCP
@@ -495,6 +510,18 @@ def is_sm10x() -> bool:
     capability query, which would otherwise raise); cached (pruners call this per tune, and
     a process is pinned to one device)."""
     return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
+
+
+@functools.cache
+def is_blackwell() -> bool:
+    """Whether the CURRENT device is any Blackwell family: sm_10x (datacenter), sm_11x
+    (Jetson Thor) or sm_12x (consumer). Wider than ``is_sm10x``: these share the FP4
+    conversion instructions but not TMEM scaled-MMA."""
+    return (
+        torch.cuda.is_available()
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability()[0] in (10, 11, 12)
+    )
 
 
 @functools.cache

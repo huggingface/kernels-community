@@ -57,7 +57,10 @@ def discover_kernel_dirs(root: Path, excludes: list[str]) -> list[str]:
         name = entry.name
         if name in filtered:
             continue
-        elif entry.is_dir() and not (entry / "build.toml").exists():
+        # Ported kernels keep build.toml in <kernel>/src.
+        elif entry.is_dir() and not (
+            (entry / "build.toml").exists() or (entry / "src" / "build.toml").exists()
+        ):
             logging.debug(f"Skipping {name} because it doesn't contain a `build.toml`.")
             continue
         if entry.is_dir():

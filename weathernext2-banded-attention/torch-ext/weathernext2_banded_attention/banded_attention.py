@@ -22,9 +22,11 @@ from .utils import device_context
 
 
 # Default follows the compiler's float32 dot precision; IEEE requests full float32 multiplication.
+# TF32x3 (NVIDIA only) splits each float32 operand into TF32 parts: float32-level accuracy on tensor cores.
 PRECISION_DEFAULT = 0
 PRECISION_IEEE = 1
-_PRECISIONS = {"default": PRECISION_DEFAULT, "ieee": PRECISION_IEEE}
+PRECISION_TF32X3 = 2
+_PRECISIONS = {"default": PRECISION_DEFAULT, "ieee": PRECISION_IEEE, "tf32x3": PRECISION_TF32X3}
 
 
 class PreparedMask(NamedTuple):
@@ -154,6 +156,7 @@ def _banded_attention_kernel(
     rows = tile * BLOCK_M + tl.arange(0, BLOCK_M)
     dims = tl.arange(0, HEAD_DIM)
     row_valid = rows < block_size
+    scaling = scaling.to(tl.float32)
 
     query_base = query_ptr + flat_block * stride_qb + head * stride_qh
     query = tl.load(
@@ -189,6 +192,8 @@ def _banded_attention_kernel(
                 )
                 if PRECISION == 0:
                     logits = tl.dot(query, tl.trans(key))
+                elif PRECISION == 2:
+                    logits = tl.dot(query, tl.trans(key), input_precision="tf32x3")
                 else:
                     logits = tl.dot(query, tl.trans(key), input_precision="ieee")
                 # Match Faster-WeatherNext's QK dot followed by scaling.
@@ -207,6 +212,8 @@ def _banded_attention_kernel(
                 weights = weights.to(value.dtype)
                 if PRECISION == 0:
                     contribution = tl.dot(weights, value)
+                elif PRECISION == 2:
+                    contribution = tl.dot(weights, value, input_precision="tf32x3")
                 else:
                     contribution = tl.dot(weights, value, input_precision="ieee")
                 accumulator = rescale[:, None] * accumulator + contribution
@@ -264,13 +271,17 @@ def banded_attention(
         mask: `[num_blocks, block_size, 3 * block_size]`, bool, or a shared PreparedMask.
         scaling: the usual `head_dim ** -0.5`.
         precision: how `tl.dot` treats the float32 inputs. `"default"` uses Triton's default for the
-            active backend; `"ieee"` forces true float32 for strict numerical comparisons.
+            active backend; `"ieee"` forces true float32 for strict numerical comparisons; `"tf32x3"`
+            (NVIDIA only) keeps float32-level accuracy on tensor cores.
 
     Returns:
         `[batch, num_blocks, heads, block_size, head_dim]`.
     """
     if precision not in _PRECISIONS:
         raise ValueError(f"precision must be one of {sorted(_PRECISIONS)}, got {precision!r}")
+    if precision == "tf32x3" and (query.device.type != "cuda" or torch.version.hip is not None):
+        # Triton's AMD and Intel backends reject it with an assertion deep in compilation.
+        raise ValueError(f'precision="tf32x3" needs an NVIDIA GPU, got {query.device}; use "ieee" or "default".')
     batch, num_blocks, heads, block_size, head_dim = query.shape
     # `HEAD_DIM` is a `tl.constexpr` tile width and the loads along it are not masked, so a value
     # Triton cannot tile reads past the end of every row. That is silent, so reject it up front.

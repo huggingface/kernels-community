@@ -54,8 +54,8 @@ Every (row, problem, regime, impl) cell runs in THREE modes:
 
 Regimes: decode T=1 and prefill T=8192 (routed through top_k experts; attn row: M=T).
 
---smoke: fast everything-compiles pass — 3-trial tunes (via FINEGRAINED_AUTOTUNE_TRIALS, set
-before the package import) and a 256-token prefill.
+--smoke: fast everything-compiles pass — FINEGRAINED_AUTOTUNE_CONFIG=fast (unless one is already set)
+and a 256-token prefill.
 
 Baselines ("all kinds"): finegrained-fp8 (upstream), DeepGEMM (fp8/fp4/bf16), transformers
 grouped_mm/batched_mm (torch._grouped_mm / torch.bmm, the BF16 torch path), SonicMoE, OpenAI
@@ -96,7 +96,7 @@ _parser.add_argument("--devices", default="",
                      help="comma-separated physical GPUs for the shards (default 0..gpus-1); shard g "
                           "still owns tasks where i %% gpus == g, only the device it runs on changes")
 _parser.add_argument("--smoke", action="store_true",
-                     help="fast everything-compiles pass: 3-trial tunes and a 256-token prefill")
+                     help="fast everything-compiles pass: fast-mode tunes and a 256-token prefill")
 _parser.add_argument("--mock", action="store_true",
                      help="no GPU, no kernels: random-but-plausible latencies and parity so the figure "
                           "(layout, crash markers, hatching) can be validated in seconds")
@@ -118,7 +118,7 @@ REPLOT = ARGS.replot
 # i % n == g); it is the one switch that stays in the environment because the coordinator sets it.
 _SHARD = os.environ.get("BENCH_SHARD")
 if SMOKE:
-    os.environ.setdefault("FINEGRAINED_AUTOTUNE_TRIALS", "3")
+    os.environ.setdefault("FINEGRAINED_AUTOTUNE_CONFIG", "fast")
 
 import torch  # noqa: E402
 from triton.testing import do_bench, do_bench_cudagraph  # noqa: E402

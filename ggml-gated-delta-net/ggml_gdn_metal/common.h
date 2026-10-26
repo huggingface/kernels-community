@@ -79,13 +79,15 @@ void ggml_gdn_metal_flash_attn_scratch(int64_t n_seqs, int64_t n_heads, int64_t 
                                         int64_t *tmp_floats);
 
 // The two scalar gates of a gated-delta-net step, in one dispatch:
-//   beta = sigmoid(b)                                  (n_heads values)
-//   g    = -exp(a_log) * softplus(a + dt_bias)         (n_heads values)
-// All six buffers are f32 and `n_heads` long. Worth a kernel not for the arithmetic but for the launches:
-// six torch ops over 32 floats cost 59 us a layer, more than the recurrence they feed.
+//   beta = sigmoid(b)                                  (n_values values)
+//   g    = -exp(a_log) * softplus(a + dt_bias)         (n_values values)
+// All six buffers are f32. b, a, beta and g hold one value per head for each sequence, `n_values` in all;
+// a_log and dt_bias hold one per head (`n_heads`) and repeat across the sequences. Worth a kernel not
+// for the arithmetic but for the launches: six torch ops over 32 floats cost 59 us a layer, more than
+// the recurrence they feed.
 int ggml_gdn_metal_delta_gates(void *b, size_t b_off, void *a, size_t a_off, void *a_log, size_t a_log_off,
                                 void *dt_bias, size_t dt_bias_off, void *beta, size_t beta_off, void *g,
-                                size_t g_off, int64_t n_heads);
+                                size_t g_off, int64_t n_heads, int64_t n_values);
 
 // RMS-normalise each row of `n_rows` rows of `n_cols` f32 values and scale by `1 + weight`.
 //

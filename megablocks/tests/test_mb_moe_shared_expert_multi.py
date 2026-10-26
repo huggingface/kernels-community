@@ -1,9 +1,13 @@
+import kernels
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import os
 import pytest
-from megablocks.layers import MegaBlocksMoeMLPWithSharedExpert, create_shared_expert_weights
+
+megablocks = kernels.get_kernel("kernels-community/megablocks", version=1)
+MegaBlocksMoeMLPWithSharedExpert = megablocks.layers.MegaBlocksMoeMLPWithSharedExpert
+create_shared_expert_weights = megablocks.layers.create_shared_expert_weights
 
 
 def run_distributed_shared_expert_test(rank, world_size):

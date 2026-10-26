@@ -23,8 +23,9 @@ Original code: https://github.com/ROCm/aiter (MIT, © Advanced Micro Devices, In
 Apply NEOX-style RoPE to query and key tensors.
 
 - `q`, `k`: `(batch, num_heads, seq, head_dim)`.
-- `cos`, `sin`: `(batch, seq, head_dim // 2)` — the pre-`unsqueeze` form
-  transformers produces from `position_ids`.
+- `cos`, `sin`: `(batch, seq, head_dim)` or `(batch, seq, head_dim // 2)` — the
+  pre-`unsqueeze` form transformers produces from `position_ids`. Rows may hold
+  different positions (e.g. left padding).
 - Returns `(q_embed, k_embed)` in the same shape as `q`, `k`.
 
 Also exposes the lower-level entry points from AITER for direct use:
@@ -51,7 +52,7 @@ have been rewritten to package-relative form per the
 import torch
 from kernels import get_kernel
 
-rope = get_kernel("kernels-community/aiter-rope")
+rope = get_kernel("amd/aiter-rope", version=3)
 
 B, H, S, D = 2, 8, 32, 64
 q = torch.randn(B, H, S, D, device="cuda", dtype=torch.float16)

@@ -253,7 +253,7 @@ def gated_pointer_weight_warp_spec_pruner():
     sub-128 M tile — plain pointer/pointer at BM=128 and w4/w8 compiles and is often the winner.
 
     Region measured by tuning the GPT-OSS W4A16 problem (N=K=2880) with a fresh Triton cache and
-    ``FINEGRAINED_AUTOTUNE_LOG``: of 129 WS configs, the 12 that failed are exactly the ones this
+    an autotune ``log_path``: of 129 WS configs, the 12 that failed are exactly the ones this
     predicate names, and it drops none of the 117 that compiled. Every failure sat in the GATE
     shape — the ungated shape's 63 WS configs all compiled. Unfenced these are wasted compiles per
     new shape (the tuner memoizes them only after paying once). The ``BM < 128`` clause rests on a
@@ -449,6 +449,11 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None, block_within_k: bool 
             and config_dim(c, args, "BLOCK_SIZE_N") < 64
             and getattr(args.get("B"), "dtype", None) == torch.uint8
         ):
+            return False
+        # A gate|up tile overhanging N (the 2D kernel's non-aligned N: N=320 at BN=128) returns a
+        # wrong GLU / requant on every M, warp, stage, memory-mode and WS variant (all 157 such
+        # admitted configs, W4A4 gate requant N=K=320, B200 2026-10-20); a BN dividing N is correct.
+        if args.get("GATE") and args["N"] % config_dim(c, args, "BLOCK_SIZE_N"):
             return False
         # no-swap width cap: Triton miscompiles a scaled MMA wider than 256 into a sticky
         # illegal-address device trap; the stacked 2*BN extent under GATE counts in full
@@ -1157,6 +1162,9 @@ def descriptor_box_pruner(k_dim="BLOCK_SIZE_K"):
             if b is not None and getattr(b, "ndim", 0) == 2 and b.stride(-1) != 1:
                 return False
         if c.kwargs.get("A_MEMORY_MODE", "pointer") != "pointer":
+            # an A layout no descriptor can back (see `maybe_descriptor`) leaves the pointer arm
+            if "ADescriptor" in args and args["ADescriptor"] is None:
+                return False
             # descriptor A, both arms tuner-routed per the tokens-per-expert key:
             # contiguous boxes (no gather) win at dense routing (-7.1/-7.4%) and lose at
             # skew; tma gather4 (gathered rows, 1-row box, sm_100 only) is MONOTONIC in

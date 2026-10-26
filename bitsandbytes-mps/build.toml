@@ -1,7 +1,7 @@
 [general]
 name = "bitsandbytes-mps"
 version = 1
-edition = 5
+edition = 6
 license = "MIT"
 backends = ["metal"]
 
@@ -16,7 +16,7 @@ src = [
 ]
 
 [kernel.bitsandbytes_mps]
-backend = "metal"
+language = "cpp-metal"
 depends = ["torch"]
 include = ["bitsandbytes_mps"]
 src = [

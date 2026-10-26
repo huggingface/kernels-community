@@ -32,15 +32,27 @@ This kernel walks the three neighbours straight out of the ungathered tensors, s
 - the mask is streamed a tile at a time rather than expanded,
 - tiles the band never reaches are skipped before their two matmuls, not after.
 
-The mask layer builds one packed active-tile representation per forward, shared by all
+The mesh encoder builds one packed active-tile representation per forward, shared by all
 attention layers: CSR offsets, compact tile indices and one uint32 word per query row
 per active 32-key tile, following Faster-WeatherNext. Temporary scan counts and padded
 tile lists are discarded after preparation. The model-facing attention consumes those words directly, without
 unpacking the mask or storing a score matrix. Boolean masks use the same preparation
-when the attention replacement is used without its mask layer.
+when the attention replacement is used without the encoder replacement. Other attention
+implementations keep their original mask preparation and forward.
 
 The fused Triton API is forward only. The model-facing layer uses the differentiable
 fallback when gradients are required.
+
+## Tiled grid inference
+
+The conditioned MLP, grid-to-mesh, mesh-to-grid and forecasting-head replacements process
+grid points and edges in bounded tiles, following
+[Faster-WeatherNext](https://github.com/Raymondlol/Faster-WeatherNext/blob/main/docs/how-it-works.md).
+They reuse the original matrix multiplies and LayerNorm, fuse float32 conditioning and forecast
+output epilogues in Triton, and preserve PyTorch rounding for lower-precision tensors.
+Outputs are preallocated, and the graph replacements update grid latents in place during inference.
+The mesh-to-grid replacement expects receiver-sorted edges, three per grid point.
+Training, gradient-enabled execution and autocast use the reference forward instead.
 
 ## Precision
 
@@ -51,9 +63,12 @@ The reference implementation runs this attention in float32. `precision` control
 |---|---|
 | `"default"` (default) | Triton's backend default |
 | `"ieee"` | full float32 multiplication |
+| `"tf32x3"` | three TF32 passes: float32-level accuracy on tensor cores (NVIDIA only) |
 
-The direct `banded_attention` API accepts either mode. Model-facing attention uses IEEE
-float32 multiplication. CPU execution and execution requiring gradients use the reference
+The direct `banded_attention` API accepts any of these. Model-facing attention follows PyTorch's
+float32 matmul setting: at full precision (PyTorch's default) it uses TF32x3 on NVIDIA and IEEE
+elsewhere; when TF32 is allowed, e.g. with `torch.set_float32_matmul_precision("high")`, it uses
+Triton's default. CPU execution and execution requiring gradients use the reference
 implementation instead.
 
 IEEE dot products can be substantially slower than accelerated reduced-precision dots,
@@ -76,9 +91,8 @@ geometry guarantees this; the empty rows past the last mesh node are handled.
 
 The attention layer accepts boolean geometry masks, with an optional singleton head axis,
 and masks whose block axis is folded into the batch axis. Other tensor layouts take
-the gather-plus-SDPA fallback. `attn_implementation="flex_attention"` is unsupported: that
-hands the layer a `BlockMask`, which neither path can read, so it raises rather than
-quietly dropping the mask.
+the gather-plus-SDPA fallback. The optimized attention requires SDPA; other attention
+implementations, including flex attention, keep their original forward.
 
 ## Validation
 
@@ -86,8 +100,10 @@ quietly dropping the mask.
 densities, checks that a node reaching only itself returns its own value vector rather
 than NaN, checks that unsupported head dimensions raise, and checks that a backward
 reaches all four projections. Model-facing tests cover
-batch-specific masks, shared packed geometry and CPU execution. Tests use the implementation's
-fixed launch defaults, without overriding tuning configurations.
+batch-specific masks, shared packed geometry and CPU execution. Precision tests check `"tf32x3"`
+against `"ieee"`, the layer's choice under each PyTorch float32 setting, and that a compiled
+layer follows a later change of that setting. Tests use the implementation's fixed launch
+defaults, without overriding tuning configurations.
 
 Tests pick the device with `infer_device()`, so they run on whichever accelerator is present
 rather than assuming CUDA.
