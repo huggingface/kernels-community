@@ -56,11 +56,11 @@ def _active_bytes(nargs, weight):
 
 
 def rotation_count(active_bytes, device):
-    """Cycle more than twice L2, or decline an impractically large captured graph."""
+    """Calls to cycle so that together they read more than twice L2. Capped at 1024 launches per
+    captured graph, so a weight under ~2*L2/1024 stays partly warm (a negligible kernel)."""
     if active_bytes <= 0:
-        return None
-    count = 2 * torch.cuda.get_device_properties(device).L2_cache_size // active_bytes + 1
-    return count if count <= 1024 else None
+        return 1
+    return min(2 * torch.cuda.get_device_properties(device).L2_cache_size // active_bytes + 1, 1024)
 
 
 def free_device_bytes(device):
@@ -70,17 +70,18 @@ def free_device_bytes(device):
 
 
 def routed_banks(nargs, experts, count):
-    """Banks over the one expert stack: bank 0 is the call, bank ``k`` relabels its ``n`` active
-    experts to the ``k``-th block of ``n`` experts it does not route to, so every bank reads other
-    experts' weights and no weight is copied. None when there is no routing or the ``count``
-    blocks do not fit the stack."""
+    """Up to ``count`` banks over the one expert stack: bank 0 is the call, bank ``k`` relabels its
+    ``n`` active experts to the ``k``-th block of ``n`` experts it does not route to, so every bank
+    reads other experts' weights and no weight is copied. As many as the stack holds
+    (``experts // n``); None when the call has no routing."""
     ids, start = nargs.get("ExpertIds"), nargs.get("ExpertStart")
     active = _active_experts(nargs, experts)
     if active is None:
         return None
     n = active.numel()
-    if n == 0 or count * n > experts:
-        return None
+    if n == 0:
+        return [nargs]
+    count = min(count, experts // n)
     idle = torch.arange(experts, device=active.device)
     idle = idle[~torch.isin(idle, active)]
     banks = [nargs]
@@ -102,9 +103,10 @@ def routed_banks(nargs, experts, count):
     return banks
 
 
-def _copied_banks(nargs, weight, count):
-    """Banks over copies of ``B`` and its full-weight host descriptor (BSDescriptor may be an unread
-    alias of BDescriptor). None when B's descriptor covers a different span or memory is short."""
+def _weight_copies(nargs, weight, copies):
+    """Up to ``copies`` argument overrides, each a copy of ``B`` and its full-weight host descriptor
+    (BSDescriptor may be an unread alias of BDescriptor). Fewer when memory runs short; none when
+    B's descriptor covers a different span than B."""
     span_bytes = weight.numel() * weight.element_size()
     descriptor = nargs.get("BDescriptor")
     if isinstance(descriptor, TensorDescriptor):
@@ -113,39 +115,36 @@ def _copied_banks(nargs, weight, count):
         if (not isinstance(base, torch.Tensor) or not weight.is_contiguous()
                 or not base.is_contiguous() or base.data_ptr() != weight.data_ptr()
                 or base.numel() * base.element_size() != span_bytes):
-            return None
-    if (count - 1) * span_bytes > free_device_bytes(weight.device):
-        return None
-    banks = [nargs]
-    try:
-        with torch.no_grad():
-            for _ in range(count - 1):
-                clone = torch.empty_strided(weight.shape, weight.stride(),
-                                            dtype=weight.dtype, device=weight.device)
-                clone.copy_(weight)
-                bank = dict(nargs, B=clone)
-                if isinstance(descriptor, TensorDescriptor):
-                    base = clone.view(descriptor.base.dtype).view(descriptor.base.shape)
-                    bank["BDescriptor"] = maybe_descriptor(base, list(descriptor.block_shape))
-                    if nargs.get("BSDescriptor") is descriptor:
-                        bank["BSDescriptor"] = bank["BDescriptor"]
-                banks.append(bank)
-    except torch.OutOfMemoryError:
-        return None
-    return banks
+            return []
+    overrides = []
+    with torch.no_grad():
+        while len(overrides) < copies and span_bytes <= free_device_bytes(weight.device):
+            try:
+                clone = torch.empty_strided(weight.shape, weight.stride(), dtype=weight.dtype, device=weight.device)
+            except torch.OutOfMemoryError:
+                break
+            clone.copy_(weight)
+            override = {"B": clone}
+            if isinstance(descriptor, TensorDescriptor):
+                base = clone.view(descriptor.base.dtype).view(descriptor.base.shape)
+                override["BDescriptor"] = maybe_descriptor(base, list(descriptor.block_shape))
+                if nargs.get("BSDescriptor") is descriptor:
+                    override["BSDescriptor"] = override["BDescriptor"]
+            overrides.append(override)
+    return overrides
 
 
 def gemm_cold_banks(nargs):
-    """``cold_banks`` for the GEMMs: launch-argument sets that together read more than twice L2 of
-    distinct weight ``B``. A routed call reroutes to other experts of the one stack (``routed_banks``);
-    a dense call, or a stack too small for disjoint expert sets, cycles copies of B. Other operands
-    stay shared. None (cold event timing) when B cannot be rotated."""
+    """``cold_banks`` for the GEMMs: ``(banks, complete)``, launch-argument sets that together read
+    more than twice L2 of distinct weight ``B``. A routed call reroutes to other experts of the stack
+    (``routed_banks``); when the stack holds too few disjoint expert sets, and for a dense call, the
+    rerouted banks repeat over copies of B, so copies total about twice L2 plus one stack. Other
+    operands stay shared. ``complete`` is False when memory or an aliased B cut the rotation short."""
     weight = nargs["B"]
-    if not weight.is_cuda or torch._debug_has_internal_overlap(weight) != 0:
-        return None
     count = rotation_count(_active_bytes(nargs, weight), weight.device)
-    if count is None:
-        return None
-    if weight.ndim == 3 and (banks := routed_banks(nargs, weight.shape[0], count)) is not None:
-        return banks
-    return _copied_banks(nargs, weight, count)
+    banks = (routed_banks(nargs, weight.shape[0], count) if weight.ndim == 3 else None) or [nargs]
+    copies = []
+    if len(banks) < count and torch._debug_has_internal_overlap(weight) == 0:
+        copies = _weight_copies(nargs, weight, -(-count // len(banks)) - 1)
+    banks = [dict(bank, **copy) for copy in [{}, *copies] for bank in banks][:count]
+    return banks, len(banks) == count

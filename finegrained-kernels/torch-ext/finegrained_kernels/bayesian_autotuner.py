@@ -107,7 +107,7 @@ class BayesianAutotuner(Autotuner):
         self.fn_name = getattr(self.fn, "__name__", str(self.fn))
         overrides = load_autotune_config()
         self.cold_banks = cold_banks
-        self._cold_banks = None
+        self._tmp_cold_banks = None  # (banks, complete), built and freed per tune
         # Bayesian trial budget — the per-decorator default, overridable via ``n_trials`` in
         # FINEGRAINED_AUTOTUNE_CONFIG (quick sweeps / exhaustive runs without touching the
         # decorators; set it >= grid size to fall back to stock exhaustive bench-all).
@@ -340,25 +340,19 @@ class BayesianAutotuner(Autotuner):
     def _bench_rotating(self, *args, config, **meta):
         """Cold timing: one CUDA graph replays the launch over every argument set ``cold_banks``
         returns (built once per tune), each reading its inputs from beyond L2; the time is per call.
-        Falls back to cold event timing when there are no banks, or when a bank would swap an argument
-        the tuner resets or restores between launches."""
-        if self._cold_banks is None:
-            arguments = {**dict(zip(self.arg_names, args)), **meta}
-            banks = self.cold_banks(arguments)
-            mutated = self.reset_to_zero + self.restore_value
-            if banks and any(bank.get(name) is not arguments.get(name) for bank in banks for name in mutated):
-                banks = None
-            self._cold_banks = banks or False
-            if self._cold_banks is False:
-                logger.info("[autotune] %s: weight rotation unavailable; using cold event timing", self.fn_name)
-        if self._cold_banks is False:
-            return super()._bench(*args, config=config, **meta)
+        When memory cuts the rotation short the tune still times this way (partly warm) and its
+        crown is not written to the disk cache."""
+        if self._tmp_cold_banks is None:
+            self._tmp_cold_banks = self.cold_banks({**dict(zip(self.arg_names, args)), **meta})
+            if not self._tmp_cold_banks[1]:
+                logger.warning("[autotune] %s: only %d weight bank(s) fit in memory; timing is partly warm "
+                               "and this crown is not cached", self.fn_name, len(self._tmp_cold_banks[0]))
 
         config_args = config.all_kwargs()
         conflicts = meta.keys() & config.kwargs.keys()
         if conflicts:
             raise ValueError(f"Conflicting meta-parameters: {', '.join(conflicts)}")
-        calls = [{**bank, **config_args} for bank in self._cold_banks]
+        calls = [{**bank, **config_args} for bank in self._tmp_cold_banks[0]]
 
         def run():
             for arguments in calls:
@@ -434,7 +428,7 @@ class BayesianAutotuner(Autotuner):
             try:
                 ret = super().run(*args, **kwargs)
             finally:
-                self._cold_banks = None
+                self._tmp_cold_banks = None
             self._report_bench_failures()
             return ret
 
@@ -505,7 +499,7 @@ class BayesianAutotuner(Autotuner):
                 else:
                     benchmark()
             finally:
-                self._cold_banks = None
+                self._tmp_cold_banks = None
 
         config = self.cache[key]
         self.best_config = config
@@ -907,6 +901,8 @@ class BayesianAutotuner(Autotuner):
             if load_crown():  # another rank tuned this key while we waited
                 return True
             bench_fn()
+            if self._tmp_cold_banks is not None and not self._tmp_cold_banks[1]:
+                return False
             # publish INSIDE the lock: a rank released to an empty cache would tune again
             try:
                 cache.put(
@@ -1014,9 +1010,10 @@ def bayesian_autotune(
                               tuner stays independent of configuration details
     coupled_axes:             groups of config fields treated as joint choices by TPE and
                               refinement, including Config fields such as num_stages
-    cold_banks:               ``nargs -> [launch args, ...] | None``: argument sets that together read
-                              more than L2, timed as one CUDA graph per candidate so each call
-                              runs cold (e.g. ``bench.gemm_cold_banks``); None falls back to events
+    cold_banks:               ``nargs -> ([launch args, ...], complete)``: argument sets that together
+                              read more than L2, timed as one CUDA graph per candidate so each call
+                              runs cold (e.g. ``bench.gemm_cold_banks``); an incomplete rotation is
+                              still timed this way but its crown is not cached
     max_failures:             abort the tune once this many configs fail to compile/run before
                               the measured budget is met (default n_trials; runtime override
                               ``strict`` in FINEGRAINED_AUTOTUNE_CONFIG sets 0). Without it a broadly broken

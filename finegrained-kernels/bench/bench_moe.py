@@ -1364,7 +1364,7 @@ def _routing_banks(cfg, weights, hidden, idx, w, logits):
     active = idx.unique().long()
     n = active.numel()
     count = rotation_count(_tensor_bytes(weights) * n // E, 0)
-    if count is None or count * n > E:
+    if count * n > E:
         return None
     idle = torch.arange(E, device=idx.device)
     idle = idle[~torch.isin(idle, active)]
@@ -1388,8 +1388,6 @@ def _weight_banks(weights, active_experts=None):
     active_bytes = (weight_bytes if active_experts is None
                     else weight_bytes * active_experts // weights[0].shape[0])
     count = rotation_count(active_bytes, 0) if DEVICE == "cuda" else 1
-    if count is None:
-        raise RuntimeError("cold weight working set needs too many rotation banks")
     if DEVICE == "cuda":
         free = free_device_bytes(0)
         required = (count - 1) * weight_bytes

@@ -270,7 +270,7 @@ def test_routed_banks_read_disjoint_experts():
         assert len(routed) == 3 and not routed & seen
         assert bank_ids[0] == bank_ids[2]  # rows sharing an expert still share one
         seen |= routed
-    assert routed_banks({"ExpertIds": ids}, experts, 6) is None  # 6 blocks of 3 exceed 16 experts
+    assert len(routed_banks({"ExpertIds": ids}, experts, 6)) == 5  # the stack holds 5 blocks of 3
 
     start = torch.tensor([0, 0, 4, 4, 9, 9, 9, 9, 10] + [10] * 8, device=TEST_DEVICE, dtype=torch.int32)
     counts = (start[1:] - start[:-1]).tolist()
@@ -282,6 +282,26 @@ def test_routed_banks_read_disjoint_experts():
         owners = {e for e, c in enumerate(bank_counts) if c}
         assert not owners & seen
         seen |= owners
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA graph timing required")
+def test_cold_banks_reroute_inside_copies(monkeypatch):
+    """A stack holding fewer disjoint expert sets than the rotation needs repeats its rerouted banks
+    over copies, so copies stay at about twice L2 plus one stack; banks only swap B and the routing.
+    Without memory for copies the rotation shrinks and reports itself incomplete."""
+    weight = torch.zeros(8, 16, 16, device=TEST_DEVICE)
+    nargs = {"B": weight, "ExpertIds": torch.tensor([0, 1, 1, -1], device=TEST_DEVICE, dtype=torch.int32), "N": 16}
+    monkeypatch.setattr(internals.bench, "rotation_count", lambda active_bytes, device: 10)
+    banks, complete = gemm_cold_banks(nargs)
+    assert complete and len(banks) == 10
+    assert len({bank["B"].data_ptr() for bank in banks}) == 3  # 4 rerouted banks per stack, 3 stacks
+    assert all(bank.keys() == nargs.keys() and bank["N"] is nargs["N"] for bank in banks)
+    assert len({tuple(bank["ExpertIds"].tolist()) + (bank["B"].data_ptr(),) for bank in banks}) == 10
+
+    monkeypatch.setattr(internals.bench, "free_device_bytes", lambda device: 0)
+    banks, complete = gemm_cold_banks(nargs)
+    assert not complete and len(banks) == 4 and all(bank["B"] is weight for bank in banks)
 
 
 @pytest.mark.kernels_ci
