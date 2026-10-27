@@ -27,18 +27,22 @@ import pytest
 import torch
 
 from utils import (  # type: ignore
+    dequant_gate_up,
     DTYPE_TAG,
     DTYPE_TO_TOL,
+    finegrained_kernels,
+    internals,
+    make_gate_up,
+    prepare_csf,
     SUPPORTS_SWIZZLED_SCALES,
     TEST_DEVICE,
     WEIGHTS,
-    dequant_gate_up,
-    make_gate_up,
-    prepare_csf,
 )
 
-from finegrained_kernels import moe, scheduling, swizzle_mx_scales  # type: ignore
-from finegrained_kernels.epilogue import fused_glu  # type: ignore
+moe = internals.moe
+scheduling = internals.scheduling
+swizzle_mx_scales = finegrained_kernels.swizzle_mx_scales
+fused_glu = internals.epilogue.fused_glu
 
 
 @dataclass(frozen=True)
@@ -96,6 +100,10 @@ class MoEProblem:
             f"{'_negative' if self.negative_sentinels else ''}"
         )
 
+
+DEVICE_MEMORY_GIB = (
+    torch.get_device_module(TEST_DEVICE).get_device_properties(0).total_memory / 2**30 if TEST_DEVICE else 0
+)
 
 MOE_PROBLEMS = [
     # ── one decode-size + one small-batch shape per weight family ──
@@ -210,13 +218,16 @@ MOE_PROBLEMS = [
     # gate_up offsets exceed 2^31 elements (127 * 2*2048 * 6144 = 3.196e9); a regressed
     # int64 cast corrupts the high-routed tokens vs the torch reference. E is a power of
     # two (the fused-grouped scheduling kernels require it).
-    MoEProblem(
-        weights="fp8_128x128",
-        num_tokens=512,
-        num_experts=128,
-        hidden_dim=6144,
-        intermediate_dim=2048,
-        num_top_k=4,
+    pytest.param(
+        MoEProblem(
+            weights="fp8_128x128",
+            num_tokens=512,
+            num_experts=128,
+            hidden_dim=6144,
+            intermediate_dim=2048,
+            num_top_k=4,
+        ),
+        marks=pytest.mark.skipif(DEVICE_MEMORY_GIB < 40, reason="the overflow guard needs 40 GiB of device memory"),
     ),
 ]
 

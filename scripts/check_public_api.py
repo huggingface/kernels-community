@@ -418,14 +418,79 @@ def _all_grew(base: str, head: str) -> bool:
     return isinstance(old, list) and isinstance(new, list) and set(old) < set(new)
 
 
+def _python_optional_added(base: str, head: str) -> bool:
+    """Accept only appended optional positional parameters, without evaluating code."""
+    try:
+        old = ast.parse(f"def f{base}: pass").body[0]
+        new = ast.parse(f"def f{head}: pass").body[0]
+    except SyntaxError:
+        return False
+
+    # Added parameters must not consume values previously captured by *args/**kwargs.
+    if old.args.vararg is not None or old.args.kwarg is not None:
+        return False
+    n = len(old.args.posonlyargs) + len(old.args.args)
+    added = len(new.args.posonlyargs) + len(new.args.args) - n
+    if not 0 < added <= len(new.args.defaults):
+        return False
+    # Removing just the appended parameters must recover the entire old signature:
+    # names, order, parameter kinds, defaults, annotations, and return annotation.
+    new.args.args = new.args.args[: max(0, n - len(new.args.posonlyargs))]
+    new.args.posonlyargs = new.args.posonlyargs[:n]
+    new.args.defaults = new.args.defaults[:-added]
+    return ast.dump(old) == ast.dump(new)
+
+
+def _torch_optional_added(base: str, head: str) -> bool:
+    """Only accept appended defaulted arguments; preserve the existing schema."""
+    import torch
+
+    try:
+        old = torch._C.parse_schema(base)
+        new = torch._C.parse_schema(head)
+    except RuntimeError:
+        return False  # A bare op name or a TVM-FFI export, not a Torch schema.
+
+    def argument(arg):
+        alias = arg.alias_info
+        return (
+            arg.name,
+            str(arg.type),
+            str(arg.real_type),
+            arg.N,
+            arg.kwarg_only,
+            arg.has_default_value(),
+            repr(arg.default_value),
+            (alias.is_write, alias.before_set, alias.after_set) if alias else None,
+        )
+
+    n = len(old.arguments)
+    return (
+        len(new.arguments) > n
+        and new.is_backward_compatible_with(old)
+        and [argument(a) for a in old.arguments]
+        == [argument(a) for a in new.arguments[:n]]
+        and [argument(a) for a in old.returns] == [argument(a) for a in new.returns]
+        and all(a.has_default_value() and not a.kwarg_only for a in new.arguments[n:])
+    )
+
+
+def _optional_added(key: str, base: str, head: str) -> bool:
+    if key.startswith("py "):
+        return _python_optional_added(base, head)
+    if key.startswith("op "):
+        return _torch_optional_added(base, head)
+    return False
+
+
 @dataclass(frozen=True)
 class ApiDiff:
     breaking: bool
     additive: bool
 
 
-# Breaking covers symbols that were removed or whose signature changed;
-# additive covers newly exposed ones. Both require a version bump.
+# Appending optional positional parameters preserves existing calls. Other
+# signature changes and newly exposed symbols still follow the version policy.
 def report(
     kernel: str, base: dict, head: dict, limit: int = 20, preview: int = 6
 ) -> ApiDiff:
@@ -468,8 +533,10 @@ def report(
     grown = [
         k for k in changed if k.endswith(" __all__") and _all_grew(base[k], head[k])
     ]
-    # Everything else that changed is a real signature change.
-    signature_changed = set(changed) - set(grown)
+    compatible = [k for k in changed if _optional_added(k, base[k], head[k])]
+    if compatible:
+        print("     => appended optional positional arguments preserve existing signatures")
+    signature_changed = set(changed) - set(grown) - set(compatible)
     return ApiDiff(
         breaking=bool(removed or signature_changed),
         additive=bool(added or grown),
@@ -576,7 +643,9 @@ def main() -> int:
             "\n"
             "The cases where every published variant is refreshed anyway, and no\n"
             "bump is needed - brand-new, no-arch, and Torch stable-ABI kernels -\n"
-            "are recognised here already.",
+            "are recognised here already. Appending optional positional arguments\n"
+            "also needs no bump when the existing signature is unchanged.\n"
+            "Incompatible changes still require a bump.",
             file=sys.stderr,
         )
         return 1

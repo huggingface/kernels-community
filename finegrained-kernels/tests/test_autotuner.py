@@ -18,6 +18,7 @@ carries its incident."""
 
 import itertools
 import logging
+import os
 import subprocess
 import sys
 import weakref
@@ -27,14 +28,21 @@ import torch
 import triton
 import triton.language as tl
 
-from utils import TEST_DEVICE, make_weights
+from utils import finegrained_kernels, internals, make_weights, TEST_DEVICE  # type: ignore
 
-import finegrained_kernels  # type: ignore
-import finegrained_kernels.matmul  # type: ignore
-from finegrained_kernels.bayesian_autotuner import bayesian_autotune  # type: ignore
-from finegrained_kernels.bench import gemm_cold_banks, routed_banks  # type: ignore
-from finegrained_kernels.compat import is_sm10x  # type: ignore
-from finegrained_kernels.pruners import block_within_dim_pruner, mx_config_pruner  # type: ignore
+bayesian_autotune = internals.bayesian_autotuner.bayesian_autotune
+is_sm10x = internals.compat.is_sm10x
+block_within_dim_pruner = internals.pruners.block_within_dim_pruner
+mx_config_pruner = internals.pruners.mx_config_pruner
+gemm_cold_banks = internals.bench.gemm_cold_banks
+routed_banks = internals.bench.routed_banks
+
+
+@pytest.fixture
+def full_search(monkeypatch):
+    """Keep the trial budget a test's tuner declares. The suite runs in fast mode (conftest),
+    whose one trial would override it, and a tuner reads the config when it is decorated."""
+    monkeypatch.setenv("FINEGRAINED_AUTOTUNE_CONFIG", '{"strict": true}')
 
 
 @pytest.mark.kernels_ci
@@ -177,7 +185,7 @@ def test_dot_scaled_is_fenced_off_fp32_weight_only_activations():
 
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
-def test_autotuner_survives_and_reports_failing_configs(caplog):
+def test_autotuner_survives_and_reports_failing_configs(caplog, full_search):
     """A config that cannot compile must score inf (not kill the tune), the tune must
     still pick a working config, and the failure must be REPORTED — inf-scoring must
     never silently hide a broken path behind a healthy one."""
@@ -203,7 +211,7 @@ def test_autotuner_survives_and_reports_failing_configs(caplog):
 
     x = torch.randn(64, device=TEST_DEVICE)
     y = torch.empty_like(x)
-    with caplog.at_level(logging.WARNING, logger="finegrained_kernels.bayesian_autotuner"):
+    with caplog.at_level(logging.WARNING, logger=internals.bayesian_autotuner.__name__):
         _copy_kernel[(1,)](x, y, 64)
     torch.accelerator.synchronize()
     assert torch.equal(x, y)  # the good config won
@@ -212,7 +220,7 @@ def test_autotuner_survives_and_reports_failing_configs(caplog):
 
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
-def test_failed_configs_do_not_consume_trial_budget():
+def test_failed_configs_do_not_consume_trial_budget(full_search):
     """A config that fails to compile is skipped as if the trial never happened — the
     budget counts MEASURED configs (failures already sat outside the TPE densities;
     before this they still ate trial slots, wasting up to half the budget on grids
@@ -279,11 +287,11 @@ def test_routed_banks_read_disjoint_experts():
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA graph timing required")
 @pytest.mark.parametrize("n_trials", [2, 3])
-def test_rotating_weights_are_reused_and_released(monkeypatch, n_trials):
+def test_rotating_weights_are_reused_and_released(monkeypatch, n_trials, full_search):
     """Cold graph tuning reuses identical banks across configs and frees them after the search."""
     weight = torch.randn(256, device=TEST_DEVICE)
     output = torch.empty_like(weight)
-    monkeypatch.setattr("finegrained_kernels.bench.rotation_count", lambda active_bytes, device: 3)
+    monkeypatch.setattr(internals.bench, "rotation_count", lambda active_bytes, device: 3)
     pointers, references = {}, {}
 
     def observe(arguments):
@@ -327,12 +335,12 @@ def test_act_quant_arms_are_bit_equal():
     )
     A = torch.randn(4, 512, device=TEST_DEVICE, dtype=torch.bfloat16)  # below the M gate
     inline_out = finegrained_kernels.matmul_2d(A, B, None, Bs, output_dtype=torch.bfloat16)
-    saved = finegrained_kernels.matmul.MX_MATMUL_ACT_PREQUANT_MIN_M
+    saved = internals.matmul.MX_MATMUL_ACT_PREQUANT_MIN_M
     try:
-        finegrained_kernels.matmul.MX_MATMUL_ACT_PREQUANT_MIN_M = 1  # force offline
+        internals.matmul.MX_MATMUL_ACT_PREQUANT_MIN_M = 1  # force offline
         offline_out = finegrained_kernels.matmul_2d(A, B, None, Bs, output_dtype=torch.bfloat16)
     finally:
-        finegrained_kernels.matmul.MX_MATMUL_ACT_PREQUANT_MIN_M = saved
+        internals.matmul.MX_MATMUL_ACT_PREQUANT_MIN_M = saved
     assert torch.equal(inline_out, offline_out)
 
 
@@ -344,12 +352,13 @@ def test_cross_process_determinism_block_dynamic_grouped():
     within one process agree, fresh processes can disagree. Compare an output checksum
     across subprocesses — a cheap CI approximation of the 15-process flake harness."""
     script = (
-        "import sys; sys.path.insert(0,'torch-ext'); sys.path.insert(0,'tests');\n"
-        "import torch; from utils import TEST_DEVICE, make_weights; import finegrained_kernels as fg\n"
+        # the tests' own directory, as CI runs them from elsewhere
+        f"import sys; sys.path.insert(0, {os.path.dirname(os.path.abspath(__file__))!r});\n"
+        "import torch; from utils import TEST_DEVICE, make_weights, finegrained_kernels as fg, internals\n"
         "torch.manual_seed(0)\n"
         "E,N,K,S=8,512,1024,256\n"
         "eids=torch.randint(0,E,(S,),device=TEST_DEVICE,dtype=torch.int32)\n"
-        "est,gi,si=fg.scheduling.compute_grouped_scheduling(eids,E,1)\n"
+        "est,gi,si=internals.scheduling.compute_grouped_scheduling(eids,E,1)\n"
         "A=torch.randn(S,K,device=TEST_DEVICE,dtype=torch.bfloat16)\n"
         "B,Bs=make_weights(N,K,TEST_DEVICE,[128,128],num_experts=E)\n"
         "out=fg.matmul_grouped(A,B,Bs=Bs,expert_start=est,output_dtype=torch.float32,gather_idx=gi,scatter_idx=si)\n"
@@ -366,7 +375,7 @@ def test_cross_process_determinism_block_dynamic_grouped():
 
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
-def test_compile_failures_are_memoized_across_keys(caplog):
+def test_compile_failures_are_memoized_across_keys(caplog, full_search):
     """A config that fails at COMPILE stage is memoized on disk keyed by its compile
     determinants (source hash + config + constexpr values + dtypes) — a tune at a NEW
     shape key must skip the doomed compile and report the failure as memoized. Bench
@@ -398,7 +407,7 @@ def test_compile_failures_are_memoized_across_keys(caplog):
             offs = offs + tl.arange(0, 3)  # non-power-of-2 arange -> CompilationError
         tl.store(Y + offs, tl.load(X + offs, mask=offs < N), mask=offs < N)
 
-    with caplog.at_level(logging.WARNING, logger="finegrained_kernels.bayesian_autotuner"):
+    with caplog.at_level(logging.WARNING, logger=internals.bayesian_autotuner.__name__):
         for n in (32, 64):  # two shapes -> two tuning keys, same compile signature
             x = torch.randn(n, device=TEST_DEVICE)
             y = torch.empty_like(x)
