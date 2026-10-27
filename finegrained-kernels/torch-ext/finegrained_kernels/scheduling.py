@@ -18,7 +18,8 @@ import torch
 import triton
 import triton.language as tl
 
-from .compat import add_op_namespace_prefix, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, is_sm10x
+from ._ops import add_op_namespace_prefix
+from .compat import compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, is_sm10x
 
 
 @triton.jit

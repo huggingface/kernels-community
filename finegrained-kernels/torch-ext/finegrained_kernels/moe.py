@@ -47,12 +47,12 @@ from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 from .grouped import matmul_grouped
 from .batched import GATE_UNSTACK_MAX_S, matmul_batched
 from .bayesian_autotuner import bayesian_autotune
+from ._ops import add_op_namespace_prefix
 from .compat import (
     MX_SCALE_GROUP_K,
     NVFP4_SCALE_GROUP_K,
     ScalingType,
     SwizzleType,
-    add_op_namespace_prefix,
     compile_time_only_triton_op,
     compile_time_only_triton_wrap,
     device_context,

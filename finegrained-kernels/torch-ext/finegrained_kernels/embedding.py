@@ -18,11 +18,11 @@ import torch
 import triton
 import triton.language as tl
 
+from ._ops import add_op_namespace_prefix
 from .compat import (
     FP8_DTYPE,
     MX_SCALE_GROUP_K,
     NVFP4_SCALE_GROUP_K,
-    add_op_namespace_prefix,
     compile_time_only_triton_op,
     compile_time_only_triton_wrap,
     device_context,
