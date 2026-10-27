@@ -24,6 +24,7 @@ from .norm import get_supported_norms, rms_norm_rows
 from .swizzle import swizzle_mx_scales, unswizzle_mx_scales
 from .loading.scales import prepare_nvfp4_csf_scales, decompress_nvfp4_csf_scales
 from .quant import mxfp4_act_quant, mxfp8_act_quant, nvfp4_act_quant
+from . import _private_for_testing
 
 __all__ = [
     # the three GEMM dispatchers (the weight format is read off the tensors; `activation_format`
@@ -52,4 +53,6 @@ __all__ = [
     "mxfp8_act_quant",
     "mxfp4_act_quant",
     "nvfp4_act_quant",
+    # the internal modules the tests use, see `_private_for_testing`
+    "_private_for_testing",
 ]

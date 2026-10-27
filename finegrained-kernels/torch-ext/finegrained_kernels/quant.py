@@ -1077,7 +1077,7 @@ def fp8_act_quant_block_dynamic(
 
 @triton.jit
 def _fp8_act_quant_kernel(
-    x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr, PADDED_BLOCK: tl.constexpr,
+    x_ptr, y_ptr, s_ptr, stride_xm, blocks_per_row, BLOCK_SIZE: tl.constexpr, PADDED_BLOCK: tl.constexpr,
     PDL: tl.constexpr = False,
 ):
     if PDL:
@@ -1089,7 +1089,9 @@ def _fp8_act_quant_kernel(
     cols = tl.arange(0, PADDED_BLOCK)
     mask = cols < BLOCK_SIZE
     offs = pid * BLOCK_SIZE + cols
-    x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    # x's rows may sit apart (a row-strided view), so its offsets can pass int32; y and s are written dense
+    x_offs = (pid // blocks_per_row).to(tl.int64) * stride_xm + (pid % blocks_per_row) * BLOCK_SIZE + cols
+    x = tl.load(x_ptr + x_offs, mask=mask, other=0.0).to(tl.float32)
     s = tl.max(tl.abs(x)) / 448.0  # float8_e4m3fn max
     y = (x / tl.maximum(s, 1e-12)).to(y_ptr.dtype.element_ty)
     tl.store(y_ptr + offs, y, mask=mask)
@@ -1217,17 +1219,20 @@ def quantize_routed_rows_per_expert(A, As, gather_idx, expert_start, num_experts
 def fp8_act_quant_tensor_wide(
     x: torch.Tensor, block_size: int = 128
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    assert x.is_contiguous()
+    assert x.stride(-1) == 1, f"x's rows must be contiguous, got strides {tuple(x.stride())}"
     assert x.shape[-1] % block_size == 0
-    y = torch.empty_like(x, dtype=FP8_DTYPE)
+    rows = x.view(-1, x.shape[-1])
+    y = torch.empty(x.shape, dtype=FP8_DTYPE, device=x.device)
     grid = (triton.cdiv(x.numel(), block_size),)
     s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
 
     with device_context(x.device):
         compile_time_only_triton_wrap(_fp8_act_quant_kernel)[grid](
-            x,
+            rows,
             y,
             s,
+            rows.stride(0),
+            x.shape[-1] // block_size,
             BLOCK_SIZE=block_size,
             PADDED_BLOCK=triton.next_power_of_2(block_size),
             **pdl_launch_kwargs(),

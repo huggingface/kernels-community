@@ -7,7 +7,7 @@
 
 import torch
 
-from ...modules.l2norm import l2norm_bwd, l2norm_fwd
+from ...modules.norm.l2norm import l2norm_bwd, l2norm_fwd
 from ...ops.common.chunk_h import chunk_bwd_dh
 from ...ops.mesa_net.chunk_cg_solver_bwd import chunk_mesa_cg_bwd
 from ...ops.mesa_net.chunk_cg_solver_fwd import chunk_mesa_cg_fwd
@@ -364,7 +364,7 @@ def chunk_mesa_net(
         >>> import torch
         >>> import torch.nn.functional as F
         >>> from einops import rearrange
-        >>> from ...ops.mesa_net import chunk_mesa_net
+        >>> from fla.ops.mesa_net import chunk_mesa_net
         # inputs with equal lengths
         >>> B, T, H, K, V = 4, 2048, 16, 128, 128
         >>> q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device='cuda')

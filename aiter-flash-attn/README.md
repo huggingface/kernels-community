@@ -49,7 +49,7 @@ reuses the gfx1151 tuning, since both are RDNA3.5.
 import torch
 from kernels import get_kernel
 
-flash_attn = get_kernel("kernels-community/aiter-flash-attn")
+flash_attn = get_kernel("amd/aiter-flash-attn", version=2)
 
 q = torch.randn(2, 32, 8, 64, device="cuda", dtype=torch.float16)
 k = torch.randn(2, 32, 8, 64, device="cuda", dtype=torch.float16)

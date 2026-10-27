@@ -1,7 +1,7 @@
 import kernels
 import torch
 
-flash_attn2 = kernels.get_kernel("kernels-community/flash-attn2", version=3)
+flash_attn2 = kernels.get_kernel("kernels-community/flash-attn2", version=4)
 
 # make reproducible
 torch.manual_seed(0)

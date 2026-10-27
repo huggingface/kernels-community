@@ -295,7 +295,7 @@ def chunk_simple_gla(
         >>> import torch
         >>> import torch.nn.functional as F
         >>> from einops import rearrange
-        >>> from ...ops.simple_gla import chunk_simple_gla
+        >>> from fla.ops.simple_gla import chunk_simple_gla
         # inputs with equal lengths
         >>> B, T, H, K, V = 4, 2048, 4, 512, 512
         >>> q = torch.randn(B, T, H, K, device='cuda')
