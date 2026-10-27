@@ -15,9 +15,12 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
+from ._autotune import seed_cache
 from ._ops import add_op_namespace_prefix
 from .utils.library import triton_op
 from .utils.torch import custom_bwd, custom_fwd
+
+seed_cache()
 
 
 def maybe_contiguous_lastdim(x):
@@ -175,6 +178,7 @@ def rms_norm_ref(
 
 
 @triton.autotune(
+    cache_results=True,
     configs=triton_autotune_configs(),
     key=[
         "N",
@@ -502,6 +506,7 @@ def _layer_norm_fwd_impl(
 
 
 @triton.autotune(
+    cache_results=True,
     configs=triton_autotune_configs(),
     key=[
         "N",
