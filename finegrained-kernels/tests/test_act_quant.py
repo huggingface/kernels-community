@@ -16,12 +16,19 @@
 import pytest
 import torch
 
-from utils import TEST_DEVICE  # type: ignore
+from utils import internals, TEST_DEVICE  # type: ignore
 
 import triton
 import triton.language as tl
 
-from finegrained_kernels.quant import _quant_block_k_pruner, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mx_act_quant_inline, mxfp4_act_quant, mxfp8_act_quant, nvfp4_act_quant, nvfp4_quantize_two_level  # type: ignore
+_quant_block_k_pruner = internals.quant._quant_block_k_pruner
+fp8_act_quant_block_dynamic = internals.quant.fp8_act_quant_block_dynamic
+fp8_act_quant_tensor_wide = internals.quant.fp8_act_quant_tensor_wide
+mx_act_quant_inline = internals.quant.mx_act_quant_inline
+mxfp4_act_quant = internals.quant.mxfp4_act_quant
+mxfp8_act_quant = internals.quant.mxfp8_act_quant
+nvfp4_act_quant = internals.quant.nvfp4_act_quant
+nvfp4_quantize_two_level = internals.quant.nvfp4_quantize_two_level
 
 
 _FP8_DTYPE = torch.float8_e4m3fn

@@ -39,8 +39,18 @@ def decode_pdl() -> bool:
     access analysis cannot read the ``griddepcontrol`` inline asm and would mark every input mutated
     (extra copies, no fusion). Deployment decode runs eager launches under cudagraphs, where PDL
     applies. ``griddepcontrol`` is an NVIDIA primitive, so every other backend reads False and the
-    ``gdc_*`` intrinsics stay behind their ``PDL`` constexpr."""
-    return DECODE_PDL and not torch.compiler.is_compiling() and get_active_device_type() == "cuda"
+    ``gdc_*`` intrinsics stay behind their ``PDL`` constexpr. ``griddepcontrol`` also needs sm_90."""
+    return (
+        DECODE_PDL
+        and not torch.compiler.is_compiling()
+        and get_active_device_type() == "cuda"
+        and _griddepcontrol_supported()
+    )
+
+
+@functools.cache
+def _griddepcontrol_supported() -> bool:
+    return torch.version.hip is None and torch.cuda.get_device_capability() >= (9, 0)
 
 
 def pdl_launch_kwargs() -> dict:

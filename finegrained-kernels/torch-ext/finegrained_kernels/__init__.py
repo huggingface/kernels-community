@@ -36,6 +36,7 @@ from .quant import (
     repack_modelopt_int8,
     repack_ggml_int,
 )
+from . import _private_for_testing
 
 __all__ = [
     # the three GEMM dispatchers (the weight format is read off the tensors; `activation_format`
@@ -73,4 +74,6 @@ __all__ = [
     "repack_modelopt_int4",
     "repack_modelopt_int8",
     "repack_ggml_int",
+    # the internal modules the tests use, see `_private_for_testing`
+    "_private_for_testing",
 ]

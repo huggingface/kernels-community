@@ -27,25 +27,31 @@ import pytest
 import torch
 
 from utils import (  # type: ignore
+    dequant_gate_up,
     DTYPE_TAG,
     DTYPE_TO_TOL,
-    INT_BITS,
-    INT_GROUP,
+    finegrained_kernels,
+    internals,
+    make_gate_up,
+    prepare_csf,
     SUPPORTS_SWIZZLED_SCALES,
     TEST_DEVICE,
     WEIGHTS,
+    INT_BITS,
+    INT_GROUP,
     make_gptq_act_order,
     maybe_compile,
     quant_dequant_a,
     dq_grouped,
     dq_int,
-    dequant_gate_up,
-    make_gate_up,
-    prepare_csf,
 )
 
-from finegrained_kernels import fold_act_order_into_gate_up, moe, scheduling, swizzle_mx_scales  # type: ignore
-from finegrained_kernels.epilogue import apply_glu, fused_glu  # type: ignore
+moe = internals.moe
+scheduling = internals.scheduling
+swizzle_mx_scales = finegrained_kernels.swizzle_mx_scales
+fused_glu = internals.epilogue.fused_glu
+fold_act_order_into_gate_up = finegrained_kernels.fold_act_order_into_gate_up
+apply_glu = internals.epilogue.apply_glu
 
 
 @dataclass(frozen=True)
@@ -66,6 +72,8 @@ class MoEProblem:
     dtype: torch.dtype = torch.bfloat16
     # in the CI subset (kernels_ci); the rest run in test_fused_extended
     ci: bool = field(default=True, compare=False)
+    # skipped on devices with less memory, e.g. the int32 offset-overflow guard's 3.2e9-element stack
+    min_device_memory_gib: float = field(default=0.0, compare=False)
     activation_format: Optional[str] = None
     activation_scale_ub: Optional[float] = None
     compile: bool = False
@@ -114,6 +122,10 @@ class MoEProblem:
             f"{'_negative' if self.negative_sentinels else ''}"
         )
 
+
+DEVICE_MEMORY_GIB = (
+    torch.get_device_module(TEST_DEVICE).get_device_properties(0).total_memory / 2**30 if TEST_DEVICE else 0
+)
 
 MOE_PROBLEMS = [
     # ── one decode-size + one small-batch shape per weight family ──
@@ -269,6 +281,7 @@ MOE_PROBLEMS = [
         hidden_dim=6144,
         intermediate_dim=2048,
         num_top_k=4,
+        min_device_memory_gib=40,
     ),
 ]
 
@@ -481,6 +494,8 @@ def _fused_scales(problem: MoEProblem, gate_up_s, down_s):
 
 
 def _run_pair(problem: MoEProblem, fused_fn, unfused_fn):
+    if DEVICE_MEMORY_GIB < problem.min_device_memory_gib:
+        pytest.skip(f"needs {problem.min_device_memory_gib:g} GiB of device memory")
     torch.manual_seed(0)
     gate_up, gate_up_s, gate_up_g, down, down_s, down_g = _make_moe_weights(problem)
     hidden, top_k_index, top_k_weights = _make_moe_inputs(problem)
