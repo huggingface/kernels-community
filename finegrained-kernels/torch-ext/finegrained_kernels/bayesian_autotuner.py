@@ -37,7 +37,6 @@ import random
 import time
 from collections import defaultdict
 from contextlib import contextmanager
-from functools import cached_property, partial
 from pathlib import Path
 
 import torch
@@ -107,9 +106,6 @@ class BayesianAutotuner(Autotuner):
         super().__init__(*args, **kwargs)
         self.fn_name = getattr(self.fn, "__name__", str(self.fn))
         overrides = load_autotune_config()
-        # Large-model weights exceed L2, so time candidates on rotated cold weights; turning it off
-        # times warm graph replay, closer to small workloads that stay L2-resident.
-        self.rotate_weights = overrides.get("rotate_weights", True)
         self.cold_banks = cold_banks
         self._cold_banks = None
         # Bayesian trial budget — the per-decorator default, overridable via ``n_trials`` in
@@ -160,19 +156,13 @@ class BayesianAutotuner(Autotuner):
         self._dtype_str_cache: Dict[torch.dtype, str] = {}
 
     def _owns_timing(self) -> bool:
-        """Whether this tuner picks the timer: on CUDA, with no user ``do_bench`` or hooks (those
-        keep Triton's stock timing)."""
+        """Whether this tuner may time on rotated cold weights: on CUDA, with no user ``do_bench`` or
+        hooks (those keep Triton's stock timing)."""
         return (
             self._do_bench is None
             and not self.user_defined_pre_hook and not self.user_defined_post_hook
             and driver.active.get_current_target().backend == "cuda"
         )
-
-    @cached_property
-    def do_bench(self):
-        if not self._owns_timing():
-            return self._do_bench if self._do_bench is not None else driver.active.get_benchmarker()
-        return partial(do_bench, cudagraph=not self.rotate_weights)
 
     def _dtype_str(self, dtype) -> str:
         s = self._dtype_str_cache.get(dtype)
@@ -215,7 +205,7 @@ class BayesianAutotuner(Autotuner):
             self._failures.append((config, memo[sig] + "  [memoized]"))
             return [float("inf")] * 3
         try:
-            if self.cold_banks is not None and self.rotate_weights and self._owns_timing():
+            if self.cold_banks is not None and self._owns_timing():
                 timing = self._bench_rotating(*args, config=config, **meta)
             else:
                 timing = super()._bench(*args, config=config, **meta)
@@ -859,7 +849,7 @@ class BayesianAutotuner(Autotuner):
             str(self.keys),
             f"n_trials={self.n_trials},n_startup_trials={self.n_startup_trials},gamma={self.gamma},"
             f"runoff={self.runoff},basin_probes={self.basin_probes},max_refine_iters={self.max_refine_iters},"
-            f"coupled_axes={self.coupled_axes},rotate_weights={self.rotate_weights},cold_banks={self.cold_banks is not None}",
+            f"coupled_axes={self.coupled_axes},cold_banks={self.cold_banks is not None}",
             str(tuning_key),
         ] + [str(c) for c in configs]  # str(Config) is pre_hook-free and process-stable
         cache_key = hashlib.sha256("-".join(cache_key).encode("utf-8")).hexdigest()

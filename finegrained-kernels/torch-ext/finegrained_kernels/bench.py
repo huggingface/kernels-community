@@ -36,19 +36,23 @@ def do_bench(fn, quantiles=None, *, cudagraph=False, **kwargs):
     return do_bench_cudagraph(fn, quantiles=quantiles, **kwargs)
 
 
+def _active_experts(nargs, experts):
+    """The experts one call routes to (from ``ExpertIds`` or ``ExpertStart``), or None without routing."""
+    ids, start = nargs.get("ExpertIds"), nargs.get("ExpertStart")
+    if ids is not None:
+        return ids[(ids >= 0) & (ids < experts)].unique()
+    if start is not None:
+        if start.numel() < experts + 1:
+            return start.new_empty(0)  # no usable offsets: nothing to rotate
+        return (start[1:experts + 1] > start[:experts]).nonzero().flatten()
+    return None
+
+
 def _active_bytes(nargs, weight):
     """The bytes one call reads from ``weight``: only the routed experts' planes of an expert stack."""
     nbytes = weight.numel() * weight.element_size()
-    expert_ids, expert_start = nargs.get("ExpertIds"), nargs.get("ExpertStart")
-    if expert_ids is not None:
-        experts = weight.shape[0]
-        return nbytes * expert_ids[(expert_ids >= 0) & (expert_ids < experts)].unique().numel() // experts
-    if expert_start is not None:
-        experts = weight.shape[0]
-        if expert_start.numel() < experts + 1:
-            return 0
-        return nbytes * (expert_start[1:experts + 1] > expert_start[:experts]).sum().item() // experts
-    return nbytes
+    active = _active_experts(nargs, weight.shape[0])
+    return nbytes if active is None else nbytes * active.numel() // weight.shape[0]
 
 
 def rotation_count(active_bytes, device):
@@ -71,12 +75,8 @@ def routed_banks(nargs, experts, count):
     experts' weights and no weight is copied. None when there is no routing or the ``count``
     blocks do not fit the stack."""
     ids, start = nargs.get("ExpertIds"), nargs.get("ExpertStart")
-    if ids is not None:
-        active = ids[(ids >= 0) & (ids < experts)].unique()
-    elif start is not None and start.numel() >= experts + 1:
-        counts = start[1:experts + 1] - start[:experts]
-        active = (counts > 0).nonzero().flatten()
-    else:
+    active = _active_experts(nargs, experts)
+    if active is None:
         return None
     n = active.numel()
     if n == 0 or count * n > experts:
@@ -93,6 +93,7 @@ def routed_banks(nargs, experts, count):
             banks.append(dict(nargs, ExpertIds=torch.where(routed, relabel[ids.clamp(0, experts - 1)], ids)))
         else:
             # same rows, now owned by the block's experts in the same order
+            counts = start[1:experts + 1] - start[:experts]
             moved = torch.zeros_like(counts)
             moved[block] = counts[active]
             bank_start = start.clone()
