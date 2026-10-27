@@ -7,8 +7,11 @@
 import pytest
 import torch
 import torch.nn.functional as F
+from kernels import get_kernel
 
-from flash_attn_ops import layer_norm_fn, rms_norm_fn
+kernel = get_kernel("kernels-community/flash-attn-ops", version=1)
+layer_norm_fn = kernel.layer_norm_fn
+rms_norm_fn = kernel.rms_norm_fn
 
 
 def rms_norm_ref(x, weight, bias, eps):
