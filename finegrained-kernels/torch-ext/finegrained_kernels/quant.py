@@ -19,7 +19,7 @@ from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
 from .bayesian_autotuner import bayesian_autotune
 from .formats import global_scale_stride, int_weight_bits, is_per_expert_global, normalize_global_scale
-from .compat import add_op_namespace_prefix, FP8_DTYPE, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, is_blackwell, is_sm10x, pdl_launch_kwargs
+from .compat import add_op_namespace_prefix, FP8_DTYPE, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, is_blackwell, is_sm10x, pdl_launch_kwargs, sm_count
 from .ptx import e2m1x2_to_e4m3x2, e2m1x2_to_f16x2, f32x2_to_e2m1x2
 from .swizzle import swizzle_store_block
 from .scheduling import build_tile_layout, resolve_tile_inline
@@ -320,13 +320,23 @@ def _quant_block_k_pruner(configs, named_args, **kwargs):
     args = {**named_args, **kwargs}
     k, g = args["K"], args["SCALE_GROUP_K"]
     swizzled, grouped = args.get("SWIZZLED", False), args.get("GROUPED", True)
-    return [
+    kept = [
         c
         for c in configs
         if k % c.kwargs["BLOCK_K"] == 0
         and (not swizzled or c.kwargs["BLOCK_K"] % (4 * g) == 0)
         and (not grouped or c.kwargs["BLOCK_T"] == 128)
     ]
+    if grouped or not kept:
+        return kept
+    # The dense grid is cdiv(T, BLOCK_T) x K / BLOCK_K programs; keep the tiles that fill the SMs (or come closest).
+    # A tile tall enough to leave most SMs idle can still win a 2-3us tune by noise: MXFP8 6144-wide T=64 crowned
+    # BLOCK_T=64 BLOCK_K=256 (24 programs, 3.6us) over BLOCK_T=8 BLOCK_K=128 (384 programs, 2.3us).
+    def programs(c):
+        return triton.cdiv(args["T"], c.kwargs["BLOCK_T"]) * (k // c.kwargs["BLOCK_K"])
+
+    target = min(sm_count(args["X"].device.index), max(programs(c) for c in kept))
+    return [c for c in kept if programs(c) >= target]
 
 
 @triton.jit
