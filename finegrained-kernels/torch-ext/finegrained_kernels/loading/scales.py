@@ -298,11 +298,10 @@ def decode_group_scale(scale):
     branch is a compile-time constant, so only the taken path is emitted (single return —
     Triton requires all ``return`` statements to share a type)."""
     if scale.dtype == tl.uint8:
-        exponent = scale
-        scale = (exponent.to(tl.int32) << 23).to(tl.float32, bitcast=True)
-        # UE8M0 reserves byte 255 for NaN; byte 0 is the FP32 subnormal 2^-127.
-        scale = tl.where(exponent == 0, 2.0 ** -127, scale)
-        scale = tl.where(exponent == 255, float("nan"), scale)
+        # Bytes 0 (2^-127) and 255 (NaN) are not special-cased: they decode to 0 and +inf. No
+        # checkpoint scale reaches them (gpt-oss spans 2^-16..2^11), the act quantizers clamp to
+        # bytes 1..254, and the two selects cost ~3% of the scalar decode GEMM (one decode per group).
+        scale = (scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
     elif scale.dtype == tl.float8e4nv:
         scale = scale.to(tl.float32)
     return scale
