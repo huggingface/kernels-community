@@ -18,8 +18,9 @@ import torch
 import triton
 import triton.language as tl
 
+from .._ops import add_op_namespace_prefix
 from ..compat import (
-    add_op_namespace_prefix, compile_time_only_triton_op, compile_time_only_triton_wrap,
+    compile_time_only_triton_op, compile_time_only_triton_wrap,
     device_context, sm_count,
 )
 from ..quant import fp8_act_quant_inline, mx_act_quant_inline
