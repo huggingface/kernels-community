@@ -20,6 +20,69 @@ def check(monkeypatch):
     return module
 
 
+@pytest.mark.parametrize("private_name", ["_private_for_testing", "_internal"])
+@pytest.mark.parametrize("private_path", ["{name}.py", "{name}/__init__.py"])
+def test_private_module_changes_do_not_change_public_api(check, private_name, private_path):
+    files = {
+        "torch-ext/k/__init__.py": "def run(x): pass\n__all__ = ['run']\n",
+    }
+
+    def api():
+        return check.python_api(check.Source(files, lambda content: content))
+
+    baseline = api()
+    files["torch-ext/k/__init__.py"] += (
+        f"from . import {private_name}\n__all__ = ['run', '{private_name}']\n"
+    )
+    module = "torch-ext/k/" + private_path.format(name=private_name)
+    files[module] = "def helper(x): pass\n__all__ = ['helper']\n"
+    assert api() == baseline
+
+    files[module] = "def replacement(x, y): pass\n__all__ = ['replacement']\n"
+    assert api() == baseline
+
+    files["torch-ext/k/__init__.py"] = "def run(x): pass\n__all__ = ['run']\n"
+    del files[module]
+    assert api() == baseline
+
+
+def test_nested_private_modules_are_excluded(check):
+    files = {
+        "torch-ext/k/__init__.py": "from . import layers\n__all__ = ['layers']\n",
+        "torch-ext/k/layers/__init__.py": (
+            "from . import _internal\n"
+            "def run(x): pass\n"
+            "__all__ = ['run', '_internal']\n"
+        ),
+        "torch-ext/k/layers/_internal.py": "def helper(x): pass\n",
+    }
+    assert check.python_api(check.Source(files, lambda content: content)) == {
+        "py k __all__": "['layers']",
+        "py k.layers __all__": "['run']",
+        "py k.layers.run": "(x)",
+    }
+
+
+@pytest.mark.parametrize("exports", ["", "__all__ = ['run', 'helpers']\n"])
+def test_public_reexports_from_private_modules_are_checked(check, exports):
+    files = {
+        "torch-ext/k/__init__.py": (
+            "from ._internal import run\nfrom . import _internal as helpers\n" + exports
+        ),
+        "torch-ext/k/_internal.py": "def run(x): pass\n__all__ = ['run']\n",
+    }
+    source = check.Source(files, lambda content: content)
+    baseline = check.python_api(source)
+    assert baseline["py k.run"] == "(x)"
+    assert baseline["py k.helpers.run"] == "(x)"
+
+    files["torch-ext/k/_internal.py"] = "def run(x, y): pass\n__all__ = ['run']\n"
+    updated = check.python_api(source)
+    assert updated["py k.run"] == "(x, y)"
+    assert updated["py k.helpers.run"] == "(x, y)"
+    assert check.report("k", baseline, updated).breaking
+
+
 @pytest.mark.parametrize(
     "old,new,expected",
     [

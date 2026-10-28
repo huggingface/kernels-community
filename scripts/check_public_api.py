@@ -310,8 +310,10 @@ def python_api(src: Source) -> dict:
         if "*" in named:  # star re-export
             collect(ext, named["*"][0], prefix)
         if all_decl is not None:
-            exported = set(all_decl)
-            out[f"py {prefix} __all__"] = repr(sorted(all_decl))
+            # Private exports such as _private_for_testing are exposed for tests,
+            # but neither they nor their contents belong to the public contract.
+            exported = {n for n in all_decl if public(n)}
+            out[f"py {prefix} __all__"] = repr(sorted(exported))
         else:
             exported = (
                 {n for n in defs if public(n)}
