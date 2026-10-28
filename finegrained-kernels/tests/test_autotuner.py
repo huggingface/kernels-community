@@ -21,6 +21,7 @@ import logging
 import os
 import subprocess
 import sys
+import weakref
 
 import pytest
 import torch
@@ -33,6 +34,8 @@ bayesian_autotune = internals.bayesian_autotuner.bayesian_autotune
 is_sm10x = internals.compat.is_sm10x
 block_within_dim_pruner = internals.pruners.block_within_dim_pruner
 mx_config_pruner = internals.pruners.mx_config_pruner
+gemm_cold_banks = internals.bench.gemm_cold_banks
+routed_banks = internals.bench.routed_banks
 
 
 @pytest.fixture
@@ -250,6 +253,90 @@ def test_failed_configs_do_not_consume_trial_budget(full_search):
         ms for ms in _budget_kernel.configs_timings.values() if ms != float("inf")
     ]
     assert len(measured) == 3, _budget_kernel.configs_timings
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
+def test_routed_banks_read_disjoint_experts():
+    """Cold routed tuning shares one expert stack: each bank sends the same rows to its own experts."""
+    experts = 16
+    ids = torch.tensor([3, 7, 3, -1, 9], device=TEST_DEVICE, dtype=torch.int32)
+    banks = routed_banks({"ExpertIds": ids}, experts, 4)
+    seen = set()
+    for bank in banks:
+        bank_ids = bank["ExpertIds"]
+        assert bank_ids[3] == -1  # an off-rank sentinel stays one
+        routed = set(bank_ids[bank_ids >= 0].tolist())
+        assert len(routed) == 3 and not routed & seen
+        assert bank_ids[0] == bank_ids[2]  # rows sharing an expert still share one
+        seen |= routed
+    assert len(routed_banks({"ExpertIds": ids}, experts, 6)) == 5  # the stack holds 5 blocks of 3
+
+    start = torch.tensor([0, 0, 4, 4, 9, 9, 9, 9, 10] + [10] * 8, device=TEST_DEVICE, dtype=torch.int32)
+    counts = (start[1:] - start[:-1]).tolist()
+    seen = set()
+    for bank in routed_banks({"ExpertStart": start}, experts, 5):
+        bank_counts = (bank["ExpertStart"][1:] - bank["ExpertStart"][:-1]).tolist()
+        assert sorted(c for c in bank_counts if c) == sorted(c for c in counts if c)
+        assert bank["ExpertStart"][-1] == start[-1]
+        owners = {e for e, c in enumerate(bank_counts) if c}
+        assert not owners & seen
+        seen |= owners
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA graph timing required")
+def test_cold_banks_reroute_inside_copies(monkeypatch):
+    """A stack holding fewer disjoint expert sets than the rotation needs repeats its rerouted banks
+    over copies, so copies stay at about twice L2 plus one stack; banks only swap B and the routing.
+    Without memory for copies the rotation shrinks and reports itself incomplete."""
+    weight = torch.zeros(8, 16, 16, device=TEST_DEVICE)
+    nargs = {"B": weight, "ExpertIds": torch.tensor([0, 1, 1, -1], device=TEST_DEVICE, dtype=torch.int32), "N": 16}
+    monkeypatch.setattr(internals.bench, "rotation_count", lambda active_bytes, device: 10)
+    banks, complete = gemm_cold_banks(nargs)
+    assert complete and len(banks) == 10
+    assert len({bank["B"].data_ptr() for bank in banks}) == 3  # 4 rerouted banks per stack, 3 stacks
+    assert all(bank.keys() == nargs.keys() and bank["N"] is nargs["N"] for bank in banks)
+    assert len({tuple(bank["ExpertIds"].tolist()) + (bank["B"].data_ptr(),) for bank in banks}) == 10
+
+    monkeypatch.setattr(internals.bench, "free_device_bytes", lambda device: 0)
+    banks, complete = gemm_cold_banks(nargs)
+    assert not complete and len(banks) == 4 and all(bank["B"] is weight for bank in banks)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA graph timing required")
+@pytest.mark.parametrize("n_trials", [2, 3])
+def test_rotating_weights_are_reused_and_released(monkeypatch, n_trials, full_search):
+    """Cold graph tuning reuses identical banks across configs and frees them after the search."""
+    weight = torch.randn(256, device=TEST_DEVICE)
+    output = torch.empty_like(weight)
+    monkeypatch.setattr(internals.bench, "rotation_count", lambda active_bytes, device: 3)
+    pointers, references = {}, {}
+
+    def observe(arguments):
+        value = arguments["B"]
+        pointers.setdefault(arguments["BLOCK"], set()).add(value.data_ptr())
+        references[value.data_ptr()] = weakref.ref(value)
+
+    @bayesian_autotune(
+        [triton.Config({"BLOCK": block}, pre_hook=observe) for block in (32, 64, 128)],
+        ["N"],
+        n_trials=n_trials,
+        cold_banks=gemm_cold_banks,
+        cache_results=False,
+    )
+    @triton.jit
+    def copy_weight(B, C, N, BLOCK: tl.constexpr):
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        tl.store(C + offsets, tl.load(B + offsets, offsets < N, 0), offsets < N)
+
+    copy_weight[lambda meta: (triton.cdiv(256, meta["BLOCK"]),)](weight, output, 256)
+    torch.testing.assert_close(output, weight)
+    assert len(pointers) >= 2
+    assert len({frozenset(values) for values in pointers.values()}) == 1
+    assert all(len(values) == 3 for values in pointers.values())
+    assert all(reference() is None for pointer, reference in references.items() if pointer != weight.data_ptr())
 
 
 @pytest.mark.kernels_ci

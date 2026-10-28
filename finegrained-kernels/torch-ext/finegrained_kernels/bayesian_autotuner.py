@@ -55,11 +55,14 @@ from triton.runtime.autotuner import (
 )
 
 from .autotune_config import load_autotune_config
+from .bench import do_bench
 
 logger = logging.getLogger(__name__)
 
-# Include the tuner implementation alongside Triton's kernel-source hash.
-_TUNER_SOURCE_HASH = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+# Include timing and tuner implementations alongside Triton's kernel-source hash.
+_TUNER_SOURCE_HASH = hashlib.sha256(
+    Path(__file__).read_bytes() + Path(__file__).with_name("bench.py").read_bytes()
+).hexdigest()
 
 # Host-execution counter (``call_count_path`` in FINEGRAINED_AUTOTUNE_CONFIG): every
 # BayesianAutotuner.run() call increments its kernel's tally, dumped to that path at exit.
@@ -97,11 +100,14 @@ class BayesianAutotuner(Autotuner):
         path_anchor_axes: tuple[str, ...] = (),
         coupled_axes: tuple[tuple[str, ...], ...] = (),
         finite_check_args: tuple[str, ...] = (),
+        cold_banks=None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.fn_name = getattr(self.fn, "__name__", str(self.fn))
         overrides = load_autotune_config()
+        self.cold_banks = cold_banks
+        self._tmp_cold_banks = None  # (banks, complete), built and freed per tune
         # Bayesian trial budget — the per-decorator default, overridable via ``n_trials`` in
         # FINEGRAINED_AUTOTUNE_CONFIG (quick sweeps / exhaustive runs without touching the
         # decorators; set it >= grid size to fall back to stock exhaustive bench-all).
@@ -149,6 +155,15 @@ class BayesianAutotuner(Autotuner):
         self._dtype_tag_cache: Dict[tuple, str] = {}
         self._dtype_str_cache: Dict[torch.dtype, str] = {}
 
+    def _owns_timing(self) -> bool:
+        """Whether this tuner may time on rotated cold weights: on CUDA, with no user ``do_bench`` or
+        hooks (those keep Triton's stock timing)."""
+        return (
+            self._do_bench is None
+            and not self.user_defined_pre_hook and not self.user_defined_post_hook
+            and driver.active.get_current_target().backend == "cuda"
+        )
+
     def _dtype_str(self, dtype) -> str:
         s = self._dtype_str_cache.get(dtype)
         if s is None:
@@ -190,7 +205,10 @@ class BayesianAutotuner(Autotuner):
             self._failures.append((config, memo[sig] + "  [memoized]"))
             return [float("inf")] * 3
         try:
-            timing = super()._bench(*args, config=config, **meta)
+            if self.cold_banks is not None and self._owns_timing():
+                timing = self._bench_rotating(*args, config=config, **meta)
+            else:
+                timing = super()._bench(*args, config=config, **meta)
             bad = self._nonfinite_output(meta)
             if bad is not None:
                 self._failures.append((config, f"non-finite output in {bad} (numerics veto)"))
@@ -319,6 +337,34 @@ class BayesianAutotuner(Autotuner):
         except Exception:
             pass  # persistence is best-effort; the in-memory memo still holds
 
+    def _bench_rotating(self, *args, config, **meta):
+        """Cold timing: one CUDA graph replays the launch over every argument set ``cold_banks``
+        returns (built once per tune), each reading its inputs from beyond L2; the time is per call.
+        When memory cuts the rotation short the tune still times this way (partly warm) and its
+        crown is not written to the disk cache."""
+        if self._tmp_cold_banks is None:
+            self._tmp_cold_banks = self.cold_banks({**dict(zip(self.arg_names, args)), **meta})
+            if not self._tmp_cold_banks[1]:
+                logger.warning("[autotune] %s: only %d weight bank(s) fit in memory; timing is partly warm "
+                               "and this crown is not cached", self.fn_name, len(self._tmp_cold_banks[0]))
+
+        config_args = config.all_kwargs()
+        conflicts = meta.keys() & config.kwargs.keys()
+        if conflicts:
+            raise ValueError(f"Conflicting meta-parameters: {', '.join(conflicts)}")
+        calls = [{**bank, **config_args} for bank in self._tmp_cold_banks[0]]
+
+        def run():
+            for arguments in calls:
+                if config.pre_hook is not None:
+                    config.pre_hook(arguments)
+                self.pre_hook(arguments)
+                self.fn.run(**arguments)
+                self.post_hook(arguments, exception=None)
+
+        timing = do_bench(run, quantiles=(0.5, 0.2, 0.8), cudagraph=True, rep=5)
+        return [value / len(calls) for value in timing]
+
     def _report_bench_failures(self):
         """After every tune, report every UNIQUE failure — a failure is never silent:
         inf-scoring keeps the search alive, but a human must see what broke (e.g. a code
@@ -379,7 +425,10 @@ class BayesianAutotuner(Autotuner):
                 if config_kwargs is None:
                     config_kwargs = config._all_kwargs_memo = config.all_kwargs()
                 return self.fn.run(*args, **kwargs, **config_kwargs)
-            ret = super().run(*args, **kwargs)
+            try:
+                ret = super().run(*args, **kwargs)
+            finally:
+                self._tmp_cold_banks = None
             self._report_bench_failures()
             return ret
 
@@ -444,10 +493,13 @@ class BayesianAutotuner(Autotuner):
                 full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}
                 self.pre_hook(full_nargs, reset_only=True)
 
-            if self.cache_results:
-                self.check_disk_cache(key, pruned, benchmark)
-            else:
-                benchmark()
+            try:
+                if self.cache_results:
+                    self.check_disk_cache(key, pruned, benchmark)
+                else:
+                    benchmark()
+            finally:
+                self._tmp_cold_banks = None
 
         config = self.cache[key]
         self.best_config = config
@@ -791,7 +843,7 @@ class BayesianAutotuner(Autotuner):
             str(self.keys),
             f"n_trials={self.n_trials},n_startup_trials={self.n_startup_trials},gamma={self.gamma},"
             f"runoff={self.runoff},basin_probes={self.basin_probes},max_refine_iters={self.max_refine_iters},"
-            f"coupled_axes={self.coupled_axes}",
+            f"coupled_axes={self.coupled_axes},cold_banks={self.cold_banks is not None}",
             str(tuning_key),
         ] + [str(c) for c in configs]  # str(Config) is pre_hook-free and process-stable
         cache_key = hashlib.sha256("-".join(cache_key).encode("utf-8")).hexdigest()
@@ -849,6 +901,8 @@ class BayesianAutotuner(Autotuner):
             if load_crown():  # another rank tuned this key while we waited
                 return True
             bench_fn()
+            if self._tmp_cold_banks is not None and not self._tmp_cold_banks[1]:
+                return False
             # publish INSIDE the lock: a rank released to an empty cache would tune again
             try:
                 cache.put(
@@ -932,6 +986,7 @@ def bayesian_autotune(
     path_anchor_axes: tuple[str, ...] = (),
     coupled_axes: tuple[tuple[str, ...], ...] = (),
     finite_check_args: tuple[str, ...] = (),
+    cold_banks=None,
     cache_results: bool = True,
     reset_to_zero=None,
     restore_value=None,
@@ -955,6 +1010,10 @@ def bayesian_autotune(
                               tuner stays independent of configuration details
     coupled_axes:             groups of config fields treated as joint choices by TPE and
                               refinement, including Config fields such as num_stages
+    cold_banks:               ``nargs -> ([launch args, ...], complete)``: argument sets that together
+                              read more than L2, timed as one CUDA graph per candidate so each call
+                              runs cold (e.g. ``bench.gemm_cold_banks``); an incomplete rotation is
+                              still timed this way but its crown is not cached
     max_failures:             abort the tune once this many configs fail to compile/run before
                               the measured budget is met (default n_trials; runtime override
                               ``strict`` in FINEGRAINED_AUTOTUNE_CONFIG sets 0). Without it a broadly broken
@@ -983,6 +1042,7 @@ def bayesian_autotune(
             path_anchor_axes=path_anchor_axes,
             coupled_axes=coupled_axes,
             finite_check_args=finite_check_args,
+            cold_banks=cold_banks,
             cache_results=cache_results,
             **kwargs,
         )
