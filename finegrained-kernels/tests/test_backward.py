@@ -40,6 +40,7 @@ from utils import (  # type: ignore
     SUPPORTS_FP8,
     TEST_DEVICE,
     WEIGHTS,
+    INT_BITS,
 )
 
 fg = finegrained_kernels
@@ -47,6 +48,7 @@ dgrad_matmul_2d = internals.backward.dgrad_matmul_2d
 dgrad_matmul_batched = internals.backward.dgrad_matmul_batched
 dgrad_matmul_grouped = internals.backward.dgrad_matmul_grouped
 glu_backward = internals.backward.glu_backward
+dgrad_matmul_grouped_kernel = internals.backward.dgrad_matmul_grouped_kernel
 
 
 pytestmark = pytest.mark.skipif(not SUPPORTS_FP8, reason="FP8 kernels require SM89+")
@@ -259,7 +261,8 @@ def test_inference_path_is_untouched():
     assert not out.requires_grad and torch.isfinite(out.float()).all()
 
 
-QUANT_WEIGHTS = [r for r in WEIGHTS if r not in ("bf16", "fp16")]
+# Row-wise FP8 and integer formats leave gradients to the separate dgrad stream.
+QUANT_WEIGHTS = [r for r in WEIGHTS if r not in ("bf16", "fp16", "fp8_rowwise") and r not in INT_BITS]
 
 
 @pytest.mark.parametrize("weights", QUANT_WEIGHTS)
@@ -365,7 +368,6 @@ def test_dgrad_grouped_every_admitted_config_accumulates():
     benches configs by speed, so an arm that is wrong ONLY under these launch semantics gets
     crowned whenever it wins a near-tied tune — the descriptor-anchor bug this guards against
     read the wrong dY rows on exactly this launch while passing every identity-gather test."""
-    backward_module = internals.backward
     dgrad_matmul_grouped = internals.backward.dgrad_matmul_grouped
 
     torch.manual_seed(0)
@@ -394,7 +396,7 @@ def test_dgrad_grouped_every_admitted_config_accumulates():
             num_input_rows=T,
         )
 
-    tuner = backward_module.dgrad_matmul_grouped_kernel
+    tuner = dgrad_matmul_grouped_kernel
     admitted = {}
     original_prune, original_configs = tuner.early_config_prune, tuner.configs
 

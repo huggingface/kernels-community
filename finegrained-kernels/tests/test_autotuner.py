@@ -17,6 +17,7 @@ activation-quant arm equivalence, and cross-process determinism; each docstring
 carries its incident."""
 
 import itertools
+import json
 import logging
 import os
 import subprocess
@@ -521,3 +522,32 @@ def test_coupled_axes_cross_refinement_valley(monkeypatch):
         winner = kernel._bayesian_search(configs, (), {}, ())
         winners.append((winner.kwargs["BLOCK_SIZE_K"], winner.num_stages))
     assert winners == [(128, 2), (256, 3)]
+
+
+@pytest.mark.kernels_ci
+def test_force_restricts_tuning_to_matching_configs(monkeypatch):
+    """``force`` in FINEGRAINED_AUTOTUNE_CONFIG tunes only the pruned configs carrying the forced values (an
+    axis the kernel lacks is ignored), and raises when none survives."""
+
+    def tuned(force):
+        monkeypatch.setenv("FINEGRAINED_AUTOTUNE_CONFIG", json.dumps({"strict": True, "force": force}))
+
+        @bayesian_autotune(
+            [triton.Config({"BLOCK": b}, num_warps=w) for b in (32, 64, 128) for w in (2, 4)],
+            ["N"],
+            n_trials=6,
+            cache_results=False,
+        )
+        @triton.jit
+        def _force_kernel(X, Y, N, BLOCK: tl.constexpr):
+            offs = tl.arange(0, BLOCK)
+            tl.store(Y + offs, tl.load(X + offs, mask=offs < N), mask=offs < N)
+
+        x = torch.randn(256, device=TEST_DEVICE)
+        _force_kernel[(1,)](x, torch.empty_like(x), 16)
+        return _force_kernel.best_config
+
+    best = tuned({"BLOCK": 64, "num_warps": 4, "PIPELINE": "tile_loop"})
+    assert best.kwargs["BLOCK"] == 64 and best.num_warps == 4
+    with pytest.raises(RuntimeError, match="no pruned config matches"):
+        tuned({"BLOCK": 16})

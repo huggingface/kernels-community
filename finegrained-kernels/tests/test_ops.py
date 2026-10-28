@@ -30,7 +30,7 @@ weight scales pre-swizzled into the 5D SWIZZLE_32_4_4 tcgen05 layout — a pure 
 checked against the affine reference).
 Nothing in this file uses a kernel under test as the oracle."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 
 import pytest
 import torch
@@ -51,11 +51,15 @@ from utils import (  # type: ignore
     maybe_compile,
     prepare_weight_scales,
     quant_dequant_a,
+    INT_BITS,
+    INT_GROUP,
     REQUANT_FN,
     REQUANT_GROUP,
     SUPPORTS_SWIZZLED_SCALES,
     TEST_DEVICE,
     WEIGHTS,
+    dq_int,
+    make_gptq_act_order,
 )
 
 embedding_lookup = internals.embedding.embedding_lookup
@@ -69,6 +73,24 @@ ue8m0_as_uint8 = internals.formats.ue8m0_as_uint8
 decode_group_scale = internals.scales.decode_group_scale
 nvfp4_act_quant = internals.quant.nvfp4_act_quant
 apply_glu = internals.epilogue.apply_glu
+repack_modelopt_int4 = finegrained_kernels.repack_modelopt_int4
+repack_modelopt_int8 = finegrained_kernels.repack_modelopt_int8
+repack_ggml_int = finegrained_kernels.repack_ggml_int
+dequantize_int_weight = finegrained_kernels.dequantize_int_weight
+repack_awq_int4 = finegrained_kernels.repack_awq_int4
+repack_gptq_int4 = finegrained_kernels.repack_gptq_int4
+int_weight_only_matmul_batched_kernel = internals.batched.int_weight_only_matmul_batched_kernel
+mx_dynamic_matmul_batched_kernel = internals.batched.mx_dynamic_matmul_batched_kernel
+w8a8_tensor_dynamic_fp8_matmul_batched_kernel = internals.batched.w8a8_tensor_dynamic_fp8_matmul_batched_kernel
+block_fp8_weight_only_matmul_grouped_kernel = internals.grouped.block_fp8_weight_only_matmul_grouped_kernel
+full_precision_matmul_grouped_kernel = internals.grouped.full_precision_matmul_grouped_kernel
+int_weight_only_matmul_grouped_kernel = internals.grouped.int_weight_only_matmul_grouped_kernel
+mx_dynamic_matmul_grouped_kernel = internals.grouped.mx_dynamic_matmul_grouped_kernel
+w8a8_block_static_fp8_matmul_grouped_kernel = internals.grouped.w8a8_block_static_fp8_matmul_grouped_kernel
+w8a8_tensor_dynamic_fp8_matmul_grouped_kernel = internals.grouped.w8a8_tensor_dynamic_fp8_matmul_grouped_kernel
+int_weight_only_matmul_2d_kernel = internals.matmul.int_weight_only_matmul_2d_kernel
+mx_dynamic_matmul_kernel = internals.matmul.mx_dynamic_matmul_kernel
+w8a8_tensor_dynamic_fp8_matmul_kernel = internals.matmul.w8a8_tensor_dynamic_fp8_matmul_kernel
 
 
 # ── the scenario spec ─────────────────────────────────────────────────────────────
@@ -90,6 +112,7 @@ class Problem:
     swiglu_alpha: float | None = None
     swiglu_limit: float | None = None
     activation_format: str | None = None
+    activation_scale_ub: float | None = None
     quantize_output: bool = False
     per_expert_globals: bool = False  # activation (and requant output) globals calibrated per expert
     prequant: bool = False  # pass As explicitly (must be bit-identical to raw A)
@@ -101,11 +124,21 @@ class Problem:
     empty_expert: bool = False
     compile: bool = False
     bias: bool = False  # a per-expert output bias, added on the accumulator before the GLU
+    zero_points: bool = False  # asymmetric integer weights: a zero point per weight scale group
+    int_group: int | None = INT_GROUP  # None spans K (per-channel)
+    pre_quant_scale: bool = False  # AWQ input transform, shared for dense or per expert when routed
+    svdquant_rank: int = 0  # dense NVFP4 residual plus BF16 low-rank correction
     dtype: torch.dtype = torch.bfloat16
+    # in the CI subset (kernels_ci); the rest run in test_op_scenarios_extended
+    ci: bool = field(default=True, compare=False)
 
     @property
     def id(self):
         tag = self.weights
+        if self.activation_scale_ub is not None:
+            tag += "_capped"
+        if self.weights in INT_BITS and self.int_group != INT_GROUP:
+            tag += f"_group{self.int_group or 'channel'}"
         if self.gate:
             tag += f"_gate_{self.act_fn}"
             if self.swiglu_alpha is not None:
@@ -136,6 +169,12 @@ class Problem:
             tag += "_compile"
         if self.bias:
             tag += "_bias"
+        if self.zero_points:
+            tag += "_zp"
+        if self.pre_quant_scale:
+            tag += "_prequantscale"
+        if self.svdquant_rank:
+            tag += f"_svdquant_r{self.svdquant_rank}"
         if self.dtype != torch.bfloat16:
             tag += f"_{str(self.dtype).rsplit('.', 1)[-1]}"  # float16 / float32
         return f"{tag}_S{self.S}_E{self.E}_N{self.N}_K{self.K}"
@@ -166,11 +205,17 @@ def scenarios() -> list[Problem]:
                 out.append(
                     Problem(weights=w, gate=True, activation_format=fmt, quantize_output=True, swizzled=True)
                 )
-        default_in = {"fp8_128x128": "fp8", "fp8_tensor": "fp8"}.get(w)
+        default_in = {"fp8_128x128": "fp8", "fp8_tensor": "fp8", "fp8_rowwise": "fp8"}.get(w)
         for fmt in row["activation_formats"]:
             if fmt != default_in:
                 out.append(Problem(weights=w, activation_format=fmt))
     out += [
+        # Coarse and per-tensor FP8 with raw BF16/FP16 activations.
+        Problem(ci=False, weights="fp8_128x128", activation_format="bf16", S=1, N=192, K=384, bias=True, dtype=torch.float16),
+        Problem(ci=False, weights="fp8_128x128_ue8m0", activation_format="bf16", S=8, empty_expert=True, sentinel_fraction=0.25),
+        Problem(weights="fp8_tensor", activation_format="bf16", S=1, gate=True, bias=True, compile=True),
+        Problem(weights="fp8_128x128", activation_format="bf16", S=257, N=256, K=512, gate=True, bias=True, compile=True),
+        Problem(ci=False, weights="fp8_128x128", activation_format="bf16", S=1025, E=1, N=192, K=384, compile=True, bias=True),
         Problem(weights="fp16", dtype=torch.float16),
         # gate WITHOUT requant (raw GLU intermediate) — one quantized + one full format
         Problem(weights="mxfp8", gate=True),
@@ -186,6 +231,13 @@ def scenarios() -> list[Problem]:
         Problem(weights="fp8_128x128", prequant=True),
         Problem(weights="mxfp8", prequant=True),
         Problem(weights="nvfp4", prequant=True),
+        Problem(weights="mxfp4", activation_format="fp8", static=True, gate=True, pre_quant_scale=True, compile=True),
+        Problem(weights="nvfp4", activation_format="fp8", static=True, gate=True, pre_quant_scale=True, compile=True),
+        Problem(weights="nvfp4", S=8, gate=True, pre_quant_scale=True, compile=True),
+        Problem(weights="nvfp4", S=1, svdquant_rank=32, pre_quant_scale=True, bias=True),
+        Problem(ci=False, weights="nvfp4", S=64, N=129, K=320, svdquant_rank=128, pre_quant_scale=True, compile=True),
+        Problem(ci=False, weights="nvfp4", S=128, svdquant_rank=32, pre_quant_scale=True, gate=True,
+                activation_format="nvfp4", quantize_output=True, swizzled=True),
         Problem(weights="mxfp8", sentinel_fraction=0.25),
         # the prefill expansion (>= 4096 routed rows below 1024 per expert) copies only the local rows:
         # values + 2D scales, and raw bf16 rows
@@ -196,6 +248,7 @@ def scenarios() -> list[Problem]:
         # decode shape (small M — inline act-quant on MX, the software/scalar arms elsewhere)
         Problem(weights="mxfp8", S=8),
         Problem(weights="nvfp4", S=8),
+        Problem(weights="bf16", S=4, gate=True),  # the full-precision swapped decode tiles
         # the TOP of the 2D swap decode band (mx_2d_swap_scope_pruner scopes SWAP_AB to M <= 16):
         # the arm's tile choices differ across the band, and an A-descriptor trap that is clean at
         # S=4 fires by S=16, so the edge is the cell that sees it
@@ -253,9 +306,12 @@ def scenarios() -> list[Problem]:
         # launch-scale smoke (the matrix rides small shapes; this catches scale-dependent
         # scheduling/tiling regressions)
         Problem(weights="mxfp8", S=2048, E=16, N=512, K=1024),
+        # UE8M0 block FP8 above M=256: the 2D op runs it as cuBLAS's MXFP8 GEMM
+        Problem(weights="fp8_128x128_ue8m0", S=2048, E=16, N=512, K=1024),
         Problem(weights="fp8_128x128", compile=True),
         Problem(weights="mxfp4", compile=True),
         Problem(weights="bf16", compile=True),  # the fp kernel's pre_hook under compile
+        Problem(ci=False, weights="fp8_rowwise", S=256, activation_scale_ub=0.5, compile=True),
         Problem(weights="fp8_tensor", static=True, compile=True),  # the static arm's operand marshalling
         # calibrated (static) activation quant, reached when As is a calibrated scale rather than
         # per-block. One value per quantized module, so the OP fixes the shape: a dense linear
@@ -265,6 +321,20 @@ def scenarios() -> list[Problem]:
         # per-TENSOR weights: the shipped static form (Ministral-3 dense, Mistral-4 MoE — both
         # write qscheme_act="TENSOR" with weight_block_size=None)
         Problem(weights="fp8_tensor", static=True),
+        # row-wise weights (Llama 4 FP8): the stacked gate|up rows carry their own scales, the swapped decode
+        # tile folds them on its other axis, a caller's per-token As rides as-is, and the launch-scale shape
+        # reaches the grouped kernel's descriptor / warp-specialized arms
+        Problem(weights="fp8_rowwise", gate=True),
+        Problem(ci=False, weights="fp8_rowwise", S=8),
+        Problem(ci=False, weights="fp8_rowwise", gate=True, S=8),
+        Problem(ci=False, weights="fp8_rowwise", prequant=True, compile=True),
+        Problem(ci=False, weights="fp8_rowwise", S=4096, E=8, prequant=True, noncontiguous=True),
+        Problem(weights="fp8_rowwise", static=True, S=17),
+        Problem(ci=False, weights="fp8_rowwise", S=257, bias=True, empty_expert=True, compile=True),
+        Problem(ci=False, weights="fp8_rowwise", S=2048, E=16, N=512, K=1024),
+        # the prefill expansion lays the routed rows out, and their per-token scales with them
+        Problem(ci=False, weights="fp8_rowwise", S=4096, E=8, sentinel_fraction=0.5),
+        Problem(ci=False, weights="fp8_tensor", S=4096, E=8),
         # non-aligned N (64-grid, off the 128-grid — gpt-oss H=I=2880 shape). matmul_2d masks the
         # N-tail; routed MX runs the affine arm (per-row scales, any BN|N); routed FP8 rejects it
         # (its scales are 128-blocked along N — raises pointing to matmul_2d).
@@ -301,6 +371,35 @@ def scenarios() -> list[Problem]:
         Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, bias=True),
         Problem(weights="mxfp4", activation_format="bf16", gate=True, swiglu_alpha=1.702, swiglu_limit=7.0, bias=True),
         Problem(weights="mxfp4", activation_format="bf16", gate=True, swiglu_alpha=1.702, swiglu_limit=7.0, bias=True, S=8),
+        # int4 weight-only (the format matrix above gives each row its plain cell): the gated GLU with
+        # a bias, decode (the batched swap reduce at S=1), a K off the BK grid (the batched tail tile
+        # slides back) and fp16 activations, each with and without zero points
+        Problem(ci=False, weights="int4", gate=True, swiglu_alpha=1.702, swiglu_limit=7.0, bias=True),
+        Problem(weights="int4", zero_points=True, gate=True, bias=True),
+        Problem(ci=False, weights="int4", S=1),
+        Problem(ci=False, weights="int4", zero_points=True, S=8),
+        Problem(ci=False, weights="int4", zero_points=True, K=640),
+        Problem(ci=False, weights="int4", dtype=torch.float16),
+        Problem(ci=False, weights="int4", zero_points=True, dtype=torch.float16),
+        # the 8- and 2-bit widths ride the same kernels (the width follows from the weight's word count)
+        Problem(ci=False, weights="int8", zero_points=True, S=1),
+        Problem(ci=False, weights="int8", zero_points=True, gate=True, bias=True),
+        Problem(ci=False, weights="int8", dtype=torch.float16),
+        Problem(ci=False, weights="int2", zero_points=True, S=1),
+        Problem(weights="int2", zero_points=True, gate=True, bias=True),
+        # Wide groups and per-channel scales retain rounded weight dequantization.
+        Problem(ci=False, weights="int2", int_group=512, K=1024),
+        Problem(ci=False, weights="int4", int_group=512, K=1024, zero_points=True, gate=True, bias=True),
+        Problem(ci=False, weights="int8", int_group=None, K=1024, zero_points=True),
+        # per-channel with K off the 128 grid (gpt-oss K=2880): only a 64-wide K tile divides K
+        Problem(weights="int8", int_group=None, K=320),
+        Problem(ci=False, weights="int4", int_group=None, K=1024, compile=True),
+        Problem(ci=False, weights="int4", zero_points=True, compile=True),
+        Problem(weights="int4", S=8, gate=True, bias=True, pre_quant_scale=True, compile=True),
+        Problem(weights="int4", S=32, gate=True, bias=True, activation_format="fp8", static=True,
+                pre_quant_scale=True, compile=True),
+        Problem(weights="int8", int_group=None, gate=True, bias=True, activation_format="int8", static=True,
+                pre_quant_scale=True, compile=True),
     ]
     return out
 
@@ -340,6 +439,17 @@ def _bias(problem: Problem, op):
     return bias[0] if op == "matmul" else bias
 
 
+def _zero_points(problem: Problem, E):
+    """The scenario's integer zero points, else None: one per weight scale group, ``(E, rows, K // group)``
+    over the stack the weights were made at. Seeded, so the reference and the op read the identical values."""
+    if not problem.zero_points:
+        return None
+    g = torch.Generator(device=TEST_DEVICE).manual_seed(2)
+    rows = 2 * problem.N if problem.gate else problem.N
+    shape = (E, rows, problem.K // (problem.int_group or problem.K))
+    return torch.randint(0, 1 << INT_BITS[problem.weights], shape, device=TEST_DEVICE, dtype=torch.uint8, generator=g)
+
+
 def _make_noncontig(x):
     base = torch.empty((x.numel(), 2), dtype=x.dtype, device=x.device)
     base[:, 0] = x
@@ -356,6 +466,8 @@ def _static_scale(problem: Problem, op, A):
     if not problem.static:
         return None
     scale = make_static_activation_scale(A)
+    if problem.activation_format == "int8":
+        scale = scale * (448.0 / 127.0)
     if op == "matmul":
         return scale
     fan = torch.linspace(0.5, 2.0, problem.E, device=A.device, dtype=torch.float32)
@@ -376,7 +488,7 @@ def _act_global(problem: Problem, A, expert_ids=None):
     vector modelopt writes (one ``input_scale`` per expert), fanned around the per-tensor value so
     an ignored entry shows up. Weight-only (bf16 activations) and non-nvfp4 formats have no second
     level (None)."""
-    if problem.weights != "nvfp4" or problem.activation_format == "bf16":
+    if problem.weights != "nvfp4" or problem.activation_format in ("bf16", "fp8"):
         return None
     g = _nvfp4_global(A)
     if not problem.per_expert_globals:
@@ -398,6 +510,8 @@ def _dequant_a(problem: Problem, op, A, expert_ids=None):
     calibrated static scale of each row's expert), plus the pre-quantized ``(Aq, As)`` form for the prequant round-trip
     check (``None`` where ``A`` stays raw)."""
     row = WEIGHTS[problem.weights]
+    if problem.activation_scale_ub is not None:
+        return quant_dequant_a(A, problem.K, activation_scale_ub=problem.activation_scale_ub), None
     static_scale = _static_scale(problem, op, A)
     act_global = _act_global(problem, A, expert_ids)
     if static_scale is not None:  # static (calibrated) activation quant
@@ -443,6 +557,20 @@ def _act_dequant(problem: Problem, op, A, As=None, As_global=None, expert_ids=No
     return WEIGHTS[problem.weights]["dq_act"](A, As)
 
 
+def _pre_quant_scale(problem: Problem, op):
+    E = 1 if op == "matmul" else problem.E
+    scale = torch.linspace(0.5, 1.5, E * problem.K, device=TEST_DEVICE, dtype=problem.dtype)
+    return scale if op == "matmul" else scale.view(E, problem.K)
+
+
+def _svdquant_factors(problem: Problem):
+    g = torch.Generator(device=TEST_DEVICE).manual_seed(87)
+    rows = problem.N * (2 if problem.gate else 1)
+    a = torch.randn(problem.svdquant_rank, problem.K, generator=g, device=TEST_DEVICE, dtype=problem.dtype) / problem.K**0.5
+    b = torch.randn(rows, problem.svdquant_rank, generator=g, device=TEST_DEVICE, dtype=problem.dtype) * 20
+    return a, b
+
+
 def _fp32_intermediate(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_global=None):
     """The fp32 GLU output on the format-quantized operands — the pre-requant oracle, shared by the
     global calibration (``_out_global``) and the reference (``_reference``), reading the SAME ``A``/
@@ -450,9 +578,39 @@ def _fp32_intermediate(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As
     gather ``W[expert]`` and zero sentinel rows; GLU in fp32 (the production epilogue applies it to
     the fp32 accumulator directly)."""
     row = WEIGHTS[problem.weights]
-    A_dq = _act_dequant(problem, op, A, As, As_global, expert_ids)
+    A_raw = A
+    if problem.pre_quant_scale:
+        scale = _pre_quant_scale(problem, op)
+        if op != "matmul":
+            scale = scale[expert_ids.long().clamp(max=problem.E - 1)]
+        A_raw = A * scale
+    if problem.static and problem.activation_format in ("fp8", "int8"):
+        act_scale = _rowwise(problem, _static_scale(problem, op, A), expert_ids)
+        normalized = A_raw.float() / act_scale
+        A_quant = normalized.round().clamp(-128, 127) if problem.activation_format == "int8" else normalized.clamp(-448, 448).to(torch.float8_e4m3fn).float()
+        A_dq = A_quant * act_scale
+    elif problem.pre_quant_scale and problem.weights == "nvfp4" and As_global is not None:
+        aq, scales = nvfp4_act_quant(A_raw, global_scale=As_global, expert_index=expert_ids)
+        A_dq = dq_grouped(aq.view(torch.int8), scales, NVFP4_SCALE_GROUP_K) * _rowwise(problem, As_global, expert_ids)
+    else:
+        A_dq = _act_dequant(problem, op, A_raw, As, As_global, expert_ids)
     # (E, rows, K) fp32
-    W = dequant_gate_up(row, B, Bs, Bs_global) if problem.gate else row["dequant"](B, Bs, Bs_global)
+    if problem.weights in INT_BITS:  # dequantized to the activation dtype, as the GEMM does
+        W = dq_int(B, Bs, _zero_points(problem, B.shape[0]),
+                   None if problem.activation_format in ("fp8", "int8") else problem.dtype, problem.int_group or problem.K)
+        if problem.activation_format == "fp8":
+            global_scale = Bs_global.view(-1, 1, 1)
+            W = (W / global_scale).clamp(-448, 448).to(torch.float8_e4m3fn).float() * global_scale
+    elif problem.weights == "nvfp4" and problem.activation_format == "fp8":
+        W = dq_grouped(B, Bs, 32) * Bs_global.view(-1, 1, 1)
+    elif problem.gate:
+        W = dequant_gate_up(row, B, Bs, Bs_global)
+    else:
+        W = row["dequant"](B, Bs, Bs_global)
+    if problem.activation_format == "bf16" and problem.weights != "nvfp4":
+        # the dequantized weight in the activation dtype, as the GEMM does; NVFP4 applies its
+        # second-level global after the dot, so its W * global never rounds
+        W = W.to(A.dtype).float()
     bias = _bias(problem, op)
     if op == "matmul":
         ref = A_dq @ W[0].T  # single linear, no routing
@@ -464,7 +622,12 @@ def _fp32_intermediate(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As
         if bias is not None:
             ref = ref + bias.float()[local]
         ref[expert_ids.long() >= problem.E] = 0
-    if problem.gate:
+    if problem.svdquant_rank:
+        lora_a, lora_b = _svdquant_factors(problem)
+        down = (A_raw.float() @ lora_a.float().T).to(problem.dtype)
+        correction = (down.float() @ lora_b.float().T).to(problem.dtype)
+        ref = ref.to(problem.dtype) + correction
+    if problem.gate and problem.act_fn is not None:  # act_fn=None: the raw gate|up columns
         gate_v, up_v = ref[..., 0::2], ref[..., 1::2]
         ref = apply_glu(
             gate_v, up_v, problem.act_fn, problem.swiglu_alpha, problem.swiglu_limit
@@ -506,7 +669,8 @@ def _reference(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, A
     return list(REQUANT_FN[problem.activation_format](scaled.to(problem.dtype)))
 
 
-def _op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_global=None, out_global=None):
+def _op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_global=None, out_global=None,
+        output_dtype=None):
     """The op half of the symmetric ``(ref, op)`` pair — the same inputs as ``_reference`` (plus
     ``As`` for the pre-quantized-input test). Runs the kernel on the format's operands (swizzling
     weight scales; the two-level per-tensor globals ride as the decoupled ``a_global_scale`` /
@@ -517,7 +681,12 @@ def _op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_globa
     it before requant — the same scalar the reference uses, so the two spaces match."""
     # a requant cell names its format explicitly (the reference snaps to that grid)
     assert not problem.quantize_output or problem.activation_format not in (None, "bf16")
-    kw = dict(activation_format=problem.activation_format, quantize_output=problem.quantize_output)
+    kw = dict(activation_format=problem.activation_format, activation_scale_ub=problem.activation_scale_ub, quantize_output=problem.quantize_output)
+    if problem.svdquant_rank:
+        lora_a, lora_b = _svdquant_factors(problem)
+        kw.update(svdquant_lora_a=lora_a, svdquant_lora_b=lora_b, simulate_unfused=True)
+    if problem.pre_quant_scale:
+        kw["a_pre_quant_scale"] = _pre_quant_scale(problem, op)
     if problem.gate:
         kw.update(
             gate=True,
@@ -526,9 +695,12 @@ def _op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_globa
             swiglu_limit=problem.swiglu_limit,
         )
     if not problem.quantize_output:
-        kw["output_dtype"] = problem.dtype
+        kw["output_dtype"] = output_dtype or (None if problem.prequant else problem.dtype)
     if problem.bias:
         kw["bias"] = _bias(problem, op)
+    if problem.zero_points:
+        zero_points = _zero_points(problem, B.shape[0])
+        kw["b_zero"] = zero_points[0] if op == "matmul" else zero_points
     if out_global is not None:  # provided NVFP4 output global (next proj's input_scale)
         kw["output_global_scale"] = out_global
     if problem.static:  # fused static activation quant — As is the calibrated scale
@@ -623,6 +795,8 @@ def _check(problem: Problem, dq_out, ref_cmp, expert_ids, op):
         else expert_ids.long() < problem.E
     )
     if not problem.quantize_output:
+        # Use output-dtype tolerances: Torch and tuned kernels may sum FP32
+        # products in different orders, and GLU can amplify near-zero differences.
         atol, rtol = DTYPE_TO_TOL[problem.dtype]
         if IS_SM89:
             atol = max(atol, 1e-2 * ref_cmp[keep].abs().max().item())
@@ -651,42 +825,62 @@ def _check(problem: Problem, dq_out, ref_cmp, expert_ids, op):
 
 def _make_weights(problem: Problem, row, E):
     """The scenario's weights: ``(B, Bs, Bs_global)``; under gate the interleaved gate|up stack."""
-    if problem.gate:
-        weight, scales, global_scale = make_gate_up(row, problem.N, problem.K, E)
-    else:
-        weight, scales, global_scale = row["make"](problem.N, problem.K, E)
+    kwargs = {"group": problem.int_group or problem.K} if problem.weights in INT_BITS else {}
+    if problem.gate and problem.weights not in INT_BITS:
+        B, Bs, Bs_global = make_gate_up(row, problem.N, problem.K, E)
+    else:  # INT groups run along K per row: the stack quantizes as is
+        B, Bs, Bs_global = row["make"](2 * problem.N if problem.gate else problem.N, problem.K, E, **kwargs)
+    if problem.weights == "nvfp4" and problem.activation_format == "fp8":
+        Bs = Bs[..., ::2].contiguous()  # valid group-32 E4M3 payload; both FP4 halves use one scale
+    if problem.weights in INT_BITS and problem.activation_format == "fp8":
+        Bs = Bs.float()
+        Bs_global = dq_int(B, Bs, group=problem.int_group or problem.K).abs().amax(dim=(-2, -1)).div(448).clamp(min=1e-12)
+    elif problem.weights in INT_BITS and problem.activation_format == "int8":
+        Bs = Bs.float()
     if problem.csf_encoding:
         # E4M3 codes 24 apart (more than the 15 a CSF offset holds): an exception in every expert
-        scales[..., 0, :2] = scales.new_tensor([0.125, 1.0])
-    return weight, scales, global_scale
+        Bs[..., 0, :2] = Bs.new_tensor([0.125, 1.0])
+    return B, Bs, Bs_global
 
 
-def _skip_moe_only(problem: Problem, op: str) -> None:
-    """matmul_2d is the single-GEMM sibling: skip only the scenarios it can't represent — expert
-    routing (sentinel / noncontiguous / empty-expert / the MoE prequant-As check) and non-MX
-    input/output format knobs (its FP8 paths infer the quant from the scale shape and return the
-    intermediate dense). Everything else — including full-precision (BF16/FP16) weights and a
-    shared static activation scale — runs on all three ops."""
+def _skip_unsupported(problem: Problem, op: str) -> None:
+    """The scenarios an op can't represent. matmul_2d is the single-GEMM
+    sibling: it skips expert routing (sentinel / noncontiguous / empty-expert / the MoE prequant-As
+    check) and non-MX input/output format knobs (its FP8 paths infer the quant from the scale shape and
+    return the intermediate dense). Everything else — including full-precision (BF16/FP16) weights and
+    a shared static activation scale — runs on all three ops."""
+    if problem.svdquant_rank and op != "matmul":
+        pytest.skip("SVDQuant checkpoint support is dense")
     if op != "matmul":
         return
-    if problem.sentinel_fraction or problem.noncontiguous or problem.empty_expert or problem.prequant:
+    if problem.sentinel_fraction or problem.noncontiguous or problem.empty_expert:
         pytest.skip("expert-routing scenario (MoE only)")
+    if problem.prequant and problem.weights != "fp8_rowwise":
+        pytest.skip("prequantized block-scale inputs need routing")
     if problem.per_expert_globals:
         pytest.skip("per-expert globals need routing (MoE only)")
 
     mx = problem.weights in ("mxfp8", "mxfp8_u8", "mxfp4", "nvfp4")
-    if not mx and (problem.activation_format is not None or problem.quantize_output):
+    int_quantized = problem.weights in INT_BITS and problem.activation_format in ("fp8", "int8")
+    if not mx and not int_quantized and (problem.activation_format not in (None, "bf16") or problem.quantize_output):
         pytest.skip("an explicit activation format / requant is MX-only for matmul_2d")
 
 
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 @pytest.mark.parametrize("op", ["batched", "grouped", "matmul"])
-@pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
+@pytest.mark.parametrize("problem", [p for p in PROBLEMS if p.ci], ids=lambda p: p.id)
 def test_op_scenarios(problem: Problem, op):
     """Reference (the op written in torch) vs op (the kernel): same inputs, each returning the op's
     own output format, compared once through the shared ``_dequant``."""
-    _skip_moe_only(problem, op)
+    _run_scenario(problem, op)
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
+@pytest.mark.parametrize("op", ["batched", "grouped", "matmul"])
+@pytest.mark.parametrize("problem", [p for p in PROBLEMS if not p.ci], ids=lambda p: p.id)
+def test_op_scenarios_extended(problem: Problem, op):
+    """The scenarios outside the CI subset: variants of a format the CI cells already cover."""
+def _run_scenario(problem: Problem, op):
+    _skip_unsupported(problem, op)
     gated_nvfp4_requant = problem.weights == "nvfp4" and problem.gate and problem.quantize_output
     if IS_SM89 and op == "matmul" and gated_nvfp4_requant and not (problem.swizzled or problem.per_expert_globals):
         pytest.skip("matmul_2d returns wrong values for a gated NVFP4 requant with one global on sm_89")
@@ -694,7 +888,8 @@ def test_op_scenarios(problem: Problem, op):
     row = WEIGHTS[problem.weights]
     E = 1 if op == "matmul" else problem.E  # matmul is a single weight matrix
     B, Bs, Bs_global = _make_weights(problem, row, E)
-    if op != "matmul" and problem.N % 128 != 0 and problem.weights.startswith("fp8"):
+    if (op != "matmul" and problem.N % 128 != 0 and problem.weights.startswith("fp8")
+            and problem.activation_format != "bf16"):
         # fp8 weight scales are 128-blocked along N, so routed fp8 rejects non-128 N. MX (per-row
         # scales, BN | N) handles it on the affine arm — falls through to the normal ref-vs-op run.
         with pytest.raises(ValueError, match="matmul_2d"):
@@ -703,8 +898,8 @@ def test_op_scenarios(problem: Problem, op):
     # ref is the op written in torch; both take the same inputs — including the PROVIDED nvfp4 output
     # global — and return the op's own format, so _dequant reads them identically and _check compares
     # once. _assert_op_layout is the one op-only check (the reference never swizzles its output).
-    # prequant scenarios hand the op its activations already quantized (As set — routed ops only,
-    # _skip_moe_only excludes matmul); otherwise raw A + As=None and the op quantizes it. Reference
+    # prequant scenarios hand the op its activations already quantized (As set); otherwise
+    # raw A + As=None and the op quantizes it. Reference
     # and op take the identical (A, As): pre-quantizing just hands the op the values it would
     # otherwise compute, and _fp32_intermediate reads whichever form it's given. The nvfp4 activation
     # global comes off the RAW A (before prequant replaces it) and rides separately as As_global.
@@ -758,6 +953,8 @@ def _run_ref_vs_op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, shared
         As_global = _act_global(problem, A, expert_ids)
         if problem.prequant:
             A, As = _prequant_args(problem, op, A, expert_ids)
+            if problem.noncontiguous and As is not None:
+                As = _make_noncontig(As.reshape(-1)).view(As.shape)
         g_out = _out_global(problem, op, A, expert_ids, B, Bs, Bs_global, As, As_global)
         ref = _reference(problem, op, A, expert_ids, B, Bs, Bs_global, As=As, As_global=As_global, out_global=g_out)
         if shared is not None:
@@ -768,6 +965,26 @@ def _run_ref_vs_op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, shared
         )
     out = _op(problem, op, A, expert_ids, B, Bs, Bs_global, As=As, As_global=As_global, out_global=g_out)
     _assert_op_layout(problem, op, out)
+    if problem.gate and not problem.quantize_output:
+        # The GLU scales the gate|up accumulation error by |act(gate)|: on a cancelling up column
+        # the summation-order noise of any fp32 GEMM (cuBLAS included) exceeds the output
+        # tolerance. So check the GEMM (raw gate|up, act_fn=None) against the reference, then the
+        # GLU against the reference GLU of the kernel's own gate|up (fp32, as the epilogue reads its
+        # accumulators) — each at its own error scale.
+        raw_problem = replace(problem, act_fn=None)
+        raw_ref = shared.get("raw_ref") if shared else None
+        if raw_ref is None:
+            raw_ref = _fp32_intermediate(raw_problem, op, A, expert_ids, B, Bs, Bs_global, As, As_global)
+            if shared is not None:
+                shared["raw_ref"] = raw_ref
+        raw = _dequant(raw_problem, _op(
+            raw_problem, op, A, expert_ids, B, Bs, Bs_global, As=As, As_global=As_global, out_global=g_out,
+            output_dtype=torch.float32,
+        ), g_out, expert_ids)
+        _check(raw_problem, raw, raw_ref, expert_ids, op)
+        ref = apply_glu(
+            raw[..., 0::2], raw[..., 1::2], problem.act_fn, problem.swiglu_alpha, problem.swiglu_limit
+        ).float()
     _check(
         problem,
         _dequant(problem, out, g_out, expert_ids),
@@ -784,44 +1001,61 @@ def _run_ref_vs_op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, shared
 # kernel (the dense gate fusion and its gate_pointer_only/WS pruners), and one nvfp4 cell
 # (E4M3 scales: the nvfp4_native_ok fence + software decode arms).
 _SWEEP_CELLS = [
-    (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True), "grouped", "mx_dynamic_matmul_grouped_kernel"),
+    (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True), "grouped", mx_dynamic_matmul_grouped_kernel),
     # K off the BK=128 grid admits the BK=64 rows, the family a K=256 cell never reaches
-    (Problem(weights="mxfp4", K=320), "grouped", "mx_dynamic_matmul_grouped_kernel"),
-    (Problem(weights="mxfp8", K=320), "grouped", "mx_dynamic_matmul_grouped_kernel"),
-    (Problem(weights="mxfp4", S=8), "batched", "mx_dynamic_matmul_batched_kernel"),
-    (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "grouped", "mx_dynamic_matmul_grouped_kernel"),
-    (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "matmul", "mx_dynamic_matmul_kernel"),
+    (Problem(weights="mxfp4", K=320), "grouped", mx_dynamic_matmul_grouped_kernel),
+    (Problem(weights="mxfp8", K=320), "grouped", mx_dynamic_matmul_grouped_kernel),
+    (Problem(weights="mxfp4", S=8), "batched", mx_dynamic_matmul_batched_kernel),
+    (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "grouped", mx_dynamic_matmul_grouped_kernel),
+    (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "matmul", mx_dynamic_matmul_kernel),
     # non-128 N on the 2D gate|up tile (gpt-oss-style N=320): the BN=128 tile overhangs N
-    (Problem(weights="mxfp4", gate=True, activation_format="mxfp4", quantize_output=True, N=320, K=320), "matmul", "mx_dynamic_matmul_kernel"),
-    (Problem(weights="nvfp4", gate=True, activation_format="nvfp4", quantize_output=True, swizzled=True, S=8), "batched", "mx_dynamic_matmul_batched_kernel"),
+    (Problem(weights="mxfp4", gate=True, activation_format="mxfp4", quantize_output=True, N=320, K=320), "matmul", mx_dynamic_matmul_kernel),
+    (Problem(weights="nvfp4", gate=True, activation_format="nvfp4", quantize_output=True, swizzled=True, S=8), "batched", mx_dynamic_matmul_batched_kernel),
+    (Problem(weights="fp8_128x128", activation_format="bf16"), "grouped", block_fp8_weight_only_matmul_grouped_kernel),
+    # gathered gate|up rows on the raw-activation dot arms: a TMA-gathered descriptor A under WS
+    # is the lowering failure warp_spec_memory_mode_pruner(gather_only=True) fences
+    (Problem(weights="bf16", gate=True), "grouped", full_precision_matmul_grouped_kernel),
+    # the static block-scale kernel: its own three-stream K-loop under the block-dynamic fences
+    (Problem(weights="fp8_128x128", gate=True, static=True), "grouped", w8a8_block_static_fp8_matmul_grouped_kernel),
     # the calibrated (static) arm on per-tensor weights: it hands the kernel a RAW A to quantize
     # per tile, the one activation form that cannot ride the TMA gather, so its admitted set is
     # the one a memory-mode fence gets wrong (silently — the tuner forgives what will not lower)
-    (Problem(weights="fp8_tensor", static=True), "grouped", "w8a8_tensor_dynamic_fp8_matmul_grouped_kernel"),
+    (Problem(weights="fp8_tensor", static=True), "grouped", w8a8_tensor_dynamic_fp8_matmul_grouped_kernel),
+    # row-wise weights: the per-row scale vector each arm folds on its own weight-row axis — the
+    # stacked gate|up span, the swapped decode tile, and the 2D kernel's tile
+    (Problem(weights="fp8_rowwise", gate=True, S=257, bias=True, empty_expert=True), "grouped", w8a8_tensor_dynamic_fp8_matmul_grouped_kernel),
+    (Problem(weights="fp8_rowwise", gate=True, S=8), "batched", w8a8_tensor_dynamic_fp8_matmul_batched_kernel),
+    (Problem(weights="fp8_rowwise", gate=True, S=256), "matmul", w8a8_tensor_dynamic_fp8_matmul_kernel),
+
+    # the int4 weight-only kernels: the 2D kernel's tile x WS x memory-mode space and the batched
+    # dot / swapped-reduce arms, asymmetric so the zero-point reads are in every config
+    (Problem(weights="int4", zero_points=True, gate=True), "matmul", int_weight_only_matmul_2d_kernel),
+    (Problem(weights="int4", zero_points=True, S=8), "batched", int_weight_only_matmul_batched_kernel),
+    # the 2D kernel's single-token scalar reduce: its narrow tiles and the gate|up rows
+    (Problem(weights="int4", zero_points=True, gate=True, S=1), "matmul", int_weight_only_matmul_2d_kernel),
+    (Problem(weights="int4", zero_points=True, gate=True), "grouped", int_weight_only_matmul_grouped_kernel),
+    (Problem(weights="int8", zero_points=True, S=4), "matmul", int_weight_only_matmul_2d_kernel),
+    (Problem(weights="int2", zero_points=True, S=4), "matmul", int_weight_only_matmul_2d_kernel),
+    # Sweeps include BK < group, so a tuned winner cannot hide wide-group addressing.
+    (Problem(weights="int4", int_group=512, K=1024, S=4, zero_points=True, gate=True), "matmul", int_weight_only_matmul_2d_kernel),
+    (Problem(weights="int4", int_group=512, K=1024, zero_points=True, gate=True), "batched", int_weight_only_matmul_batched_kernel),
+    (Problem(weights="int4", int_group=None, K=1024, zero_points=True, gate=True), "grouped", int_weight_only_matmul_grouped_kernel),
 ]
 
 
 @pytest.mark.slow
 @pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 @pytest.mark.parametrize(
-    "problem, op, kernel_name",
+    "problem, op, tuner",
     _SWEEP_CELLS,
     ids=[f"{p.id}_{op}" for p, op, _ in _SWEEP_CELLS],
 )
-def test_every_admitted_config_is_correct(problem: Problem, op, kernel_name):
+def test_every_admitted_config_is_correct(problem: Problem, op, tuner):
     """Force-run EVERY config the pruners admit for one launch and hard-check each against the
     torch oracle. The tuner benches configs by SPEED, so a wrong-but-fast config that slips the
     pruners gets crowned silently — the class no winner-only test can see. A forced config may
     fail to compile/launch (the tuner's forgiven-inf path — reported, not asserted); a config
     that RUNS must be correct."""
-    batched_mod = internals.batched
-    grouped_mod = internals.grouped
-    matmul_mod = internals.matmul
-    quant_mod = internals.quant
-
-    # the op's own kernel, or one of the shared passes it launches (the activation quant)
-    op_mod = {"batched": batched_mod, "grouped": grouped_mod, "matmul": matmul_mod}[op]
-    tuner = getattr(op_mod, kernel_name, None) or getattr(quant_mod, kernel_name)
     A, expert_ids = _routed(problem)
     row = WEIGHTS[problem.weights]
     B, Bs, Bs_global = _make_weights(problem, row, problem.E)
@@ -832,6 +1066,7 @@ def test_every_admitted_config_is_correct(problem: Problem, op, kernel_name):
     def spy(configs, named_args, **kwargs):
         kept = orig_prune(configs, named_args, **kwargs) if orig_prune else configs
         admitted["configs"] = list(kept)
+        admitted.setdefault("launches", []).append(tuner.launch_snapshot({**named_args, **kwargs}))  # gate cases launch twice
         return kept
 
     tuner.early_config_prune = spy
@@ -839,7 +1074,9 @@ def test_every_admitted_config_is_correct(problem: Problem, op, kernel_name):
     try:
         tuner.cache.clear()
         _run_ref_vs_op(problem, op, A, expert_ids, B, Bs, Bs_global, shared=shared)
-        assert admitted.get("configs"), "the spy never saw a prune pass — wrong kernel_name?"
+        assert admitted.get("configs"), "the spy never saw a prune pass"
+        for nargs in admitted["launches"]:  # every config runs below, in each launch's specialization
+            tuner.precompile(admitted["configs"], nargs, workers=16)
         forgiven = []
         for cfg in admitted["configs"]:
             tuner.configs = [cfg]
@@ -1103,3 +1340,278 @@ def test_embedding_invalid_index_fails_in_separate_process(index, packed):
         torch.multiprocessing.spawn(
             _embedding_invalid_index, args=(index, packed), nprocs=1
         )
+
+
+@pytest.mark.skipif(not SUPPORTS_SWIZZLED_SCALES, reason="native scaled MMA required")
+@pytest.mark.parametrize("strategy", ["split", "persistent"])
+def test_svdquant_scheduling(monkeypatch, strategy):
+    """Force both schedules: a short correctness tune can miss split-K or multiple tile iterations."""
+    tuner = mx_dynamic_matmul_kernel
+    persistent = strategy == "persistent"
+    config = next(c for c in tuner.configs if c.kwargs.get("SPLIT_K") == (1 if persistent else 4)
+                  and c.kwargs["PERSISTENT"] == persistent
+                  and c.kwargs["BLOCK_SIZE_N"] == c.kwargs["BLOCK_SIZE_K"] == 128
+                  and c.kwargs["WARP_SPEC"] and c.num_warps == 4 and c.num_stages == 3)
+    baseline = next(c for c in tuner.configs if c.kwargs == dict(config.kwargs, PERSISTENT=False)
+                    and c.num_warps == config.num_warps and c.num_stages == config.num_stages)
+    monkeypatch.setattr(tuner, "configs", [config])
+    monkeypatch.setattr(tuner, "early_config_prune", None)
+    tuner.cache.clear()
+    if persistent:
+        monkeypatch.setattr(internals.matmul, "persistent_program_count", lambda _: 2)
+    problem = Problem(weights="nvfp4", S=384 if persistent else 1, N=256,
+                      K=256 if persistent else 1024, svdquant_rank=32,
+                      pre_quant_scale=True, bias=True, swizzled=True, compile=True)
+    A, ids = _routed(problem)
+    B, Bs, global_scale = _make_weights(problem, WEIGHTS[problem.weights], 1)
+    try:
+        if persistent:
+            # Scheduling must preserve every bit, including BF16 midpoint choices from FP32 sum order.
+            act_global = _act_global(problem, A, ids)
+            actual = _op(problem, "matmul", A, ids, B, Bs, global_scale, As_global=act_global)
+            tuner.configs = [baseline]
+            tuner.cache.clear()
+            expected = _op(problem, "matmul", A, ids, B, Bs, global_scale, As_global=act_global)
+            assert torch.equal(actual, expected)
+        else:
+            _run_ref_vs_op(problem, "matmul", A, ids, B, Bs, global_scale)
+    finally:
+        tuner.cache.clear()
+
+
+@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="two concurrent CUDA streams required")
+def test_int4_split_k_concurrent_streams():
+    """Two split-K int4 matmuls launched concurrently on two streams, many times over, must equal their serial results
+    bit for bit: each launch reduces through its own arrival counters and partials (shared counters would let one
+    launch's arrivals finish another's tile early and sum unwritten partials). Both streams first sleep, so the
+    launches queue up behind the sleep and then run overlapped, with small grids that co-reside on the GPU."""
+    tuner = int_weight_only_matmul_2d_kernel
+    split = [c for c in tuner.configs if c.kwargs.get("SPLIT_K") == 8 and c.kwargs["BLOCK_SIZE_N"] == 16
+             and c.kwargs["BLOCK_SIZE_K"] == 128 and c.kwargs["A_MEMORY_MODE"] == "pointer"
+             and c.num_warps == 2 and c.num_stages == 3]
+    assert split, "no SPLIT_K=8 decode config in the grid"
+    g = torch.Generator(device=TEST_DEVICE).manual_seed(3)
+    N, K, M = 512, 4096, 4
+    problems = []
+    for _ in range(2):
+        q = torch.randint(0, 16, (N, K), device=TEST_DEVICE, dtype=torch.int32, generator=g)
+        B = (q.reshape(N, K // 8, 8) << (4 * torch.arange(8, device=TEST_DEVICE, dtype=torch.int32))).sum(-1, dtype=torch.int32).view(torch.uint32)
+        Bs = (torch.rand(N, K // 128, device=TEST_DEVICE, generator=g) * 0.02 + 0.005).to(torch.bfloat16)
+        A = torch.randn(M, K, device=TEST_DEVICE, dtype=torch.bfloat16, generator=g)
+        problems.append((A, B, Bs))
+    orig_prune, orig_configs = tuner.early_config_prune, tuner.configs
+    try:
+        tuner.configs, tuner.early_config_prune = split[:1], None
+        tuner.cache.clear()
+        serial = [finegrained_kernels.matmul_2d(A, B, None, Bs) for A, B, Bs in problems]
+        torch.cuda.synchronize()
+        streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+        outs = [[], []]
+        for stream in streams:
+            with torch.cuda.stream(stream):
+                torch.cuda._sleep(200_000_000)
+        for _ in range(100):
+            for i, (A, B, Bs) in enumerate(problems):
+                with torch.cuda.stream(streams[i]):
+                    outs[i].append(finegrained_kernels.matmul_2d(A, B, None, Bs))
+        torch.cuda.synchronize()
+    finally:
+        tuner.early_config_prune, tuner.configs = orig_prune, orig_configs
+        tuner.cache.clear()
+    for i in range(2):
+        for out in outs[i]:
+            assert torch.equal(out, serial[i]), "a concurrent split-K launch differs from its serial result"
+
+
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
+@pytest.mark.parametrize("op", ["matmul", "batched", "grouped"])
+def test_int_natural_layout_refused(op):
+    """int32 words, a checkpoint's natural packing, are refused by every integer op: only uint32 words, the
+    interleaved layout ``interleave_int_words`` and the repacks emit, are read."""
+    B, Bs, _ = WEIGHTS["int4"]["make"](256, 512, 1)
+    A = torch.randn(4, 512, device=TEST_DEVICE, dtype=torch.bfloat16)
+    expert_ids = torch.zeros(4, device=TEST_DEVICE, dtype=torch.int32)
+    expert_start = torch.tensor([0, 4], device=TEST_DEVICE, dtype=torch.int32)
+    run = {
+        "matmul": lambda W: finegrained_kernels.matmul_2d(A, W[0], None, Bs[0]),
+        "batched": lambda W: finegrained_kernels.matmul_batched(A, W, None, Bs, expert_ids=expert_ids),
+        "grouped": lambda W: finegrained_kernels.matmul_grouped(A, W, None, Bs, expert_start=expert_start),
+    }[op]
+    run(B)
+    with pytest.raises(AssertionError, match="interleave_int_words"):
+        run(B.view(torch.int32))
+
+
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
+@pytest.mark.parametrize("checkpoint", ["gptq", "gptq_v2", "gptq_symmetric", "awq", "modelopt_int4", "modelopt_int8", "ggml_q4_0", "ggml_q8_0"])
+def test_int_repacks(checkpoint):
+    """GPTQ / AWQ int4 linears packed by their own conventions (GPTQ: values along K, zero points along N minus 1,
+    0 under ``gptq_v2``; AWQ: both along N in its ``[0, 2, 4, 6, 1, 3, 5, 7]`` column order) repack to weights whose
+    dequant is ``(q - zero) * scale`` of the source values. ModelOpt stores signed values, INT4 across
+    output-channel pairs or INT8 unpacked, and both must preserve the original signed-weight reference."""
+
+    g = torch.Generator(device=TEST_DEVICE).manual_seed(4)
+    K, N, group = 512, 256, 128
+    if checkpoint.startswith(("modelopt", "ggml")):
+        ggml = checkpoint.startswith("ggml")
+        bits = 4 if checkpoint in ("modelopt_int4", "ggml_q4_0") else 8
+        group = 32 if ggml else (128 if bits == 4 else K)
+        # Cover dense 2D and stacked experts without a separate codec/metadata test matrix.
+        leading = () if bits == 4 else (2,)
+        signed = torch.randint(-(1 << (bits - 1)), 1 << (bits - 1), (*leading, N, K),
+                               device=TEST_DEVICE, dtype=torch.int8, generator=g)
+        scales = (torch.rand(*leading, N, K // group, device=TEST_DEVICE, generator=g) * 0.02 + 0.005).to(
+            torch.float16 if ggml else torch.float32
+        )
+        if ggml:
+            d = scales.half()
+            d[..., 1::2] *= -1  # canonical Q4_0 scales can be negative
+            d[..., 0] = 0
+            blocks = torch.empty(*leading, N, K // group, 2 + 4 * bits, device=TEST_DEVICE, dtype=torch.uint8)
+            blocks[..., :2] = d.contiguous().view(torch.uint8).view(*leading, N, K // group, 2)
+            values = signed.reshape(*leading, N, K // group, group)
+            if bits == 4:
+                values = values.int() + 8
+                blocks[..., 2:] = (values[..., :16] | (values[..., 16:] << 4)).to(torch.uint8)
+            else:
+                blocks[..., 2:] = values.view(torch.uint8)
+            W, Ws, Wz = repack_ggml_int(blocks, "Q4_0" if bits == 4 else "Q8_0")
+            scales = d.float()  # GGML reconstructs q*d in FP32 before casting the weight.
+        elif bits == 4:
+            qweight = ((signed[0::2].int() & 15) | ((signed[1::2].int() & 15) << 4)).to(torch.uint8)
+            W, Ws, Wz = repack_modelopt_int4(qweight, scales)
+        else:
+            W, Ws, Wz = repack_modelopt_int8(signed, scales.squeeze(-1))
+        ref = signed.to(scales.dtype) * scales.repeat_interleave(group, dim=-1)
+        assert W.dtype == torch.uint32 and Wz is None
+        assert torch.equal(dequantize_int_weight(W, Ws, K), ref)
+        A = torch.randn(8, K, device=TEST_DEVICE, dtype=torch.float16, generator=g)
+        if bits == 4:
+            out = finegrained_kernels.matmul_2d(A, W, None, Ws)
+            expected = A.float() @ ref.half().float().T
+        else:
+            expert_ids = torch.arange(8, device=TEST_DEVICE, dtype=torch.int32) % 2
+            run = torch.compile(finegrained_kernels.matmul_batched, fullgraph=True)
+            out = run(A, W, None, Ws, expert_ids=expert_ids)
+            expected = torch.bmm(ref[expert_ids.long()].half().float(), A.float().unsqueeze(-1)).squeeze(-1)
+        atol, rtol = DTYPE_TO_TOL[torch.float16]
+        torch.testing.assert_close(out.float(), expected.half().float(), atol=atol, rtol=rtol)
+        return
+    q = torch.randint(0, 16, (K, N), device=TEST_DEVICE, dtype=torch.int32, generator=g)
+    z = torch.randint(0, 16, (K // group, N), device=TEST_DEVICE, dtype=torch.int32, generator=g)
+    if checkpoint == "gptq_symmetric":
+        z.fill_(8)
+    scales = (torch.rand(K // group, N, device=TEST_DEVICE, generator=g) * 0.02 + 0.005).to(torch.float16)
+    nibble = 4 * torch.arange(8, device=TEST_DEVICE, dtype=torch.int32)
+
+    def pack_n(x, order=range(8)):  # (rows, N) -> (rows, N // 8), word nibble i = column order[i]
+        cols = x.reshape(x.shape[0], N // 8, 8)[..., list(order)]
+        return (cols << nibble).sum(-1, dtype=torch.int32)
+
+    if checkpoint == "awq":
+        awq_order = (0, 2, 4, 6, 1, 3, 5, 7)
+        W, Ws, Wz = repack_awq_int4(pack_n(q, awq_order), pack_n(z, awq_order), scales)
+    else:
+        qweight = (q.reshape(K // 8, 8, N) << nibble[None, :, None]).sum(1, dtype=torch.int32)
+        offset = 0 if checkpoint == "gptq_v2" else 1
+        W, Ws, Wz = repack_gptq_int4(
+            qweight, pack_n((z - offset) & 0xF), scales, zeros_offset=offset,
+            symmetric=checkpoint == "gptq_symmetric",
+        )
+    assert W.dtype == torch.uint32
+    ref = (q.T - z.T.repeat_interleave(group, dim=1)).to(torch.float16) * scales.T.repeat_interleave(group, dim=1)
+    assert torch.equal(dequantize_int_weight(W, Ws, K, Wz), ref)
+
+
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
+@pytest.mark.parametrize(
+    "weights,tuner,activation_format",
+    [
+        ("bf16", full_precision_matmul_grouped_kernel, None),
+        ("mxfp8", mx_dynamic_matmul_grouped_kernel, None),
+        ("int4", int_weight_only_matmul_grouped_kernel, None),
+        ("fp8_tensor", block_fp8_weight_only_matmul_grouped_kernel, "bf16"),
+    ],
+)
+def test_grouped_packed_schedule_built_by_its_configs(weights, tuner, activation_format):
+    """A ``PACKED_SCHEDULE`` config reads the tile schedule its own pre_hook builds (``fill_packed_schedule``), the
+    other configs launch without it: forced to one packed config, a grouped op equals its inline-layout twin (same
+    tile, same K order) bit for bit."""
+    torch.manual_seed(0)
+    E, S, N, K = 4, 512, 256, 512
+    B, Bs, _ = WEIGHTS[weights]["make"](N, K, E)
+    A = torch.randn(S, K, device=TEST_DEVICE, dtype=torch.bfloat16)
+    expert_ids = torch.randint(0, E, (S,), device=TEST_DEVICE, dtype=torch.int32)
+    order = torch.argsort(expert_ids, stable=True).to(torch.int32)
+    expert_start = torch.zeros(E + 1, device=TEST_DEVICE, dtype=torch.int32)
+    expert_start[1:] = torch.histc(expert_ids.float(), bins=E, min=0, max=E - 1).to(torch.int32).cumsum(0)
+    admitted: dict = {}
+    orig_prune, orig_configs = tuner.early_config_prune, tuner.configs
+
+    def spy(configs, named_args, **kwargs):
+        admitted["configs"] = orig_prune(configs, named_args, **kwargs)
+        return admitted["configs"]
+
+    def run():
+        tuner.cache.clear()
+        return finegrained_kernels.matmul_grouped(A, B, None, Bs, expert_start=expert_start, gather_idx=order, activation_format=activation_format)
+
+    try:
+        tuner.early_config_prune = spy
+        run()
+        packed = next(c for c in admitted["configs"] if c.kwargs.get("PACKED_SCHEDULE"))
+        twin = next(
+            c for c in orig_configs
+            if not c.kwargs.get("PACKED_SCHEDULE") and c.num_warps == packed.num_warps
+            and c.num_stages == packed.num_stages
+            and {k: v for k, v in c.kwargs.items() if k != "PACKED_SCHEDULE"}
+            == {k: v for k, v in packed.kwargs.items() if k != "PACKED_SCHEDULE"}
+        )
+        tuner.early_config_prune = None
+        outs = []
+        for c in (packed, twin):
+            tuner.configs = [c]
+            outs.append(run())
+    finally:
+        tuner.early_config_prune, tuner.configs = orig_prune, orig_configs
+        tuner.cache.clear()
+    assert torch.equal(outs[0], outs[1]), "the packed-schedule config differs from its inline twin"
+
+
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
+@pytest.mark.parametrize("M", [1, 16, 256])
+@pytest.mark.parametrize("op", ["matmul", "grouped", "batched"])
+def test_int4_act_order(op, M):
+    """Act-order GPTQ (``desc_act=True``, groups scattered across K): repacked to contiguous groups plus a K order the
+    ops gather A's columns by (``b_perm``), every op matches ``A @ W_ref.T`` with the weight dequantized in A's own
+    order; an identity ``g_idx`` repacks exactly as no ``g_idx`` (three tensors, same bits)."""
+
+    torch.manual_seed(0)
+    E, N, K = (1 if op == "matmul" else 4), 256, 512
+    W, Ws, Wz, perm, W_ref = make_gptq_act_order(N, K, E)
+    A = torch.randn(M, K, device=TEST_DEVICE, dtype=torch.bfloat16)
+    if op == "matmul":
+        out = finegrained_kernels.matmul_2d(A, W[0], None, Ws[0], b_zero=Wz[0], b_perm=perm[0])
+        ref = A.float() @ W_ref[0].T
+    else:
+        expert_ids = torch.randint(0, E, (M,), device=TEST_DEVICE, dtype=torch.int32)
+        ref = torch.einsum("sk,snk->sn", A.float(), W_ref[expert_ids.long()])
+        if op == "batched":
+            out = finegrained_kernels.matmul_batched(A, W, None, Ws, expert_ids=expert_ids, b_zero=Wz, b_perm=perm)
+        else:
+            order = torch.argsort(expert_ids, stable=True)
+            expert_start = torch.zeros(E + 1, device=TEST_DEVICE, dtype=torch.int32)
+            expert_start[1:] = torch.histc(expert_ids.float(), bins=E, min=0, max=E - 1).to(torch.int32).cumsum(0)
+            out = finegrained_kernels.matmul_grouped(
+                A, W, None, Ws, expert_start=expert_start, gather_idx=order.to(torch.int32), b_zero=Wz, b_perm=perm,
+            )
+            ref = ref[order]
+    err = ((out.float() - ref).norm() / ref.norm()).item()
+    assert err < 4e-3, f"{op} M={M}: act-order vs dequantized reference {err:.2e}"
+
+    q = torch.randint(0, 2**31 - 1, (K // 8, N), device=TEST_DEVICE, dtype=torch.int32)
+    z = torch.randint(0, 2**31 - 1, (K // 128, N // 8), device=TEST_DEVICE, dtype=torch.int32)
+    s = torch.rand(K // 128, N, device=TEST_DEVICE).to(torch.bfloat16)
+    identity = repack_gptq_int4(q, z, s, g_idx=torch.arange(K, device=TEST_DEVICE, dtype=torch.int32) // 128)
+    plain = repack_gptq_int4(q, z, s)
+    assert len(identity) == 3 and all(torch.equal(x, y) for x, y in zip(identity, plain))

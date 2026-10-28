@@ -1,0 +1,1219 @@
+category,problem,regime,impl,mode,latency_us,parity_vs_finegrained_kernels,cache_policy
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),decode,finegrained-kernels,eager,319.57,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),decode,finegrained-kernels,cudagraph,41.66,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),decode,finegrained-kernels,compile,60.06,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),decode,deepgemm,eager,838.51,0.003989361692219973,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),decode,deepgemm,cudagraph,375.96,0.003989361692219973,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),decode,deepgemm,compile,138.75,0.003989361692219973,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),decode,vllm,eager,191.89,0.003656914923340082,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),decode,vllm,cudagraph,52.76,0.003656914923340082,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),decode,vllm,compile,68.66,0.003656914923340082,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),decode,trtllm,eager,143.36,0.0438368059694767,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),decode,trtllm,cudagraph,49.30,0.0438368059694767,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),decode,trtllm,compile,,0.0438368059694767,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),decode,transformers@main,eager,184.98,0.06646126508712769,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),decode,transformers@main,cudagraph,66.84,0.06646126508712769,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),decode,transformers@main,compile,85.50,0.06646126508712769,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),decode,finegrained-fp8,eager,113.26,0.06437059491872787,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),decode,finegrained-fp8,cudagraph,72.21,0.06437059491872787,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),decode,finegrained-fp8,compile,272.96,0.06437059491872787,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),prefill,finegrained-kernels,eager,2816.00,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),prefill,finegrained-kernels,cudagraph,2827.34,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),prefill,finegrained-kernels,compile,2871.74,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),prefill,deepgemm,eager,8885.31,0.009009009227156639,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),prefill,deepgemm,cudagraph,8672.72,0.009009009227156639,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),prefill,deepgemm,compile,3502.11,0.009009009227156639,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),prefill,vllm,eager,6208.58,0.009009009227156639,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),prefill,vllm,cudagraph,6190.34,0.009009009227156639,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),prefill,vllm,compile,6224.83,0.009009009227156639,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),prefill,trtllm,eager,3692.54,0.05563340708613396,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),prefill,trtllm,cudagraph,3833.00,0.05563340708613396,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),prefill,trtllm,compile,,0.05563340708613396,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),prefill,transformers@main,eager,14126.21,0.07203687727451324,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),prefill,transformers@main,cudagraph,14047.33,0.07203687727451324,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),prefill,transformers@main,compile,12940.16,0.07203687727451324,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),prefill,finegrained-fp8,eager,7310.30,0.06919142603874207,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),prefill,finegrained-fp8,cudagraph,7295.10,0.06919142603874207,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),prefill,finegrained-fp8,compile,,0.06919142603874207,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),decode,humming,eager,235.26,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),decode,humming,cudagraph,57.00,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),decode,humming,compile,,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),prefill,humming,eager,10471.42,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),prefill,humming,cudagraph,10458.98,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),prefill,humming,compile,,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),decode,finegrained-kernels,eager,270.17,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),decode,finegrained-kernels,cudagraph,30.28,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),decode,finegrained-kernels,compile,46.38,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),decode,deepgemm,eager,845.83,0.003759398590773344,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),decode,deepgemm,cudagraph,455.78,0.003759398590773344,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),decode,deepgemm,compile,162.10,0.003759398590773344,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),decode,trtllm,eager,164.50,0.035185184329748154,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),decode,trtllm,cudagraph,28.62,0.035185184329748154,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),decode,trtllm,compile,,0.035185184329748154,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),decode,transformers@main,eager,194.51,0.003759398590773344,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),decode,transformers@main,cudagraph,86.83,0.003759398590773344,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),decode,transformers@main,compile,2081.80,0.003759398590773344,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),decode,finegrained-fp8,eager,132.62,0.021616540849208832,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),decode,finegrained-fp8,cudagraph,78.01,0.021616540849208832,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),decode,finegrained-fp8,compile,,0.021616540849208832,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),prefill,finegrained-kernels,eager,1733.57,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),prefill,finegrained-kernels,cudagraph,1732.28,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),prefill,finegrained-kernels,compile,1790.11,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),prefill,deepgemm,eager,10615.62,0.00826446246355772,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),prefill,deepgemm,cudagraph,10419.78,0.00826446246355772,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),prefill,deepgemm,compile,3022.05,0.00826446246355772,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),prefill,trtllm,eager,1453.06,0.03541666641831398,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),prefill,trtllm,cudagraph,1726.77,0.03541666641831398,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),prefill,trtllm,compile,,0.03541666641831398,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),prefill,transformers@main,eager,12045.38,0.00826446246355772,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),prefill,transformers@main,cudagraph,11957.50,0.00826446246355772,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),prefill,transformers@main,compile,10837.89,0.00826446246355772,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),prefill,finegrained-fp8,eager,,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),prefill,finegrained-fp8,cudagraph,,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),prefill,finegrained-fp8,compile,,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),decode,humming,eager,507.89,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),decode,humming,cudagraph,37.58,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),decode,humming,compile,,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),prefill,humming,eager,1635.20,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),prefill,humming,cudagraph,1645.75,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),prefill,humming,compile,,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),decode,finegrained-kernels,eager,299.04,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),decode,finegrained-kernels,cudagraph,84.46,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),decode,finegrained-kernels,compile,98.50,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),decode,vllm,eager,185.47,0.06809701770544052,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),decode,vllm,cudagraph,86.82,0.06809701770544052,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),decode,vllm,compile,110.75,0.06809701770544052,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),decode,trtllm,eager,134.11,0.07037036865949631,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),decode,trtllm,cudagraph,75.99,0.07037036865949631,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),decode,trtllm,compile,,0.07037036865949631,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),decode,transformers@main,eager,175.17,0.007751937955617905,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),decode,transformers@main,cudagraph,98.08,0.007751937955617905,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),decode,transformers@main,compile,142.30,0.007751937955617905,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),decode,finegrained-fp8,eager,223.94,0.015384615398943424,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),decode,finegrained-fp8,cudagraph,110.18,0.015384615398943424,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),decode,finegrained-fp8,compile,480.32,0.015384615398943424,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),prefill,finegrained-kernels,eager,7120.77,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),prefill,finegrained-kernels,cudagraph,6876.35,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),prefill,finegrained-kernels,compile,7145.76,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),prefill,vllm,eager,13005.66,0.05561674013733864,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),prefill,vllm,cudagraph,12993.76,0.05561674013733864,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),prefill,vllm,compile,13048.83,0.05561674013733864,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),prefill,trtllm,eager,7760.03,0.07096070051193237,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),prefill,trtllm,cudagraph,7677.65,0.07096070051193237,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),prefill,trtllm,compile,,0.07096070051193237,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),prefill,transformers@main,eager,29634.59,0.0043668122962117195,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),prefill,transformers@main,cudagraph,29547.20,0.0043668122962117195,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),prefill,transformers@main,compile,28273.95,0.0043668122962117195,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),prefill,finegrained-fp8,eager,15447.01,0.017467249184846878,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),prefill,finegrained-fp8,cudagraph,15437.38,0.017467249184846878,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),prefill,finegrained-fp8,compile,,0.017467249184846878,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),decode,humming,eager,230.24,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),decode,humming,cudagraph,100.51,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),decode,humming,compile,,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),prefill,humming,eager,23727.14,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),prefill,humming,cudagraph,23720.93,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),prefill,humming,compile,,,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),decode,finegrained-kernels,eager,203.95,,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),decode,finegrained-kernels,cudagraph,23.37,,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),decode,finegrained-kernels,compile,42.04,,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),decode,vllm,eager,168.31,0.004545454401522875,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),decode,vllm,cudagraph,38.26,0.004545454401522875,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),decode,vllm,compile,54.27,0.004545454401522875,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),decode,trtllm,eager,133.07,0.004545454401522875,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),decode,trtllm,cudagraph,27.15,0.004545454401522875,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),decode,trtllm,compile,,0.004545454401522875,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),prefill,finegrained-kernels,eager,1115.20,,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),prefill,finegrained-kernels,cudagraph,1174.67,,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),prefill,finegrained-kernels,compile,1120.42,,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),prefill,vllm,eager,1708.99,0.005244755186140537,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),prefill,vllm,cudagraph,1640.45,0.005244755186140537,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),prefill,vllm,compile,1603.58,0.005244755186140537,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),prefill,trtllm,eager,1148.86,0.010416666977107525,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),prefill,trtllm,cudagraph,1271.52,0.010416666977107525,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),prefill,trtllm,compile,,0.010416666977107525,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),decode,humming,eager,481.63,,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),decode,humming,cudagraph,39.76,,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),decode,humming,compile,,,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),prefill,humming,eager,1148.99,,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),prefill,humming,cudagraph,1155.72,,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),prefill,humming,compile,,,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),decode,finegrained-kernels,eager,267.28,,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),decode,finegrained-kernels,cudagraph,46.40,,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),decode,finegrained-kernels,compile,66.66,,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),decode,transformers@main,eager,216.06,0.005025125574320555,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),decode,transformers@main,cudagraph,137.23,0.005025125574320555,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),decode,transformers@main,compile,234.48,0.005025125574320555,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),decode,torch,eager,582.18,0.004999999888241291,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),decode,torch,cudagraph,129.18,0.004999999888241291,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),decode,torch,compile,,0.004999999888241291,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),decode,finegrained-fp8,eager,115.71,0.005025125574320555,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),decode,finegrained-fp8,cudagraph,68.95,0.005025125574320555,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),decode,finegrained-fp8,compile,,0.005025125574320555,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),prefill,finegrained-kernels,eager,2621.41,,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),prefill,finegrained-kernels,cudagraph,2857.15,,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),prefill,finegrained-kernels,compile,2646.30,,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),prefill,transformers@main,eager,,,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),prefill,transformers@main,cudagraph,,,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),prefill,transformers@main,compile,,,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),prefill,torch,eager,3880.90,0.005780346691608429,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),prefill,torch,cudagraph,3698.71,0.005780346691608429,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),prefill,torch,compile,,0.005780346691608429,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),prefill,finegrained-fp8,eager,,,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),prefill,finegrained-fp8,cudagraph,,,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),prefill,finegrained-fp8,compile,,,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),decode,humming,eager,516.80,,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),decode,humming,cudagraph,65.21,,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),decode,humming,compile,,,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),prefill,humming,eager,2586.62,,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),prefill,humming,cudagraph,2766.39,,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),prefill,humming,compile,,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),decode,finegrained-kernels,eager,180.83,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),decode,finegrained-kernels,cudagraph,85.24,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),decode,finegrained-kernels,compile,128.00,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),decode,finegrained-kernels-unfused,eager,234.34,0.003357689129188657,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),decode,finegrained-kernels-unfused,cudagraph,102.65,0.003357689129188657,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),decode,finegrained-kernels-unfused,compile,109.60,0.003357689129188657,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),decode,torch_weight_only,eager,3152.83,0.007042247336357832,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),decode,torch_weight_only,cudagraph,3110.71,0.007042247336357832,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),decode,torch_weight_only,compile,462.98,0.007042247336357832,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),decode,marlin,eager,119.74,0.010563370771706104,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),decode,marlin,cudagraph,98.41,0.010563370771706104,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),decode,marlin,compile,,0.010563370771706104,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),prefill,finegrained-kernels,eager,11234.02,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),prefill,finegrained-kernels,cudagraph,10923.17,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),prefill,finegrained-kernels,compile,11140.26,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),prefill,finegrained-kernels-unfused,eager,13139.04,0.004768677055835724,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),prefill,finegrained-kernels-unfused,cudagraph,12774.21,0.004768677055835724,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),prefill,finegrained-kernels-unfused,compile,12193.86,0.004768677055835724,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),prefill,torch_weight_only,eager,99688.45,0.0099502457305789,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),prefill,torch_weight_only,cudagraph,99341.38,0.0099502457305789,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),prefill,torch_weight_only,compile,42867.84,0.0099502457305789,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),prefill,marlin,eager,25676.77,0.014851480722427368,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),prefill,marlin,cudagraph,25655.97,0.014851480722427368,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),prefill,marlin,compile,,0.014851480722427368,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),decode,humming,eager,250.11,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),decode,humming,cudagraph,87.90,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),decode,humming,compile,,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),prefill,humming,eager,10260.48,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),prefill,humming,cudagraph,9327.68,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),prefill,humming,compile,,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),decode,finegrained-kernels,eager,185.38,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),decode,finegrained-kernels,cudagraph,83.32,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),decode,finegrained-kernels,compile,111.68,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),decode,finegrained-kernels-unfused,eager,239.46,0.005897871684283018,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),decode,finegrained-kernels-unfused,cudagraph,101.25,0.005897871684283018,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),decode,finegrained-kernels-unfused,compile,113.57,0.005897871684283018,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),decode,torch_weight_only,eager,3315.65,0.006993000861257315,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),decode,torch_weight_only,cudagraph,3272.09,0.006993000861257315,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),decode,torch_weight_only,compile,1659.87,0.006993000861257315,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),decode,marlin,eager,121.86,0.0069444384425878525,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),decode,marlin,cudagraph,100.48,0.0069444384425878525,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),decode,marlin,compile,,0.0069444384425878525,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),prefill,finegrained-kernels,eager,11355.14,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),prefill,finegrained-kernels,cudagraph,10971.46,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),prefill,finegrained-kernels,compile,11335.74,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),prefill,finegrained-kernels-unfused,eager,13191.14,0.004599593114107847,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),prefill,finegrained-kernels-unfused,cudagraph,12861.15,0.004599593114107847,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),prefill,finegrained-kernels-unfused,compile,12278.75,0.004599593114107847,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),prefill,torch_weight_only,eager,105074.56,0.0099502457305789,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),prefill,torch_weight_only,cudagraph,104624.13,0.0099502457305789,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),prefill,torch_weight_only,compile,294561.92,0.0099502457305789,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),prefill,marlin,eager,28034.27,0.0099502457305789,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),prefill,marlin,cudagraph,28074.21,0.0099502457305789,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),prefill,marlin,compile,,0.0099502457305789,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),decode,humming,eager,252.70,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),decode,humming,cudagraph,94.51,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),decode,humming,compile,,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),prefill,humming,eager,10659.71,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),prefill,humming,cudagraph,9664.54,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),prefill,humming,compile,,,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),decode,finegrained-kernels,eager,257.03,,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),decode,finegrained-kernels,cudagraph,15.05,,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),decode,finegrained-kernels,compile,29.78,,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),decode,vllm_marlin,eager,124.92,0.005076141562312841,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),decode,vllm_marlin,cudagraph,33.86,0.005076141562312841,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),decode,vllm_marlin,compile,,0.005076141562312841,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),decode,flashinfer_mxint4,eager,123.00,0.005076141562312841,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),decode,flashinfer_mxint4,cudagraph,25.16,0.005076141562312841,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),decode,flashinfer_mxint4,compile,,0.005076141562312841,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),prefill,finegrained-kernels,eager,739.20,,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),prefill,finegrained-kernels,cudagraph,700.32,,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),prefill,finegrained-kernels,compile,709.92,,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),prefill,vllm_marlin,eager,2554.91,0.008196720853447914,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),prefill,vllm_marlin,cudagraph,2541.34,0.008196720853447914,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),prefill,vllm_marlin,compile,,0.008196720853447914,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),prefill,flashinfer_mxint4,eager,746.59,0.008230452425777912,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),prefill,flashinfer_mxint4,cudagraph,705.88,0.008230452425777912,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),prefill,flashinfer_mxint4,compile,,0.008230452425777912,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),decode,humming,eager,,,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),decode,humming,cudagraph,,,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),decode,humming,compile,,,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),prefill,humming,eager,816.13,,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),prefill,humming,cudagraph,809.58,,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),prefill,humming,compile,,,rotating_gt_2l2
+quantized,QuantTrio/Qwen3-30B-A3B-Thinking-2507-AWQ W4A16 g128 asym BF16 (E128 H2048 I768 top8),decode,finegrained-kernels,eager,257.56,,rotating_gt_2l2
+quantized,QuantTrio/Qwen3-30B-A3B-Thinking-2507-AWQ W4A16 g128 asym BF16 (E128 H2048 I768 top8),decode,finegrained-kernels,cudagraph,15.25,,rotating_gt_2l2
+quantized,QuantTrio/Qwen3-30B-A3B-Thinking-2507-AWQ W4A16 g128 asym BF16 (E128 H2048 I768 top8),decode,finegrained-kernels,compile,30.14,,rotating_gt_2l2
+quantized,QuantTrio/Qwen3-30B-A3B-Thinking-2507-AWQ W4A16 g128 asym BF16 (E128 H2048 I768 top8),decode,vllm_marlin,eager,115.09,0.0060606058686971664,rotating_gt_2l2
+quantized,QuantTrio/Qwen3-30B-A3B-Thinking-2507-AWQ W4A16 g128 asym BF16 (E128 H2048 I768 top8),decode,vllm_marlin,cudagraph,33.70,0.0060606058686971664,rotating_gt_2l2
+quantized,QuantTrio/Qwen3-30B-A3B-Thinking-2507-AWQ W4A16 g128 asym BF16 (E128 H2048 I768 top8),decode,vllm_marlin,compile,,0.0060606058686971664,rotating_gt_2l2
+quantized,QuantTrio/Qwen3-30B-A3B-Thinking-2507-AWQ W4A16 g128 asym BF16 (E128 H2048 I768 top8),prefill,finegrained-kernels,eager,787.36,,rotating_gt_2l2
+quantized,QuantTrio/Qwen3-30B-A3B-Thinking-2507-AWQ W4A16 g128 asym BF16 (E128 H2048 I768 top8),prefill,finegrained-kernels,cudagraph,752.73,,rotating_gt_2l2
+quantized,QuantTrio/Qwen3-30B-A3B-Thinking-2507-AWQ W4A16 g128 asym BF16 (E128 H2048 I768 top8),prefill,finegrained-kernels,compile,749.82,,rotating_gt_2l2
+quantized,QuantTrio/Qwen3-30B-A3B-Thinking-2507-AWQ W4A16 g128 asym BF16 (E128 H2048 I768 top8),prefill,vllm_marlin,eager,2532.35,0.007518797181546688,rotating_gt_2l2
+quantized,QuantTrio/Qwen3-30B-A3B-Thinking-2507-AWQ W4A16 g128 asym BF16 (E128 H2048 I768 top8),prefill,vllm_marlin,cudagraph,2526.63,0.007518797181546688,rotating_gt_2l2
+quantized,QuantTrio/Qwen3-30B-A3B-Thinking-2507-AWQ W4A16 g128 asym BF16 (E128 H2048 I768 top8),prefill,vllm_marlin,compile,,0.007518797181546688,rotating_gt_2l2
+quantized,QuantTrio/Qwen3-30B-A3B-Thinking-2507-AWQ W4A16 g128 asym BF16 (E128 H2048 I768 top8),decode,humming,eager,,,rotating_gt_2l2
+quantized,QuantTrio/Qwen3-30B-A3B-Thinking-2507-AWQ W4A16 g128 asym BF16 (E128 H2048 I768 top8),decode,humming,cudagraph,,,rotating_gt_2l2
+quantized,QuantTrio/Qwen3-30B-A3B-Thinking-2507-AWQ W4A16 g128 asym BF16 (E128 H2048 I768 top8),decode,humming,compile,,,rotating_gt_2l2
+quantized,QuantTrio/Qwen3-30B-A3B-Thinking-2507-AWQ W4A16 g128 asym BF16 (E128 H2048 I768 top8),prefill,humming,eager,852.00,,rotating_gt_2l2
+quantized,QuantTrio/Qwen3-30B-A3B-Thinking-2507-AWQ W4A16 g128 asym BF16 (E128 H2048 I768 top8),prefill,humming,cudagraph,843.70,,rotating_gt_2l2
+quantized,QuantTrio/Qwen3-30B-A3B-Thinking-2507-AWQ W4A16 g128 asym BF16 (E128 H2048 I768 top8),prefill,humming,compile,,,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),decode,finegrained-kernels,eager,157.79,,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),decode,finegrained-kernels,cudagraph,51.81,,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),decode,finegrained-kernels,compile,82.85,,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),decode,transformers,eager,195.42,0.0063694254495203495,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),decode,transformers,cudagraph,170.02,0.0063694254495203495,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),decode,transformers,compile,87.04,0.0063694254495203495,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),decode,sonicmoe,eager,442.69,0.0063694254495203495,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),decode,sonicmoe,cudagraph,108.57,0.0063694254495203495,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),decode,sonicmoe,compile,121.70,0.0063694254495203495,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),decode,vllm,eager,115.71,0.0063694254495203495,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),decode,vllm,cudagraph,65.88,0.0063694254495203495,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),decode,vllm,compile,91.26,0.0063694254495203495,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),decode,deepgemm,eager,514.34,0.0063694254495203495,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),decode,deepgemm,cudagraph,176.75,0.0063694254495203495,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),decode,deepgemm,compile,134.27,0.0063694254495203495,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),decode,megablocks,eager,618.34,0.0063694254495203495,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),decode,megablocks,cudagraph,,0.0063694254495203495,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),decode,megablocks,compile,,0.0063694254495203495,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),prefill,finegrained-kernels,eager,3297.41,,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),prefill,finegrained-kernels,cudagraph,3354.89,,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),prefill,finegrained-kernels,compile,3333.28,,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),prefill,transformers,eager,4672.61,0.00796812679618597,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),prefill,transformers,cudagraph,4581.82,0.00796812679618597,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),prefill,transformers,compile,2954.46,0.00796812679618597,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),prefill,sonicmoe,eager,3231.74,0.00796812679618597,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),prefill,sonicmoe,cudagraph,3205.22,0.00796812679618597,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),prefill,sonicmoe,compile,2826.24,0.00796812679618597,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),prefill,vllm,eager,3689.47,0.00796812679618597,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),prefill,vllm,cudagraph,3627.49,0.00796812679618597,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),prefill,vllm,compile,3575.94,0.00796812679618597,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),prefill,deepgemm,eager,6157.41,0.00796812679618597,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),prefill,deepgemm,cudagraph,5893.61,0.00796812679618597,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),prefill,deepgemm,compile,5931.33,0.00796812679618597,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),prefill,megablocks,eager,6958.18,0.00796812679618597,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),prefill,megablocks,cudagraph,,0.00796812679618597,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),prefill,megablocks,compile,,0.00796812679618597,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),decode,finegrained-kernels,eager,157.18,,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),decode,finegrained-kernels,cudagraph,90.90,,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),decode,finegrained-kernels,compile,132.16,,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),decode,transformers,eager,346.21,0.004149376880377531,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),decode,transformers,cudagraph,319.03,0.004149376880377531,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),decode,transformers,compile,154.62,0.004149376880377531,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),decode,sonicmoe,eager,453.34,0.008264461532235146,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),decode,sonicmoe,cudagraph,144.54,0.008264461532235146,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),decode,sonicmoe,compile,160.96,0.008264461532235146,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),decode,vllm,eager,129.86,0.004149376880377531,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),decode,vllm,cudagraph,105.89,0.004149376880377531,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),decode,vllm,compile,130.08,0.004149376880377531,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),decode,deepgemm,eager,525.34,0.00622406555339694,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),decode,deepgemm,cudagraph,215.22,0.00622406555339694,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),decode,deepgemm,compile,177.12,0.00622406555339694,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),decode,megablocks,eager,1257.38,0.005186721216887236,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),decode,megablocks,cudagraph,,0.005186721216887236,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),decode,megablocks,compile,,0.005186721216887236,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),prefill,finegrained-kernels,eager,5945.28,,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),prefill,finegrained-kernels,cudagraph,5831.19,,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),prefill,finegrained-kernels,compile,5890.05,,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),prefill,transformers,eager,9096.00,0.00952380895614624,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),prefill,transformers,cudagraph,8830.90,0.00952380895614624,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),prefill,transformers,compile,7274.59,0.00952380895614624,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),prefill,sonicmoe,eager,6011.87,0.00952380895614624,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),prefill,sonicmoe,cudagraph,6548.06,0.00952380895614624,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),prefill,sonicmoe,compile,5639.33,0.00952380895614624,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),prefill,vllm,eager,7034.82,0.00476190447807312,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),prefill,vllm,cudagraph,6358.16,0.00476190447807312,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),prefill,vllm,compile,6586.43,0.00476190447807312,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),prefill,deepgemm,eager,10332.16,0.00952380895614624,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),prefill,deepgemm,cudagraph,9870.66,0.00952380895614624,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),prefill,deepgemm,compile,10794.18,0.00952380895614624,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),prefill,megablocks,eager,10149.89,0.00952380895614624,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),prefill,megablocks,cudagraph,,0.00952380895614624,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),prefill,megablocks,compile,,0.00952380895614624,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),decode,finegrained-kernels,eager,160.99,,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),decode,finegrained-kernels,cudagraph,104.81,,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),decode,finegrained-kernels,compile,140.10,,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),decode,transformers,eager,392.13,0.003311258042231202,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),decode,transformers,cudagraph,365.50,0.003311258042231202,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),decode,transformers,compile,179.20,0.003311258042231202,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),decode,sonicmoe,eager,459.58,0.006622516084462404,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),decode,sonicmoe,cudagraph,165.59,0.006622516084462404,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),decode,sonicmoe,compile,182.53,0.006622516084462404,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),decode,vllm,eager,150.43,0.003311258042231202,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),decode,vllm,cudagraph,127.07,0.003311258042231202,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),decode,vllm,compile,154.66,0.003311258042231202,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),decode,deepgemm,eager,559.14,0.004139072261750698,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),decode,deepgemm,cudagraph,237.73,0.004139072261750698,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),decode,deepgemm,compile,195.74,0.004139072261750698,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),decode,megablocks,eager,710.66,0.004552979487925768,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),decode,megablocks,cudagraph,,0.004552979487925768,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),decode,megablocks,compile,,0.004552979487925768,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),prefill,finegrained-kernels,eager,7099.39,,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),prefill,finegrained-kernels,cudagraph,6984.18,,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),prefill,finegrained-kernels,compile,7223.52,,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),prefill,transformers,eager,10479.68,0.007999999448657036,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),prefill,transformers,cudagraph,10068.61,0.007999999448657036,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),prefill,transformers,compile,8987.87,0.007999999448657036,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),prefill,sonicmoe,eager,7801.95,0.00803212821483612,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),prefill,sonicmoe,cudagraph,7051.73,0.00803212821483612,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),prefill,sonicmoe,compile,8023.14,0.00803212821483612,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),prefill,vllm,eager,8228.96,0.00803212821483612,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),prefill,vllm,cudagraph,8594.30,0.00803212821483612,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),prefill,vllm,compile,7462.11,0.00803212821483612,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),prefill,deepgemm,eager,12801.79,0.00803212821483612,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),prefill,deepgemm,cudagraph,12060.80,0.00803212821483612,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),prefill,deepgemm,compile,13538.37,0.00803212821483612,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),prefill,megablocks,eager,11222.02,0.00803212821483612,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),prefill,megablocks,cudagraph,,0.00803212821483612,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),prefill,megablocks,compile,,0.00803212821483612,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),decode,finegrained-kernels,eager,140.74,,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),decode,finegrained-kernels,cudagraph,13.88,,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),decode,finegrained-kernels,compile,16.92,,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),decode,torch_weight_only,eager,332.28,1.962939313671086e-05,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),decode,torch_weight_only,cudagraph,326.74,1.962939313671086e-05,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),decode,torch_weight_only,compile,16.39,1.962939313671086e-05,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),decode,marlin,eager,23.92,0.00251256232149899,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),decode,marlin,cudagraph,16.38,0.00251256232149899,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),decode,marlin,compile,19.80,0.00251256232149899,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),prefill,finegrained-kernels,eager,580.61,,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),prefill,finegrained-kernels,cudagraph,565.95,,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),prefill,finegrained-kernels,compile,585.92,,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),prefill,torch_weight_only,eager,822.61,0.0,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),prefill,torch_weight_only,cudagraph,789.93,0.0,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),prefill,torch_weight_only,compile,546.53,0.0,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),prefill,marlin,eager,2444.78,0.00352112646214664,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),prefill,marlin,cudagraph,2430.20,0.00352112646214664,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),prefill,marlin,compile,2471.43,0.00352112646214664,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),decode,humming,eager,44.08,,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),decode,humming,cudagraph,16.15,,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),decode,humming,compile,57.52,,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),prefill,humming,eager,544.89,,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),prefill,humming,cudagraph,541.63,,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),prefill,humming,compile,516.29,,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),decode,finegrained-kernels,eager,139.41,,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),decode,finegrained-kernels,cudagraph,14.16,,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),decode,finegrained-kernels,compile,19.93,,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),decode,torch_weight_only,eager,356.35,1.0119817488885019e-05,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),decode,torch_weight_only,cudagraph,351.69,1.0119817488885019e-05,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),decode,torch_weight_only,compile,18.95,1.0119817488885019e-05,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),decode,marlin,eager,22.86,0.00518134655430913,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),decode,marlin,cudagraph,17.20,0.00518134655430913,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),decode,marlin,compile,20.76,0.00518134655430913,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),prefill,finegrained-kernels,eager,513.37,,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),prefill,finegrained-kernels,cudagraph,520.84,,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),prefill,finegrained-kernels,compile,549.06,,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),prefill,torch_weight_only,eager,835.26,0.0,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),prefill,torch_weight_only,cudagraph,809.51,0.0,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),prefill,torch_weight_only,compile,588.66,0.0,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),prefill,marlin,eager,2457.77,0.007142856251448393,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),prefill,marlin,cudagraph,2440.38,0.007142856251448393,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),prefill,marlin,compile,2482.70,0.007142856251448393,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),decode,humming,eager,41.55,,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),decode,humming,cudagraph,15.27,,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),decode,humming,compile,55.32,,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),prefill,humming,eager,547.32,,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),prefill,humming,cudagraph,584.68,,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),prefill,humming,compile,588.97,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),decode,finegrained-kernels,eager,90.07,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),decode,finegrained-kernels,cudagraph,9.08,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),decode,finegrained-kernels,compile,9.57,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),decode,vllm_exllama,eager,15.14,0.0011691347463056445,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),decode,vllm_exllama,cudagraph,12.39,0.0011691347463056445,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),decode,vllm_exllama,compile,12.86,0.0011691347463056445,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),decode,vllm_marlin,eager,22.55,0.00019500778580550104,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),decode,vllm_marlin,cudagraph,9.03,0.00019500778580550104,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),decode,vllm_marlin,compile,9.64,0.00019500778580550104,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),prefill,finegrained-kernels,eager,202.14,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),prefill,finegrained-kernels,cudagraph,174.18,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),prefill,finegrained-kernels,compile,207.91,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),prefill,vllm_exllama,eager,225.73,0.006590772420167923,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),prefill,vllm_exllama,cudagraph,197.79,0.006590772420167923,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),prefill,vllm_exllama,compile,240.39,0.006590772420167923,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),prefill,vllm_marlin,eager,786.24,0.000598444021306932,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),prefill,vllm_marlin,cudagraph,770.00,0.000598444021306932,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),prefill,vllm_marlin,compile,793.48,0.000598444021306932,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),decode,humming,eager,42.74,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),decode,humming,cudagraph,9.54,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),decode,humming,compile,38.76,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),prefill,humming,eager,204.89,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),prefill,humming,cudagraph,179.33,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),prefill,humming,compile,200.67,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),decode,finegrained-kernels,eager,87.25,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),decode,finegrained-kernels,cudagraph,9.65,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),decode,finegrained-kernels,compile,10.75,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),decode,vllm_exllama,eager,19.90,0.0018975331913679838,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),decode,vllm_exllama,cudagraph,16.77,0.0018975331913679838,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),decode,vllm_exllama,compile,17.74,0.0018975331913679838,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),decode,vllm_marlin,eager,21.82,0.00023719164892099798,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),decode,vllm_marlin,cudagraph,9.49,0.00023719164892099798,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),decode,vllm_marlin,compile,10.75,0.00023719164892099798,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),prefill,finegrained-kernels,eager,179.38,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),prefill,finegrained-kernels,cudagraph,186.76,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),prefill,finegrained-kernels,compile,200.07,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),prefill,vllm_exllama,eager,225.16,0.005402160808444023,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),prefill,vllm_exllama,cudagraph,211.96,0.005402160808444023,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),prefill,vllm_exllama,compile,218.88,0.005402160808444023,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),prefill,vllm_marlin,eager,868.15,0.0006006006151437759,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),prefill,vllm_marlin,cudagraph,852.18,0.0006006006151437759,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),prefill,vllm_marlin,compile,875.85,0.0006006006151437759,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),decode,humming,eager,42.31,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),decode,humming,cudagraph,10.21,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),decode,humming,compile,42.01,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),prefill,humming,eager,184.52,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),prefill,humming,cudagraph,182.71,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),prefill,humming,compile,194.18,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-AWQ qkv W4A16 g128 asym FP16 (N=4608 K=3584),decode,finegrained-kernels,eager,163.67,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-AWQ qkv W4A16 g128 asym FP16 (N=4608 K=3584),decode,finegrained-kernels,cudagraph,9.39,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-AWQ qkv W4A16 g128 asym FP16 (N=4608 K=3584),decode,finegrained-kernels,compile,9.95,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-AWQ qkv W4A16 g128 asym FP16 (N=4608 K=3584),decode,vllm_marlin,eager,21.70,0.0001717032864689827,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-AWQ qkv W4A16 g128 asym FP16 (N=4608 K=3584),decode,vllm_marlin,cudagraph,9.08,0.0001717032864689827,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-AWQ qkv W4A16 g128 asym FP16 (N=4608 K=3584),decode,vllm_marlin,compile,9.69,0.0001717032864689827,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-AWQ qkv W4A16 g128 asym FP16 (N=4608 K=3584),prefill,finegrained-kernels,eager,248.21,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-AWQ qkv W4A16 g128 asym FP16 (N=4608 K=3584),prefill,finegrained-kernels,cudagraph,225.73,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-AWQ qkv W4A16 g128 asym FP16 (N=4608 K=3584),prefill,finegrained-kernels,compile,266.41,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-AWQ qkv W4A16 g128 asym FP16 (N=4608 K=3584),prefill,vllm_marlin,eager,802.62,0.00044642857392318547,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-AWQ qkv W4A16 g128 asym FP16 (N=4608 K=3584),prefill,vllm_marlin,cudagraph,784.25,0.00044642857392318547,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-AWQ qkv W4A16 g128 asym FP16 (N=4608 K=3584),prefill,vllm_marlin,compile,807.78,0.00044642857392318547,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-AWQ qkv W4A16 g128 asym FP16 (N=4608 K=3584),decode,humming,eager,42.51,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-AWQ qkv W4A16 g128 asym FP16 (N=4608 K=3584),decode,humming,cudagraph,9.73,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-AWQ qkv W4A16 g128 asym FP16 (N=4608 K=3584),decode,humming,compile,38.39,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-AWQ qkv W4A16 g128 asym FP16 (N=4608 K=3584),prefill,humming,eager,211.25,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-AWQ qkv W4A16 g128 asym FP16 (N=4608 K=3584),prefill,humming,cudagraph,196.56,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-AWQ qkv W4A16 g128 asym FP16 (N=4608 K=3584),prefill,humming,compile,205.00,,rotating_gt_2l2
+linear quantized,yury-kapoyko/nemotron-diff-vlm-8b-w4a8_awq ModelOpt QKV W4A8 g128 sym BF16 (N=6144 K=4096),decode,finegrained-kernels,eager,130.17,,rotating_gt_2l2
+linear quantized,yury-kapoyko/nemotron-diff-vlm-8b-w4a8_awq ModelOpt QKV W4A8 g128 sym BF16 (N=6144 K=4096),decode,finegrained-kernels,cudagraph,26.81,,rotating_gt_2l2
+linear quantized,yury-kapoyko/nemotron-diff-vlm-8b-w4a8_awq ModelOpt QKV W4A8 g128 sym BF16 (N=6144 K=4096),decode,finegrained-kernels,compile,27.34,,rotating_gt_2l2
+linear quantized,yury-kapoyko/nemotron-diff-vlm-8b-w4a8_awq ModelOpt QKV W4A8 g128 sym BF16 (N=6144 K=4096),prefill,finegrained-kernels,eager,611.02,,rotating_gt_2l2
+linear quantized,yury-kapoyko/nemotron-diff-vlm-8b-w4a8_awq ModelOpt QKV W4A8 g128 sym BF16 (N=6144 K=4096),prefill,finegrained-kernels,cudagraph,607.35,,rotating_gt_2l2
+linear quantized,yury-kapoyko/nemotron-diff-vlm-8b-w4a8_awq ModelOpt QKV W4A8 g128 sym BF16 (N=6144 K=4096),prefill,finegrained-kernels,compile,634.07,,rotating_gt_2l2
+linear quantized,yury-kapoyko/nemotron-diff-vlm-8b-w4a8_awq ModelOpt QKV W4A8 g128 sym BF16 (N=6144 K=4096),decode,humming,eager,65.87,,rotating_gt_2l2
+linear quantized,yury-kapoyko/nemotron-diff-vlm-8b-w4a8_awq ModelOpt QKV W4A8 g128 sym BF16 (N=6144 K=4096),decode,humming,cudagraph,13.42,,rotating_gt_2l2
+linear quantized,yury-kapoyko/nemotron-diff-vlm-8b-w4a8_awq ModelOpt QKV W4A8 g128 sym BF16 (N=6144 K=4096),decode,humming,compile,,,rotating_gt_2l2
+linear quantized,yury-kapoyko/nemotron-diff-vlm-8b-w4a8_awq ModelOpt QKV W4A8 g128 sym BF16 (N=6144 K=4096),prefill,humming,eager,1559.61,,rotating_gt_2l2
+linear quantized,yury-kapoyko/nemotron-diff-vlm-8b-w4a8_awq ModelOpt QKV W4A8 g128 sym BF16 (N=6144 K=4096),prefill,humming,cudagraph,1558.12,,rotating_gt_2l2
+linear quantized,yury-kapoyko/nemotron-diff-vlm-8b-w4a8_awq ModelOpt QKV W4A8 g128 sym BF16 (N=6144 K=4096),prefill,humming,compile,,,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant up r32 (N=21504 K=5376),decode,finegrained-kernels,eager,371.47,7.77363165980205e-05,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant up r32 (N=21504 K=5376),decode,finegrained-kernels,cudagraph,24.16,7.77363165980205e-05,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant up r32 (N=21504 K=5376),decode,finegrained-kernels,compile,30.48,7.77363165980205e-05,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant up r32 (N=21504 K=5376),decode,flashinfer_svdquant,eager,163.97,0.004975124262273312,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant up r32 (N=21504 K=5376),decode,flashinfer_svdquant,cudagraph,23.87,0.004975124262273312,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant up r32 (N=21504 K=5376),decode,flashinfer_svdquant,compile,,0.004975124262273312,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant up r32 (N=21504 K=5376),prefill,finegrained-kernels,eager,492.54,0.0021551724057644606,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant up r32 (N=21504 K=5376),prefill,finegrained-kernels,cudagraph,462.70,0.0021551724057644606,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant up r32 (N=21504 K=5376),prefill,finegrained-kernels,compile,495.40,0.0021551724057644606,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant up r32 (N=21504 K=5376),prefill,flashinfer_svdquant,eager,370.72,0.010775862261652946,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant up r32 (N=21504 K=5376),prefill,flashinfer_svdquant,cudagraph,382.84,0.010775862261652946,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant up r32 (N=21504 K=5376),prefill,flashinfer_svdquant,compile,,0.010775862261652946,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant down r32 (N=5376 K=21504),decode,finegrained-kernels,eager,193.51,0.0,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant down r32 (N=5376 K=21504),decode,finegrained-kernels,cudagraph,28.72,0.0,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant down r32 (N=5376 K=21504),decode,finegrained-kernels,compile,34.29,0.0,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant down r32 (N=5376 K=21504),decode,flashinfer_svdquant,eager,83.20,0.0054054055362939835,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant down r32 (N=5376 K=21504),decode,flashinfer_svdquant,cudagraph,36.15,0.0054054055362939835,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant down r32 (N=5376 K=21504),decode,flashinfer_svdquant,compile,,0.0054054055362939835,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant down r32 (N=5376 K=21504),prefill,finegrained-kernels,eager,583.94,0.0049019609577953815,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant down r32 (N=5376 K=21504),prefill,finegrained-kernels,cudagraph,595.85,0.0049019609577953815,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant down r32 (N=5376 K=21504),prefill,finegrained-kernels,compile,726.02,0.0049019609577953815,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant down r32 (N=5376 K=21504),prefill,flashinfer_svdquant,eager,533.76,0.0049019609577953815,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant down r32 (N=5376 K=21504),prefill,flashinfer_svdquant,cudagraph,529.14,0.0049019609577953815,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant down r32 (N=5376 K=21504),prefill,flashinfer_svdquant,compile,,0.0049019609577953815,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),decode,finegrained-kernels,eager,249.25,,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),decode,finegrained-kernels,cudagraph,28.83,,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),decode,finegrained-kernels,compile,44.41,,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),decode,trtllm,eager,251.01,0.005649717524647713,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),decode,trtllm,cudagraph,30.22,0.005649717524647713,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),decode,trtllm,compile,,0.005649717524647713,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),decode,vllm_marlin,eager,148.16,0.005649717524647713,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),decode,vllm_marlin,cudagraph,52.33,0.005649717524647713,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),decode,vllm_marlin,compile,,0.005649717524647713,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),decode,triton_kernels,eager,527.34,0.005649717524647713,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),decode,triton_kernels,cudagraph,146.98,0.005649717524647713,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),decode,triton_kernels,compile,,0.005649717524647713,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),prefill,finegrained-kernels,eager,3191.68,,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),prefill,finegrained-kernels,cudagraph,3168.72,,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),prefill,finegrained-kernels,compile,3207.42,,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),prefill,trtllm,eager,3200.93,0.0060606058686971664,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),prefill,trtllm,cudagraph,3195.17,0.0060606058686971664,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),prefill,trtllm,compile,,0.0060606058686971664,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),prefill,vllm_marlin,eager,7166.02,0.0060606058686971664,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),prefill,vllm_marlin,cudagraph,7143.89,0.0060606058686971664,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),prefill,vllm_marlin,compile,,0.0060606058686971664,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),prefill,triton_kernels,eager,7181.12,0.0060606058686971664,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),prefill,triton_kernels,cudagraph,7172.00,0.0060606058686971664,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),prefill,triton_kernels,compile,,0.0060606058686971664,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),decode,humming,eager,266.63,,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),decode,humming,cudagraph,45.97,,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),decode,humming,compile,,,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),prefill,humming,eager,3901.50,,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),prefill,humming,cudagraph,3903.51,,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),prefill,humming,compile,,,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),decode,finegrained-kernels,eager,351.97,,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),decode,finegrained-kernels,cudagraph,36.48,,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),decode,finegrained-kernels,compile,57.89,,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),decode,trtllm,eager,155.71,0.02521008439362049,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),decode,trtllm,cudagraph,36.68,0.02521008439362049,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),decode,trtllm,compile,,0.02521008439362049,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),decode,flashinfer_cutlass_moe,eager,112.08,0.0042372881434857845,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),decode,flashinfer_cutlass_moe,cudagraph,108.47,0.0042372881434857845,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),decode,flashinfer_cutlass_moe,compile,,0.0042372881434857845,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),decode,torch,eager,646.69,0.008474576286971569,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),decode,torch,cudagraph,149.43,0.008474576286971569,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),decode,torch,compile,,0.008474576286971569,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),prefill,finegrained-kernels,eager,2513.92,,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),prefill,finegrained-kernels,cudagraph,2565.40,,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),prefill,finegrained-kernels,compile,2610.24,,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),prefill,trtllm,eager,2401.12,0.024234693497419357,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),prefill,trtllm,cudagraph,6229.68,0.024234693497419357,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),prefill,trtllm,compile,,0.024234693497419357,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),prefill,flashinfer_cutlass_moe,eager,4103.97,0.0051282052882015705,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),prefill,flashinfer_cutlass_moe,cudagraph,4167.95,0.0051282052882015705,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),prefill,flashinfer_cutlass_moe,compile,,0.0051282052882015705,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),prefill,torch,eager,4815.90,0.010204081423580647,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),prefill,torch,cudagraph,4727.46,0.010204081423580647,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),prefill,torch,compile,,0.010204081423580647,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),decode,finegrained-kernels,eager,167.36,,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),decode,finegrained-kernels,cudagraph,38.36,,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),decode,finegrained-kernels,compile,60.90,,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),decode,transformers,eager,161.25,0.004999999422580004,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),decode,transformers,cudagraph,129.10,0.004999999422580004,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),decode,transformers,compile,76.24,0.004999999422580004,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),decode,vllm,eager,128.86,0.004999999422580004,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),decode,vllm,cudagraph,47.73,0.004999999422580004,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),decode,vllm,compile,65.14,0.004999999422580004,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),decode,deepgemm,eager,322.29,0.004999999422580004,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),decode,deepgemm,cudagraph,154.81,0.004999999422580004,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),decode,deepgemm,compile,106.06,0.004999999422580004,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),prefill,finegrained-kernels,eager,2475.04,,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),prefill,finegrained-kernels,cudagraph,2588.33,,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),prefill,finegrained-kernels,compile,2561.95,,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),prefill,transformers,eager,3393.66,0.00555555522441864,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),prefill,transformers,cudagraph,3265.96,0.00555555522441864,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),prefill,transformers,compile,2139.26,0.00555555522441864,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),prefill,vllm,eager,2827.20,0.00555555522441864,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),prefill,vllm,cudagraph,2635.83,0.00555555522441864,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),prefill,vllm,compile,2712.70,0.00555555522441864,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),prefill,deepgemm,eager,4224.99,0.00555555522441864,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),prefill,deepgemm,cudagraph,3979.42,0.00555555522441864,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),prefill,deepgemm,compile,3169.57,0.00555555522441864,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),decode,finegrained-kernels,eager,163.39,,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),decode,finegrained-kernels,cudagraph,70.60,,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),decode,finegrained-kernels,compile,101.38,,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),decode,transformers,eager,287.71,0.0057471259497106075,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),decode,transformers,cudagraph,249.44,0.0057471259497106075,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),decode,transformers,compile,119.65,0.0057471259497106075,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),decode,vllm,eager,114.72,0.005714285187423229,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),decode,vllm,cudagraph,80.33,0.005714285187423229,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),decode,vllm,compile,107.52,0.005714285187423229,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),decode,deepgemm,eager,565.25,0.005714285187423229,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),decode,deepgemm,cudagraph,192.59,0.005714285187423229,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),decode,deepgemm,compile,150.62,0.005714285187423229,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),prefill,finegrained-kernels,eager,4093.02,,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),prefill,finegrained-kernels,cudagraph,4379.33,,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),prefill,finegrained-kernels,compile,4233.34,,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),prefill,transformers,eager,6463.36,0.0061349691823124886,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),prefill,transformers,cudagraph,6372.32,0.0061349691823124886,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),prefill,transformers,compile,4843.87,0.0061349691823124886,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),prefill,vllm,eager,5932.99,0.0061349691823124886,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),prefill,vllm,cudagraph,5761.45,0.0061349691823124886,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),prefill,vllm,compile,5978.34,0.0061349691823124886,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),prefill,deepgemm,eager,7818.46,0.0061349691823124886,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),prefill,deepgemm,cudagraph,7386.46,0.0061349691823124886,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),prefill,deepgemm,compile,7110.75,0.0061349691823124886,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),decode,finegrained-kernels,eager,128.16,,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),decode,finegrained-kernels,cudagraph,14.60,,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),decode,finegrained-kernels,compile,18.09,,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),decode,finegrained-fp8,eager,58.90,0.037254903465509415,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),decode,finegrained-fp8,cudagraph,24.77,0.037254903465509415,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),decode,finegrained-fp8,compile,26.61,0.037254903465509415,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),decode,deepgemm,eager,226.17,8.311169949593022e-06,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),decode,deepgemm,cudagraph,54.28,8.311169949593022e-06,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),decode,deepgemm,compile,22.05,8.311169949593022e-06,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),decode,vllm_mm,eager,25.42,0.0,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),decode,vllm_mm,cudagraph,16.89,0.0,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),decode,vllm_mm,compile,,0.0,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),prefill,finegrained-kernels,eager,312.14,,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),prefill,finegrained-kernels,cudagraph,286.76,,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),prefill,finegrained-kernels,compile,314.20,,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),prefill,finegrained-fp8,eager,3260.26,0.03485576808452606,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),prefill,finegrained-fp8,cudagraph,3259.21,0.03485576808452606,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),prefill,finegrained-fp8,compile,3357.20,0.03485576808452606,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),prefill,deepgemm,eager,716.48,0.0,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),prefill,deepgemm,cudagraph,653.85,0.0,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),prefill,deepgemm,compile,324.47,0.0,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),prefill,vllm_mm,eager,519.14,0.0025906735099852085,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),prefill,vllm_mm,cudagraph,498.08,0.0025906735099852085,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),prefill,vllm_mm,compile,,0.0025906735099852085,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),decode,humming,eager,133.26,,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),decode,humming,cudagraph,17.56,,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),decode,humming,compile,,,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),prefill,humming,eager,2876.42,,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),prefill,humming,cudagraph,2874.51,,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),prefill,humming,compile,,,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),decode,finegrained-kernels,eager,123.33,,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),decode,finegrained-kernels,cudagraph,15.85,,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),decode,finegrained-kernels,compile,20.31,,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),decode,torch_mm,eager,102.82,0.0,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),decode,torch_mm,cudagraph,22.27,0.0,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),decode,torch_mm,compile,,0.0,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),decode,vllm_mm,eager,79.48,0.09569378197193146,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),decode,vllm_mm,cudagraph,37.36,0.09569378197193146,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),decode,vllm_mm,compile,26.84,0.09569378197193146,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),decode,flashinfer_mm,eager,148.69,0.09569378197193146,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),decode,flashinfer_mm,cudagraph,44.35,0.09569378197193146,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),decode,flashinfer_mm,compile,,0.09569378197193146,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),prefill,finegrained-kernels,eager,350.64,,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),prefill,finegrained-kernels,cudagraph,330.95,,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),prefill,finegrained-kernels,compile,370.34,,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),prefill,torch_mm,eager,362.90,0.0,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),prefill,torch_mm,cudagraph,352.02,0.0,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),prefill,torch_mm,compile,,0.0,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),prefill,vllm_mm,eager,637.34,0.09352517873048782,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),prefill,vllm_mm,cudagraph,616.84,0.09352517873048782,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),prefill,vllm_mm,compile,507.74,0.09352517873048782,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),prefill,flashinfer_mm,eager,622.39,0.09352517873048782,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),prefill,flashinfer_mm,cudagraph,596.06,0.09352517873048782,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),prefill,flashinfer_mm,compile,,0.09352517873048782,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),decode,nvfp4_gemm,eager,32.97,0.10181451588869095,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),decode,nvfp4_gemm,cudagraph,24.96,0.10181451588869095,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),decode,nvfp4_gemm,compile,25.83,0.10181451588869095,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),prefill,nvfp4_gemm,eager,467.56,0.10105665773153305,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),prefill,nvfp4_gemm,cudagraph,457.35,0.10105665773153305,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),prefill,nvfp4_gemm,compile,511.21,0.10105665773153305,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),decode,finegrained-kernels,eager,116.74,,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),decode,finegrained-kernels,cudagraph,31.64,,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),decode,finegrained-kernels,compile,43.04,,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),decode,finegrained-fp8,eager,57.86,0.0,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),decode,finegrained-fp8,cudagraph,54.79,0.0,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),decode,finegrained-fp8,compile,60.42,0.0,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),decode,vllm_mm,eager,49.18,0.0357142873108387,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),decode,vllm_mm,cudagraph,39.90,0.0357142873108387,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),decode,vllm_mm,compile,,0.0357142873108387,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),prefill,finegrained-kernels,eager,1769.98,,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),prefill,finegrained-kernels,cudagraph,1804.46,,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),prefill,finegrained-kernels,compile,1697.92,,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),prefill,finegrained-fp8,eager,11980.29,0.0,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),prefill,finegrained-fp8,cudagraph,11978.48,0.0,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),prefill,finegrained-fp8,compile,11153.94,0.0,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),prefill,vllm_mm,eager,1495.57,0.03991596773266792,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),prefill,vllm_mm,cudagraph,1435.28,0.03991596773266792,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),prefill,vllm_mm,compile,,0.03991596773266792,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),decode,humming,eager,62.77,,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),decode,humming,cudagraph,40.05,,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),decode,humming,compile,,,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),prefill,humming,eager,8670.21,,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),prefill,humming,cudagraph,8652.78,,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),prefill,humming,compile,,,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),decode,finegrained-kernels,eager,63.26,,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),decode,finegrained-kernels,cudagraph,13.44,,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),decode,finegrained-kernels,compile,17.05,,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),decode,torch_mm,eager,39.94,0.0,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),decode,torch_mm,cudagraph,14.21,0.0,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),decode,torch_mm,compile,17.40,0.0,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),decode,vllm_mm,eager,23.16,0.004273504484444857,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),decode,vllm_mm,cudagraph,14.47,0.004273504484444857,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),decode,vllm_mm,compile,17.91,0.004273504484444857,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),prefill,finegrained-kernels,eager,273.05,,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),prefill,finegrained-kernels,cudagraph,268.24,,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),prefill,finegrained-kernels,compile,297.66,,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),prefill,torch_mm,eager,303.97,0.0,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),prefill,torch_mm,cudagraph,276.65,0.0,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),prefill,torch_mm,compile,300.37,0.0,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),prefill,vllm_mm,eager,334.36,0.0028248587623238564,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),prefill,vllm_mm,cudagraph,303.91,0.0028248587623238564,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),prefill,vllm_mm,compile,356.69,0.0028248587623238564,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),decode,humming,eager,145.98,,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),decode,humming,cudagraph,14.16,,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),decode,humming,compile,,,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),prefill,humming,eager,295.74,,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),prefill,humming,cudagraph,314.39,,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),prefill,humming,compile,,,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),decode,finegrained-kernels,eager,115.08,,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),decode,finegrained-kernels,cudagraph,25.68,,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),decode,finegrained-kernels,compile,32.07,,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),decode,torch_mm,eager,90.13,0.0007621950935572386,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),decode,torch_mm,cudagraph,27.41,0.0007621950935572386,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),decode,torch_mm,compile,,0.0007621950935572386,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),decode,finegrained-fp8,eager,67.63,0.0007621950935572386,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),decode,finegrained-fp8,cudagraph,65.24,0.0007621950935572386,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),decode,finegrained-fp8,compile,68.32,0.0007621950935572386,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),decode,flashinfer_mm,eager,95.89,0.0007621950935572386,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),decode,flashinfer_mm,cudagraph,93.56,0.0007621950935572386,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),decode,flashinfer_mm,compile,,0.0007621950935572386,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),prefill,finegrained-kernels,eager,599.69,,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),prefill,finegrained-kernels,cudagraph,594.28,,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),prefill,finegrained-kernels,compile,639.38,,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),prefill,torch_mm,eager,631.45,0.0,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),prefill,torch_mm,cudagraph,623.15,0.0,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),prefill,torch_mm,compile,,0.0,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),prefill,finegrained-fp8,eager,4884.10,0.0,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),prefill,finegrained-fp8,cudagraph,4883.01,0.0,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),prefill,finegrained-fp8,compile,4504.91,0.0,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),prefill,flashinfer_mm,eager,661.09,0.0,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),prefill,flashinfer_mm,cudagraph,708.95,0.0,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),prefill,flashinfer_mm,compile,,0.0,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),decode,humming,eager,150.03,,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),decode,humming,cudagraph,23.54,,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),decode,humming,compile,,,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),prefill,humming,eager,868.03,,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),prefill,humming,cudagraph,816.55,,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),prefill,humming,compile,,,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),decode,finegrained-kernels,eager,319.66,,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),decode,finegrained-kernels,cudagraph,33.89,,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),decode,finegrained-kernels,compile,51.56,,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),decode,torch_rowwise,eager,281.65,0.010471202433109283,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),decode,torch_rowwise,cudagraph,73.46,0.010471202433109283,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),decode,torch_rowwise,compile,67.19,0.010471202433109283,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),decode,fbgemm,eager,177.03,0.010471202433109283,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),decode,fbgemm,cudagraph,85.86,0.010471202433109283,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),decode,fbgemm,compile,85.02,0.010471202433109283,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),decode,vllm,eager,178.77,0.010471202433109283,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),decode,vllm,cudagraph,57.21,0.010471202433109283,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),decode,vllm,compile,72.06,0.010471202433109283,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),prefill,finegrained-kernels,eager,1056.77,,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),prefill,finegrained-kernels,cudagraph,1004.85,,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),prefill,finegrained-kernels,compile,1026.14,,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),prefill,torch_rowwise,eager,1973.38,0.022346366196870804,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),prefill,torch_rowwise,cudagraph,1855.56,0.022346366196870804,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),prefill,torch_rowwise,compile,1479.78,0.022346366196870804,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),prefill,fbgemm,eager,1637.47,0.03491619974374771,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),prefill,fbgemm,cudagraph,1562.78,0.03491619974374771,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),prefill,fbgemm,compile,1376.38,0.03491619974374771,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),prefill,vllm,eager,2452.32,0.03491619974374771,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),prefill,vllm,cudagraph,2425.16,0.03491619974374771,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),prefill,vllm,compile,2469.89,0.03491619974374771,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),decode,humming,eager,520.59,,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),decode,humming,cudagraph,45.01,,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),decode,humming,compile,,,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),prefill,humming,eager,1104.77,,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),prefill,humming,cudagraph,1213.38,,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),prefill,humming,compile,,,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),decode,finegrained-kernels,eager,251.52,,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),decode,finegrained-kernels,cudagraph,11.49,,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),decode,finegrained-kernels,compile,14.61,,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),decode,torch_mm,eager,58.76,0.0,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),decode,torch_mm,cudagraph,14.70,0.0,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),decode,torch_mm,compile,17.15,0.0,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),decode,fbgemm,eager,22.79,0.0,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),decode,fbgemm,cudagraph,18.45,0.0,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),decode,fbgemm,compile,18.95,0.0,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),decode,vllm_mm,eager,57.68,0.0,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),decode,vllm_mm,cudagraph,13.91,0.0,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),decode,vllm_mm,compile,15.87,0.0,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),prefill,finegrained-kernels,eager,269.98,,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),prefill,finegrained-kernels,cudagraph,287.43,,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),prefill,finegrained-kernels,compile,315.06,,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),prefill,torch_mm,eager,279.04,0.0,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),prefill,torch_mm,cudagraph,280.14,0.0,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),prefill,torch_mm,compile,298.77,0.0,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),prefill,fbgemm,eager,272.12,0.012180116958916187,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),prefill,fbgemm,cudagraph,257.10,0.012180116958916187,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),prefill,fbgemm,compile,279.98,0.012180116958916187,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),prefill,vllm_mm,eager,246.65,0.012180116958916187,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),prefill,vllm_mm,cudagraph,247.34,0.012180116958916187,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),prefill,vllm_mm,compile,278.41,0.012180116958916187,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),decode,humming,eager,164.86,,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),decode,humming,cudagraph,13.94,,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),decode,humming,compile,,,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),prefill,humming,eager,237.21,,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),prefill,humming,cudagraph,219.52,,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),prefill,humming,compile,,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),batch,finegrained-kernels,eager,844.93,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),batch,finegrained-kernels,cudagraph,821.68,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),batch,finegrained-kernels,compile,849.02,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),batch,deepgemm,eager,2467.97,0.004166666883975267,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),batch,deepgemm,cudagraph,2281.38,0.004166666883975267,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),batch,deepgemm,compile,1023.01,0.004166666883975267,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),batch,vllm,eager,863.01,0.008333333767950535,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),batch,vllm,cudagraph,840.10,0.008333333767950535,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),batch,vllm,compile,865.34,0.008333333767950535,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),batch,trtllm,eager,769.02,0.047340426594018936,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),batch,trtllm,cudagraph,752.20,0.047340426594018936,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),batch,trtllm,compile,,0.047340426594018936,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),batch,humming,eager,1094.59,0.08867521584033966,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),batch,humming,cudagraph,1075.15,0.08867521584033966,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),batch,humming,compile,,0.08867521584033966,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),batch,transformers@main,eager,1056.77,0.0711805522441864,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),batch,transformers@main,cudagraph,975.58,0.0711805522441864,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6),batch,transformers@main,compile,935.01,0.0711805522441864,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),batch,finegrained-kernels,eager,701.34,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),batch,finegrained-kernels,cudagraph,681.80,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),batch,finegrained-kernels,compile,699.42,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),batch,deepgemm,eager,2590.91,0.0043668122962117195,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),batch,deepgemm,cudagraph,2398.92,0.0043668122962117195,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),batch,deepgemm,compile,736.22,0.0043668122962117195,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),batch,trtllm,eager,425.89,0.03695652261376381,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),batch,trtllm,cudagraph,409.47,0.03695652261376381,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),batch,trtllm,compile,,0.03695652261376381,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),batch,humming,eager,527.36,0.0043668122962117195,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),batch,humming,cudagraph,466.94,0.0043668122962117195,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),batch,humming,compile,,0.0043668122962117195,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),batch,transformers@main,eager,1922.05,0.0043668122962117195,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),batch,transformers@main,cudagraph,1850.16,0.0043668122962117195,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6),batch,transformers@main,compile,1809.34,0.0043668122962117195,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),batch,finegrained-kernels,eager,300.26,,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),batch,finegrained-kernels,cudagraph,131.58,,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),batch,finegrained-kernels,compile,148.51,,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),batch,vllm_marlin,eager,137.12,0.005747126415371895,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),batch,vllm_marlin,cudagraph,121.98,0.005747126415371895,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),batch,vllm_marlin,compile,,0.005747126415371895,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),batch,flashinfer_mxint4,eager,125.98,0.005747126415371895,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),batch,flashinfer_mxint4,cudagraph,111.63,0.005747126415371895,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),batch,flashinfer_mxint4,compile,,0.005747126415371895,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),batch,humming,eager,264.35,0.008620689623057842,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),batch,humming,cudagraph,91.75,0.008620689623057842,rotating_gt_2l2
+quantized,Qwen/Qwen3-30B-A3B-GPTQ-Int4 W4A16 g128 sym BF16 (E128 H2048 I768 top8),batch,humming,compile,,0.008620689623057842,rotating_gt_2l2
+quantized,QuantTrio/Qwen3-30B-A3B-Thinking-2507-AWQ W4A16 g128 asym BF16 (E128 H2048 I768 top8),batch,finegrained-kernels,eager,331.46,,rotating_gt_2l2
+quantized,QuantTrio/Qwen3-30B-A3B-Thinking-2507-AWQ W4A16 g128 asym BF16 (E128 H2048 I768 top8),batch,finegrained-kernels,cudagraph,143.30,,rotating_gt_2l2
+quantized,QuantTrio/Qwen3-30B-A3B-Thinking-2507-AWQ W4A16 g128 asym BF16 (E128 H2048 I768 top8),batch,finegrained-kernels,compile,158.50,,rotating_gt_2l2
+quantized,QuantTrio/Qwen3-30B-A3B-Thinking-2507-AWQ W4A16 g128 asym BF16 (E128 H2048 I768 top8),batch,vllm_marlin,eager,131.01,0.0062500000931322575,rotating_gt_2l2
+quantized,QuantTrio/Qwen3-30B-A3B-Thinking-2507-AWQ W4A16 g128 asym BF16 (E128 H2048 I768 top8),batch,vllm_marlin,cudagraph,115.84,0.0062500000931322575,rotating_gt_2l2
+quantized,QuantTrio/Qwen3-30B-A3B-Thinking-2507-AWQ W4A16 g128 asym BF16 (E128 H2048 I768 top8),batch,vllm_marlin,compile,,0.0062500000931322575,rotating_gt_2l2
+quantized,QuantTrio/Qwen3-30B-A3B-Thinking-2507-AWQ W4A16 g128 asym BF16 (E128 H2048 I768 top8),batch,humming,eager,263.46,0.0074218749068677425,rotating_gt_2l2
+quantized,QuantTrio/Qwen3-30B-A3B-Thinking-2507-AWQ W4A16 g128 asym BF16 (E128 H2048 I768 top8),batch,humming,cudagraph,101.36,0.0074218749068677425,rotating_gt_2l2
+quantized,QuantTrio/Qwen3-30B-A3B-Thinking-2507-AWQ W4A16 g128 asym BF16 (E128 H2048 I768 top8),batch,humming,compile,,0.0074218749068677425,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),batch,finegrained-kernels,eager,1473.38,,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),batch,finegrained-kernels,cudagraph,1450.76,,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),batch,finegrained-kernels,compile,1473.70,,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),batch,transformers,eager,2114.69,0.008163264021277428,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),batch,transformers,cudagraph,2134.06,0.008163264021277428,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),batch,transformers,compile,2043.07,0.008163264021277428,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),batch,sonicmoe,eager,1635.30,0.00819671992212534,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),batch,sonicmoe,cudagraph,1649.86,0.00819671992212534,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),batch,sonicmoe,compile,1588.32,0.00819671992212534,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),batch,vllm,eager,1488.00,0.008163264021277428,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),batch,vllm,cudagraph,1465.00,0.008163264021277428,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),batch,vllm,compile,1492.16,0.008163264021277428,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),batch,deepgemm,eager,2268.16,0.008163264021277428,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),batch,deepgemm,cudagraph,2204.74,0.008163264021277428,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),batch,deepgemm,compile,1854.50,0.008163264021277428,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),batch,megablocks,eager,6834.88,0.008163264021277428,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),batch,megablocks,cudagraph,,0.008163264021277428,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6),batch,megablocks,compile,,0.008163264021277428,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),batch,finegrained-kernels,eager,877.44,,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),batch,finegrained-kernels,cudagraph,849.42,,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),batch,finegrained-kernels,compile,877.60,,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),batch,transformers,eager,1262.50,0.006097560282796621,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),batch,transformers,cudagraph,1236.91,0.006097560282796621,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),batch,transformers,compile,946.24,0.006097560282796621,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),batch,vllm,eager,902.02,0.006097560282796621,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),batch,vllm,cudagraph,883.25,0.006097560282796621,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),batch,vllm,compile,902.34,0.006097560282796621,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),batch,deepgemm,eager,1495.94,0.006097560282796621,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),batch,deepgemm,cudagraph,1398.46,0.006097560282796621,rotating_gt_2l2
+unquantized,openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4),batch,deepgemm,compile,1021.95,0.006097560282796621,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),batch,finegrained-kernels,eager,2360.35,,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),batch,finegrained-kernels,cudagraph,2336.78,,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),batch,finegrained-kernels,compile,2362.46,,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),batch,transformers,eager,3308.45,0.005076141562312841,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),batch,transformers,cudagraph,3458.37,0.005076141562312841,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),batch,transformers,compile,3291.36,0.005076141562312841,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),batch,sonicmoe,eager,2534.34,0.007614212576299906,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),batch,sonicmoe,cudagraph,2697.46,0.007614212576299906,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),batch,sonicmoe,compile,2528.42,0.007614212576299906,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),batch,vllm,eager,2329.60,0.005102040246129036,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),batch,vllm,cudagraph,2306.58,0.005102040246129036,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),batch,vllm,compile,2332.80,0.005102040246129036,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),batch,deepgemm,eager,3216.48,0.005076141562312841,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),batch,deepgemm,cudagraph,3165.67,0.005076141562312841,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),batch,deepgemm,compile,2798.40,0.005076141562312841,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),batch,megablocks,eager,5297.73,0.005076141562312841,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),batch,megablocks,cudagraph,,0.005076141562312841,rotating_gt_2l2
+unquantized,zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8),batch,megablocks,compile,,0.005076141562312841,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),batch,finegrained-kernels,eager,2708.48,,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),batch,finegrained-kernels,cudagraph,2689.07,,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),batch,finegrained-kernels,compile,2713.79,,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),batch,transformers,eager,4045.92,0.008474575355648994,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),batch,transformers,cudagraph,4213.38,0.008474575355648994,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),batch,transformers,compile,3895.46,0.008474575355648994,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),batch,sonicmoe,eager,3269.57,0.008474575355648994,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),batch,sonicmoe,cudagraph,2927.88,0.008474575355648994,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),batch,sonicmoe,compile,2942.05,0.008474575355648994,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),batch,vllm,eager,2720.86,0.008438818156719208,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),batch,vllm,cudagraph,2693.99,0.008438818156719208,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),batch,vllm,compile,2718.72,0.008438818156719208,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),batch,deepgemm,eager,3629.15,0.008438818156719208,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),batch,deepgemm,cudagraph,3629.36,0.008438818156719208,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),batch,deepgemm,compile,3238.88,0.008438818156719208,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),batch,megablocks,eager,5803.97,0.008438818156719208,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),batch,megablocks,cudagraph,,0.008438818156719208,rotating_gt_2l2
+unquantized,deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8),batch,megablocks,compile,,0.008438818156719208,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),batch,finegrained-kernels,eager,1787.90,,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),batch,finegrained-kernels,cudagraph,1764.03,,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),batch,finegrained-kernels,compile,1789.95,,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),batch,transformers,eager,2677.76,0.006622516084462404,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),batch,transformers,cudagraph,2678.96,0.006622516084462404,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),batch,transformers,compile,2603.30,0.006622516084462404,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),batch,vllm,eager,1868.83,0.006622516084462404,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),batch,vllm,cudagraph,1843.18,0.006622516084462404,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),batch,vllm,compile,1858.59,0.006622516084462404,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),batch,deepgemm,eager,2581.47,0.006622516084462404,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),batch,deepgemm,cudagraph,2497.49,0.006622516084462404,rotating_gt_2l2
+unquantized,MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4),batch,deepgemm,compile,2078.72,0.006622516084462404,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),batch,finegrained-kernels,eager,130.96,,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),batch,finegrained-kernels,cudagraph,14.88,,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),batch,finegrained-kernels,compile,20.82,,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),batch,deepgemm,eager,411.74,0.0015625000232830644,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),batch,deepgemm,cudagraph,60.80,0.0015625000232830644,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),batch,deepgemm,compile,25.46,0.0015625000232830644,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),batch,vllm_mm,eager,55.96,0.0,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),batch,vllm_mm,cudagraph,16.72,0.0,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),batch,vllm_mm,compile,,0.0,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),batch,humming,eager,142.02,0.048061709851026535,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),batch,humming,cudagraph,34.84,0.048061709851026535,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096),batch,humming,compile,,0.048061709851026535,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),batch,finegrained-kernels,eager,103.98,,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),batch,finegrained-kernels,cudagraph,17.60,,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),batch,finegrained-kernels,compile,25.80,,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),batch,torch_mm,eager,103.96,0.0,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),batch,torch_mm,cudagraph,23.18,0.0,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),batch,torch_mm,compile,,0.0,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),batch,vllm_mm,eager,151.28,0.1039094626903534,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),batch,vllm_mm,cudagraph,49.58,0.1039094626903534,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),batch,vllm_mm,compile,36.72,0.1039094626903534,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),batch,flashinfer_mm,eager,153.98,0.1039094626903534,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),batch,flashinfer_mm,cudagraph,45.98,0.1039094626903534,rotating_gt_2l2
+linear quantized,nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144),batch,flashinfer_mm,compile,,0.1039094626903534,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),batch,finegrained-kernels,eager,125.44,,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),batch,finegrained-kernels,cudagraph,33.16,,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),batch,finegrained-kernels,compile,51.15,,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),batch,vllm_mm,eager,57.82,0.03703703731298447,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),batch,vllm_mm,cudagraph,54.17,0.03703703731298447,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),batch,vllm_mm,compile,,0.03703703731298447,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),batch,humming,eager,146.54,0.00917431153357029,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),batch,humming,cudagraph,86.44,0.00917431153357029,rotating_gt_2l2
+linear quantized,deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168),batch,humming,compile,,0.00917431153357029,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),batch,finegrained-kernels,eager,695.30,,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),batch,finegrained-kernels,cudagraph,685.96,,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),batch,finegrained-kernels,compile,697.28,,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),batch,trtllm,eager,343.10,0.006666666828095913,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),batch,trtllm,cudagraph,329.72,0.006666666828095913,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),batch,trtllm,compile,,0.006666666828095913,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),batch,vllm_marlin,eager,551.01,0.006666666828095913,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),batch,vllm_marlin,cudagraph,533.96,0.006666666828095913,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),batch,vllm_marlin,compile,,0.006666666828095913,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),batch,humming,eager,695.30,0.006666666828095913,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),batch,humming,cudagraph,682.63,0.006666666828095913,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),batch,humming,compile,,0.006666666828095913,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),batch,triton_kernels,eager,3095.55,0.006666666828095913,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),batch,triton_kernels,cudagraph,3096.07,0.006666666828095913,rotating_gt_2l2
+quantized,openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4),batch,triton_kernels,compile,,0.006666666828095913,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),batch,finegrained-kernels,eager,119.66,,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),batch,finegrained-kernels,cudagraph,12.70,,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),batch,finegrained-kernels,compile,19.13,,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),batch,torch_mm,eager,39.99,0.0,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),batch,torch_mm,cudagraph,13.79,0.0,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),batch,torch_mm,compile,17.74,0.0,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),batch,vllm_mm,eager,23.49,0.0,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),batch,vllm_mm,cudagraph,14.47,0.0,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),batch,vllm_mm,compile,20.34,0.0,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),batch,humming,eager,138.15,0.006493506487458944,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),batch,humming,cudagraph,15.36,0.006493506487458944,rotating_gt_2l2
+linear quantized,mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096),batch,humming,compile,,0.006493506487458944,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),batch,finegrained-kernels,eager,84.99,,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),batch,finegrained-kernels,cudagraph,23.48,,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),batch,finegrained-kernels,compile,35.48,,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),batch,torch_mm,eager,181.74,0.0,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),batch,torch_mm,cudagraph,28.47,0.0,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),batch,torch_mm,compile,,0.0,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),batch,flashinfer_mm,eager,75.09,0.0,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),batch,flashinfer_mm,cudagraph,45.24,0.0,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),batch,flashinfer_mm,compile,,0.0,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),batch,humming,eager,159.11,0.0,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),batch,humming,cudagraph,24.99,0.0,rotating_gt_2l2
+linear quantized,MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144),batch,humming,compile,,0.0,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),batch,finegrained-kernels,eager,131.86,,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),batch,finegrained-kernels,cudagraph,12.09,,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),batch,finegrained-kernels,compile,16.90,,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),batch,torch_mm,eager,61.66,0.0,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),batch,torch_mm,cudagraph,15.64,0.0,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),batch,torch_mm,compile,19.43,0.0,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),batch,fbgemm,eager,22.14,0.006578946486115456,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),batch,fbgemm,cudagraph,17.27,0.006578946486115456,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),batch,fbgemm,compile,20.22,0.006578946486115456,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),batch,vllm_mm,eager,57.84,0.006578946486115456,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),batch,vllm_mm,cudagraph,13.36,0.006578946486115456,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),batch,vllm_mm,compile,22.65,0.006578946486115456,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),batch,humming,eager,85.79,0.004366811830550432,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),batch,humming,cudagraph,15.06,0.004366811830550432,rotating_gt_2l2
+linear quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120),batch,humming,compile,,0.004366811830550432,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),batch,finegrained-kernels,eager,79.40,,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),batch,finegrained-kernels,cudagraph,26.44,,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),batch,finegrained-kernels,compile,31.06,,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),batch,torch_weight_only,eager,331.63,0.0,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),batch,torch_weight_only,cudagraph,326.25,0.0,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),batch,torch_weight_only,compile,42.53,0.0,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),batch,marlin,eager,35.51,0.004016063641756773,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),batch,marlin,cudagraph,33.37,0.004016063641756773,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),batch,marlin,compile,37.90,0.004016063641756773,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),batch,humming,eager,54.10,0.003999999724328518,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),batch,humming,cudagraph,19.13,0.003999999724328518,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 tensor linear (N=8192 K=6144),batch,humming,compile,72.75,0.003999999724328518,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),batch,finegrained-kernels,eager,76.45,,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),batch,finegrained-kernels,cudagraph,26.45,,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),batch,finegrained-kernels,compile,31.25,,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),batch,torch_weight_only,eager,356.87,0.0,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),batch,torch_weight_only,cudagraph,350.85,0.0,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),batch,torch_weight_only,compile,43.69,0.0,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),batch,marlin,eager,38.39,0.004329003859311342,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),batch,marlin,cudagraph,36.16,0.004329003859311342,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),batch,marlin,compile,40.61,0.004329003859311342,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),batch,humming,eager,26.98,0.004329003859311342,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),batch,humming,cudagraph,19.62,0.004329003859311342,rotating_gt_2l2
+linear quantized,unknown model FP8 W8A16 block128 linear (N=8192 K=6144),batch,humming,compile,36.35,0.004329003859311342,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),batch,finegrained-kernels,eager,167.20,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),batch,finegrained-kernels,cudagraph,13.18,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),batch,finegrained-kernels,compile,14.21,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),batch,vllm_exllama,eager,37.76,0.00509832426905632,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),batch,vllm_exllama,cudagraph,23.85,0.00509832426905632,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),batch,vllm_exllama,compile,24.71,0.00509832426905632,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),batch,vllm_marlin,eager,52.35,0.000728332030121237,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),batch,vllm_marlin,cudagraph,15.87,0.000728332030121237,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),batch,vllm_marlin,compile,16.67,0.000728332030121237,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),batch,humming,eager,58.58,0.000728332030121237,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),batch,humming,cudagraph,11.71,0.000728332030121237,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 qkv W4A16 g128 sym FP16 (N=4608 K=3584),batch,humming,compile,57.75,0.000728332030121237,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),batch,finegrained-kernels,eager,87.73,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),batch,finegrained-kernels,cudagraph,11.45,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),batch,finegrained-kernels,compile,13.44,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),batch,vllm_exllama,eager,33.72,0.004920514766126871,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),batch,vllm_exllama,cudagraph,27.39,0.004920514766126871,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),batch,vllm_exllama,compile,29.05,0.004920514766126871,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),batch,vllm_marlin,eager,23.60,0.00037850113585591316,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),batch,vllm_marlin,cudagraph,16.27,0.00037850113585591316,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),batch,vllm_marlin,compile,18.00,0.00037850113585591316,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),batch,humming,eager,59.09,0.003217259654775262,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),batch,humming,cudagraph,12.61,0.003217259654775262,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8 qkv W8A16 g128 sym FP16 (N=4608 K=3584),batch,humming,compile,61.58,0.003217259654775262,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-AWQ qkv W4A16 g128 asym FP16 (N=4608 K=3584),batch,finegrained-kernels,eager,87.03,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-AWQ qkv W4A16 g128 asym FP16 (N=4608 K=3584),batch,finegrained-kernels,cudagraph,15.20,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-AWQ qkv W4A16 g128 asym FP16 (N=4608 K=3584),batch,finegrained-kernels,compile,16.45,,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-AWQ qkv W4A16 g128 asym FP16 (N=4608 K=3584),batch,vllm_marlin,eager,23.87,0.0005497525562532246,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-AWQ qkv W4A16 g128 asym FP16 (N=4608 K=3584),batch,vllm_marlin,cudagraph,15.99,0.0005497525562532246,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-AWQ qkv W4A16 g128 asym FP16 (N=4608 K=3584),batch,vllm_marlin,compile,16.91,0.0005497525562532246,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-AWQ qkv W4A16 g128 asym FP16 (N=4608 K=3584),batch,humming,eager,59.40,0.007421659771353006,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-AWQ qkv W4A16 g128 asym FP16 (N=4608 K=3584),batch,humming,cudagraph,12.44,0.007421659771353006,rotating_gt_2l2
+linear quantized,Qwen/Qwen2.5-7B-Instruct-AWQ qkv W4A16 g128 asym FP16 (N=4608 K=3584),batch,humming,compile,59.86,0.007421659771353006,rotating_gt_2l2
+linear quantized,yury-kapoyko/nemotron-diff-vlm-8b-w4a8_awq ModelOpt QKV W4A8 g128 sym BF16 (N=6144 K=4096),batch,finegrained-kernels,eager,126.45,,rotating_gt_2l2
+linear quantized,yury-kapoyko/nemotron-diff-vlm-8b-w4a8_awq ModelOpt QKV W4A8 g128 sym BF16 (N=6144 K=4096),batch,finegrained-kernels,cudagraph,23.46,,rotating_gt_2l2
+linear quantized,yury-kapoyko/nemotron-diff-vlm-8b-w4a8_awq ModelOpt QKV W4A8 g128 sym BF16 (N=6144 K=4096),batch,finegrained-kernels,compile,24.53,,rotating_gt_2l2
+linear quantized,yury-kapoyko/nemotron-diff-vlm-8b-w4a8_awq ModelOpt QKV W4A8 g128 sym BF16 (N=6144 K=4096),batch,humming,eager,69.66,0.02747252583503723,rotating_gt_2l2
+linear quantized,yury-kapoyko/nemotron-diff-vlm-8b-w4a8_awq ModelOpt QKV W4A8 g128 sym BF16 (N=6144 K=4096),batch,humming,cudagraph,25.16,0.02747252583503723,rotating_gt_2l2
+linear quantized,yury-kapoyko/nemotron-diff-vlm-8b-w4a8_awq ModelOpt QKV W4A8 g128 sym BF16 (N=6144 K=4096),batch,humming,compile,,0.02747252583503723,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant up r32 (N=21504 K=5376),batch,finegrained-kernels,eager,214.83,0.0021367522422224283,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant up r32 (N=21504 K=5376),batch,finegrained-kernels,cudagraph,24.60,0.0021367522422224283,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant up r32 (N=21504 K=5376),batch,finegrained-kernels,compile,32.79,0.0021367522422224283,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant up r32 (N=21504 K=5376),batch,flashinfer_svdquant,eager,85.26,0.024038461968302727,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant up r32 (N=21504 K=5376),batch,flashinfer_svdquant,cudagraph,23.73,0.024038461968302727,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant up r32 (N=21504 K=5376),batch,flashinfer_svdquant,compile,,0.024038461968302727,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),batch,finegrained-kernels,eager,901.22,,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),batch,finegrained-kernels,cudagraph,885.66,,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),batch,finegrained-kernels,compile,906.34,,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),batch,trtllm,eager,671.74,0.0234375,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),batch,trtllm,cudagraph,654.39,0.0234375,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),batch,trtllm,compile,,0.0234375,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),batch,flashinfer_cutlass_moe,eager,1272.93,0.0051282052882015705,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),batch,flashinfer_cutlass_moe,cudagraph,1315.03,0.0051282052882015705,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),batch,flashinfer_cutlass_moe,compile,,0.0051282052882015705,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),batch,torch,eager,927.78,0.010309278033673763,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),batch,torch,cudagraph,849.40,0.010309278033673763,rotating_gt_2l2
+quantized,nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8),batch,torch,compile,,0.010309278033673763,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant down r32 (N=5376 K=21504),batch,finegrained-kernels,eager,218.06,0.004651162773370743,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant down r32 (N=5376 K=21504),batch,finegrained-kernels,cudagraph,33.92,0.004651162773370743,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant down r32 (N=5376 K=21504),batch,finegrained-kernels,compile,41.98,0.004651162773370743,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant down r32 (N=5376 K=21504),batch,flashinfer_svdquant,eager,85.46,0.004651162773370743,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant down r32 (N=5376 K=21504),batch,flashinfer_svdquant,cudagraph,34.75,0.004651162773370743,rotating_gt_2l2
+linear quantized,Gemma-4-31B ModelOpt SVDQuant down r32 (N=5376 K=21504),batch,flashinfer_svdquant,compile,,0.004651162773370743,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),batch,finegrained-kernels,eager,1563.65,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),batch,finegrained-kernels,cudagraph,1547.95,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),batch,finegrained-kernels,compile,1567.74,,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),batch,vllm,eager,1598.43,0.07412060350179672,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),batch,vllm,cudagraph,1586.24,0.07412060350179672,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),batch,vllm,compile,1604.70,0.07412060350179672,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),batch,trtllm,eager,1414.27,0.08700980246067047,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),batch,trtllm,cudagraph,1395.48,0.08700980246067047,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),batch,trtllm,compile,,0.08700980246067047,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),batch,humming,eager,1997.73,0.02651515230536461,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),batch,humming,cudagraph,1980.68,0.02651515230536461,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),batch,humming,compile,,0.02651515230536461,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),batch,transformers@main,eager,1813.57,0.005050505045801401,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),batch,transformers@main,cudagraph,1739.62,0.005050505045801401,rotating_gt_2l2
+quantized,deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8),batch,transformers@main,compile,1698.88,0.005050505045801401,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),batch,finegrained-kernels,eager,465.98,,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),batch,finegrained-kernels,cudagraph,442.18,,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),batch,finegrained-kernels,compile,469.95,,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),batch,vllm,eager,557.95,0.008968610316514969,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),batch,vllm,cudagraph,537.45,0.008968610316514969,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),batch,vllm,compile,556.10,0.008968610316514969,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),batch,trtllm,eager,421.76,0.0066964286379516125,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),batch,trtllm,cudagraph,401.77,0.0066964286379516125,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),batch,trtllm,compile,,0.0066964286379516125,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),batch,humming,eager,478.02,0.008968610316514969,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),batch,humming,cudagraph,449.00,0.008968610316514969,rotating_gt_2l2
+quantized,mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4),batch,humming,compile,,0.008968610316514969,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),batch,finegrained-kernels,eager,1112.19,,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),batch,finegrained-kernels,cudagraph,1121.27,,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),batch,finegrained-kernels,compile,1117.34,,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),batch,humming,eager,1045.25,0.005747126415371895,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),batch,humming,cudagraph,1024.66,0.005747126415371895,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),batch,humming,compile,,0.005747126415371895,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),batch,torch,eager,1135.49,0.005747126415371895,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),batch,torch,cudagraph,1047.22,0.005747126415371895,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),batch,torch,compile,,0.005747126415371895,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),batch,transformers@main,eager,,,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),batch,transformers@main,cudagraph,,,rotating_gt_2l2
+quantized,MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4),batch,transformers@main,compile,,,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),batch,finegrained-kernels,eager,442.43,,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),batch,finegrained-kernels,cudagraph,316.13,,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),batch,finegrained-kernels,compile,347.07,,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),batch,torch_rowwise,eager,1230.66,0.01930146850645542,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),batch,torch_rowwise,cudagraph,589.23,0.01930146850645542,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),batch,torch_rowwise,compile,594.14,0.01930146850645542,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),batch,fbgemm,eager,420.80,0.025275733321905136,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),batch,fbgemm,cudagraph,362.32,0.025275733321905136,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),batch,fbgemm,compile,367.58,0.025275733321905136,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),batch,vllm,eager,418.72,0.025275733321905136,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),batch,vllm,cudagraph,396.93,0.025275733321905136,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),batch,vllm,compile,420.90,0.025275733321905136,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),batch,humming,eager,564.10,0.031018514186143875,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),batch,humming,cudagraph,341.48,0.031018514186143875,rotating_gt_2l2
+quantized,meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1),batch,humming,compile,,0.031018514186143875,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),batch,finegrained-kernels,eager,2305.18,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),batch,finegrained-kernels,cudagraph,2421.80,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),batch,finegrained-kernels,compile,2307.07,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),batch,finegrained-kernels-unfused,eager,2365.44,0.00417735893279314,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),batch,finegrained-kernels-unfused,cudagraph,2397.31,0.00417735893279314,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),batch,finegrained-kernels-unfused,compile,2331.94,0.00417735893279314,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),batch,torch_weight_only,eager,94456.80,0.008333329111337662,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),batch,torch_weight_only,cudagraph,94062.46,0.008333329111337662,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),batch,torch_weight_only,compile,11686.18,0.008333329111337662,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),batch,marlin,eager,1877.09,0.016806714236736298,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),batch,marlin,cudagraph,1955.02,0.016806714236736298,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),batch,marlin,compile,,0.016806714236736298,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),batch,humming,eager,1834.02,0.00945377629250288,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),batch,humming,cudagraph,1830.95,0.00945377629250288,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4),batch,humming,compile,,0.00945377629250288,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),batch,finegrained-kernels,eager,2329.63,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),batch,finegrained-kernels,cudagraph,2352.90,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),batch,finegrained-kernels,compile,2350.14,,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),batch,finegrained-kernels-unfused,eager,2384.96,0.0039850869216024876,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),batch,finegrained-kernels-unfused,cudagraph,2433.89,0.0039850869216024876,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),batch,finegrained-kernels-unfused,compile,2346.02,0.0039850869216024876,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),batch,torch_weight_only,eager,99866.56,0.00836819689720869,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),batch,torch_weight_only,cudagraph,99473.31,0.00836819689720869,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),batch,torch_weight_only,compile,12338.37,0.00836819689720869,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),batch,marlin,eager,1952.74,0.00836819689720869,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),batch,marlin,cudagraph,2066.93,0.00836819689720869,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),batch,marlin,compile,,0.00836819689720869,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),batch,humming,eager,1960.80,0.008403357118368149,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),batch,humming,cudagraph,1995.67,0.008403357118368149,rotating_gt_2l2
+quantized,unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4),batch,humming,compile,,0.008403357118368149,rotating_gt_2l2

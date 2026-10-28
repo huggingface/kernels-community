@@ -211,6 +211,7 @@ def quant_dequant_a(
     *,
     scale: torch.Tensor | None = None,
     pow2_scale: bool = False,
+    activation_scale_ub: float | None = None,
 ) -> torch.Tensor:
     """Mirror a kernel's inline activation quant→dequant round-trip in fp32.
 
@@ -224,7 +225,11 @@ def quant_dequant_a(
         return A_fp8.float() * scale
     M, K = A.shape
     groups = A.float().reshape(M, K // block_k, block_k)
-    s = groups.abs().amax(dim=-1, keepdim=True) / 448.0
+    amax = groups.abs().amax(dim=-1, keepdim=True)
+    if activation_scale_ub is not None:
+        amax = amax.clamp(max=activation_scale_ub)
+        groups = groups.clamp(min=-amax, max=amax)
+    s = amax / 448.0
     if pow2_scale:
         s = (_ue8m0_exp(s) << 23).view(torch.float32)
     A_fp8 = (groups / s.clamp(min=1e-12)).to(FP8_DTYPE)
@@ -238,11 +243,13 @@ def quant_dequant_a(
 # family default applied to a raw A); dq_act dequantizes its output for the torch oracle.
 
 fp8_act_quant_block_dynamic = internals.quant.fp8_act_quant_block_dynamic
+interleave_int_words = internals.quant.interleave_int_words
 fp8_act_quant_tensor_wide = internals.quant.fp8_act_quant_tensor_wide
 mxfp4_act_quant = internals.quant.mxfp4_act_quant
 mxfp8_act_quant = internals.quant.mxfp8_act_quant
 nvfp4_act_quant = internals.quant.nvfp4_act_quant
 nvfp4_quantize_two_level = internals.quant.nvfp4_quantize_two_level
+repack_gptq_int4 = internals.quant.repack_gptq_int4
 
 _E2M1_LUT = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 _E2M1_LUT = _E2M1_LUT + [-v for v in _E2M1_LUT]
@@ -327,6 +334,42 @@ def _make_mx(weight_dtype, scale_dtype):
     return make
 
 
+INT_GROUP = 128  # GPTQ / AWQ / compressed-tensors' usual group
+INT_BITS = {"int2": 2, "int4": 4, "int8": 8}  # the integer weight rows below and their value widths
+
+
+def _make_int(bits):
+    def make(N, K, E, group=INT_GROUP):
+        """Integer weights in the GEMMs' layout: ``(E, N, K // VPW)`` uint32 words of ``VPW = 32 // bits`` unsigned
+        values along K in the kernels' interleaved order (``interleave_int_words``) and bf16 group scales;
+        single-level. A zero point is a scenario knob (``dq_int``)."""
+        vpw = 32 // bits
+        q = torch.randint(0, 1 << bits, (E, N, K), device=TEST_DEVICE, dtype=torch.int32)
+        shifts = bits * torch.arange(vpw, device=TEST_DEVICE, dtype=torch.int32)
+        natural = (q.reshape(E, N, K // vpw, vpw) << shifts).sum(-1, dtype=torch.int32)
+        scales = (torch.rand(E, N, K // group, device=TEST_DEVICE) * 0.02 + 0.005).to(torch.bfloat16)
+        return interleave_int_words(natural, bits), scales, None
+
+    return make
+
+
+def dq_int(B, Bs, Bz=None, dtype=None, group=INT_GROUP):
+    """Dequant of interleaved integer weight words the compressed-tensors way, the reference the GEMMs match bit for
+    bit: ``(q - zero)`` in the scale dtype times the per-group scale (rounded once, in that dtype), then cast to
+    ``dtype`` (the activation's; ``None`` keeps the scale dtype). The width follows from the shapes; the zero point
+    is ``2 ** (bits - 1)`` when ``Bz`` is None. Returned as fp32."""
+    K = Bs.shape[-1] * group
+    vpw = K // B.shape[-1]
+    bits = 32 // vpw
+    p = torch.arange(vpw, device=B.device, dtype=torch.int32)
+    slots = (B.view(torch.int32).unsqueeze(-1) >> (bits * p)) & ((1 << bits) - 1)  # (..., words, slot)
+    # slot s < vpw / 2 holds K offset 2s, slot s + vpw / 2 offset 2s + 1
+    q = torch.stack([slots[..., : vpw // 2], slots[..., vpw // 2 :]], dim=-1).reshape(*B.shape[:-1], K)
+    zero = (1 << (bits - 1)) if Bz is None else torch.repeat_interleave(Bz.int(), group, dim=-1)
+    W = (q - zero).to(Bs.dtype) * torch.repeat_interleave(Bs, group, dim=-1)
+    return (W if dtype is None else W.to(dtype)).float()
+
+
 # None follows the weight family, so MXFP8 and MXFP4 rows resolve it differently
 _MX8_ACT = {None: mxfp8_act_quant, "mxfp8": mxfp8_act_quant, "mxfp4": mxfp4_act_quant}
 _MX4_ACT = {None: mxfp4_act_quant, "mxfp8": mxfp8_act_quant, "mxfp4": mxfp4_act_quant}
@@ -335,9 +378,10 @@ WEIGHTS = {
     "fp8_128x128": dict(
         make=lambda N, K, E: (*make_weights(N, K, TEST_DEVICE, [128, 128], num_experts=E), None),
         dequant=lambda B, Bs, g=None: dq_block_fp8(B, Bs, 128, 128),
-        activation_formats=("fp8",),
+        activation_formats=("fp8", "bf16"),
         requant_formats=("fp8",),
         act_quant={
+            "bf16": None,
             None: lambda A: fp8_act_quant_block_dynamic(A, 128),
             "fp8": lambda A: fp8_act_quant_block_dynamic(A, 128),
         },
@@ -350,9 +394,10 @@ WEIGHTS = {
             N, K, TEST_DEVICE, [128, 128], scale_dtype=torch.float8_e8m0fnu, num_experts=E
         ), None),
         dequant=lambda B, Bs, g=None: dq_block_fp8(B, Bs, 128, 128),
-        activation_formats=("fp8",),
+        activation_formats=("fp8", "bf16"),
         requant_formats=("fp8",),
         act_quant={
+            "bf16": None,
             None: lambda A: fp8_act_quant_block_dynamic(A, 128, use_ue8m0=True),
             "fp8": lambda A: fp8_act_quant_block_dynamic(A, 128, use_ue8m0=True),
         },
@@ -363,6 +408,19 @@ WEIGHTS = {
             N, K, TEST_DEVICE, None, scale_layout="per_tensor_3d", num_experts=E
         ), None),
         dequant=lambda B, Bs, g=None: B.float() * Bs.float().reshape(-1, 1, 1),
+        activation_formats=("fp8", "bf16"),
+        requant_formats=(),
+        act_quant={
+            "bf16": None,
+            None: lambda A: fp8_act_quant_tensor_wide(A, A.shape[-1]),
+            "fp8": lambda A: fp8_act_quant_tensor_wide(A, A.shape[-1]),
+        },
+        dq_act=lambda q, s: q.float() * s.float().reshape(-1, 1),
+    ),
+    # Row-wise FP8: one fp32 scale per output row, (E, N, 1) — Llama 4 FP8; per-token activations.
+    "fp8_rowwise": dict(
+        make=lambda N, K, E: (*make_weights(N, K, TEST_DEVICE, [1, K], num_experts=E), None),
+        dequant=lambda B, Bs, g=None: B.float() * Bs.float(),
         activation_formats=("fp8",),
         requant_formats=(),
         act_quant={
@@ -407,6 +465,30 @@ WEIGHTS = {
         requant_formats=("nvfp4",),
         act_quant={None: nvfp4_act_quant, "nvfp4": nvfp4_act_quant},
         dq_act=lambda q, s: dq_grouped(q, s, NVFP4_SCALE_GROUP_K),
+    ),
+    "int4": dict(
+        make=_make_int(4),
+        dequant=lambda B, Bs, g=None: dq_int(B, Bs),
+        activation_formats=(),
+        requant_formats=(),
+        act_quant={None: None},
+        dq_act=None,
+    ),
+    "int8": dict(
+        make=_make_int(8),
+        dequant=lambda B, Bs, g=None: dq_int(B, Bs),
+        activation_formats=(),
+        requant_formats=(),
+        act_quant={None: None},
+        dq_act=None,
+    ),
+    "int2": dict(
+        make=_make_int(2),
+        dequant=lambda B, Bs, g=None: dq_int(B, Bs),
+        activation_formats=(),
+        requant_formats=(),
+        act_quant={None: None},
+        dq_act=None,
     ),
     "bf16": dict(
         make=_make_full(torch.bfloat16),
@@ -462,6 +544,8 @@ def dequantize_weight(
     """A quantized weight back to fp32, for any format the ops accept: E4M3 or packed-E2M1
     values, per-tensor / block / per-row-group scales, with the optional NVFP4 second-level
     global folded in. Host-side torch — the correctness path, not the fast one."""
+    if B.dtype == torch.uint32:  # integer words (interleaved), the GEMMs' rounded dequant
+        return dq_int(B, Bs)
     if B.dtype == torch.int8:  # packed E2M1: two codes per byte along K
         lut = torch.tensor(_E2M1 + tuple(-v for v in _E2M1), device=B.device, dtype=torch.float32)
         b = B.view(torch.uint8)
@@ -481,6 +565,26 @@ def dequantize_weight(
     if global_scale is not None:
         out = out * global_scale.float().reshape(-1)[0]
     return out
+
+
+def make_gptq_act_order(N, K, E, group=INT_GROUP, scale_dtype=torch.bfloat16):
+    """``E`` act-order GPTQ int4 linears (``desc_act=True``: each one's groups scattered across K by a random
+    ``g_idx``), packed in GPTQ's own layout and repacked: ``(W, Ws, Wz, perm, W_ref)``, ``W``/``Ws``/``Wz`` stacked
+    ``(E, N, ...)``, ``perm`` ``(E, K)`` int32 and ``W_ref`` ``(E, N, K)`` fp32 the dequantized weight in A's natural
+    K order, ``(q - zero) * scale`` rounded in the scale dtype."""
+    nibble = 4 * torch.arange(8, device=TEST_DEVICE, dtype=torch.int32)
+    out = []
+    for _ in range(E):
+        q = torch.randint(0, 16, (K, N), device=TEST_DEVICE, dtype=torch.int32)
+        z = torch.randint(1, 16, (K // group, N), device=TEST_DEVICE, dtype=torch.int32)
+        s = (torch.rand(K // group, N, device=TEST_DEVICE) * 0.02 + 0.005).to(scale_dtype)
+        g_idx = (torch.arange(K, device=TEST_DEVICE, dtype=torch.int32) // group)[torch.randperm(K, device=TEST_DEVICE)]
+        qweight = (q.reshape(K // 8, 8, N) << nibble[None, :, None]).sum(1, dtype=torch.int32)
+        qzeros = (((z - 1) & 0xF).reshape(K // group, N // 8, 8) << nibble).sum(-1, dtype=torch.int32)
+        W, Ws, Wz, perm = repack_gptq_int4(qweight, qzeros, s, g_idx=g_idx)
+        ref = ((q - z[g_idx.long()]).to(scale_dtype) * s[g_idx.long()]).T.float()
+        out.append((W, Ws, Wz, perm, ref))
+    return tuple(torch.stack(t) for t in zip(*out))
 
 
 def encode_csf_scales(scales):
