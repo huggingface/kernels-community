@@ -1166,6 +1166,7 @@ def main(*, dry_run: bool = False):
             upload=dispatch_upload,
             bot_comment_id=str(status_comment_id or "") if dispatch_upload else "",
             requested_backends=kernel_backends.get(kernel_name),
+            requested_by=ctx.get("commenter") or "",
             # The audit is per-PR, so request it only once (on the first kernel).
             run_security=run_security and index == 0,
             dry_run=dry_run,

@@ -191,6 +191,7 @@ def _build_inputs(
     target_branch: str,
     upload: bool,
     bot_comment_id: str,
+    requested_by: str = "",
 ) -> dict:
     inputs = {
         "kernel_name": kernel_name,
@@ -211,6 +212,8 @@ def _build_inputs(
         inputs["upload"] = "false"
     if upload and bot_comment_id:
         inputs["bot_comment_id"] = bot_comment_id
+    if requested_by:
+        inputs["requested_by"] = requested_by
     return inputs
 
 
@@ -277,6 +280,7 @@ def _plan_build_actions(
     bot_comment_id: str,
     metadata_ref: str = "",
     requested_backends: list[str] | None = None,
+    requested_by: str = "",
 ) -> None:
     backends = read_backends(kernel_name, metadata_ref)
     if requested_backends is not None and backends is not None:
@@ -329,6 +333,7 @@ def _plan_build_actions(
                         target_branch=target_branch,
                         upload=upload,
                         bot_comment_id=bot_comment_id,
+                        requested_by=requested_by,
                     ),
                 },
                 description=f"for kernel `{kernel_name}` on ref `{ref}`",
@@ -354,6 +359,7 @@ def plan_dispatch(
     security_only: bool = False,
     metadata_ref: str = "",
     requested_backends: list[str] | None = None,
+    requested_by: str = "",
 ) -> DispatchPlan:
     want_security = run_security or security_only
     plan = DispatchPlan(kernel_name=kernel_name, head_sha=head_sha)
@@ -374,6 +380,7 @@ def plan_dispatch(
             upload=upload,
             bot_comment_id=bot_comment_id,
             requested_backends=requested_backends,
+            requested_by=requested_by,
         )
 
     if want_security:
@@ -526,6 +533,7 @@ def dispatch(
     security_only: bool = False,
     metadata_ref: str = "",
     requested_backends: list[str] | None = None,
+    requested_by: str = "",
 ) -> DispatchResult:
     if not security_only and (not kernel_name or not KERNEL_NAME_RE.match(kernel_name)):
         result = DispatchResult(kernel_name=kernel_name)
@@ -550,6 +558,7 @@ def dispatch(
         security_only=security_only,
         metadata_ref=metadata_ref,
         requested_backends=requested_backends,
+        requested_by=requested_by,
     )
     if dry_run:
         return _result_from_plan(plan)
