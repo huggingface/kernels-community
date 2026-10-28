@@ -39,8 +39,8 @@ jobs:
       - name: Regenerate selected ports and compare
         env:
           # Refresh the runner to catch upstream changes.
-          # TODO: switch back to main once huggingface/kernels#877 is merged.
-          KERNEL_PORT: "nix run --refresh github:huggingface/kernels/kernel-port-no-importlib#kernel-port --"
+          # TODO: switch back to main once huggingface/kernels#946 is merged.
+          KERNEL_PORT: "nix run --refresh github:huggingface/kernels/kernel-port-declarative#kernel-port --"
           BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || '' }}
         run: |
           if [ -n "$BASE_REF" ]; then
