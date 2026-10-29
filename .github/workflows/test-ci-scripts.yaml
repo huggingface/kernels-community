@@ -18,6 +18,9 @@ on:
       - ".github/pr-labels.json"
       - "scripts/check_public_api.py"
       - "scripts/test_check_public_api.py"
+      - "scripts/kernel_status_snapshot.py"
+      - "scripts/test_kernel_status_snapshot.py"
+      - "scripts/kernel-status/**"
       # test_dispatch.py sweeps every kernel's build.toml (parses it, checks the
       # declared backends map to a known build workflow), so a kernel manifest
       # change can break this suite too.
@@ -36,6 +39,9 @@ on:
       - ".github/pr-labels.json"
       - "scripts/check_public_api.py"
       - "scripts/test_check_public_api.py"
+      - "scripts/kernel_status_snapshot.py"
+      - "scripts/test_kernel_status_snapshot.py"
+      - "scripts/kernel-status/**"
       - "**/build.toml"
       - ".github/workflows/build*.yaml"
       - ".github/workflows/pr-autolabel.yml"
@@ -69,4 +75,8 @@ jobs:
       - name: Run tests
         run: |
           uv run --no-project --python 3.11 --with 'pytest>=8,<9' \
-            pytest .github/scripts scripts/test_check_public_api.py -v
+            pytest .github/scripts scripts/test_check_public_api.py scripts/test_kernel_status_snapshot.py -v
+
+      - name: Test kernel-status CLI
+        working-directory: scripts/kernel-status
+        run: cargo test --locked
