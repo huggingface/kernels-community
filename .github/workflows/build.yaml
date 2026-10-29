@@ -581,7 +581,7 @@ jobs:
           gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$BOT_COMMENT_ID" -f body="$BODY"
 
   # Record this run in the kernel-status dataset (`kernels-community/kernel-status`).
-  # Only default-branch code runs here: the PR head is fetched as data (build.toml,
+  # PR code never runs here: the PR head is fetched as data (build.toml,
   # flake.lock), never executed, because this job holds a Hub write token.
   emit-status-event:
     if: always() && inputs.skip_build != true && needs.setup.outputs.skip != 'true'
@@ -601,15 +601,19 @@ jobs:
         id: data-ref
         env:
           PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
         run: |
           case "$PR_NUMBER" in
-            '') echo "ref=HEAD" >> "$GITHUB_OUTPUT" ;;
+            '') echo "ref=HEAD" >> "$GITHUB_OUTPUT"; exit 0 ;;
             *[!0-9]*) echo "Invalid pr_number input: must be numeric"; exit 1 ;;
-            *)
-              git fetch --depth=1 origin "refs/pull/$PR_NUMBER/head"
-              echo "ref=FETCH_HEAD" >> "$GITHUB_OUTPUT"
-              ;;
           esac
+          # Prefer the dispatched head SHA, the PR ref may have moved during the build.
+          case "$HEAD_SHA" in
+            '') git fetch --depth=1 origin "refs/pull/$PR_NUMBER/head" ;;
+            *[!0-9a-f]*) echo "Invalid head_sha input: must be a hex SHA"; exit 1 ;;
+            *) git fetch --depth=1 origin "$HEAD_SHA" ;;
+          esac
+          echo "ref=FETCH_HEAD" >> "$GITHUB_OUTPUT"
 
       - name: Download Hub upload summaries
         if: inputs.mode != 'pr' && inputs.upload != false

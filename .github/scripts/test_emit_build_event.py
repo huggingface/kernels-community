@@ -73,3 +73,16 @@ def test_build_event_drops_own_job_and_records_trigger():
     assert event["source"]["builder_rev"] == "123"
     assert event["result"]["overall"] == "success"
     assert event["run_url"].endswith("/actions/runs/42")
+
+
+def test_read_sources_tolerates_broken_config(tmp_path, monkeypatch):
+    kernel = tmp_path / "relu"
+    kernel.mkdir()
+    (kernel / "build.toml").write_text("[general\nversion = 2")
+    (kernel / "flake.lock").write_text("{not json")
+    monkeypatch.chdir(tmp_path)
+    for args in (["init", "-q"], ["add", "."], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x"]):
+        emit_build_event.subprocess.run(["git", *args], check=True)
+    sources = emit_build_event.read_sources("relu", "HEAD")
+    assert sources["config"]["version"] is None
+    assert sources["source"]["builder_rev"] is None
