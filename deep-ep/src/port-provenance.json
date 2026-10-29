@@ -1,0 +1,24 @@
+{
+  "format": 1,
+  "recipe": "sha256:af8185d18844fed5176d18703b1df8076128595079d6d9a41ac51d45e74df9f0",
+  "runner": "kernel-port 0.1.0",
+  "sources": {
+    "deepjit": {
+      "repo": "https://github.com/deepseek-ai/DeepJIT.git",
+      "commit": "cba802df081985141eeee36803685775c183a047"
+    },
+    "nccl": {
+      "repo": "https://github.com/NVIDIA/nccl.git",
+      "commit": "12df1a11afad322be5a204a2db890161cbf8131d"
+    },
+    "python": {
+      "repo": "https://github.com/deepseek-ai/DeepEP.git",
+      "commit": "def865146e95aa9ea223e277c0a8a4c6b81e5ac7"
+    },
+    "upstream": {
+      "repo": "https://github.com/deepseek-ai/DeepEP.git",
+      "commit": "def865146e95aa9ea223e277c0a8a4c6b81e5ac7"
+    }
+  },
+  "tree": "sha256:63ebef5e5ae48ec8a20933bba076c6ed130d713bc41d2f0fc375ceefa9eeb5b7"
+}

@@ -650,3 +650,75 @@ release, carry out the following steps:
 
 If the user did not specify the version tag, stop and ask which tag to sync
 from.
+
+## deep-ep
+
+`deep-ep/` is upstream DeepEP (https://github.com/deepseek-ai/DeepEP) in its
+upstream layout, with the `third-party/deep_jit` submodule (DeepJIT) inlined at
+the commit the DeepEP release pins. Only the small host extension is built;
+DeepEP's GPU kernels are JIT-compiled at runtime by DeepJIT. When the user asks
+to sync a DeepEP release, update `deep-ep/port/port.kdl` and its handwritten
+`overlay/` files, then regenerate and check the output with
+`deep-ep/port/regenerate.py` (see `deep-ep/port/README.md`). Do not make porting
+changes only in the generated tree. The recipe pins DeepEP, DeepJIT and NCCL
+and retains the existing Torch ops/custom-class bindings. The synchronization
+requirements encoded in the recipe are:
+
+- Fetch https://github.com/deepseek-ai/DeepEP.git and check out the release
+  commit the user specified (upstream does not tag V2 releases; find the
+  "DeepEP V<x>" commit and check `__version__` in `deep_ep/__init__.py`).
+- Update the source pin to that release and the DeepJIT vendor pin to its
+  submodule commit. Keep upstream edits in guarded recipe operations so the
+  porting changes remain reviewable separately from imported code.
+- Delete upstream's build entry points again (`setup.py`, `pyproject.toml`,
+  `CMakeLists.txt`, `build.sh`, `install.sh`, `develop.sh`): `kernel-builder
+  create-pyproject` generates `setup.py`, `pyproject.toml` and `CMakeLists.txt`
+  and refuses to overwrite existing ones.
+- Re-apply the line-for-line porting changes to the vendored C++:
+  - Wrap every pybind11 `register_apis`/`register_event_apis` function in
+    `csrc/` in `#ifndef DEEP_EP_KERNELS`, and the `deep_jit/python_api.hpp`
+    include in `csrc/runtime/jit.hpp`. They are replaced by
+    `torch-ext/torch_binding.cpp`.
+  - `third-party/deep_jit/include/deep_jit/utils/gil.hpp`: no pybind11 under
+    `DEEP_EP_KERNELS` (Torch already releases the GIL around custom ops and
+    custom class methods).
+  - `csrc/kernels/comm/symmetric.hpp`: define `SYS_pidfd_open`/`SYS_pidfd_getfd`
+    when missing (the manylinux_2_28 kernel headers predate them).
+  - `third-party/deep_jit/include/deep_jit/utils/exception.hpp`: include
+    `<elfutils/libdwfl.h>` only if available (`__has_include`), with a stub
+    `DwflApi` otherwise; backtraces then lack source lines.
+  Everything else in `csrc/` compiles unchanged: `torch-ext/compat/` provides
+  `pybind11/*.h` and `torch/python.h` shims that implement the few pybind11
+  value types upstream uses in function bodies (`tuple`, `make_tuple`, `none`,
+  `cast`, `bytearray`, `gil_scoped_release`) on top of `c10::IValue`.
+  `torch-ext/deep_ep_holders.hpp` converts `EventHandle` and deferred
+  epilogues to Torch custom classes.
+- Keep `torch-ext/torch_binding.cpp` in sync with upstream's pybind11
+  registrations (`csrc/python_api.cpp` and the `register_apis` functions):
+  free functions are Torch ops, `EPBuffer`/`BucketBuffer`/`EngramBuffer`/
+  `PPBuffer`/`Context`/`EventHandle` are Torch custom classes. Torch schemas
+  have no 32-bit ints, so the bindings take `int64_t` and convert.
+- Copy upstream `deep_ep/` to `torch-ext/deep_ep/` (Python files and
+  `include/`, which DeepJIT compiles at runtime, so it must be shipped). Then:
+  - make the `deep_ep._C` imports relative (`from .. import _C`,
+    `from .._C import EventHandle`);
+  - in `__init__.py`, keep the `_nccl_symbols` import first, and replace the
+    import-time `check_nccl_so()`/`init_jit()` calls by the deferred versions
+    from `_runtime.py`.
+  `_C.py` (the upstream `deep_ep._C` API on top of the ops and classes),
+  `_runtime.py` (requirement checks and JIT initialization on first buffer
+  creation) and `_nccl_symbols.py` are local files with no upstream
+  counterpart; update `_C.py` when the pybind11 API changes.
+- In every upstream test, replace `import deep_ep` with
+  `deep_ep = kernels.get_kernel("kernels-community/deep-ep", version=1)`.
+  Load utility submodules with `importlib.import_module` using
+  `deep_ep.__name__` as the package prefix; do not insert test paths into
+  `sys.path` or alias the kernel to `deep_ep` in `sys.modules`.
+- Update the DeepEP/DeepJIT commits in `build.toml`, `CARD.md` and
+  `__version__`, and the NCCL/CUDA minimums in `_runtime.py` and `CARD.md` if
+  upstream's README changed them.
+
+NCCL is a header-only dependency (`nccl` in `depends`): the extension must not
+link or ship libnccl. Its NCCL symbols are resolved from the library PyTorch
+loaded, which `_nccl_symbols.py` re-opens with `RTLD_GLOBAL | RTLD_NOLOAD`
+before the extension is loaded.
