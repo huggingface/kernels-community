@@ -16,16 +16,17 @@ DOT_MIN_SCALE = 2
 
 
 @triton.jit
-def _tile_image(tile_ends, images, height, width, BLOCK_IMAGES: tl.constexpr, UNIFORM: tl.constexpr):
+def _tile_image(
+    tile_ends, images, height, width, out_height, out_width, BLOCK_IMAGES: tl.constexpr, UNIFORM: tl.constexpr
+):
     """Image of the program's tile, its tile index in that image, and the image layout.
 
-    With `UNIFORM`, every image has the same output size and the grid has one row per image. Otherwise the grid is
-    flat and the image is the number of images whose last tile is before this one."""
+    With `UNIFORM`, every image has the output size `out_height x out_width` and the grid has one row per image.
+    Otherwise the grid is flat, the image is the number of images whose last tile is before this one, and its layout
+    is read from `images`."""
     if UNIFORM:
         tile = tl.program_id(0)
         image = tl.program_id(1).to(tl.int64)
-        out_height = tl.load(images).to(tl.int32)
-        out_width = tl.load(images + 1).to(tl.int32)
         out_start = image * out_height * out_width
     else:
         index = tl.sum((tl.load(tile_ends + tl.arange(0, BLOCK_IMAGES)) <= tl.program_id(0)).to(tl.int32), axis=0)
@@ -39,12 +40,14 @@ def _tile_image(tile_ends, images, height, width, BLOCK_IMAGES: tl.constexpr, UN
     return tile, image, out_height, out_width, out_start, height_scale, width_scale
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["out_height", "out_width"])
 def _upsample_argmax_kernel(
     logits,
     output,
     tile_ends,
     images,
+    out_height,
+    out_width,
     classes,
     height,
     width,
@@ -56,7 +59,7 @@ def _upsample_argmax_kernel(
 
     For each class, every pixel reads its 4 neighbors in the logits and keeps the best class so far."""
     tile, image, out_height, out_width, out_start, height_scale, width_scale = _tile_image(
-        tile_ends, images, height, width, BLOCK_IMAGES, UNIFORM
+        tile_ends, images, height, width, out_height, out_width, BLOCK_IMAGES, UNIFORM
     )
     pixels = tile * BLOCK + tl.arange(0, BLOCK)
     active = pixels < out_height * out_width
@@ -95,12 +98,14 @@ def _upsample_argmax_kernel(
     tl.store(output + out_start + pixels, best_class, mask=active)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["out_height", "out_width"])
 def _dot_upsample_argmax_kernel(
     logits,
     output,
     tile_ends,
     images,
+    out_height,
+    out_width,
     classes,
     height,
     width,
@@ -117,7 +122,7 @@ def _dot_upsample_argmax_kernel(
     class, the tile is `row_matrix @ patch @ column_matrix` in float16, where both matrices hold the bilinear weights.
     """
     tile, image, out_height, out_width, out_start, height_scale, width_scale = _tile_image(
-        tile_ends, images, height, width, BLOCK_IMAGES, UNIFORM
+        tile_ends, images, height, width, out_height, out_width, BLOCK_IMAGES, UNIFORM
     )
     tiles_per_row = tl.cdiv(out_width, BLOCK_N)
     rows = (tile // tiles_per_row) * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -185,7 +190,7 @@ def _uses_tensor_cores(height, width, out_height, out_width):
 def _upsample_argmax_plan(device, height, width, sizes):
     """One launch per kernel path for the whole batch. Each launch gets the last tile of every image and the image
     layouts in one transfer, so a program finds its image without a launch per image. A batch with one output size
-    skips that search: its grid has one row per image."""
+    needs no metadata on the device: its grid has one row per image and the output size is a kernel argument."""
     uniform = len(set(sizes)) == 1
     out_starts = list(accumulate([0] + [out_height * out_width for out_height, out_width in sizes[:-1]]))
     launches = []
@@ -202,12 +207,16 @@ def _upsample_argmax_plan(device, height, width, sizes):
             ]
         else:
             tile_counts = [triton.cdiv(sizes[index][0] * sizes[index][1], BLOCK) for index in indices]
-        block_images = 1 if uniform else triton.next_power_of_2(len(indices) + 1)
-        tile_ends = list(accumulate(tile_counts))
-        tile_ends += [2**62] * (block_images - len(tile_ends))
-        images = [value for index in indices for value in (*sizes[index], out_starts[index], index)]
-        tile_ends, images = _as_tensors(device, torch.int64, tile_ends, images)
-        grid = (tile_counts[0], len(sizes)) if uniform else (sum(tile_counts),)
+        if uniform:
+            block_images = 1
+            arguments = (None, None, *sizes[0])
+            grid = (tile_counts[0], len(sizes))
+        else:
+            block_images = triton.next_power_of_2(len(indices) + 1)
+            tile_ends = list(accumulate(tile_counts)) + [2**62] * (block_images - len(indices))
+            images = [value for index in indices for value in (*sizes[index], out_starts[index], index)]
+            arguments = (*_as_tensors(device, torch.int64, tile_ends, images), 0, 0)
+            grid = (sum(tile_counts),)
         constants = {"BLOCK_IMAGES": block_images, "UNIFORM": uniform}
         if tensor_cores:
             constants.update(
@@ -219,7 +228,7 @@ def _upsample_argmax_plan(device, height, width, sizes):
         else:
             constants["BLOCK"] = BLOCK
         kernel = _dot_upsample_argmax_kernel if tensor_cores else _upsample_argmax_kernel
-        launches.append((kernel, grid, tile_ends, images, constants))
+        launches.append((kernel, grid, arguments, constants))
     return launches
 
 
@@ -244,8 +253,8 @@ def upsample_argmax(logits: torch.Tensor, sizes: Sequence[tuple[int, int]]) -> l
         device=logits.device,
     )
     with torch.cuda.device(logits.device):
-        for kernel, grid, tile_ends, images, constants in _upsample_argmax_plan(logits.device, height, width, sizes):
-            kernel[grid](logits, output, tile_ends, images, classes, height, width, **constants)
+        for kernel, grid, arguments, constants in _upsample_argmax_plan(logits.device, height, width, sizes):
+            kernel[grid](logits, output, *arguments, classes, height, width, **constants)
     return [
         chunk.view(size)
         for chunk, size in zip(

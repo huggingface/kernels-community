@@ -84,7 +84,8 @@ program 7: images whose tiles end at or before 7 -> 2 (ends 4 and 6) -> image 2
 ```
 
 The table of tile ends and the output sizes and offsets of each image are copied once and cached per batch layout.
-When all images have the same output size, the kernel skips the table: the launch grid has one row per image.
+When all images have the same output size, as with one image, there is no table: the launch grid has one row per
+image and the output size is a kernel argument.
 
 A photo of 480x640 is 150 tiles on tensor cores, fewer than one wave on an A100. With one launch per image, most of
 the GPU waits at the end of each launch. With one launch per batch, the tiles of the next image fill it.
@@ -112,5 +113,16 @@ Batches with one output size run at the same speed as before.
 - `resize_normalize_patchify` needs target sizes that are multiples of `patch_size * block_size`.
 - With `round_to_uint8=True`, results can differ from torch by one uint8 level where a value falls on a rounding
   boundary.
-- The metadata of a batch layout (input sizes, target sizes, crop) is cached, up to 1024 layouts. A new layout costs
-  one extra copy and one extra launch, so batches of photos that all have different sizes pay that cost on every call.
+- The metadata of a batch layout is cached, up to 1024 layouts. The key is the tuple of all sizes in the batch, so a
+  batch of photos with different sizes almost never hits the cache. A miss costs one extra copy to the device, plus
+  one extra launch for the resize. Measured on an A100:
+
+  | call | known layout | new layout | reference |
+  |---|---|---|---|
+  | `resize_normalize`, 32 photos of different sizes | 0.73 ms | 0.78 ms | torchvision 6.3 ms |
+  | `resize_normalize`, 1 photo | 0.16 ms | 0.49 ms | torchvision 0.43 ms |
+  | `upsample_argmax`, 16 photos of different sizes | 0.86 ms | 1.14 ms | one launch per image 1.36 ms |
+  | `upsample_argmax`, 1 image | 0.13 ms | 0.15 ms | one launch per image 0.13 ms |
+
+  At batch 1 with a new size on every call, `resize_normalize` is about 13% slower than torchvision. `upsample_argmax`
+  keeps no device metadata when all output sizes are equal, so a new size there adds only about 0.02 ms on the CPU.
