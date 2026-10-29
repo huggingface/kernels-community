@@ -312,52 +312,28 @@ struct FMHAFwdMainloopXe2<
     auto prefetch_q = make_block_2d_prefetch(copy_q);
     auto prefetch_k = make_block_2d_prefetch(copy_k);
     auto prefetch_v = make_block_2d_prefetch(copy_v);
-    auto prefetch_v_paged =
-        make_block_2d_prefetch<SGPerWG::value>(tile_shape_v, V_2D);
 
     auto pQgQ = prefetch_q.get_slice(thr_id).partition_S(gQ);
     auto pKgK = prefetch_k.get_slice(thr_id).partition_S(gK);
     auto pVgV = prefetch_v.get_slice(thr_id).partition_S(gV_split);
-    auto pVgV_paged = prefetch_v_paged.get_slice(thr_id).partition_S(gV);
 
-    // PagedKV: translate logical K index to physical page-tile index.
+    // PagedKV: address each physical page from its base pointer so block loads use page-local offsets.
     int tiles_per_page = 0;
     int b_offset = 0;
-    int page_idx = 0, next_page_idx = blk_k0;
     if constexpr (PagedKV) {
       tiles_per_page = params.paged.page_size / get<1>(TileShapeQK{});
       b_offset = idx_b * params.paged.max_pages_per_seq;
-      int page_local_idx =
-          blk_k0 * get<1>(TileShapeQK{}) / params.paged.page_size;
-      next_page_idx =
-          params.paged.ptr_page_table[b_offset + page_local_idx] *
-              tiles_per_page +
-          blk_k0 % tiles_per_page;
     }
 
     for (int D = 0; D < size<3>(pQgQ); D++) {
       prefetch(prefetch_q, pQgQ(_, _, _, D));
     }
-    if constexpr (PagedKV) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int D = 0; D < size<4>(pKgK); D++) {
-        prefetch(prefetch_k, pKgK(_, _, _, next_page_idx, D));
-      }
-    } else {
+    if constexpr (!PagedKV) {
       int prefetch_k_stages = (total_blk < Stages ? total_blk : Stages);
       for (int D = 0; D < size<4>(pKgK); D++) {
         CUTLASS_PRAGMA_UNROLL
         for (int K = blk_k0; K < blk_k0 + prefetch_k_stages; K++) {
-          int pk;
-          if constexpr (PagedKV) {
-            int ploc = K * get<1>(TileShapeQK{}) / params.paged.page_size;
-            pk = params.paged.ptr_page_table[b_offset + ploc] *
-                     tiles_per_page +
-                 K % tiles_per_page;
-          } else {
-            pk = K;
-          }
-          prefetch(prefetch_k, pKgK(_, _, _, pk, D));
+          prefetch(prefetch_k, pKgK(_, _, _, K, D));
         }
       }
     }
@@ -372,34 +348,47 @@ struct FMHAFwdMainloopXe2<
         cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), _));
 
     for (int K = blk_k0; K < blk_k1; K++) {
-      // PagedKV: advance page index (current = next computed last iter).
+      int physical_page = 0;
       if constexpr (PagedKV) {
-        page_idx = next_page_idx;
-        int next_logical = K + 1;
-        int next_page_local_idx =
-            next_logical * get<1>(TileShapeQK{}) / params.paged.page_size;
-        bool valid_page =
-            next_page_local_idx < params.paged.max_pages_per_seq;
-        if (valid_page) {
-          next_page_idx =
-              params.paged.ptr_page_table[b_offset + next_page_local_idx] *
-                  tiles_per_page +
-              next_logical % tiles_per_page;
-        } else {
-          next_page_idx = params.paged.max_pages_per_seq * tiles_per_page - 1;
-        }
+        physical_page = params.paged.ptr_page_table[
+            b_offset + K * get<1>(TileShapeQK{}) / params.paged.page_size];
       }
-
-      auto tKgK_cache =
-          PagedKV ? tKgK(_, _, _, page_idx, _) : tKgK(_, _, _, K, _);
-      auto tVgV_cache =
-          PagedKV ? tVgV(_, _, _, _, page_idx) : tVgV(_, _, _, _, K);
-
-      // Paged path uses the old whole-V-tile prefetch pattern; split-V
-      // prefetch-after-GEMM can hang on BMG for some paged cases.
+      auto page_k = [&] {
+        if constexpr (PagedKV) {
+          return make_tensor(
+            K_2D.data() + static_cast<int64_t>(physical_page) *
+                params.paged.page_size * get<0>(K_2D.layout().stride()),
+            make_layout(make_shape(params.paged.page_size, size<1>(K_2D)),
+                        K_2D.layout().stride()));
+        } else {
+          return K_2D;
+        }
+      }();
+      auto page_k_tiles = local_tile(
+          make_identity_tensor(page_k.shape()), TileShapeQK{},
+          make_coord(_, _, _), Step<X, _1, _1>{});
+      TiledCopyK page_k_copy{page_k};
+      auto page_k_src = page_k_copy.get_slice(thr_id).partition_S(page_k_tiles);
       if constexpr (PagedKV) {
-        prefetch(prefetch_v_paged, pVgV_paged(_, _, _, page_idx));
-      } else if constexpr (!PagedKV) {
+        auto page_k_prefetch = make_block_2d_prefetch(page_k_copy);
+        auto page_k_prefetch_src =
+            page_k_prefetch.get_slice(thr_id).partition_S(page_k_tiles);
+        for (int D = 0; D < size<4>(page_k_prefetch_src); D++) {
+          prefetch(page_k_prefetch, page_k_prefetch_src(_, _, _, K % tiles_per_page, D));
+        }
+        auto page_v = make_tensor(
+            V_2D.data() + static_cast<int64_t>(physical_page) *
+                params.paged.page_size * get<1>(V_2D.layout().stride()),
+            make_layout(make_shape(size<0>(V_2D), params.paged.page_size),
+                        V_2D.layout().stride()));
+        auto page_tiles = local_tile(
+            make_identity_tensor(page_v.shape()), tile_shape_v,
+            make_coord(get<1>(blk_qv), _));
+        auto page_prefetch =
+          make_block_2d_prefetch<SGPerWG::value>(tile_shape_v, page_v);
+        auto page_src = page_prefetch.get_slice(thr_id).partition_S(page_tiles);
+        prefetch(page_prefetch, page_src(_, _, _, K % tiles_per_page));
+      } else {
         CUTLASS_PRAGMA_UNROLL
         for (int VV = 0; VV < VTiles; VV++) {
           prefetch(prefetch_v, pVgV(_, _, _, VV, K));
@@ -443,7 +432,11 @@ struct FMHAFwdMainloopXe2<
             }
           }
         }
-        copy(copy_k, tKgK_cache(_, _, _, D), tKrK);
+        if constexpr (PagedKV) {
+          copy(page_k_copy, page_k_src(_, _, _, K % tiles_per_page, D), tKrK);
+        } else {
+          copy(copy_k, tKgK(_, _, _, K, D), tKrK);
+        }
         reorder(tQrQ, tSrQ);
         reorder(tKrK, tSrK);
         cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
@@ -578,40 +571,34 @@ struct FMHAFwdMainloopXe2<
       /* GEMM 2: A += P * V, split in v dimension */
       CUTLASS_PRAGMA_UNROLL
       for (int VV = 0; VV < VTiles; VV++) {
-        copy(copy_v, tVgV_cache(_, _, _, VV), tVrV);
+        if constexpr (PagedKV) {
+          auto page_v = make_tensor(
+              V_2D.data() + static_cast<int64_t>(physical_page) *
+                  params.paged.page_size * get<1>(V_2D.layout().stride()),
+              make_layout(make_shape(size<0>(V_2D), params.paged.page_size),
+                          V_2D.layout().stride()));
+          auto page_tiles = local_tile(
+              make_identity_tensor(page_v.shape()), tile_shape_v,
+              make_coord(get<1>(blk_qv), _));
+          auto page_split = local_tile(
+              page_tiles, TileShapePV{}, make_coord(_, _, 0),
+              Step<X, _1, _1>{});
+          TiledCopyV page_copy{page_v};
+          auto page_src = page_copy.get_slice(thr_id).partition_S(page_split);
+          copy(page_copy, page_src(_, _, _, VV, K % tiles_per_page), tVrV);
+        } else {
+          copy(copy_v, tVgV(_, _, _, VV, K), tVrV);
+        }
         reorder(tVrV, tArV);
         cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
       }
 
-      if constexpr (PagedKV) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int D = 0; D < size<4>(pKgK); D++) {
-          prefetch(prefetch_k, pKgK(_, _, _, next_page_idx, D));
-        }
-      } else {
+      if constexpr (!PagedKV) {
         int K_next = K + Stages;
         if (K_next < blk_k1) {
-          if constexpr (PagedKV) {
-            int next_page_local_idx =
-                K_next * get<1>(TileShapeQK{}) / params.paged.page_size;
-            int pk_next;
-            if (next_page_local_idx < params.paged.max_pages_per_seq) {
-              pk_next =
-                  params.paged.ptr_page_table[b_offset + next_page_local_idx] *
-                      tiles_per_page +
-                  K_next % tiles_per_page;
-            } else {
-              pk_next = params.paged.max_pages_per_seq * tiles_per_page - 1;
-            }
-            CUTLASS_PRAGMA_UNROLL
-            for (int D = 0; D < size<4>(pKgK); D++) {
-              prefetch(prefetch_k, pKgK(_, _, _, pk_next, D));
-            }
-          } else {
-            CUTLASS_PRAGMA_UNROLL
-            for (int D = 0; D < size<4>(pKgK); D++) {
-              prefetch(prefetch_k, pKgK(_, _, _, K_next, D));
-            }
+          CUTLASS_PRAGMA_UNROLL
+          for (int D = 0; D < size<4>(pKgK); D++) {
+            prefetch(prefetch_k, pKgK(_, _, _, K_next, D));
           }
         }
       }

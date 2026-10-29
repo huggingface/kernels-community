@@ -134,7 +134,54 @@ def flash_attn_varlen_func(
     return out
 
 
+def flash_attn_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p: float = 0.0,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: tuple = (-1, -1),
+    softcap: float = 0.0,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
+    return_attn_probs: bool = False,
+    s_aux: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Fixed-length Flash Attention, with the API of the original `flash_attn_func`.
+
+    `q` is [batch, seqlen_q, num_heads, head_dim] and `k`/`v` are [batch, seqlen_k, num_heads_kv, head_dim];
+    the output has `q`'s shape. Every sequence in the batch has the full length, so this runs the varlen
+    kernel with offsets that are a plain stride. Arguments are as in `flash_attn_varlen_func`.
+    """
+    batch, seqlen_q = q.shape[:2]
+    seqlen_k = k.shape[1]
+    cu_seqlens_q = torch.arange(0, (batch + 1) * seqlen_q, seqlen_q, dtype=torch.int32, device=q.device)
+    cu_seqlens_k = torch.arange(0, (batch + 1) * seqlen_k, seqlen_k, dtype=torch.int32, device=q.device)
+    out = flash_attn_varlen_func(
+        q.reshape(-1, *q.shape[2:]),
+        k.reshape(-1, *k.shape[2:]),
+        v.reshape(-1, *v.shape[2:]),
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqlen_q,
+        seqlen_k,
+        dropout_p=dropout_p,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        softcap=softcap,
+        alibi_slopes=alibi_slopes,
+        deterministic=deterministic,
+        return_attn_probs=return_attn_probs,
+        s_aux=s_aux,
+    )
+    return out.view(batch, seqlen_q, *out.shape[1:])
+
+
 __all__ = [
     "flash_attention_varlen",
+    "flash_attn_func",
     "flash_attn_varlen_func",
 ]

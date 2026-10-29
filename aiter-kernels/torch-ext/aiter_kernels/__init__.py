@@ -8,7 +8,7 @@ Hugging Face Hub kernel. Each subpackage under :mod:`aiter_kernels` maps 1:1
 to the equivalent upstream module under ``aiter.ops.triton``.
 
 Flash Attention is **not** included here — it lives in
-``kernels-community/aiter-flash-attn`` and is synced separately.
+``amd/aiter-flash-attn`` and is synced separately.
 """
 
 from __future__ import annotations

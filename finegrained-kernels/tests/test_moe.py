@@ -27,15 +27,22 @@ import pytest
 import torch
 
 from utils import (  # type: ignore
+    dequant_gate_up,
     DTYPE_TAG,
     DTYPE_TO_TOL,
+    finegrained_kernels,
+    internals,
+    make_gate_up,
+    prepare_csf,
     SUPPORTS_SWIZZLED_SCALES,
     TEST_DEVICE,
     WEIGHTS,
 )
 
-from finegrained_kernels import moe, scheduling, swizzle_mx_scales  # type: ignore
-from finegrained_kernels.epilogue import fused_glu  # type: ignore
+moe = internals.moe
+scheduling = internals.scheduling
+swizzle_mx_scales = finegrained_kernels.swizzle_mx_scales
+fused_glu = internals.epilogue.fused_glu
 
 
 @dataclass(frozen=True)
@@ -59,6 +66,7 @@ class MoEProblem:
     swiglu_limit: Optional[float] = None
     act_fn: Union[str, Callable] = "silu"  # a callable runs on the host between the GEMMs
     swizzled: bool = False  # pre-swizzled (5D SWIZZLE_32_4_4) weight scales — the deployment layout
+    csf_encoding: bool = False  # NVFP4 weight scales handed to the fused block as CSF streams
     input_globals: bool = False  # calibrated NVFP4 activation input_scale per projection
     expert_globals: bool = False  # the down's calibrated input_scale differs per expert
     static: bool = False  # calibrated (static) activation scale, one per expert
@@ -82,6 +90,7 @@ class MoEProblem:
             f"{self.weights}_T{self.num_tokens}_E{self.num_experts}_H{self.hidden_dim}"
             f"_I{self.intermediate_dim}_top{self.num_top_k}_{DTYPE_TAG[self.dtype]}"
             f"{act}{fmt}{'_swizzled' if self.swizzled else ''}"
+            f"{'_csf' if self.csf_encoding else ''}"
             f"{'_inputglobals' if self.input_globals else ''}"
             f"{'_expertglobals' if self.expert_globals else ''}"
             f"{'_static' if self.static else ''}"
@@ -91,6 +100,10 @@ class MoEProblem:
             f"{'_negative' if self.negative_sentinels else ''}"
         )
 
+
+DEVICE_MEMORY_GIB = (
+    torch.get_device_module(TEST_DEVICE).get_device_properties(0).total_memory / 2**30 if TEST_DEVICE else 0
+)
 
 MOE_PROBLEMS = [
     # ── one decode-size + one small-batch shape per weight family ──
@@ -138,6 +151,8 @@ MOE_PROBLEMS = [
     MoEProblem(weights="mxfp4", num_tokens=1, swizzled=True),
     MoEProblem(weights="nvfp4", swizzled=True),
     MoEProblem(weights="nvfp4", num_tokens=1, swizzled=True),
+    MoEProblem(weights="nvfp4", csf_encoding=True),
+    MoEProblem(weights="nvfp4", num_tokens=1, csf_encoding=True),
     # the full deployment stack for a calibrated NVFP4 checkpoint: pre-swizzled artifact +
     # per-projection input globals, at decode batch (the bench's GLM-NVFP4 decode cell)
     MoEProblem(weights="nvfp4", num_tokens=1, swizzled=True, input_globals=True),
@@ -203,13 +218,16 @@ MOE_PROBLEMS = [
     # gate_up offsets exceed 2^31 elements (127 * 2*2048 * 6144 = 3.196e9); a regressed
     # int64 cast corrupts the high-routed tokens vs the torch reference. E is a power of
     # two (the fused-grouped scheduling kernels require it).
-    MoEProblem(
-        weights="fp8_128x128",
-        num_tokens=512,
-        num_experts=128,
-        hidden_dim=6144,
-        intermediate_dim=2048,
-        num_top_k=4,
+    pytest.param(
+        MoEProblem(
+            weights="fp8_128x128",
+            num_tokens=512,
+            num_experts=128,
+            hidden_dim=6144,
+            intermediate_dim=2048,
+            num_top_k=4,
+        ),
+        marks=pytest.mark.skipif(DEVICE_MEMORY_GIB < 40, reason="the overflow guard needs 40 GiB of device memory"),
     ),
 ]
 
@@ -220,11 +238,11 @@ def _make_moe_weights(problem: MoEProblem):
     deployment contract, not per call): the gate_up scale is the ONE gate-interleaved artifact
     (6D — the shape carries the layout) and every forward consumes it directly — fused kernels
     read block pairs, the unfused plain GEMM remaps its block index in-kernel."""
-    make = WEIGHTS[problem.weights]["make"]
-    gate_up, gate_up_s, gate_up_g = make(
-        2 * problem.intermediate_dim, problem.hidden_dim, problem.num_experts
+    row = WEIGHTS[problem.weights]
+    gate_up, gate_up_s, gate_up_g = make_gate_up(
+        row, problem.intermediate_dim, problem.hidden_dim, problem.num_experts
     )
-    down, down_s, down_g = make(
+    down, down_s, down_g = row["make"](
         problem.hidden_dim, problem.intermediate_dim, problem.num_experts
     )
     if problem.swizzled:
@@ -232,6 +250,10 @@ def _make_moe_weights(problem: MoEProblem):
             pytest.skip("the SWIZZLE_32_4_4 scale layout is the tcgen05 fast path (CUDA-only)")
         gate_up_s = swizzle_mx_scales(gate_up_s)
         down_s = swizzle_mx_scales(down_s)
+    if problem.csf_encoding:
+        # E4M3 codes 24 apart (more than the 15 a CSF offset holds): an exception in every expert, of both projections
+        gate_up_s[..., 0, :2] = gate_up_s.new_tensor([0.125, 1.0])
+        down_s[..., 0, :2] = down_s.new_tensor([0.125, 1.0])
     return gate_up, gate_up_s, gate_up_g, down, down_s, down_g
 
 
@@ -288,7 +310,7 @@ def _static_scales(problem: MoEProblem, hidden, gate_up, gate_up_s, top_k_index)
     routed to it. ``None`` on a dynamic problem, which quantizes at runtime instead."""
     if not problem.static:
         return None, None
-    weight = WEIGHTS[problem.weights]["dequant"](gate_up, gate_up_s).float()
+    weight = dequant_gate_up(WEIGHTS[problem.weights], gate_up, gate_up_s).float()
     inter = fused_glu(
         torch.einsum("th,enh->etn", hidden.float(), weight),
         problem.act_fn,
@@ -353,6 +375,22 @@ def _assert_fused_correctness(out, ref, problem: MoEProblem):
     torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
 
 
+def _fused_scales(problem: MoEProblem, gate_up_s, down_s):
+    """The fused block's ``(gate_up_proj_scale_inv, down_proj_scale_inv, kwargs)``: the dense
+    scales, or under ``csf_encoding`` their CSF fixed streams with the exceptions as kwargs (the
+    block decodes them itself; the unfused reference keeps the dense scales)."""
+    if not problem.csf_encoding:
+        return gate_up_s, down_s, {}
+    gate_up_fixed, gate_up_exceptions, gate_up_offsets = prepare_csf(gate_up_s)
+    down_fixed, down_exceptions, down_offsets = prepare_csf(down_s)
+    return gate_up_fixed, down_fixed, dict(
+        gate_up_proj_scale_exceptions=gate_up_exceptions,
+        gate_up_proj_scale_exception_offsets=gate_up_offsets,
+        down_proj_scale_exceptions=down_exceptions,
+        down_proj_scale_exception_offsets=down_offsets,
+    )
+
+
 def _run_pair(problem: MoEProblem, fused_fn, unfused_fn):
     torch.manual_seed(0)
     gate_up, gate_up_s, gate_up_g, down, down_s, down_g = _make_moe_weights(problem)
@@ -363,16 +401,18 @@ def _run_pair(problem: MoEProblem, fused_fn, unfused_fn):
     ref = unfused_fn(
         hidden, top_k_index, top_k_weights, gate_up, down, gate_up_s, down_s, **common
     )
+    fused_gate_up_s, fused_down_s, csf = _fused_scales(problem, gate_up_s, down_s)
     out = fused_fn(
         hidden,
         top_k_index,
         top_k_weights,
         gate_up,
         down,
-        gate_up_s,
-        down_s,
+        fused_gate_up_s,
+        fused_down_s,
         simulate_unfused=True,
         **common,
+         **csf,
     )
     _assert_fused_correctness(out, ref, problem)
 

@@ -16,7 +16,9 @@ crash-config pruner guards, autotuner resilience and reporting for failing confi
 activation-quant arm equivalence, and cross-process determinism; each docstring
 carries its incident."""
 
+import itertools
 import logging
+import os
 import subprocess
 import sys
 
@@ -25,13 +27,19 @@ import torch
 import triton
 import triton.language as tl
 
-from utils import TEST_DEVICE, make_weights
+from utils import finegrained_kernels, internals, make_weights, TEST_DEVICE  # type: ignore
 
-import finegrained_kernels  # type: ignore
-import finegrained_kernels.matmul  # type: ignore
-from finegrained_kernels.bayesian_autotuner import bayesian_autotune  # type: ignore
-from finegrained_kernels.compat import is_sm10x  # type: ignore
-from finegrained_kernels.pruners import block_within_dim_pruner, mx_config_pruner  # type: ignore
+bayesian_autotune = internals.bayesian_autotuner.bayesian_autotune
+is_sm10x = internals.compat.is_sm10x
+block_within_dim_pruner = internals.pruners.block_within_dim_pruner
+mx_config_pruner = internals.pruners.mx_config_pruner
+
+
+@pytest.fixture
+def full_search(monkeypatch):
+    """Keep the trial budget a test's tuner declares. The suite runs in fast mode (conftest),
+    whose one trial would override it, and a tuner reads the config when it is decorated."""
+    monkeypatch.setenv("FINEGRAINED_AUTOTUNE_CONFIG", '{"strict": true}')
 
 
 @pytest.mark.kernels_ci
@@ -102,10 +110,10 @@ def test_wide_gate_dot_scaled_configs_are_pruned():
         )
         for bn in (64, 128, 256)  # GATE width = 2*BN
     ]
-    kept = prune(cfgs, {"K": 4096, "GATE": True})
+    kept = prune(cfgs, {"K": 4096, "N": 4096, "GATE": True})
     # 2*256 > the 256 cap
     assert {c.kwargs["BLOCK_SIZE_N"] for c in kept} == {64, 128}
-    plain = prune(cfgs, {"K": 4096, "GATE": False})
+    plain = prune(cfgs, {"K": 4096, "N": 4096, "GATE": False})
     assert {c.kwargs["BLOCK_SIZE_N"] for c in plain} == {64, 128, 256}
 
 
@@ -174,7 +182,7 @@ def test_dot_scaled_is_fenced_off_fp32_weight_only_activations():
 
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
-def test_autotuner_survives_and_reports_failing_configs(caplog):
+def test_autotuner_survives_and_reports_failing_configs(caplog, full_search):
     """A config that cannot compile must score inf (not kill the tune), the tune must
     still pick a working config, and the failure must be REPORTED — inf-scoring must
     never silently hide a broken path behind a healthy one."""
@@ -200,7 +208,7 @@ def test_autotuner_survives_and_reports_failing_configs(caplog):
 
     x = torch.randn(64, device=TEST_DEVICE)
     y = torch.empty_like(x)
-    with caplog.at_level(logging.WARNING, logger="finegrained_kernels.bayesian_autotuner"):
+    with caplog.at_level(logging.WARNING, logger=internals.bayesian_autotuner.__name__):
         _copy_kernel[(1,)](x, y, 64)
     torch.accelerator.synchronize()
     assert torch.equal(x, y)  # the good config won
@@ -209,7 +217,7 @@ def test_autotuner_survives_and_reports_failing_configs(caplog):
 
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
-def test_failed_configs_do_not_consume_trial_budget():
+def test_failed_configs_do_not_consume_trial_budget(full_search):
     """A config that fails to compile is skipped as if the trial never happened — the
     budget counts MEASURED configs (failures already sat outside the TPE densities;
     before this they still ate trial slots, wasting up to half the budget on grids
@@ -260,12 +268,12 @@ def test_act_quant_arms_are_bit_equal():
     )
     A = torch.randn(4, 512, device=TEST_DEVICE, dtype=torch.bfloat16)  # below the M gate
     inline_out = finegrained_kernels.matmul_2d(A, B, None, Bs, output_dtype=torch.bfloat16)
-    saved = finegrained_kernels.matmul.MX_MATMUL_ACT_PREQUANT_MIN_M
+    saved = internals.matmul.MX_MATMUL_ACT_PREQUANT_MIN_M
     try:
-        finegrained_kernels.matmul.MX_MATMUL_ACT_PREQUANT_MIN_M = 1  # force offline
+        internals.matmul.MX_MATMUL_ACT_PREQUANT_MIN_M = 1  # force offline
         offline_out = finegrained_kernels.matmul_2d(A, B, None, Bs, output_dtype=torch.bfloat16)
     finally:
-        finegrained_kernels.matmul.MX_MATMUL_ACT_PREQUANT_MIN_M = saved
+        internals.matmul.MX_MATMUL_ACT_PREQUANT_MIN_M = saved
     assert torch.equal(inline_out, offline_out)
 
 
@@ -277,12 +285,13 @@ def test_cross_process_determinism_block_dynamic_grouped():
     within one process agree, fresh processes can disagree. Compare an output checksum
     across subprocesses — a cheap CI approximation of the 15-process flake harness."""
     script = (
-        "import sys; sys.path.insert(0,'torch-ext'); sys.path.insert(0,'tests');\n"
-        "import torch; from utils import TEST_DEVICE, make_weights; import finegrained_kernels as fg\n"
+        # the tests' own directory, as CI runs them from elsewhere
+        f"import sys; sys.path.insert(0, {os.path.dirname(os.path.abspath(__file__))!r});\n"
+        "import torch; from utils import TEST_DEVICE, make_weights, finegrained_kernels as fg, internals\n"
         "torch.manual_seed(0)\n"
         "E,N,K,S=8,512,1024,256\n"
         "eids=torch.randint(0,E,(S,),device=TEST_DEVICE,dtype=torch.int32)\n"
-        "est,gi,si=fg.scheduling.compute_grouped_scheduling(eids,E,1)\n"
+        "est,gi,si=internals.scheduling.compute_grouped_scheduling(eids,E,1)\n"
         "A=torch.randn(S,K,device=TEST_DEVICE,dtype=torch.bfloat16)\n"
         "B,Bs=make_weights(N,K,TEST_DEVICE,[128,128],num_experts=E)\n"
         "out=fg.matmul_grouped(A,B,Bs=Bs,expert_start=est,output_dtype=torch.float32,gather_idx=gi,scatter_idx=si)\n"
@@ -299,14 +308,14 @@ def test_cross_process_determinism_block_dynamic_grouped():
 
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
-def test_compile_failures_are_memoized_across_keys(caplog):
+def test_compile_failures_are_memoized_across_keys(caplog, full_search):
     """A config that fails at COMPILE stage is memoized on disk keyed by its compile
     determinants (source hash + config + constexpr values + dtypes) — a tune at a NEW
     shape key must skip the doomed compile and report the failure as memoized. Bench
     -stage errors are excluded by design (a sticky-context cascade must never fence
     healthy configs).
 
-    The suite pins ``FINEGRAINED_AUTOTUNE_MAX_FAILURES=0`` so a config the tuner cannot compile
+    The suite pins ``strict`` in FINEGRAINED_AUTOTUNE_CONFIG so a config the tuner cannot compile
     fails loudly instead of being forgiven (conftest). This test IS that machinery and compiles
     a deliberately doomed config, so it passes `max_failures` for its own tune — otherwise the
     first reject aborts before there is anything to memoize."""
@@ -331,7 +340,7 @@ def test_compile_failures_are_memoized_across_keys(caplog):
             offs = offs + tl.arange(0, 3)  # non-power-of-2 arange -> CompilationError
         tl.store(Y + offs, tl.load(X + offs, mask=offs < N), mask=offs < N)
 
-    with caplog.at_level(logging.WARNING, logger="finegrained_kernels.bayesian_autotuner"):
+    with caplog.at_level(logging.WARNING, logger=internals.bayesian_autotuner.__name__):
         for n in (32, 64):  # two shapes -> two tuning keys, same compile signature
             x = torch.randn(n, device=TEST_DEVICE)
             y = torch.empty_like(x)
@@ -343,3 +352,85 @@ def test_compile_failures_are_memoized_across_keys(caplog):
     assert len(msgs) == 2, msgs
     assert "[memoized]" not in msgs[0] or "[memoized]" in msgs[1]
     assert "[memoized]" in msgs[1], msgs[1]
+
+
+@pytest.mark.kernels_ci
+def test_basin_anchors_cover_interior_and_wide_output_tiles():
+    """Each swap basin gets an interior anchor and a wide output tile, both with
+    middle K, warp, and stage settings rather than lexicographic extremes.
+    """
+    grid = itertools.product(
+        (False, True), (16, 64, 128), (64, 128, 256), (64, 128, 256), (4, 8, 16), (2, 4, 6)
+    )
+    configs = [
+        triton.Config(
+            {"BLOCK_SIZE_M": bm, "BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk, "SWAP_AB": swap},
+            num_warps=warps, num_stages=stages,
+        )
+        for swap, bm, bn, bk, warps, stages in grid
+    ]
+    @bayesian_autotune(configs, [], path_anchor_axes=("SWAP_AB",))
+    @triton.jit
+    def kernel(
+        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
+        BLOCK_SIZE_K: tl.constexpr, SWAP_AB: tl.constexpr,
+    ):
+        pass
+
+    anchors = [configs[i] for i in kernel._basin_anchor_indices(configs)]
+    assert len(anchors) == 4
+    for c in anchors:
+        assert c.kwargs["BLOCK_SIZE_K"] == 128
+        assert c.num_warps == 8 and c.num_stages == 4
+    assert [(c.kwargs["BLOCK_SIZE_M"], c.kwargs["BLOCK_SIZE_N"]) for c in anchors] == [
+        (64, 128), (128, 256), (64, 128), (128, 256),
+    ]
+
+
+@pytest.mark.kernels_ci
+def test_runoff_winner_uses_remeasured_candidates(monkeypatch):
+    """A fourth tile's stale search sample must not beat the runoff's three fresh samples."""
+    configs = [triton.Config({"BLOCK": block}) for block in (16, 32, 64, 128)]
+
+    @bayesian_autotune(configs, [], n_trials=4, basin_probes=False, max_refine_iters=0)
+    @triton.jit
+    def kernel(BLOCK: tl.constexpr):
+        pass
+
+    # Exercise runoff even when the surrounding correctness run limits tuning to one trial.
+    monkeypatch.setattr(kernel, "n_trials", len(configs))
+    monkeypatch.setattr(kernel, "runoff", True)
+    samples = {16: iter((1.0, 6.0)), 32: iter((2.0, 5.0)),
+               64: iter((3.0, 7.0)), 128: iter((4.0,))}
+    monkeypatch.setattr(kernel, "_bench", lambda *args, config, **kwargs: next(samples[config.kwargs["BLOCK"]]))
+    winner = kernel._bayesian_search(configs, (), {}, ())
+    assert winner.kwargs["BLOCK"] == 32
+
+
+@pytest.mark.kernels_ci
+def test_coupled_axes_cross_refinement_valley(monkeypatch):
+    """K and pipeline stages must change together when either change alone is slower."""
+    configs = [
+        triton.Config({"BLOCK_SIZE_K": bk}, num_stages=stages)
+        for bk in (128, 256) for stages in (2, 3)
+    ]
+    scores = {(128, 2): 10.0, (128, 3): 12.0, (256, 2): 12.0, (256, 3): 1.0}
+    winners = []
+    for coupled_axes in ((), (("BLOCK_SIZE_K", "num_stages"),)):
+        @bayesian_autotune(configs, [], coupled_axes=coupled_axes, cache_results=False)
+        @triton.jit
+        def kernel(BLOCK_SIZE_K: tl.constexpr):
+            pass
+
+        monkeypatch.setattr(kernel, "n_trials", 2)
+        monkeypatch.setattr(kernel, "n_startup_trials", 2)
+        monkeypatch.setattr(kernel, "runoff", False)
+        monkeypatch.setattr(kernel, "basin_probes", True)
+        monkeypatch.setattr(kernel, "max_refine_iters", 1)
+        monkeypatch.setattr(kernel, "_basin_anchor_indices", lambda configs: [0, 1])
+        monkeypatch.setattr(
+            kernel, "_bench", lambda *args, config, **kwargs: scores[(config.kwargs["BLOCK_SIZE_K"], config.num_stages)]
+        )
+        winner = kernel._bayesian_search(configs, (), {}, ())
+        winners.append((winner.kwargs["BLOCK_SIZE_K"], winner.num_stages))
+    assert winners == [(128, 2), (256, 3)]

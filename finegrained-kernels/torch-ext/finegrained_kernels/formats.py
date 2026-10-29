@@ -15,7 +15,7 @@
 import torch
 import triton
 
-from .compat import MX_SCALE_GROUP_K, NIBBLES_PER_BYTE, NVFP4_SCALE_GROUP_K
+from .compat import MX_SCALE_GROUP_K, NIBBLES_PER_BYTE, NVFP4_SCALE_GROUP_K, UE8M0_DTYPE
 
 def ue8m0_as_uint8(scale: torch.Tensor | None) -> torch.Tensor | None:
     """View UE8M0 (``float8_e8m0fnu``) weight scales as ``uint8`` for the Triton
@@ -24,7 +24,7 @@ def ue8m0_as_uint8(scale: torch.Tensor | None) -> torch.Tensor | None:
     optional scale) passes through as ``None`` — kernels take the arg as None."""
     if scale is None:
         return None
-    return scale.view(torch.uint8) if scale.dtype == torch.float8_e8m0fnu else scale
+    return scale.view(torch.uint8) if scale.dtype == UE8M0_DTYPE else scale
 
 def e2m1_as_uint8(weight: torch.Tensor) -> torch.Tensor:
     """View an ``int8``-stored MXFP4 (packed E2M1) weight as ``uint8`` — a zero-cost
@@ -36,7 +36,7 @@ def e2m1_as_uint8(weight: torch.Tensor) -> torch.Tensor:
 # exponent bits, and a common on-disk encoding (e.g. group-32 "mxfp8" checkpoints store the
 # scale tensor as uint8). Both are valid MX scales: ``ue8m0_as_uint8`` reinterprets to uint8
 # and the kernels decode ``2^(exp-127)`` inline, so the detectors accept either dtype.
-UE8M0_SCALE_DTYPES = (torch.float8_e8m0fnu, torch.uint8)
+UE8M0_SCALE_DTYPES = (torch.uint8,) if UE8M0_DTYPE is None else (UE8M0_DTYPE, torch.uint8)
 
 def _shapes_match(weight: torch.Tensor, scale: torch.Tensor, group: int) -> bool:
     """Shape leg of the family predicates: matching leading dims and a last dim of
@@ -153,8 +153,12 @@ def validate_dense_operands(A: torch.Tensor, B: torch.Tensor) -> None:
 
 def validate_dense_2d_operands(A: torch.Tensor, B: torch.Tensor) -> None:
     """Shared (rows, K) x (N, K) operand checks for the 2D dense unpacked-fp8 wrappers — matching
-    K, contiguous A, 2D B. The packed-E2M1 (MX) 2D op does its own (K is two values per
+    K, unit-stride A rows, 2D B. The packed-E2M1 (MX) 2D op does its own (K is two values per
     stored byte, so B is (N, K // 2)).
+
+    A's rows may sit any distance apart, e.g. the last position of each sequence that
+    ``generate`` hands the LM head (``hidden[:, -1:]``). The wrappers flatten A with ``view``, so a
+    layout without a fixed row stride raises instead of being copied, and read its row stride.
 
     B may be row-major or a transposed view of a row-major tensor. The kernels read both of B's
     strides, and ``descriptor_box_pruner`` keeps the TMA arms — which require a unit-stride
@@ -163,12 +167,18 @@ def validate_dense_2d_operands(A: torch.Tensor, B: torch.Tensor) -> None:
     assert A.shape[-1] == B.shape[-1], (
         f"K mismatch: A has K={A.shape[-1]}, B has K={B.shape[-1]}"
     )
-    assert A.is_contiguous(), "A must be contiguous"
+    assert A.stride(-1) == 1, f"A's rows must be contiguous, got strides {tuple(A.stride())}"
     assert B.ndim == 2, f"B must be 2D (N, K), got ndim={B.ndim}"
     assert B.is_contiguous() or B.t().is_contiguous(), (
         "B must be contiguous or a transposed view of a contiguous tensor, got strides "
         f"{tuple(B.stride())} for shape {tuple(B.shape)}"
     )
+
+def gate_out_cols(N: int, gate: bool, act_fn: str | None) -> int:
+    """Output width of a GEMM over ``N``-wide projections: the GLU's ``N``, or under ``act_fn=None``
+    the raw interleaved ``2N`` gate|up columns (the caller applies the activation)."""
+    return 2 * N if gate and act_fn is None else N
+
 
 def expert_weight_shape(B: torch.Tensor, gate: bool) -> tuple[int, int, int]:
     """(num_experts, n_rows, N) of an expert weight stack — under a gate epilogue B is

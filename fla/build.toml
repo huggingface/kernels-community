@@ -1,9 +1,13 @@
 [general]
 name = "fla"
-version = 1
-edition = 5
+version = 2
+edition = 6
 license = "MIT"
-backends = ["cuda", "xpu"]
+backends = [
+    "cuda",
+    "rocm",
+    "xpu",
+]
 python-depends = ["einops"]
 
 [general.hub]

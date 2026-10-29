@@ -61,7 +61,7 @@ row-interleaved view (`_interleave_gate_up`) because the kernels read gate|up in
 python bench/bench_moe.py                    # full grid, single GPU -> bench_moe.csv + bench_moe.png
 python bench/bench_moe.py --gpus 8           # shard problems across 8 GPUs (one process per GPU), then merge + plot
 python bench/bench_moe.py --gpus 5 --devices 3,4,5,6,7   # pin the shards to GPUs 3-7
-python bench/bench_moe.py --smoke            # fast everything-compiles pass (3-trial tunes, 256-tok prefill)
+python bench/bench_moe.py --smoke            # fast everything-compiles pass (fast-mode tunes, 256-tok prefill)
 python bench/bench_moe.py --no-preswizzle    # affine MX scales instead of the fast path
 python bench/bench_moe.py gpt-oss            # substring filter on row/problem names
 python bench/bench_moe.py --replot           # rebuild the figure from an existing bench_moe.csv

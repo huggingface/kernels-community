@@ -5,7 +5,7 @@
 Mirrors ``aiter/ops/triton/rope/`` upstream and additionally exposes
 ``apply_rotary_transformers`` — a transformers-compatible shim that lets
 this submodule serve as a drop-in replacement for the standalone
-``kernels-community/aiter-rope`` repo (and for the ROCm entry of
+``amd/aiter-rope`` repo (and for the ROCm entry of
 transformers' ``_KERNEL_MAPPING["rotary_pos_emb"]``).
 """
 
@@ -35,7 +35,7 @@ def apply_rotary_transformers(q, k, cos, sin, unsqueeze_dim=1):
 
     Drop-in replacement for ``kernels-community/rotary``'s
     ``apply_rotary_transformers`` and for the same-named function in
-    ``kernels-community/aiter-rope``.
+    ``amd/aiter-rope``.
 
     Args:
         q, k: ``(batch, heads, seq, head_dim)``.

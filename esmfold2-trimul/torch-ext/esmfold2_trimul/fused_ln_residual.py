@@ -60,7 +60,9 @@ def _ln_fwd_kernel(
     TILE_M: tl.constexpr,
 ):
     pid = tl.program_id(axis=0).to(tl.int64)
-    M64 = M.to(tl.int64)
+    # tl.cast, not M.to: M is a plain int when Triton specializes it (M == 1),
+    # and when torch.compile analyzes the kernel.
+    M64 = tl.cast(M, tl.int64)
 
     offs_m = pid * TILE_M + tl.arange(0, TILE_M).to(tl.int64)
     offs_d = tl.arange(0, D).to(tl.int64)
@@ -108,7 +110,9 @@ def _ln_bwd_kernel(
     TILE_M: tl.constexpr,
 ):
     pid = tl.program_id(axis=0).to(tl.int64)
-    M64 = M.to(tl.int64)
+    # tl.cast, not M.to: M is a plain int when Triton specializes it (M == 1),
+    # and when torch.compile analyzes the kernel.
+    M64 = tl.cast(M, tl.int64)
 
     offs_m = pid * TILE_M + tl.arange(0, TILE_M).to(tl.int64)
     offs_d = tl.arange(0, D).to(tl.int64)

@@ -11,33 +11,32 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared test helpers: quantized-weight constructors and dequant references.
+"""Shared test helpers: the kernel under test, quantized-weight constructors and dequant references.
 
-The ``finegrained_kernels`` package is on ``sys.path`` via ``conftest.py`` (pytest
-auto-loads it before any test module)."""
+The tests load the kernel with ``get_kernel``, as users do. ``kernel-builder testshell`` sets
+``LOCAL_KERNELS`` so that the local build loads instead of the Hub one."""
 
 import torch
-
-from finegrained_kernels.compat import (  # type: ignore
-    MX_SCALE_GROUP_K,
-    NVFP4_SCALE_GROUP_K,
-    is_sm10x,
-)
+from kernels import get_kernel
 
 
-# ── Device + capability ───────────────────────────────────────────────────────
+finegrained_kernels = get_kernel("kernels-community/finegrained-kernels", version=0)
+# the internal modules the tests reach into
+internals = finegrained_kernels._private_for_testing
+
+MX_SCALE_GROUP_K = internals.compat.MX_SCALE_GROUP_K
+NVFP4_SCALE_GROUP_K = internals.compat.NVFP4_SCALE_GROUP_K
+is_sm10x = internals.compat.is_sm10x
+prepare_nvfp4_csf_scales = internals.scales.prepare_nvfp4_csf_scales
 
 TEST_DEVICE = (
     torch.accelerator.current_accelerator().type
     if torch.accelerator.is_available()
     else None
 )
-# FP8 kernels require Hopper (SM90) or newer on CUDA. SM89 (Ada Lovelace) can
-# technically compile fp8e4nv but its numerics drift from the dequant+matmul
-# reference by enough to need separate tolerances — not worth maintaining for
-# a non-target deployment SM.
+# FP8 kernels require Ada (SM89) or newer on CUDA, the first with FP8 tensor cores.
 SUPPORTS_FP8 = TEST_DEVICE == "xpu" or (
-    TEST_DEVICE == "cuda" and torch.cuda.get_device_capability() >= (9, 0)
+    TEST_DEVICE == "cuda" and torch.cuda.get_device_capability() >= (8, 9)
 )
 # The MX paths (MXFP4/MXFP8) need no extra gate: ``tl.dot_scaled`` runs natively on
 # Blackwell (SM100+) and via software emulation (the DecomposeScaledBlocked pass —
@@ -46,6 +45,9 @@ SUPPORTS_FP8 = TEST_DEVICE == "xpu" or (
 # SM90 (Hopper, e.g. H100) is the only architecture the benchmark baselines
 # are calibrated against — every other SM has its own latency profile.
 IS_SM90 = TEST_DEVICE == "cuda" and torch.cuda.get_device_capability() == (9, 0)
+# Ada's FP8 tensor cores accumulate with less precision than fp32, so an output element can miss the
+# fixed tolerance by a few bf16 ulps where the sum cancels. The tests bound such errors by the output's scale.
+IS_SM89 = TEST_DEVICE == "cuda" and torch.cuda.get_device_capability() == (8, 9)
 # The SWIZZLE_32_4_4 scale layout exists to feed tcgen05, so the ops only grow a
 # swizzled arm where that instruction is: sm_10x. Elsewhere the scales stay row-major
 # (affine) and the pre-swizzled variants of each problem are skipped rather than run
@@ -235,7 +237,12 @@ def quant_dequant_a(
 # (E, N, K); act_quant[activation_format] -> the host quant fn the ops themselves call (None = the
 # family default applied to a raw A); dq_act dequantizes its output for the torch oracle.
 
-from finegrained_kernels.quant import fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mxfp4_act_quant, mxfp8_act_quant, nvfp4_act_quant, nvfp4_quantize_two_level  # type: ignore  # noqa: E402
+fp8_act_quant_block_dynamic = internals.quant.fp8_act_quant_block_dynamic
+fp8_act_quant_tensor_wide = internals.quant.fp8_act_quant_tensor_wide
+mxfp4_act_quant = internals.quant.mxfp4_act_quant
+mxfp8_act_quant = internals.quant.mxfp8_act_quant
+nvfp4_act_quant = internals.quant.nvfp4_act_quant
+nvfp4_quantize_two_level = internals.quant.nvfp4_quantize_two_level
 
 _E2M1_LUT = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 _E2M1_LUT = _E2M1_LUT + [-v for v in _E2M1_LUT]
@@ -476,3 +483,92 @@ def dequantize_weight(
     return out
 
 
+def encode_csf_scales(scales):
+    """Independent CSF fixture encoder; the original dense bytes remain the oracle."""
+    shape = scales.shape
+    values = scales.cpu().contiguous().view(torch.uint8)
+    values = values.reshape(-1, shape[-2], shape[-1])
+    experts, rows, cols = values.shape
+    bases = values.amin(dim=-1, keepdim=True).clamp_max(240)
+    delta = values.to(torch.int16) - bases.to(torch.int16)
+    nibbles = delta.clamp(0, 15).to(torch.uint8)
+    packed = nibbles[:, :, ::2] | (nibbles[:, :, 1::2] << 4)
+    fixed = torch.cat(
+        (
+            bases.reshape(experts, rows // 16, 16),
+            packed.reshape(experts, rows // 16, 16 * cols // 2),
+        ),
+        dim=-1,
+    )
+    streams = []
+    for expert in range(experts):
+        positions = (
+            ((delta[expert] < 0) | (delta[expert] > 15)).flatten().nonzero().flatten()
+        )
+        streams.append(
+            (positions | (values[expert].flatten()[positions].long() << 24)).to(
+                torch.uint32
+            )
+        )
+    return fixed, streams
+
+
+def prepare_csf(scales):
+    """Encode dense NVFP4 scales to the prepared CSF streams ``(fixed, exceptions, expert_offsets)``."""
+    fixed, exceptions = encode_csf_scales(scales)
+    return prepare_nvfp4_csf_scales(
+        fixed.to(scales.device), [stream.to(scales.device) for stream in exceptions]
+    )
+
+
+def prepare_weight_scales(scales, csf_encoding, fn, compiled=False):
+    """Wrap a matrix Problem's existing op; CSF cases hand the op the compressed streams, which
+    it decodes itself (compiled cases capture decode + GEMM together)."""
+    if not csf_encoding:
+        return maybe_compile(fn, compiled)
+    fixed, exceptions, expert_offsets = prepare_csf(scales)
+
+    def run(A, B, As, Bs, **kwargs):
+        return fn(
+            A, B, As, fixed, b_scale_exceptions=exceptions,
+            b_scale_exception_offsets=expert_offsets, **kwargs,
+        )
+
+    return maybe_compile(run, compiled)
+
+
+def interleave_rows(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    """``[g0, u0, g1, u1, ...]`` along the row dim (-2), the fused gate|up weight layout."""
+    byte = gate.element_size() == 1 and gate.dtype.is_floating_point  # fp8/e8m0 can't stack
+    g, u = (gate.view(torch.uint8), up.view(torch.uint8)) if byte else (gate, up)
+    out = torch.stack((g, u), dim=-2).flatten(-3, -2)
+    return out.view(gate.dtype) if byte else out
+
+
+def _row_scaled(Bs, Bs_global) -> bool:
+    """Whether a weight's scales live on its rows (per-row groups or row blocks) with no stack-wide
+    second level — so gate and up can each keep their own, interleaved with the rows."""
+    return Bs is None or (Bs_global is None and Bs.ndim == 3 and Bs.shape[-2] > 1)
+
+
+def make_gate_up(row: dict, N: int, K: int, E):
+    """A ``(E, 2N, K)`` gate|up weight as checkpoints ship it: gate and up quantized as separate
+    projections, then their rows and scale rows interleaved — so a 128x128 scale block covers rows
+    of ONE projection. Never quantize the interleaved stack instead: a reference dequantizing that
+    shares the kernel's ``row // block_n`` assumption and cannot catch a wrong scale lookup. Only a
+    stack-wide scale (tensor-wide FP8, the NVFP4 global) is quantized over the stack, since the
+    kernels take one per expert and a loader folds the two projections' into it."""
+    gate, gate_s, gate_g = row["make"](N, K, E)
+    if not _row_scaled(gate_s, gate_g):
+        return row["make"](2 * N, K, E)
+    up, up_s, _ = row["make"](N, K, E)
+    return interleave_rows(gate, up), None if gate_s is None else interleave_rows(gate_s, up_s), None
+
+
+def dequant_gate_up(row: dict, B, Bs, Bs_global=None) -> torch.Tensor:
+    """fp32 of a ``make_gate_up`` weight, each projection dequantized against its own scales."""
+    if not _row_scaled(Bs, Bs_global):
+        return row["dequant"](B, Bs, Bs_global)
+    return interleave_rows(*(
+        row["dequant"](B[..., p::2, :], None if Bs is None else Bs[..., p::2, :]) for p in (0, 1)
+    ))

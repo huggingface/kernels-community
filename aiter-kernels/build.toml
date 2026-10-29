@@ -1,12 +1,12 @@
 [general]
 name = "aiter-kernels"
 version = 2
-edition = 5
+edition = 6
 license = "MIT"
 backends = ["rocm"]
 
 [general.hub]
-repo-id = "kernels-community/aiter-kernels"
+repo-id = "amd/aiter-kernels"
 
 [torch-noarch]
 pyext = [
