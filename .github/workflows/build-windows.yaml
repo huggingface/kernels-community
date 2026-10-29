@@ -57,6 +57,11 @@ on:
         required: false
         type: string
         default: ""
+      requested_by:
+        description: "GitHub login that requested the build (recorded in the kernel-status dataset)"
+        required: false
+        type: string
+        default: ""
 
 
 # These build workflows are reachable only via workflow_dispatch, so `github.head_ref`
@@ -439,3 +444,58 @@ jobs:
             -f target_url="$RUN_URL" \
             -f description="$DESC" \
             -f context="$STATUS_CONTEXT"
+
+  # Record this run in the kernel-status dataset (`kernels-community/kernel-status`).
+  # PR code never runs here: the PR head is fetched as data (build.toml,
+  # flake.lock), never executed, because this job holds a Hub write token.
+  emit-status-event:
+    if: always() && inputs.skip_build != true
+    needs: [build-kernel]
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Fetch PR head as data
+        id: data-ref
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          case "$PR_NUMBER" in
+            '') echo "ref=HEAD" >> "$GITHUB_OUTPUT"; exit 0 ;;
+            *[!0-9]*) echo "Invalid pr_number input: must be numeric"; exit 1 ;;
+          esac
+          # Prefer the dispatched head SHA, the PR ref may have moved during the build.
+          case "$HEAD_SHA" in
+            '') git fetch --depth=1 origin "refs/pull/$PR_NUMBER/head" ;;
+            *[!0-9a-f]*) echo "Invalid head_sha input: must be a hex SHA"; exit 1 ;;
+            *) git fetch --depth=1 origin "$HEAD_SHA" ;;
+          esac
+          echo "ref=FETCH_HEAD" >> "$GITHUB_OUTPUT"
+
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+
+      - name: Emit build event
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          KERNEL: ${{ inputs.kernel_name }}
+          MODE: ${{ inputs.mode }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          DISPATCH_KEY: ${{ inputs.dispatch_key }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          REPO_PREFIX: ${{ inputs.repo_prefix }}
+          UPLOAD: ${{ inputs.upload }}
+          REQUESTED_BY: ${{ inputs.requested_by }}
+          DATA_REF: ${{ steps.data-ref.outputs.ref }}
+        run: |
+          uv run --no-project --python 3.11 --with 'huggingface_hub>=0.34,<2' \
+            .github/scripts/emit_build_event.py windows
