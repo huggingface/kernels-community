@@ -41,13 +41,13 @@ def read_sources(kernel: str, ref: str) -> dict:
         try:
             config = tomllib.loads(git("show", f"{ref}:{candidate}"))
             break
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, tomllib.TOMLDecodeError):
             continue
     builder = {}
     try:
         lock = json.loads(git("show", f"{ref}:{kernel}/flake.lock"))
         builder = lock["nodes"]["kernel-builder"]["locked"]
-    except (subprocess.CalledProcessError, KeyError):
+    except (subprocess.CalledProcessError, KeyError, json.JSONDecodeError):
         pass
     general = (config or {}).get("general", {})
     return {
