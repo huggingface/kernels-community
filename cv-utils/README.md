@@ -45,6 +45,61 @@ each pass rounds to uint8, like torchvision on uint8 tensors.
 per input. It writes each value directly at its place in the patch layout, in `block_size x block_size` blocks of
 patches, and returns `grid_thw` as an int64 tensor.
 
+### `upsample_argmax`
+
+Semantic segmentation models predict logits at a low resolution, for example 150 classes at 128x128. The class map is
+`interpolate(logits, size=(H, W), mode="bilinear").argmax(0)`. In torch, that stores every class at full size before
+the argmax: 150 x 480 x 640 float32 values, or 184 MB for one photo. The kernel computes each output pixel from 4
+logits per class and keeps only the best class. It writes one int64 per pixel, which is 2.4 MB for the same photo.
+
+One output pixel, 2x2 logits upsampled to 4x4, output pixel `(1, 2)`:
+
+```
+source position:  row = (1 + 0.5) * 2/4 - 0.5 = 0.25      column = (2 + 0.5) * 2/4 - 0.5 = 0.75
+
+weights of the 4 neighbors          class 0 logits        class 1 logits
+   (1-0.25)(1-0.75)  (1-0.25)(0.75)     2    0                0    1
+   (0.25)(1-0.75)    (0.25)(0.75)       1    3                2    1
+ = 0.1875   0.5625
+   0.0625   0.1875
+
+class 0: 0.1875*2 + 0.5625*0 + 0.0625*1 + 0.1875*3 = 1.000   <- best so far, class 0
+class 1: 0.1875*0 + 0.5625*1 + 0.0625*2 + 0.1875*1 = 0.875      not better, keep class 0
+```
+
+The loop over classes keeps only the best value and its class. The upsampled logits are never stored. When both sides
+grow at least 2x, a program computes a 32x64 output tile for each class as `row_weights @ patch @ column_weights`
+on tensor cores, where `patch` is the block of logits under the tile.
+
+A batch has one output size per image. The work is cut into tiles of output pixels: 256 pixels, or 32x64 on tensor
+cores. All tiles of all images go to one launch. For example, with images of 4, 2 and 3 tiles:
+
+```
+tiles of the launch       0  1  2  3 | 4  5 | 6  7  8
+image                     0  0  0  0 | 1  1 | 2  2  2
+last tile + 1 per image            4 |    6 |       9
+
+program 7: images whose tiles end at or before 7 -> 2 (ends 4 and 6) -> image 2
+           first tile of image 2 is 6            -> tile 1 of image 2
+```
+
+The table of tile ends and the output sizes and offsets of each image are copied once and cached per batch layout.
+When all images have the same output size, the kernel skips the table: the launch grid has one row per image.
+
+A photo of 480x640 is 150 tiles on tensor cores, fewer than one wave on an A100. With one launch per image, most of
+the GPU waits at the end of each launch. With one launch per batch, the tiles of the next image fill it.
+
+A100, real logits, 16 COCO photos of different sizes, median ms:
+
+| model | one launch per image | one launch per batch | speedup |
+|---|---|---|---|
+| SegFormer ADE20K (150 classes) | 1.36 | 0.86 | 1.58x |
+| RF-DETR-Seg large (91 classes) | 0.83 | 0.43 | 1.92x |
+| SegFormer Cityscapes (19 classes) | 0.74 | 0.46 | 1.63x |
+| Mask2Former ADE20K (float32 path) | 2.71 | 2.03 | 1.34x |
+
+Batches with one output size run at the same speed as before.
+
 ## Limitations
 
 - `upsample_argmax` runs on tensor cores in float16 when both sides are upsampled at least 2x. Then a few pixels

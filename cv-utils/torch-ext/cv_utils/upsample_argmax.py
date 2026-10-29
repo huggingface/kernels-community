@@ -1,9 +1,13 @@
 import math
 from collections.abc import Sequence
+from functools import lru_cache
+from itertools import accumulate
 
 import torch
 import triton
 import triton.language as tl
+
+from .resize import MAX_PLANS, _as_tensors
 
 
 BLOCK = 256
@@ -12,23 +16,49 @@ DOT_MIN_SCALE = 2
 
 
 @triton.jit
+def _tile_image(tile_ends, images, height, width, BLOCK_IMAGES: tl.constexpr, UNIFORM: tl.constexpr):
+    """Image of the program's tile, its tile index in that image, and the image layout.
+
+    With `UNIFORM`, every image has the same output size and the grid has one row per image. Otherwise the grid is
+    flat and the image is the number of images whose last tile is before this one."""
+    if UNIFORM:
+        tile = tl.program_id(0)
+        image = tl.program_id(1).to(tl.int64)
+        out_height = tl.load(images).to(tl.int32)
+        out_width = tl.load(images + 1).to(tl.int32)
+        out_start = image * out_height * out_width
+    else:
+        index = tl.sum((tl.load(tile_ends + tl.arange(0, BLOCK_IMAGES)) <= tl.program_id(0)).to(tl.int32), axis=0)
+        tile = tl.program_id(0) - tl.load(tile_ends + index - 1, mask=index > 0, other=0)
+        out_height = tl.load(images + index * 4).to(tl.int32)
+        out_width = tl.load(images + index * 4 + 1).to(tl.int32)
+        out_start = tl.load(images + index * 4 + 2)
+        image = tl.load(images + index * 4 + 3)
+    height_scale = height.to(tl.float32) / out_height.to(tl.float32)
+    width_scale = width.to(tl.float32) / out_width.to(tl.float32)
+    return tile, image, out_height, out_width, out_start, height_scale, width_scale
+
+
+@triton.jit
 def _upsample_argmax_kernel(
     logits,
     output,
+    tile_ends,
+    images,
     classes,
     height,
     width,
-    out_height,
-    out_width,
-    height_scale,
-    width_scale,
     BLOCK: tl.constexpr,
+    BLOCK_IMAGES: tl.constexpr,
+    UNIFORM: tl.constexpr,
 ):
-    """Bilinear upsample + argmax, `BLOCK` output pixels per program.
+    """Bilinear upsample + argmax, `BLOCK` output pixels per program, one program per tile of every image.
 
     For each class, every pixel reads its 4 neighbors in the logits and keeps the best class so far."""
-    image = tl.program_id(1).to(tl.int64)
-    pixels = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tile, image, out_height, out_width, out_start, height_scale, width_scale = _tile_image(
+        tile_ends, images, height, width, BLOCK_IMAGES, UNIFORM
+    )
+    pixels = tile * BLOCK + tl.arange(0, BLOCK)
     active = pixels < out_height * out_width
     rows = pixels // out_width
     columns = pixels % out_width
@@ -62,33 +92,36 @@ def _upsample_argmax_kernel(
         best = tl.where(better, value, best)
         best_class = tl.where(better, class_index, best_class)
         channel += plane
-    tl.store(output + image * out_height * out_width + pixels, best_class, mask=active)
+    tl.store(output + out_start + pixels, best_class, mask=active)
 
 
 @triton.jit
 def _dot_upsample_argmax_kernel(
     logits,
     output,
+    tile_ends,
+    images,
     classes,
     height,
     width,
-    out_height,
-    out_width,
-    height_scale,
-    width_scale,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     PATCH_H: tl.constexpr,
     PATCH_W: tl.constexpr,
+    BLOCK_IMAGES: tl.constexpr,
+    UNIFORM: tl.constexpr,
 ):
     """Bilinear upsample + argmax with tensor cores.
 
     Each program computes a `BLOCK_M x BLOCK_N` output tile from a `PATCH_H x PATCH_W` patch of the logits. For each
     class, the tile is `row_matrix @ patch @ column_matrix` in float16, where both matrices hold the bilinear weights.
     """
-    image = tl.program_id(2).to(tl.int64)
-    rows = tl.program_id(1) * BLOCK_M + tl.arange(0, BLOCK_M)
-    columns = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    tile, image, out_height, out_width, out_start, height_scale, width_scale = _tile_image(
+        tile_ends, images, height, width, BLOCK_IMAGES, UNIFORM
+    )
+    tiles_per_row = tl.cdiv(out_width, BLOCK_N)
+    rows = (tile // tiles_per_row) * BLOCK_M + tl.arange(0, BLOCK_M)
+    columns = (tile % tiles_per_row) * BLOCK_N + tl.arange(0, BLOCK_N)
     source_row = tl.maximum((rows.to(tl.float32) + 0.5) * height_scale - 0.5, 0.0)
     source_column = tl.maximum((columns.to(tl.float32) + 0.5) * width_scale - 0.5, 0.0)
     row0 = source_row.to(tl.int32)
@@ -101,13 +134,21 @@ def _dot_upsample_argmax_kernel(
     first_column = tl.min(column0, axis=0)
     patch_rows = tl.arange(0, PATCH_H)
     patch_columns = tl.arange(0, PATCH_W)
-    row_matrix = tl.where(patch_rows[None, :] == (row0 - first_row)[:, None], 1.0 - row_weight1[:, None], 0.0)
+    row_matrix = tl.where(
+        patch_rows[None, :] == (row0 - first_row)[:, None],
+        1.0 - row_weight1[:, None],
+        0.0,
+    )
     row_matrix += tl.where(patch_rows[None, :] == (row1 - first_row)[:, None], row_weight1[:, None], 0.0)
     column_matrix = tl.where(
-        patch_columns[:, None] == (column0 - first_column)[None, :], 1.0 - column_weight1[None, :], 0.0
+        patch_columns[:, None] == (column0 - first_column)[None, :],
+        1.0 - column_weight1[None, :],
+        0.0,
     )
     column_matrix += tl.where(
-        patch_columns[:, None] == (column1 - first_column)[None, :], column_weight1[None, :], 0.0
+        patch_columns[:, None] == (column1 - first_column)[None, :],
+        column_weight1[None, :],
+        0.0,
     )
     row_matrix = row_matrix.to(tl.float16)
     column_matrix = column_matrix.to(tl.float16)
@@ -128,7 +169,7 @@ def _dot_upsample_argmax_kernel(
         best_class = tl.where(better, class_index, best_class)
         channel += plane
     output_mask = (rows[:, None] < out_height) & (columns[None, :] < out_width)
-    output_offsets = image * out_height * out_width + rows[:, None] * out_width + columns[None, :]
+    output_offsets = out_start + rows[:, None] * out_width + columns[None, :]
     tl.store(output + output_offsets, best_class.to(tl.int64), mask=output_mask)
 
 
@@ -136,42 +177,50 @@ def _patch_side(block, in_length, out_length):
     return max(16, triton.next_power_of_2(math.ceil(block * in_length / out_length) + 3))
 
 
-def _launch(logits, out_height, out_width):
-    batch, classes, height, width = logits.shape
-    output = torch.empty(batch, out_height, out_width, dtype=torch.int64, device=logits.device)
-    if out_height >= DOT_MIN_SCALE * height and out_width >= DOT_MIN_SCALE * width:
-        block_m, block_n = DOT_TILE
-        grid = (triton.cdiv(out_width, block_n), triton.cdiv(out_height, block_m), batch)
-        _dot_upsample_argmax_kernel[grid](
-            logits,
-            output,
-            classes,
-            height,
-            width,
-            out_height,
-            out_width,
-            height / out_height,
-            width / out_width,
-            BLOCK_M=block_m,
-            BLOCK_N=block_n,
-            PATCH_H=_patch_side(block_m, height, out_height),
-            PATCH_W=_patch_side(block_n, width, out_width),
-        )
-        return output
-    grid = (triton.cdiv(out_height * out_width, BLOCK), batch)
-    _upsample_argmax_kernel[grid](
-        logits,
-        output,
-        classes,
-        height,
-        width,
-        out_height,
-        out_width,
-        height / out_height,
-        width / out_width,
-        BLOCK=BLOCK,
-    )
-    return output
+def _uses_tensor_cores(height, width, out_height, out_width):
+    return out_height >= DOT_MIN_SCALE * height and out_width >= DOT_MIN_SCALE * width
+
+
+@lru_cache(maxsize=MAX_PLANS)
+def _upsample_argmax_plan(device, height, width, sizes):
+    """One launch per kernel path for the whole batch. Each launch gets the last tile of every image and the image
+    layouts in one transfer, so a program finds its image without a launch per image. A batch with one output size
+    skips that search: its grid has one row per image."""
+    uniform = len(set(sizes)) == 1
+    out_starts = list(accumulate([0] + [out_height * out_width for out_height, out_width in sizes[:-1]]))
+    launches = []
+    for tensor_cores in (False, True):
+        indices = [
+            index for index, size in enumerate(sizes) if _uses_tensor_cores(height, width, *size) == tensor_cores
+        ]
+        if not indices:
+            continue
+        if tensor_cores:
+            tile_counts = [
+                triton.cdiv(sizes[index][0], DOT_TILE[0]) * triton.cdiv(sizes[index][1], DOT_TILE[1])
+                for index in indices
+            ]
+        else:
+            tile_counts = [triton.cdiv(sizes[index][0] * sizes[index][1], BLOCK) for index in indices]
+        block_images = 1 if uniform else triton.next_power_of_2(len(indices) + 1)
+        tile_ends = list(accumulate(tile_counts))
+        tile_ends += [2**62] * (block_images - len(tile_ends))
+        images = [value for index in indices for value in (*sizes[index], out_starts[index], index)]
+        tile_ends, images = _as_tensors(device, torch.int64, tile_ends, images)
+        grid = (tile_counts[0], len(sizes)) if uniform else (sum(tile_counts),)
+        constants = {"BLOCK_IMAGES": block_images, "UNIFORM": uniform}
+        if tensor_cores:
+            constants.update(
+                BLOCK_M=DOT_TILE[0],
+                BLOCK_N=DOT_TILE[1],
+                PATCH_H=max(_patch_side(DOT_TILE[0], height, sizes[index][0]) for index in indices),
+                PATCH_W=max(_patch_side(DOT_TILE[1], width, sizes[index][1]) for index in indices),
+            )
+        else:
+            constants["BLOCK"] = BLOCK
+        kernel = _dot_upsample_argmax_kernel if tensor_cores else _upsample_argmax_kernel
+        launches.append((kernel, grid, tile_ends, images, constants))
+    return launches
 
 
 def upsample_argmax(logits: torch.Tensor, sizes: Sequence[tuple[int, int]]) -> list[torch.Tensor]:
@@ -187,8 +236,20 @@ def upsample_argmax(logits: torch.Tensor, sizes: Sequence[tuple[int, int]]) -> l
     if len(sizes) != len(logits):
         raise ValueError(f"Pass one size per image, got {len(sizes)} sizes for {len(logits)} images.")
     logits = logits.contiguous()
-    sizes = [tuple(int(side) for side in size) for size in sizes]
+    _, classes, height, width = logits.shape
+    sizes = tuple(tuple(int(side) for side in size) for size in sizes)
+    output = torch.empty(
+        sum(out_height * out_width for out_height, out_width in sizes),
+        dtype=torch.int64,
+        device=logits.device,
+    )
     with torch.cuda.device(logits.device):
-        if len(set(sizes)) == 1:
-            return list(_launch(logits, *sizes[0]).unbind(0))
-        return [_launch(logits[index : index + 1], *size)[0] for index, size in enumerate(sizes)]
+        for kernel, grid, tile_ends, images, constants in _upsample_argmax_plan(logits.device, height, width, sizes):
+            kernel[grid](logits, output, tile_ends, images, classes, height, width, **constants)
+    return [
+        chunk.view(size)
+        for chunk, size in zip(
+            output.split([out_height * out_width for out_height, out_width in sizes]),
+            sizes,
+        )
+    ]
