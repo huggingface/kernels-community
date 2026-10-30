@@ -35,4 +35,17 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          python scripts/report_kernel_failures.py --verbose --clear-cache
+          python scripts/report_kernel_failures.py --verbose --clear-cache --results-json "$RUNNER_TEMP/abi-results.json"
+
+      # Runs even when the ABI check fails, so the failures land in the snapshot.
+      - name: Publish kernel-status snapshot
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          ABI_ARGS=""
+          if [ -f "$RUNNER_TEMP/abi-results.json" ]; then
+            ABI_ARGS="--abi-results $RUNNER_TEMP/abi-results.json"
+          fi
+          python scripts/kernel_status_snapshot.py $ABI_ARGS --upload
