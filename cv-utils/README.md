@@ -1,8 +1,199 @@
 ---
+license: apache-2.0
 tags:
-- kernels
+  - kernels
 ---
 
 # cv_utils
 
-This is a build for some kernel utilities for computer vision, including generic_nms and connected_components
+Kernels for computer vision pre- and post-processing.
+
+| function | computes | backend |
+|---|---|---|
+| `cc_2d` | connected-component labels of binary masks, optionally with component areas | CUDA |
+| `connected_component_areas` | the component area of every pixel of a mask of any height and width | CUDA |
+| `generic_nms` | non-maximum suppression of boxes | CUDA |
+| `resize_normalize` | antialiased resize to one size per image, center crop, rescale and normalize of uint8 images | Triton |
+| `resize_normalize_patchify` | the same, written in the Qwen2-VL `pixel_values` patch layout, for images and videos | Triton |
+| `upsample_argmax` | the class of every pixel of bilinearly upsampled segmentation logits, without storing the upsampled logits | Triton |
+
+## Usage
+
+```python
+from kernels import get_kernel
+
+cv_utils = get_kernel("kernels-community/cv-utils", version=2)
+pixel_values = cv_utils.resize_normalize(images, [(224, 224)] * len(images), image_mean, image_std, 1 / 255, "bicubic")
+```
+
+`transformers` image processors call these kernels when loaded with `use_kernels=True`.
+
+## How it works
+
+### `resize_normalize`
+
+An antialiased resize computes each output pixel as a weighted sum of the input pixels under a filter. When the image
+shrinks, the filter widens by the shrink factor. One row of 6 pixels resized to 3 with bilinear antialiasing:
+
+```
+scale = 6 / 3 = 2      filter half-width = 1 * 2 = 2 input pixels      taps per output = 2 * ceil(2) + 1 = 5
+
+output 1: center = (1 + 0.5) * 2 = 3.0, taps at inputs 1 to 5
+   input            1      2      3      4      5
+   distance        0.75   0.25   0.25   0.75   1.25      |input + 0.5 - center| / 2
+   weight          0.25   0.75   0.75   0.25   0         1 - distance, at least 0
+   / sum (2.0)     0.125  0.375  0.375  0.125  0
+   value           20     30     40     50     60
+
+   output 1 = 0.125*20 + 0.375*30 + 0.375*40 + 0.125*50 = 35
+```
+
+At the border, taps outside the image get weight 0, and the other weights are divided by their sum again. Output 0
+uses inputs 0, 1 and 2 with weights 3/7, 3/7 and 1/7, and gives 17.14, like
+`torch.nn.functional.interpolate(..., antialias=True)`.
+
+The filter is separable, so the resize runs in two passes. A 2D filter with 5 taps per side reads 25 inputs per output
+pixel. Two passes read 5 + 5.
+
+```
+uint8 (C, 480, 640) --horizontal pass--> (C, 480, 224) --vertical pass--> float32 (C, 224, 224)
+                       resize width       scratch buffer   resize height
+                                                           round to uint8, rescale, normalize
+```
+
+The weights and the first tap of each output position depend only on the input and output sizes. A table per image
+and per pass holds them. The vertical pass also applies rescale and normalize in one step, with mean and std divided
+by the rescale factor: `(x - mean / rescale) / (std / rescale) == (x * rescale - mean) / std`. With
+`round_to_uint8=True`, each pass rounds to uint8 like torchvision on uint8 tensors. The horizontal pass is skipped
+when no image changes width.
+
+Images of different sizes share each launch. The grid is (image, row tile, column tile), sized for the largest output.
+Programs whose tile is outside their image return at once:
+
+```
+           column tile 0   column tile 1
+image 0    work            work            image 0 is wide
+image 1    work            return          image 1 is narrow
+```
+
+The sizes, offsets and filter tables of a batch layout are computed with one copy to the device and one launch, and
+cached. A call with a known layout then launches only the two passes.
+
+### `resize_normalize_patchify`
+
+Qwen2-VL takes `pixel_values` with one row per patch of `patch_size x patch_size` pixels. The patches are ordered in
+`block_size x block_size` blocks (`merge_size`, 2 for Qwen2-VL), so that the 4 patches merged by the model are next
+to each other. A 56x56 image with 14-pixel patches has a 4x4 grid of patches:
+
+```
+patch grid                         row of each patch in pixel_values
+ (0,0) (0,1) | (0,2) (0,3)           0  1 |  4  5
+ (1,0) (1,1) | (1,2) (1,3)           2  3 |  6  7
+ ------------+------------          ------+------
+ (2,0) (2,1) | (2,2) (2,3)           8  9 | 12 13
+ (3,0) (3,1) | (3,2) (3,3)          10 11 | 14 15
+```
+
+In torch, this layout is a `view` to 10 dimensions, a `permute`, and a copy: the image is written once in `(C, H, W)`,
+then read and written again in patch order. The kernel computes the place of each value and writes it there once.
+Pixel (20, 33) of channel `c`, with patch 14, block 2, 4 patches per row, `C = 3` and `T = 2`:
+
+```
+patch row, column      20 // 14 = 1      33 // 14 = 2
+block row, column      1 // 2 = 0        2 // 2 = 1        2 blocks per row
+patch                  ((0 * 2 + 1) * 2 + 1 % 2) * 2 + 2 % 2 = 6
+inside the patch       (20 % 14) * 14 + 33 % 14 = 89
+pixel_values index     6 * (C * T * 14 * 14) + (c * T + t) * 14 * 14 + 89,  for t = 0 and t = 1
+```
+
+Each patch row holds `C x T x patch x patch` values, where `T` is `temporal_patch_size`. Frame `f` of a video goes to
+temporal group `f // T`, at slot `f % T`. An image is one frame, so the kernel writes each value `T` times instead of
+repeating the image first. When a video has a frame count that is not a multiple of `T`, the last frame fills the
+remaining slots. The kernel returns `grid_thw` as an int64 tensor.
+
+### `connected_component_areas`
+
+`cc_2d` labels 8-connected components but needs an even height and width. `connected_component_areas` pads the mask
+with background to even sizes, runs `cc_2d` with counts, and crops the areas back to the input size.
+
+### `upsample_argmax`
+
+Semantic segmentation models predict logits at a low resolution, for example 150 classes at 128x128. The class map is
+`interpolate(logits, size=(H, W), mode="bilinear").argmax(0)`. In torch, that stores every class at full size before
+the argmax: 150 x 480 x 640 float32 values, or 184 MB for one photo. The kernel computes each output pixel from 4
+logits per class and keeps only the best class. It writes one int64 per pixel, which is 2.4 MB for the same photo.
+
+One output pixel, 2x2 logits upsampled to 4x4, output pixel `(1, 2)`:
+
+```
+source position:  row = (1 + 0.5) * 2/4 - 0.5 = 0.25      column = (2 + 0.5) * 2/4 - 0.5 = 0.75
+
+weights of the 4 neighbors          class 0 logits        class 1 logits
+   (1-0.25)(1-0.75)  (1-0.25)(0.75)     2    0                0    1
+   (0.25)(1-0.75)    (0.25)(0.75)       1    3                2    1
+ = 0.1875   0.5625
+   0.0625   0.1875
+
+class 0: 0.1875*2 + 0.5625*0 + 0.0625*1 + 0.1875*3 = 1.000   <- best so far, class 0
+class 1: 0.1875*0 + 0.5625*1 + 0.0625*2 + 0.1875*1 = 0.875      not better, keep class 0
+```
+
+The loop over classes keeps only the best value and its class. The upsampled logits are never stored. When both sides
+grow at least 2x, a program computes a 32x64 output tile for each class as `row_weights @ patch @ column_weights`
+on tensor cores, where `patch` is the block of logits under the tile.
+
+A batch has one output size per image. The work is cut into tiles of output pixels: 256 pixels, or 32x64 on tensor
+cores. All tiles of all images go to one launch. For example, with images of 4, 2 and 3 tiles:
+
+```
+tiles of the launch       0  1  2  3 | 4  5 | 6  7  8
+image                     0  0  0  0 | 1  1 | 2  2  2
+last tile + 1 per image            4 |    6 |       9
+
+program 7: images whose tiles end at or before 7 -> 2 (ends 4 and 6) -> image 2
+           first tile of image 2 is 6            -> tile 1 of image 2
+```
+
+The table of tile ends and the output sizes and offsets of each image are copied once and cached per batch layout.
+When all images have the same output size, as with one image, there is no table: the launch grid has one row per
+image and the output size is a kernel argument.
+
+A photo of 480x640 is 150 tiles on tensor cores, fewer than one wave on an A100. With one launch per image, most of
+the GPU waits at the end of each launch. With one launch per batch, the tiles of the next image fill it.
+
+A100, real logits, 16 COCO photos of different sizes, median ms:
+
+| model | one launch per image | one launch per batch | speedup |
+|---|---|---|---|
+| SegFormer ADE20K (150 classes) | 1.36 | 0.86 | 1.58x |
+| RF-DETR-Seg large (91 classes) | 0.83 | 0.43 | 1.92x |
+| SegFormer Cityscapes (19 classes) | 0.74 | 0.46 | 1.63x |
+| Mask2Former ADE20K (float32 path) | 2.71 | 2.03 | 1.34x |
+
+Batches with one output size run at the same speed as before.
+
+## Limitations
+
+- `upsample_argmax` runs on tensor cores in float16 when both sides are upsampled at least 2x. Then a few pixels
+  at near-ties between two classes can get another class than in float32 (about 1e-4 of pixels on ADE20K, with no
+  change in mIoU). Smaller upsampling factors run in float32.
+- Inputs are uint8 `(C, H, W)` tensors on one CUDA device, with the same channel count.
+- Bilinear and bicubic only. The output is float32.
+- `resize_normalize` takes the resized size of each image from the caller, and an optional crop no larger than
+  any of them. It returns one `(C, H, W)` tensor per image.
+- `resize_normalize_patchify` needs target sizes that are multiples of `patch_size * block_size`.
+- With `round_to_uint8=True`, results can differ from torch by one uint8 level where a value falls on a rounding
+  boundary.
+- The metadata of a batch layout is cached, up to 1024 layouts. The key is the tuple of all sizes in the batch, so a
+  batch of photos with different sizes almost never hits the cache. A miss costs one extra copy to the device, plus
+  one extra launch for the resize. Measured on an A100:
+
+  | call | known layout | new layout | reference |
+  |---|---|---|---|
+  | `resize_normalize`, 32 photos of different sizes | 0.73 ms | 0.78 ms | torchvision 6.3 ms |
+  | `resize_normalize`, 1 photo | 0.16 ms | 0.49 ms | torchvision 0.43 ms |
+  | `upsample_argmax`, 16 photos of different sizes | 0.86 ms | 1.14 ms | one launch per image 1.36 ms |
+  | `upsample_argmax`, 1 image | 0.13 ms | 0.15 ms | one launch per image 0.13 ms |
+
+  At batch 1 with a new size on every call, `resize_normalize` is about 13% slower than torchvision. `upsample_argmax`
+  keeps no device metadata when all output sizes are equal, so a new size there adds only about 0.02 ms on the CPU.
