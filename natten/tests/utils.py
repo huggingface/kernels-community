@@ -24,12 +24,20 @@
 import time
 from typing import Optional, Tuple, Union
 
+import kernels
 import torch
-from natten.backends.reference import reference_fna_generic
-from natten.functional import neighborhood_attention_generic
-from natten.types import CausalArgType, DimensionType, KernelSchedule
-from natten.utils import log
-from natten.utils.checks import check_all_args
+
+natten = kernels.get_kernel("shi-labs/natten", version=1)
+
+reference_fna_generic = natten._private_for_testing.reference.reference_fna_generic
+neighborhood_attention_generic = (
+    natten._private_for_testing.functional.neighborhood_attention_generic
+)
+CausalArgType = natten._private_for_testing._types.CausalArgType
+DimensionType = natten._private_for_testing._types.DimensionType
+KernelSchedule = natten._private_for_testing._types.KernelSchedule
+log = natten._private_for_testing.log
+check_all_args = natten._private_for_testing.checks.check_all_args
 
 logger = log.get_logger("natten_tests")
 

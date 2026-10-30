@@ -1,7 +1,12 @@
+import kernels
 import torch
 import pytest
 
-from quantization_bitsandbytes import gemm_4bit_forward
+quantization_bitsandbytes = kernels.get_kernel(
+    "kernels-community/quantization-bitsandbytes", version=1
+)
+
+gemm_4bit_forward = quantization_bitsandbytes.gemm_4bit_forward
  
  
 _NF4_QUANT_TABLE = torch.tensor(

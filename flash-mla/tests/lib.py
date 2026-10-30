@@ -6,9 +6,13 @@ import random
 
 import torch
 import kernelkit as kk
-# import flash_mla
-from kernels import get_kernel, get_local_kernel
-flash_mla = get_kernel("drbh/tmp-kernel-123")
+import kernels
+
+# The kernel is only built for sm90/sm100; tests that launch kernels are gated on
+# the device capability, so skip the device-architecture check at load time.
+flash_mla = kernels.get_kernel(
+    "kernels-community/flash-mla", version=1, check_arch=False
+)
 
 import quant
 

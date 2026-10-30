@@ -4,10 +4,13 @@
 # `flash_attn.layers.rotary` module, which we do not vendor. Here we test the
 # vendored Triton kernel directly against a pure-PyTorch reference.
 
+import kernels
 import pytest
 import torch
 
-from flash_attn_ops import apply_rotary
+flash_attn_ops = kernels.get_kernel("kernels-community/flash-attn-ops", version=1)
+
+apply_rotary = flash_attn_ops.apply_rotary
 
 
 def rotary_ref(x, cos, sin, interleaved=False):

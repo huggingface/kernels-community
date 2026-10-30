@@ -24,11 +24,20 @@
 import random
 import unittest
 
+import kernels
 import torch
-from natten.token_permute import token_permute_operation, token_unpermute_operation
-from natten.utils.testing import skip_if_cuda_is_not_supported, supports_float16
 
 from .utils import logger
+
+natten = kernels.get_kernel("shi-labs/natten", version=1)
+
+token_permute_operation = natten._private_for_testing.token_permute.token_permute_operation
+token_unpermute_operation = (
+    natten._private_for_testing.token_permute.token_unpermute_operation
+)
+testing = natten._private_for_testing.testing
+skip_if_cuda_is_not_supported = testing.skip_if_cuda_is_not_supported
+supports_float16 = testing.supports_float16
 
 
 def _reset_everything(random_seed: int = 42, torch_seed: int = 42):

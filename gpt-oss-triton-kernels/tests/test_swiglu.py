@@ -1,8 +1,17 @@
-from triton_kernels.routing import routing_torch
-from triton_kernels.swiglu import swiglu, swiglu_torch, PrecisionConfig
-from triton_kernels.testing import assert_close
 import torch
 import pytest
+
+import kernels
+
+triton_kernels = kernels.get_kernel("kernels-community/gpt-oss-triton-kernels", version=1)
+
+_private = triton_kernels._private_for_testing
+
+routing_torch = _private.routing.routing_torch
+swiglu = _private.swiglu.swiglu
+swiglu_torch = _private.swiglu.swiglu_torch
+PrecisionConfig = _private.swiglu.PrecisionConfig
+assert_close = _private.testing.assert_close
 
 from .test_routing import init_data as init_routing_data
 
