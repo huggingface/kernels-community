@@ -48,6 +48,7 @@ def _vertical_patchify_kernel(
     PATCH: tl.constexpr,
     PATCH_BLOCK: tl.constexpr,
     TEMPORAL: tl.constexpr,
+    TRIM_ROWS: tl.constexpr,
 ):
     """Second pass of `resize_normalize_patchify`: like `_vertical_kernel`, but writes each value at its place in
     the patch layout. The last frame of an input is repeated to fill its last temporal patch."""
@@ -94,7 +95,10 @@ def _vertical_patchify_kernel(
         total = tl.zeros([BLOCK_ROWS, BLOCK_COLUMNS], dtype=tl.float32)
         for tap in range(taps):
             weight = tl.load(weights + tap, mask=row_active, other=0)
-            index = tl.minimum(tl.maximum(first_tap + tap, row_start), row_start + used_height - 1) - row_start
+            if TRIM_ROWS:
+                index = tl.minimum(tl.maximum(first_tap + tap, row_start), row_start + used_height - 1) - row_start
+            else:
+                index = tl.minimum(tl.maximum(first_tap + tap, 0), used_height - 1)
             pixels = tl.load(source + index.to(tl.int64)[:, None] * row_stride, mask=active, other=0)
             total += weight[:, None] * pixels.to(tl.float32)
         total = (_round(total, ROUND_TO_UINT8) - tl.load(means + channel)) / tl.load(stds + channel)
@@ -200,5 +204,6 @@ def resize_normalize_patchify(
             PATCH=patch_size,
             PATCH_BLOCK=block_size,
             TEMPORAL=temporal_patch_size,
+            TRIM_ROWS=plan["trim_rows"],
         )
     return output, torch.tensor(plan["grid_thw"], dtype=torch.int64)

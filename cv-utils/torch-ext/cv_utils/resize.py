@@ -103,6 +103,7 @@ def _horizontal_kernel(
     ANTIALIAS: tl.constexpr,
     ROUND_TO_UINT8: tl.constexpr,
     FRAME_POINTERS: tl.constexpr,
+    TRIM_ROWS: tl.constexpr,
 ):
     """First pass: resizes the width of the rows of every frame that the second pass reads into `intermediate`, one
     tile of channel rows per program."""
@@ -128,8 +129,10 @@ def _horizontal_kernel(
         source = tl.load(frames + frame).to(tl.pointer_type(tl.uint8))
     else:
         source = frames + frame.to(tl.int64) * CHANNELS * height * width
-    source_rows = rows // used_height * height + tl.load(row_starts + frame) + rows % used_height
-    source += source_rows[:, None] * width
+    if TRIM_ROWS:
+        source += (rows // used_height * height + tl.load(row_starts + frame) + rows % used_height)[:, None] * width
+    else:
+        source += rows[:, None] * width
     total = tl.zeros([BLOCK_ROWS, BLOCK_COLUMNS], dtype=tl.float32)
     for tap in range(taps):
         weight = tl.load(weights + tap, mask=column_active, other=0)
@@ -165,6 +168,7 @@ def _vertical_kernel(
     ROUND_TO_UINT8: tl.constexpr,
     ALIGNED: tl.constexpr,
     OUTPUT_ALIGNED: tl.constexpr,
+    TRIM_ROWS: tl.constexpr,
     ALIGNMENT: tl.constexpr,
 ):
     """Second pass: resizes the height of `intermediate`, then rescales, normalizes and writes `(C, H, W)` outputs."""
@@ -200,7 +204,10 @@ def _vertical_kernel(
         total = tl.zeros([BLOCK_ROWS, BLOCK_COLUMNS], dtype=tl.float32)
         for tap in range(taps):
             weight = tl.load(weights + tap, mask=row_active, other=0)
-            index = tl.minimum(tl.maximum(first_tap + tap, row_start), row_start + used_height - 1) - row_start
+            if TRIM_ROWS:
+                index = tl.minimum(tl.maximum(first_tap + tap, row_start), row_start + used_height - 1) - row_start
+            else:
+                index = tl.minimum(tl.maximum(first_tap + tap, 0), used_height - 1)
             pixels = tl.load(source + index.to(tl.int64)[:, None] * row_stride, mask=active, other=0)
             total += weight[:, None] * pixels.to(tl.float32)
         total = (_round(total, ROUND_TO_UINT8) - tl.load(means + channel)) / tl.load(stds + channel)
@@ -428,6 +435,7 @@ def _plan_passes(
         "vertical_lists": vertical_list_tensors,
         "aligned": all(value % ROW_ALIGNMENT == 0 for value in row_strides + intermediate_offsets),
         "uniform_output": len(set(out_sizes)) == 1,
+        "trim_rows": used_heights != heights,
     }
 
 
@@ -463,6 +471,7 @@ def _horizontal_pass(sources, plan, channels, cubic, antialias, round_to_uint8):
             ANTIALIAS=antialias,
             ROUND_TO_UINT8=round_to_uint8,
             FRAME_POINTERS=len(sources) > 1,
+            TRIM_ROWS=plan["trim_rows"],
             num_warps=HORIZONTAL_WARPS,
         )
     return intermediate
@@ -554,6 +563,7 @@ def resize_normalize(
             ROUND_TO_UINT8=round_to_uint8,
             ALIGNED=plan["aligned"],
             OUTPUT_ALIGNED=plan["output_aligned"],
+            TRIM_ROWS=plan["trim_rows"],
             ALIGNMENT=ROW_ALIGNMENT,
         )
     if plan["uniform_output"]:
