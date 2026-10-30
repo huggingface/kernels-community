@@ -1,11 +1,15 @@
-"""Shared test helpers: quantized-weight constructors and dequant references.
+"""Shared test helpers: quantized-weight constructors and dequant references."""
 
-The ``finegrained_fp8`` package is on ``sys.path`` via ``conftest.py`` (pytest
-auto-loads it before any test module)."""
-
+import kernels
 import torch
 
-from finegrained_fp8.utils import MX_SCALE_GROUP_K, NIBBLES_PER_BYTE  # type: ignore
+finegrained_fp8 = kernels.get_kernel("kernels-community/finegrained-fp8", version=4)
+
+# the internal modules the tests reach into
+internals = finegrained_fp8._private_for_testing
+
+MX_SCALE_GROUP_K = internals.utils.MX_SCALE_GROUP_K
+NIBBLES_PER_BYTE = internals.utils.NIBBLES_PER_BYTE
 
 
 # ── Device + capability ───────────────────────────────────────────────────────

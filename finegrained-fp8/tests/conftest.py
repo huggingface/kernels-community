@@ -1,13 +1,9 @@
-"""Auto-loaded by pytest before any test module imports — adds the package's
-``torch-ext`` source dir to ``sys.path`` so the suite runs without an install
-step, then gates the whole suite on FP8 hardware support."""
+"""Auto-loaded by pytest before any test module imports — gates the whole
+suite on FP8 hardware support."""
 
-import sys
-from pathlib import Path
+import pytest
 
-import pytest  # noqa: E402
-
-from utils import SUPPORTS_FP8  # type: ignore  # noqa: E402
+from utils import SUPPORTS_FP8  # type: ignore
 
 
 def pytest_collection_modifyitems(config, items):

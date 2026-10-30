@@ -24,14 +24,22 @@ import types
 from contextlib import contextmanager
 from typing import Optional
 
+import kernels
 import pytest
 import torch
 
-import msa.interface as sparse_interface
-from msa.interface import sparse_atten_func, sparse_atten_nvfp4_kv_func
-from msa.sparse_index_utils import build_k2q_csr, build_k2q_csr_torch_reference
-from msa.src.sm100.prepare_scheduler import (
-    prepare_sparse_fwd_schedule_and_split,
+# The kernel is only built for sm100; the whole module is gated on an SM100-class
+# device below, so skip the device-architecture check at load time.
+msa = kernels.get_kernel("MiniMaxAI/msa", version=0, check_arch=False)
+
+sparse_interface = msa._private_for_testing.interface
+sparse_atten_func = sparse_interface.sparse_atten_func
+sparse_atten_nvfp4_kv_func = sparse_interface.sparse_atten_nvfp4_kv_func
+_sparse_index_utils = msa._private_for_testing.sparse_index_utils
+build_k2q_csr = _sparse_index_utils.build_k2q_csr
+build_k2q_csr_torch_reference = _sparse_index_utils.build_k2q_csr_torch_reference
+prepare_sparse_fwd_schedule_and_split = (
+    msa._private_for_testing.prepare_scheduler.prepare_sparse_fwd_schedule_and_split
 )
 
 # The Triton reference backend was removed for the open-source release.
@@ -39,7 +47,10 @@ from msa.src.sm100.prepare_scheduler import (
 TRITON_REFERENCE_AVAILABLE = False
 
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="SM100-class CUDA device required",
+)
 
 DEFAULT_B = 1
 DEFAULT_SQ = 32768
@@ -442,7 +453,7 @@ def _make_synthetic_nvfp4_tensor(
 ) -> object:
     """Create deterministic packed NVFP4 data with unit block/global scales."""
 
-    from msa.quantize import Nvfp4QuantizedTensor
+    Nvfp4QuantizedTensor = msa.Nvfp4QuantizedTensor
 
     if shape[-1] % 16 != 0:
         raise ValueError("NVFP4 synthetic shape requires D divisible by 16")
@@ -480,7 +491,7 @@ def _make_synthetic_nvfp4_tensor(
 
 def _quantize_bf16_to_nvfp4_or_skip(x: torch.Tensor) -> object:
     _install_flash_attn3_stub_for_te_import()
-    from msa.quantize import quantize_bf16_to_nvfp4_128x4
+    quantize_bf16_to_nvfp4_128x4 = msa.quantize_bf16_to_nvfp4_128x4
 
     try:
         return quantize_bf16_to_nvfp4_128x4(x)
@@ -489,7 +500,7 @@ def _quantize_bf16_to_nvfp4_or_skip(x: torch.Tensor) -> object:
 
 
 def _dequant_nvfp4_to_bf16(qx: object, *, include_global_scale: bool = True) -> torch.Tensor:
-    from msa.quantize import dequantize_nvfp4_128x4_to_bf16
+    dequantize_nvfp4_128x4_to_bf16 = msa.dequantize_nvfp4_128x4_to_bf16
 
     return dequantize_nvfp4_128x4_to_bf16(
         qx,

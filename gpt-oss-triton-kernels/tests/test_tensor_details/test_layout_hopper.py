@@ -1,14 +1,25 @@
 import pytest
 from triton._internal_testing import is_cuda
-from triton_kernels.tensor import wrap_torch_tensor, convert_layout, FP4
-from triton_kernels.tensor_details.layout import HopperMXScaleLayout, HopperMXValueLayout
-from triton_kernels.numerics_details.mxfp import downcast_to_mxfp, upcast_from_mxfp
-from triton_kernels.tensor_details.layout_details.hopper_value import mxfp4_to_bf16_triton
-from triton_kernels.tensor_details.layout_details.hopper_scale import unswizzle_mxfp4_scale_hopper
-from triton_kernels.target_info import cuda_capability_geq
 import triton.language as tl
 import triton
 import torch
+
+import kernels
+
+triton_kernels = kernels.get_kernel("kernels-community/gpt-oss-triton-kernels", version=1)
+
+_private = triton_kernels._private_for_testing
+
+wrap_torch_tensor = _private.tensor.wrap_torch_tensor
+convert_layout = _private.tensor.convert_layout
+FP4 = _private.tensor.FP4
+HopperMXScaleLayout = _private.layout.HopperMXScaleLayout
+HopperMXValueLayout = _private.layout.HopperMXValueLayout
+downcast_to_mxfp = _private.mxfp.downcast_to_mxfp
+upcast_from_mxfp = _private.mxfp.upcast_from_mxfp
+mxfp4_to_bf16_triton = _private.hopper_value.mxfp4_to_bf16_triton
+unswizzle_mxfp4_scale_hopper = _private.hopper_scale.unswizzle_mxfp4_scale_hopper
+cuda_capability_geq = _private.target_info.cuda_capability_geq
 
 # ------------------------------------------------------------
 # Torch tests

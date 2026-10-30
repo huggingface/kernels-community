@@ -1,15 +1,18 @@
 from typing import List, Tuple
 
+import kernels
 import pytest
 import torch
 
-from punica_sgmv import (
-    get_tmp_tensors,
-    lora_a_sgmv_cutlass,
-    lora_b_sgmv_cutlass,
-    pad_rank,
-    use_cutlass_shrink,
-)
+punica_sgmv = kernels.get_kernel("kernels-community/punica-sgmv", version=1)
+
+pytestmark = pytest.mark.kernels_ci
+
+get_tmp_tensors = punica_sgmv.get_tmp_tensors
+lora_a_sgmv_cutlass = punica_sgmv.lora_a_sgmv_cutlass
+lora_b_sgmv_cutlass = punica_sgmv.lora_b_sgmv_cutlass
+pad_rank = punica_sgmv.pad_rank
+use_cutlass_shrink = punica_sgmv.use_cutlass_shrink
 
 
 def lora_ref_impl(

@@ -5,22 +5,50 @@ import pytest
 import torch
 from typing import Union
 import triton
+import kernels
+
+triton_kernels = kernels.get_kernel("kernels-community/gpt-oss-triton-kernels", version=1)
+
+_private = triton_kernels._private_for_testing
+
 # routing utilities
-from triton_kernels.routing import routing
+routing = _private.routing.routing
 # matmul utilities
-import triton_kernels.matmul_ogs_details.opt_flags as opt_flags
-from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig, FusedActivation, FnSpecs, FnName, Epilogue
-from triton_kernels.matmul_ogs import matmul_ogs_set_idle_sms, matmul_ogs, matmul_ogs_torch
-from triton_kernels.swiglu import swiglu, swiglu_fn, PrecisionConfig as SwiGLUPrecisionConfig
-from triton_kernels.tensor import convert_layout, wrap_torch_tensor, FP4
-from triton_kernels.tensor_details import layout
+opt_flags = _private.opt_flags
+FlexCtx = _private.matmul_ogs.FlexCtx
+PrecisionConfig = _private.matmul_ogs.PrecisionConfig
+FusedActivation = _private.matmul_ogs.FusedActivation
+FnSpecs = _private.matmul_ogs.FnSpecs
+FnName = _private.matmul_ogs.FnName
+Epilogue = _private.matmul_ogs.Epilogue
+matmul_ogs_set_idle_sms = _private.matmul_ogs.matmul_ogs_set_idle_sms
+matmul_ogs = _private.matmul_ogs.matmul_ogs
+matmul_ogs_torch = _private.matmul_ogs.matmul_ogs_torch
+swiglu = _private.swiglu.swiglu
+swiglu_fn = _private.swiglu.swiglu_fn
+SwiGLUPrecisionConfig = _private.swiglu.PrecisionConfig
+convert_layout = _private.tensor.convert_layout
+wrap_torch_tensor = _private.tensor.wrap_torch_tensor
+FP4 = _private.tensor.FP4
+layout = _private.layout
 # numerics utilities
-from triton_kernels.numerics import InFlexData, OutFlexData
-from triton_kernels.numerics_details.mxfp import downcast_to_mxfp, upcast_from_mxfp, dequantize_mxfp8_fn, downcast_to_mxfp_torch, upcast_from_mxfp_torch, MXFP_BLOCK_SIZE
+InFlexData = _private.numerics.InFlexData
+OutFlexData = _private.numerics.OutFlexData
+downcast_to_mxfp = _private.mxfp.downcast_to_mxfp
+upcast_from_mxfp = _private.mxfp.upcast_from_mxfp
+dequantize_mxfp8_fn = _private.mxfp.dequantize_mxfp8_fn
+downcast_to_mxfp_torch = _private.mxfp.downcast_to_mxfp_torch
+upcast_from_mxfp_torch = _private.mxfp.upcast_from_mxfp_torch
+MXFP_BLOCK_SIZE = _private.mxfp.MXFP_BLOCK_SIZE
 # testing utilities
-from triton_kernels.testing import assert_close, compute_actual_scale
+assert_close = _private.testing.assert_close
+compute_actual_scale = _private.testing.compute_actual_scale
 # target-specific utilities
-from triton_kernels.target_info import is_hip, is_xpu, is_hip_cdna3, is_cuda, is_hip_cdna4
+is_hip = _private.target_info.is_hip
+is_xpu = _private.target_info.is_xpu
+is_hip_cdna3 = _private.target_info.is_hip_cdna3
+is_cuda = _private.target_info.is_cuda
+is_hip_cdna4 = _private.target_info.is_hip_cdna4
 
 # ---------------
 # initialize data
@@ -500,7 +528,7 @@ def test_op(m, n, k, split_k, do_gather, do_scatter, fused_scatter, has_y_gammas
 def test_set_idle_sms():
     if not is_cuda():
         pytest.skip("Only supported on CUDA")
-    from triton_kernels.matmul_ogs_details.opt_flags import make_opt_flags
+    make_opt_flags = opt_flags.make_opt_flags
     num_idle_sms = 24
     matmul_ogs_set_idle_sms(num_idle_sms)
     flags = make_opt_flags(torch.float32, torch.float32, torch.float32, PrecisionConfig(), \

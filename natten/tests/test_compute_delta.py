@@ -25,14 +25,17 @@ import random
 import unittest
 
 import torch
-from natten._libnatten import compute_delta  # type: ignore
-from natten.utils.testing import (
-    skip_if_libnatten_is_not_supported,
-    supports_bfloat16,
-    supports_float16,
-)
+import kernels
 
 from .utils import logger
+
+natten = kernels.get_kernel("shi-labs/natten", version=1)
+
+compute_delta = natten._private_for_testing._libnatten.compute_delta
+testing = natten._private_for_testing.testing
+skip_if_libnatten_is_not_supported = testing.skip_if_libnatten_is_not_supported
+supports_bfloat16 = testing.supports_bfloat16
+supports_float16 = testing.supports_float16
 
 
 def _reset_everything(random_seed: int = 42, torch_seed: int = 42):

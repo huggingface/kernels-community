@@ -38,9 +38,13 @@ from .quantize import (
     swizzle_nvfp4_scale_to_128x4,
 )
 
+# Internal modules for the test suite; not public API.
+from . import _private_for_testing  # noqa: F401
+
 __version__ = "0.1.1"
 
 __all__ = [
+    "_private_for_testing",
     # attention
     "sparse_atten_func",
     "sparse_atten_nvfp4_kv_func",

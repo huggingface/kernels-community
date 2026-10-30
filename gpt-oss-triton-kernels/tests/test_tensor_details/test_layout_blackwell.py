@@ -1,6 +1,11 @@
 import pytest
 import torch
-from triton_kernels.tensor_details.layout import BlackwellMXScaleLayout
+
+import kernels
+
+triton_kernels = kernels.get_kernel("kernels-community/gpt-oss-triton-kernels", version=1)
+
+BlackwellMXScaleLayout = triton_kernels._private_for_testing.layout.BlackwellMXScaleLayout
 
 # ------------------------------------------------------------
 # Torch tests

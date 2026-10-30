@@ -1,9 +1,13 @@
 # Copyright (c) 2024, Tri Dao.
 
+import kernels
 import pytest
 import torch
 import torch.nn.functional as F
-from flash_attn_ops import CrossEntropyLoss
+
+flash_attn_ops = kernels.get_kernel("kernels-community/flash-attn-ops", version=1)
+
+CrossEntropyLoss = flash_attn_ops.CrossEntropyLoss
 
 is_sm8x = torch.cuda.get_device_capability("cuda")[0] >= 8
 
