@@ -178,9 +178,7 @@ def resize_normalize_patchify(
         cubic,
         antialias,
     )
-    same_shape = len(inputs) > 1 and all(frames.shape == inputs[0].shape for frames in inputs)
-    sources = [torch.cat(inputs)] if same_shape else inputs
-    intermediate = _horizontal_pass(sources, plan, channels, cubic, antialias, round_to_uint8)
+    intermediate = _horizontal_pass(inputs, plan, channels, cubic, antialias, round_to_uint8)
     output = torch.empty(plan["patches"], device=device, dtype=torch.float32)
     block_rows, block_columns = plan["vertical_tile"]
     with torch.cuda.device(device):
