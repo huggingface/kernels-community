@@ -518,12 +518,7 @@ def resize_normalize(
     if crop_size is not None and any(crop_size[0] > height or crop_size[1] > width for height, width in sizes):
         raise ValueError(f"crop_size {crop_size} is larger than a resized image.")
     _check_frames(images, 3)
-    if all(image.shape == images[0].shape for image in images):
-        image_sizes = (tuple(images[0].shape[1:]),) * len(images)
-        sources = [images[0] if len(images) == 1 else torch.stack(images)]
-    else:
-        image_sizes = tuple(tuple(image.shape[1:]) for image in images)
-        sources = images
+    image_sizes = tuple(tuple(image.shape[1:]) for image in images)
     cubic = resample == "bicubic"
     device = images[0].device
     channels = images[0].shape[0]
@@ -537,7 +532,7 @@ def resize_normalize(
         cubic,
         antialias,
     )
-    intermediate = _horizontal_pass(sources, plan, channels, cubic, antialias, round_to_uint8)
+    intermediate = _horizontal_pass(images, plan, channels, cubic, antialias, round_to_uint8)
     if plan["uniform_output"]:
         output = torch.empty((len(images), channels, *plan["out_sizes"][0]), device=device, dtype=torch.float32)
     else:
