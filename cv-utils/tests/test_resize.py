@@ -43,7 +43,15 @@ def shortest_edge_size(height, width, shortest_edge):
 @pytest.mark.parametrize("antialias", [True, False])
 @pytest.mark.parametrize("resample", ["bilinear", "bicubic"])
 @pytest.mark.parametrize(
-    "shortest_edge, crop_size", [(None, None), (None, (224, 224)), (256, (224, 224)), (256, None)]
+    "shortest_edge, crop_size",
+    [
+        (None, None),
+        (None, (224, 224)),
+        (None, (37, 50)),
+        (256, (224, 224)),
+        (256, (37, 50)),
+        (256, None),
+    ],
 )
 def test_resize_normalize_matches_interpolate(antialias, resample, shortest_edge, crop_size):
     images = random_images([(480, 640), (300, 300), (1024, 768)])

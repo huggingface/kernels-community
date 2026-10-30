@@ -89,6 +89,8 @@ def _horizontal_kernel(
     intermediate_offsets,
     row_strides,
     heights,
+    row_starts,
+    used_heights,
     widths,
     resize_widths,
     out_widths,
@@ -102,9 +104,11 @@ def _horizontal_kernel(
     ROUND_TO_UINT8: tl.constexpr,
     FRAME_POINTERS: tl.constexpr,
 ):
-    """First pass: resizes the width of every frame into `intermediate`, one tile of channel rows per program."""
+    """First pass: resizes the width of the rows of every frame that the second pass reads into `intermediate`, one
+    tile of channel rows per program."""
     frame = tl.program_id(0)
-    plane_rows = CHANNELS * tl.load(heights + frame).to(tl.int32)
+    used_height = tl.load(used_heights + frame).to(tl.int32)
+    plane_rows = CHANNELS * used_height
     out_width = tl.load(out_widths + frame).to(tl.int32)
     first_row = tl.program_id(1) * BLOCK_ROWS
     first_column = tl.program_id(2) * BLOCK_COLUMNS
@@ -119,11 +123,13 @@ def _horizontal_kernel(
     weights = tl.load(weight_pointers + frame).to(tl.pointer_type(tl.float32)) + columns * taps
     first_taps = tl.load(first_tap_pointers + frame).to(tl.pointer_type(tl.int32))
     first_tap = tl.load(first_taps + columns, mask=column_active, other=0)
+    height = tl.load(heights + frame).to(tl.int32)
     if FRAME_POINTERS:
         source = tl.load(frames + frame).to(tl.pointer_type(tl.uint8))
     else:
-        source = frames + frame.to(tl.int64) * plane_rows * width
-    source += rows[:, None] * width
+        source = frames + frame.to(tl.int64) * CHANNELS * height * width
+    source_rows = rows // used_height * height + tl.load(row_starts + frame) + rows % used_height
+    source += source_rows[:, None] * width
     total = tl.zeros([BLOCK_ROWS, BLOCK_COLUMNS], dtype=tl.float32)
     for tap in range(taps):
         weight = tl.load(weights + tap, mask=column_active, other=0)
@@ -141,6 +147,8 @@ def _vertical_kernel(
     intermediate_offsets,
     row_strides,
     heights,
+    row_starts,
+    used_heights,
     resize_heights,
     weight_pointers,
     first_tap_pointers,
@@ -185,13 +193,15 @@ def _vertical_kernel(
     weights = tl.load(weight_pointers + frame).to(tl.pointer_type(tl.float32)) + rows * taps
     first_taps = tl.load(first_tap_pointers + frame).to(tl.pointer_type(tl.int32))
     first_tap = tl.load(first_taps + rows, mask=row_active, other=0)
+    row_start = tl.load(row_starts + frame).to(tl.int32)
+    used_height = tl.load(used_heights + frame).to(tl.int32)
     for channel in tl.static_range(CHANNELS):
-        source = intermediate + intermediate_offset + channel * height.to(tl.int64) * row_stride + columns[None, :]
+        source = intermediate + intermediate_offset + channel * used_height.to(tl.int64) * row_stride + columns[None, :]
         total = tl.zeros([BLOCK_ROWS, BLOCK_COLUMNS], dtype=tl.float32)
         for tap in range(taps):
             weight = tl.load(weights + tap, mask=row_active, other=0)
-            index = tl.minimum(tl.maximum(first_tap + tap, 0), height - 1).to(tl.int64)
-            pixels = tl.load(source + index[:, None] * row_stride, mask=active, other=0)
+            index = tl.minimum(tl.maximum(first_tap + tap, row_start), row_start + used_height - 1) - row_start
+            pixels = tl.load(source + index.to(tl.int64)[:, None] * row_stride, mask=active, other=0)
             total += weight[:, None] * pixels.to(tl.float32)
         total = (_round(total, ROUND_TO_UINT8) - tl.load(means + channel)) / tl.load(stds + channel)
         plane_rows = (channel * out_height + rows).to(tl.int64)
@@ -243,6 +253,24 @@ def _check_frames(frames, ndim):
         )
 
 
+def _read_rows(size, resize_size, crop_start, out_size, cubic, antialias):
+    """First input row and number of input rows that the vertical filter of a frame reads.
+
+    The kernels compute the filter table in float32, which can move a first tap by one row and add 2 taps compared
+    to this float64 computation, so the range is widened by those amounts.
+    """
+    scale = size / resize_size
+    support = (2 if cubic else 1) * (max(scale, 1.0) if antialias else 1.0)
+    taps = math.ceil(support) * 2 + 1
+
+    def first_tap(position):
+        return math.floor(scale * (position + crop_start + 0.5) - support + 0.5)
+
+    start = max(first_tap(0) - 1, 0)
+    end = min(first_tap(out_size - 1) + taps + 2, size - 1)
+    return start, end - start + 1
+
+
 def _plan_passes(
     device, channels, frame_sizes, resize_sizes, crop_starts, out_sizes, cubic, antialias, vertical_lists
 ):
@@ -250,6 +278,8 @@ def _plan_passes(
 
     Each argument list holds one `(height, width)` per frame. The horizontal pass is skipped when no frame changes
     width, and the vertical pass then reads the frames packed in one buffer. Intermediate rows are padded to `ROW_ALIGNMENT` bytes so that the vertical pass can load them aligned.
+    Otherwise the horizontal pass only resizes the rows that the vertical pass reads, which skips the rows that a
+    crop removes.
     `vertical_lists` are int64 lists of the vertical pass, returned as tensors after the pass metadata.
     """
     heights = [height for height, _ in frame_sizes]
@@ -265,9 +295,21 @@ def _plan_passes(
     )
     if skip_horizontal:
         row_strides, intermediate_offsets, intermediate_length = widths, frame_offsets, 0
+        row_starts, used_heights = [0] * len(heights), heights
     else:
+        row_starts, used_heights = map(
+            list,
+            zip(
+                *[
+                    _read_rows(height, resize_height, top, out_height, cubic, antialias)
+                    for height, resize_height, (top, _), out_height in zip(
+                        heights, resize_heights, crop_starts, out_heights
+                    )
+                ]
+            ),
+        )
         row_strides = [-(-out_width // ROW_ALIGNMENT) * ROW_ALIGNMENT for out_width in out_widths]
-        intermediate_lengths = [channels * height * stride for height, stride in zip(heights, row_strides)]
+        intermediate_lengths = [channels * used * stride for used, stride in zip(used_heights, row_strides)]
         intermediate_offsets = list(accumulate([0] + intermediate_lengths[:-1]))
         intermediate_length = sum(intermediate_lengths)
 
@@ -295,6 +337,8 @@ def _plan_passes(
         intermediate_offsets_tensor,
         row_strides_tensor,
         heights_tensor,
+        row_starts_tensor,
+        used_heights_tensor,
         widths_tensor,
         resize_widths_tensor,
         out_widths_tensor,
@@ -310,6 +354,8 @@ def _plan_passes(
         intermediate_offsets,
         row_strides,
         heights,
+        row_starts,
+        used_heights,
         widths,
         resize_widths,
         out_widths,
@@ -341,7 +387,7 @@ def _plan_passes(
         horizontal = (
             (
                 len(frame_sizes),
-                triton.cdiv(channels * max(heights), block_rows),
+                triton.cdiv(channels * max(used_heights), block_rows),
                 triton.cdiv(max(out_widths), block_columns),
             ),
             (block_rows, block_columns),
@@ -349,6 +395,8 @@ def _plan_passes(
                 intermediate_offsets_tensor,
                 row_strides_tensor,
                 heights_tensor,
+                row_starts_tensor,
+                used_heights_tensor,
                 widths_tensor,
                 resize_widths_tensor,
                 out_widths_tensor,
@@ -371,6 +419,8 @@ def _plan_passes(
             intermediate_offsets_tensor,
             row_strides_tensor,
             heights_tensor,
+            row_starts_tensor,
+            used_heights_tensor,
             resize_heights_tensor,
             vertical_weights,
             vertical_first_taps,
