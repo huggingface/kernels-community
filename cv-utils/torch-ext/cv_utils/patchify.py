@@ -25,6 +25,8 @@ def _vertical_patchify_kernel(
     intermediate_offsets,
     row_strides,
     heights,
+    row_starts,
+    used_heights,
     resize_heights,
     weight_pointers,
     first_tap_pointers,
@@ -85,13 +87,15 @@ def _vertical_patchify_kernel(
     weights = tl.load(weight_pointers + frame).to(tl.pointer_type(tl.float32)) + rows * taps
     first_taps = tl.load(first_tap_pointers + frame).to(tl.pointer_type(tl.int32))
     first_tap = tl.load(first_taps + rows, mask=row_active, other=0)
+    row_start = tl.load(row_starts + frame).to(tl.int32)
+    used_height = tl.load(used_heights + frame).to(tl.int32)
     for channel in tl.static_range(CHANNELS):
-        source = intermediate + intermediate_offset + channel * height.to(tl.int64) * row_stride + columns[None, :]
+        source = intermediate + intermediate_offset + channel * used_height.to(tl.int64) * row_stride + columns[None, :]
         total = tl.zeros([BLOCK_ROWS, BLOCK_COLUMNS], dtype=tl.float32)
         for tap in range(taps):
             weight = tl.load(weights + tap, mask=row_active, other=0)
-            index = tl.minimum(tl.maximum(first_tap + tap, 0), height - 1).to(tl.int64)
-            pixels = tl.load(source + index[:, None] * row_stride, mask=active, other=0)
+            index = tl.minimum(tl.maximum(first_tap + tap, row_start), row_start + used_height - 1) - row_start
+            pixels = tl.load(source + index.to(tl.int64)[:, None] * row_stride, mask=active, other=0)
             total += weight[:, None] * pixels.to(tl.float32)
         total = (_round(total, ROUND_TO_UINT8) - tl.load(means + channel)) / tl.load(stds + channel)
         for temporal in tl.static_range(TEMPORAL):
