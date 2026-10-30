@@ -57,6 +57,7 @@
   "topk": ["U0586KAH2E9"],
   "trimul-gpumode": [],
   "triton-kernels": [],
+  "uccl": [],
   "vllm-flash-attn3": [],
   "vllm-moe": [],
   "yoso": [],
