@@ -1,7 +1,7 @@
 {
   description = "Flake for Torch kernel extension";
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/torch-2.15.0-final";
+    kernel-builder.url = "github:huggingface/kernels/flatten-before-kernel-flake";
   };
   outputs =
     { self, kernel-builder }:
@@ -12,10 +12,6 @@
       # This is a workaround, we should be able to specify flags per arch in
       # kernel-builder.
       torchVersions =
-        allVersions:
-        builtins.map (
-          version:
-          version // { systems = builtins.filter (system: system == "x86_64-linux") version.systems; }
-        ) allVersions;
+        allVersions: builtins.filter (version: version.system == "x86_64-linux") allVersions;
     };
 }
