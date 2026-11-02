@@ -1,0 +1,12 @@
+[general]
+name = "tokenspeed-attention"
+version = 1
+license = "MIT"
+backends = ["cuda", "rocm"]
+
+[general.hub]
+repo-id = "kernels-community/tokenspeed-attention"
+
+[torch-noarch]
+
+[kernel]
