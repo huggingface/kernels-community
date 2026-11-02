@@ -2,7 +2,7 @@
   description = "Flake for sonic-moe kernels";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/torch-2.15.0-final";
+    kernel-builder.url = "github:huggingface/kernels/flatten-before-kernel-flake";
   };
 
   outputs =
@@ -19,11 +19,7 @@
       # aarch64 in the meanwhile. Since this is a noarch kernel, the
       # resulting build will work on aarch64 as well.
       torchVersions =
-        allVersions:
-        builtins.map (
-          version:
-          version // { systems = builtins.filter (system: system == "x86_64-linux") version.systems; }
-        ) allVersions;
+        allVersions: builtins.filter (version: version.system == "x86_64-linux") allVersions;
 
     };
 }
