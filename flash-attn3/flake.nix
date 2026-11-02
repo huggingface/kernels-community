@@ -39,25 +39,16 @@
             };
           };
         in
-        builtins.concatMap (
+        builtins.map (
           version:
-          builtins.map (
-            system:
-            let
-              exceptions = ptxasExceptions.${system} or { };
-              cudaVersion = version.cudaVersion or null;
-            in
+          let
+            exceptions = ptxasExceptions.${version.system} or { };
+            cudaVersion = version.cudaVersion or null;
+          in
+          if cudaVersion != null && exceptions ? ${cudaVersion} then
+            version // { ptxasVersion = exceptions.${cudaVersion}; }
+          else
             version
-            // {
-              systems = [ system ];
-            }
-            // (
-              if cudaVersion != null && exceptions ? ${cudaVersion} then
-                { ptxasVersion = exceptions.${cudaVersion}; }
-              else
-                { }
-            )
-          ) version.systems
         ) allVersions;
 
     };
