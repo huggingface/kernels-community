@@ -2,7 +2,7 @@
   description = "Flake for flash-attn kernel";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/torch-2.15.0-final";
+    kernel-builder.url = "github:huggingface/kernels/flatten-before-kernel-flake";
   };
 
   outputs =
@@ -21,16 +21,12 @@
 
       torchVersions =
         allVersions:
-        let
-          # For CPU builds, only x86_64-linux is currently supported.
-          supported = version: system: !(version ? "cpu") || system == "x86_64-linux";
-          filteredSystems = builtins.map (
-            version: version // { systems = builtins.filter (supported version) version.systems; }
-          ) allVersions;
-        in
-        # For XPU, require Torch >= 2.9.
         builtins.filter (
-          version: !(version ? xpuVersion) || builtins.compareVersions version.torchVersion "2.9" >= 0
-        ) filteredSystems;
+          version:
+          # For CPU builds, only x86_64-linux is currently supported.
+          (!(version ? "cpu") || version.system == "x86_64-linux")
+          # For XPU, require Torch >= 2.9.
+          && (!(version ? xpuVersion) || builtins.compareVersions version.torchVersion "2.9" >= 0)
+        ) allVersions;
     };
 }

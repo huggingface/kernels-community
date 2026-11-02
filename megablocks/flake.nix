@@ -2,7 +2,7 @@
   description = "Flake for megablocks_moe kernel";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/torch-2.15.0-final";
+    kernel-builder.url = "github:huggingface/kernels/flatten-before-kernel-flake";
   };
 
   outputs =
@@ -23,14 +23,9 @@
         ];
 
       torchVersions =
-        let
-          # For CPU builds, only x86_64-linux is currently supported.
-          cpuSupported = version: system: !(version ? "cpu") || system == "x86_64-linux";
-        in
         allVersions:
-        builtins.map (
-          version: version // { systems = builtins.filter (cpuSupported version) version.systems; }
-        ) allVersions;
+        # For CPU builds, only x86_64-linux is currently supported.
+        builtins.filter (version: !(version ? "cpu") || version.system == "x86_64-linux") allVersions;
     };
 
 }
