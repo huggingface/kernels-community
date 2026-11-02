@@ -4,6 +4,7 @@ from .batched import matmul_batched
 from .grouped import matmul_grouped
 from .fused_batched import moe_fused_batched
 from .fused_grouped import moe_fused_grouped
+from . import _private_for_testing  # noqa: F401
 
 __all__ = [
     "fp8_act_quant",
@@ -17,4 +18,6 @@ __all__ = [
     "moe_fused_batched",
     # Fused grouped matmul
     "moe_fused_grouped",
+    # the internal modules the tests use, see `_private_for_testing`
+    "_private_for_testing",
 ]

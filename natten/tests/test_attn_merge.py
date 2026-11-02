@@ -25,19 +25,24 @@ import random
 import unittest
 from typing import Tuple
 
-import natten  # noqa: F401
+import kernels
 import torch
-from natten._environment import _NUM_RAND_SWEEP_TESTS as RAND_SWEEP_TESTS
-from natten.functional import attention, merge_attentions
-from natten.utils.testing import (
-    skip_if_blackwell_kernels_not_supported,
-    skip_if_hopper_kernels_not_supported,
-    skip_if_libnatten_is_not_supported,
-    skip_if_not_running_extended_tests,
-)
 from torch import Tensor
 
 from .utils import logger, reset_torch_compile
+
+natten = kernels.get_kernel("shi-labs/natten", version=1)
+
+RAND_SWEEP_TESTS = natten._private_for_testing._environment._NUM_RAND_SWEEP_TESTS
+attention = natten.attention
+merge_attentions = natten.merge_attentions
+testing = natten._private_for_testing.testing
+skip_if_blackwell_kernels_not_supported = (
+    testing.skip_if_blackwell_kernels_not_supported
+)
+skip_if_hopper_kernels_not_supported = testing.skip_if_hopper_kernels_not_supported
+skip_if_libnatten_is_not_supported = testing.skip_if_libnatten_is_not_supported
+skip_if_not_running_extended_tests = testing.skip_if_not_running_extended_tests
 
 
 def _reset_everything(random_seed: int = 42, torch_seed: int = 42):
