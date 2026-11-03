@@ -63,7 +63,6 @@ on:
         type: string
         default: ""
 
-
 # These build workflows are reachable only via workflow_dispatch, so `github.head_ref`
 # is always empty and the group used to collapse to `github.run_id` -- unique per run,
 # which made `cancel-in-progress` a no-op. Key off the dispatch inputs instead so a newer
@@ -224,7 +223,7 @@ jobs:
       group: ${{ matrix.runner }}
     # PR builds get 10h; release builds get 20h (more variants to compile).
     timeout-minutes: ${{ inputs.mode == 'pr' && 600 || 1200 }}
-    # id-token: write is needed for cosign.
+    # id-token: write is needed for Sigstore signing.
     permissions:
       contents: read
       statuses: write
@@ -330,24 +329,31 @@ jobs:
             nix run -L github:huggingface/kernels#kernel-builder -- fill-card "$KERNEL" "$KERNEL/build/CARD.md"
           fi
 
-      # cosign-installer >= v4.1.1 requires envsubst (gettext), which is not
-      # preinstalled on the custom runner images.
-      - name: Add envsubst to PATH
+      - name: Set up Python for signing
         if: inputs.mode != 'pr'
-        run: echo "$(nix build nixpkgs#gettext --no-link --print-out-paths)/bin" >> "$GITHUB_PATH"
-
-      - name: Install Cosign
-        if: inputs.mode != 'pr'
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
 
       # Sign metadata.json for each built variant.
       - name: Sign kernel metadata
         if: inputs.mode != 'pr'
+        uses: sigstore/gh-action-sigstore-python@790bc6befb9d733738f18d8f895854b453640ec9 # v3.5.0
+        with:
+          inputs: ${{ needs.setup.outputs.kernel }}/build/*/metadata.json
+          # Not a release event; never attach to releases.
+          release-signing-artifacts: false
+
+      # The action writes `<file>.sigstore.json`, but kernels expects the bundle
+      # at `metadata.json.sigstore` (and excludes only that name from the digest).
+      - name: Rename signature bundles
+        if: inputs.mode != 'pr'
+        env:
+          KERNEL: ${{ needs.setup.outputs.kernel }}
         run: |
-          KERNEL="${{ needs.setup.outputs.kernel }}"
-          while IFS= read -r metadata_file; do
-            cosign sign-blob "$metadata_file" --bundle "${metadata_file}.sigstore" --yes
-          done < <(find "$KERNEL/build" -mindepth 2 -maxdepth 2 -name "metadata.json")
+          for bundle in "$KERNEL"/build/*/metadata.json.sigstore.json; do
+            mv "$bundle" "${bundle%.json}"
+          done
 
       # Upload built artifacts to both model and kernel Hub repos.
       - name: Upload kernel to Hub
