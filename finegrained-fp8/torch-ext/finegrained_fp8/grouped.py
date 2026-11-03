@@ -215,7 +215,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
         a, a_s = fp8_act_quant_inline(a_raw)
         b = tl.load(b_ptrs)
         b_s = decode_ue8m0_scale(tl.load(bs_ptrs))
-        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        accumulator += tl.dot(a, b) * a_s[:, None] * b_s
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
         bs_ptrs += stride_bs_k
