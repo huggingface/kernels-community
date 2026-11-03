@@ -114,7 +114,8 @@ def compare(generated: Path, committed: Path) -> list:
     return problems
 
 
-def check(kernel: str, root: Path, workdir: Path) -> list:
+def check(kernel: str, root: Path, workdir: Path, write: bool = False) -> list:
+    """Regenerate a port and compare it with, or with `write` replace, <kernel>/src."""
     recipe = root / kernel / "port" / "port.kdl"
     repo, commit = parse_source(recipe)
     print(f"  {kernel}: {repo} @ {commit[:12]}")
@@ -137,15 +138,22 @@ def check(kernel: str, root: Path, workdir: Path) -> list:
         tail = (proc.stderr or proc.stdout).strip().splitlines()[-8:]
         return ["kernel-port failed:\n    " + "\n    ".join(tail)]
 
-    return compare(out, root / kernel / "src")
+    committed = root / kernel / "src"
+    if write:
+        shutil.rmtree(committed, ignore_errors=True)
+        shutil.copytree(out, committed, symlinks=True)
+        return []
+    return compare(out, committed)
 
 
 def main() -> int:
     root = Path.cwd()
     args = sys.argv[1:]
+    write = "--write" in args
+    args = [a for a in args if a != "--write"]
     if args[:1] == ["--changed-since"]:
         if len(args) != 2:
-            raise SystemExit("usage: check_ports.py --changed-since <ref>")
+            raise SystemExit("usage: check_ports.py [--write] --changed-since <ref>")
         kernels = changed_ports(root, args[1])
         if not kernels:
             print(f"No ported kernels changed since {args[1]}.")
@@ -156,7 +164,10 @@ def main() -> int:
         print("No ported kernels found (no */port/port.kdl).")
         return 0
 
-    print(f"Checking {len(kernels)} port(s) reproduce their committed tree:\n")
+    if write:
+        print(f"Regenerating {len(kernels)} port(s) into their committed tree:\n")
+    else:
+        print(f"Checking {len(kernels)} port(s) reproduce their committed tree:\n")
     failed = {}
     with tempfile.TemporaryDirectory() as tmp:
         workdir = Path(tmp)
@@ -164,12 +175,21 @@ def main() -> int:
             if not (root / kernel / "port" / "port.kdl").is_file():
                 failed[kernel] = [f"no port/port.kdl under {kernel}/"]
                 continue
-            problems = check(kernel, root, workdir)
+            problems = check(kernel, root, workdir, write=write)
             if problems:
                 failed[kernel] = problems
+            elif write:
+                print(f"     wrote {kernel}/src")
             else:
                 print("     ok - regenerates byte for byte")
 
+    if failed and write:
+        print("\nERROR: could not regenerate:\n", file=sys.stderr)
+        for kernel, problems in failed.items():
+            print(f"  {kernel}:", file=sys.stderr)
+            for p in problems:
+                print(f"    - {p}", file=sys.stderr)
+        return 1
     if failed:
         print("\nERROR: committed tree does not match the recipe.\n", file=sys.stderr)
         for kernel, problems in failed.items():
@@ -178,17 +198,17 @@ def main() -> int:
                 print(f"    - {p}", file=sys.stderr)
         print(
             "\nRegenerate with:\n"
-            "  kernel-port <kernel>/port/port.kdl --dir <upstream> "
-            "[--vendor name=<checkout> ...] --out <temporary-output>\n"
-            "Compare with <kernel>/src.\n"
-            "See the kernel's port documentation for regeneration instructions.\n"
+            "  python3 scripts/check_ports.py --write <kernel>\n"
             "If only port-provenance.json differs, the recipe changed and the\n"
             "port was not rerun.",
             file=sys.stderr,
         )
         return 1
 
-    print("\nAll ports reproduce their committed tree.")
+    if write:
+        print("\nAll ports regenerated.")
+    else:
+        print("\nAll ports reproduce their committed tree.")
     return 0
 
 

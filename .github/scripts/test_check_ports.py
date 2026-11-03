@@ -70,3 +70,49 @@ def test_check_supplies_vendors_and_compares_complete_tree(tmp_path, monkeypatch
         "committed but not generated: extra.py",
         "differs: port-provenance.json",
     ]
+
+
+def test_write_replaces_committed_tree(tmp_path, monkeypatch):
+    root, work = tmp_path / "repo", tmp_path / "work"
+    kernel = root / "example"
+    (kernel / "port").mkdir(parents=True)
+    work.mkdir()
+    (kernel / "port" / "port.kdl").write_text('source repo="upstream" commit="abc"\n')
+    committed = kernel / "src"
+    (committed / "stale").mkdir(parents=True)
+    (committed / "stale" / "old.py").write_text("old")
+    (committed / "build.toml").write_text("old manifest")
+
+    def run(command, **kwargs):
+        output = Path(command[command.index("--out") + 1])
+        (output / "pkg").mkdir(parents=True)
+        (output / "pkg" / "new.py").write_text("new")
+        (output / "build.toml").write_text("manifest")
+        return CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(ports, "checkout", lambda repo, commit, dest: dest.mkdir())
+    monkeypatch.setattr(ports.subprocess, "run", run)
+    monkeypatch.setenv("KERNEL_PORT", "test-kernel-port")
+    assert ports.check("example", root, work, write=True) == []
+    assert ports.tree_files(committed) == {"build.toml", "pkg/new.py"}
+    assert (committed / "build.toml").read_text() == "manifest"
+    assert ports.check("example", root, work) == []
+
+
+def test_write_keeps_committed_tree_when_kernel_port_fails(tmp_path, monkeypatch):
+    root, work = tmp_path / "repo", tmp_path / "work"
+    kernel = root / "example"
+    (kernel / "port").mkdir(parents=True)
+    work.mkdir()
+    (kernel / "port" / "port.kdl").write_text('source repo="upstream" commit="abc"\n')
+    (kernel / "src").mkdir()
+    (kernel / "src" / "build.toml").write_text("manifest")
+
+    monkeypatch.setattr(ports, "checkout", lambda repo, commit, dest: dest.mkdir())
+    monkeypatch.setattr(
+        ports.subprocess, "run", lambda command, **kwargs: CompletedProcess(command, 1, "", "boom")
+    )
+    monkeypatch.setenv("KERNEL_PORT", "test-kernel-port")
+    problems = ports.check("example", root, work, write=True)
+    assert problems and problems[0].startswith("kernel-port failed")
+    assert (kernel / "src" / "build.toml").read_text() == "manifest"
