@@ -22,3 +22,5 @@ __pycache__/
 
 *.png
 *.csv
+# kernel-status CLI build output
+scripts/kernel-status/target/

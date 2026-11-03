@@ -25,14 +25,26 @@ import random
 import unittest
 from typing import Optional
 
+import kernels
 import torch
-from natten.backends import get_compatible_backends, get_compatible_fmha_backends
-from natten.functional import attention, neighborhood_attention_generic
-from natten.utils.testing import skip_if_libnatten_is_not_supported
-from natten.utils.varlen import generate_varlen_parameters
 from torch import nn
 
 from .utils import logger, reset_torch_compile
+
+natten = kernels.get_kernel("shi-labs/natten", version=1)
+
+get_compatible_backends = natten._private_for_testing.backends.get_compatible_backends
+get_compatible_fmha_backends = (
+    natten._private_for_testing.backends.get_compatible_fmha_backends
+)
+attention = natten.attention
+neighborhood_attention_generic = (
+    natten._private_for_testing.functional.neighborhood_attention_generic
+)
+skip_if_libnatten_is_not_supported = (
+    natten._private_for_testing.testing.skip_if_libnatten_is_not_supported
+)
+generate_varlen_parameters = natten._private_for_testing.varlen.generate_varlen_parameters
 
 
 def _reset_everything(random_seed: int = 42, torch_seed: int = 42):

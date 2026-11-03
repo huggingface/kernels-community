@@ -80,6 +80,8 @@ depends = ["torch"]
 rocm-archs = [
     "gfx942",
     "gfx950",
+    "gfx1151",
+    "gfx1201",
 ]
 src = [
     "csrc/cumsum.h",

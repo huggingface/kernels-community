@@ -1,7 +1,10 @@
+import kernels
 import torch
 import pytest
 
-from quantization_gptq import gemm_int4_forward
+quantization_gptq = kernels.get_kernel("kernels-community/quantization-gptq", version=1)
+
+gemm_int4_forward = quantization_gptq.gemm_int4_forward
 
 
 def ref_gemm_int4(x, packed_weight, zeros, scales, group_size):

@@ -16,10 +16,7 @@ from typing import Tuple
 import torch
 
 import kernelkit as kk
-import flash_mla
-# from kernels import get_kernel
-
-# flash_mla = get_kernel("drbh/tmp-kernel-123")
+from lib import flash_mla
 
 @dataclasses.dataclass
 class TestParam:

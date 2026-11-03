@@ -9,9 +9,12 @@
 import pytest
 import torch
 
-import natten  # noqa: F401
-from natten.backends.reference import reference_fna_generic
-from natten.functional import na1d, na2d, na3d
+import kernels
+
+natten = kernels.get_kernel("shi-labs/natten", version=1)
+
+reference_fna_generic = natten._private_for_testing.reference.reference_fna_generic
+na1d, na2d, na3d = natten.na1d, natten.na2d, natten.na3d
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA"
@@ -90,7 +93,7 @@ def test_fused_matches_reference(
 @requires_cuda
 @pytest.mark.kernels_ci
 def test_ops_registered():
-    from natten._ops import ops
+    ops = natten._private_for_testing._ops.ops
 
     for name in (
         "na1d_forward",
