@@ -11,10 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Auto-loaded by pytest before any test module imports — adds the package's
-``torch-ext`` source dir to ``sys.path`` so the suite runs without an install
-step, pins each xdist worker to its own GPU, then gates the whole suite on FP8
-hardware support."""
+"""Auto-loaded by pytest before any test module imports — pins each xdist worker to its
+own GPU, then gates the whole suite on FP8 hardware support. The tests load the kernel with
+``get_kernel`` (see ``utils.py``)."""
 
 import os
 import shutil
@@ -22,16 +21,15 @@ import subprocess
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "torch-ext"))
-
 # Under test, a config the tuner cannot compile or run is a PRUNER GAP, not something to
 # tolerate: forgiving it leaves the suite green while the arm silently drops out of the search
 # (how a descriptor arm that could not lower, and a swapped gate tile that could not type-check,
 # both stayed invisible until a bench came back with empty cells). Strict mode aborts the tune on the
 # first reject so a test reports it. Deployment keeps the default, where forgiveness is what
 # lets a crowned config survive one unrelated bad neighbour.
+# The tests check correctness, not speed, so each tune compiles and measures one config.
 # An explicit FINEGRAINED_AUTOTUNE_CONFIG takes over (add "strict": true to keep this).
-os.environ.setdefault("FINEGRAINED_AUTOTUNE_CONFIG", '{"strict": true}')
+os.environ.setdefault("FINEGRAINED_AUTOTUNE_CONFIG", '{"mode": "fast", "strict": true}')
 
 
 def _visible_gpu_pool(env_var: str, list_cmd: list[str]) -> list[str]:
@@ -99,12 +97,19 @@ import pytest  # noqa: E402
 from utils import SUPPORTS_FP8  # type: ignore  # noqa: E402
 
 
+@pytest.hookimpl(tryfirst=True)
+def pytest_cmdline_main(config):
+    """Under ``-n``, a free worker (a free GPU) takes the next pending test. xdist's default
+    ``load`` scheduler splits the tail evenly, leaving GPUs idle behind one slow tune. Set here,
+    not in ``pytest.ini``, as ``--dist`` only parses with xdist installed."""
+    if getattr(config.option, "numprocesses", None) and config.option.dist == "no":
+        config.option.dist = "worksteal"
+
+
 def pytest_collection_modifyitems(config, items):
-    """Skip every test when FP8 is unsupported — kernels require SM90+ on CUDA
-    (Hopper/Blackwell) or XPU. SM<89 can't even compile ``fp8e4nv``; SM89 (Ada)
-    compiles but has numerics drift we don't gate against."""
+    """Skip every test when FP8 is unsupported. The kernels need SM89+ on CUDA, or XPU."""
     if SUPPORTS_FP8:
         return
-    skip = pytest.mark.skip(reason="FP8 kernels require SM90+ on CUDA or XPU")
+    skip = pytest.mark.skip(reason="FP8 kernels require SM89+ on CUDA or XPU")
     for item in items:
         item.add_marker(skip)

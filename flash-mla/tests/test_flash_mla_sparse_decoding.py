@@ -19,11 +19,8 @@ import rich.table
 import torch
 import kernelkit as kk
 
-import flash_mla
-# from kernels import get_kernel, get_local_kernel
-# flash_mla = get_kernel("drbh/tmp-kernel-123")
-
 import lib
+from lib import flash_mla
 from lib import TestParam
 from lib import RawTestParamForDecode as RawTestParam
 import ref

@@ -1,9 +1,14 @@
 import inspect
 
+import kernels
 import pytest
 import torch
 
-import nvfp4_gemm
+# The kernel is only built for sm100/sm120, but the pure-Python tests below also
+# run elsewhere; the tests that launch kernels are gated by `requires_blackwell`.
+nvfp4_gemm = kernels.get_kernel(
+    "kernels-community/nvfp4-gemm", version=1, check_arch=False
+)
 
 BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
 requires_blackwell = pytest.mark.skipif(not BLACKWELL, reason="requires sm100+")
@@ -88,8 +93,8 @@ def _dequant_reference(
 @pytest.mark.parametrize("n,k", [(4096, 6656), (19968, 6656), (6656, 19968)])
 @pytest.mark.parametrize("m", [1, 2])
 def test_gemv_matches_dequant(n, k, m):
-    from nvfp4_gemm import global_scale_for
-    from nvfp4_gemm._ops import ops
+    global_scale_for = nvfp4_gemm.global_scale_for
+    ops = nvfp4_gemm._private_for_testing.ops
 
     torch.manual_seed(0)
     w = torch.randn(n, k, dtype=torch.bfloat16, device="cuda") * 0.02
@@ -111,8 +116,8 @@ def test_gemv_matches_dequant(n, k, m):
 @pytest.mark.parametrize("m", [1, 2])
 def test_gemv_swiglu_matches_dequant(m):
     """Cover the row-concatenated SwiGLU launch geometry used by Onyx."""
-    from nvfp4_gemm import global_scale_for
-    from nvfp4_gemm._ops import ops
+    global_scale_for = nvfp4_gemm.global_scale_for
+    ops = nvfp4_gemm._private_for_testing.ops
 
     torch.manual_seed(0)
     n, k = 19968, 6656

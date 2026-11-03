@@ -61,6 +61,7 @@ from .modules import (
     NeighborhoodAttention2D,
     NeighborhoodAttention3D,
 )
+from . import _private_for_testing  # noqa: F401
 from .version import __version__
 
 # kernel-builder port: the package contents are installed flat into the build
@@ -137,6 +138,7 @@ if __name__ != "natten":
 
 __all__ = [
     "__version__",
+    "_private_for_testing",
     "NeighborhoodAttention1D",
     "NeighborhoodAttention2D",
     "NeighborhoodAttention3D",

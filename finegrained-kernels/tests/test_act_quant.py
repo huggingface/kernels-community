@@ -16,12 +16,18 @@
 import pytest
 import torch
 
-from utils import TEST_DEVICE  # type: ignore
+from utils import internals, TEST_DEVICE  # type: ignore
 
 import triton
 import triton.language as tl
 
-from finegrained_kernels.quant import fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mx_act_quant_inline, mxfp4_act_quant, mxfp8_act_quant, nvfp4_act_quant, nvfp4_quantize_two_level  # type: ignore
+fp8_act_quant_block_dynamic = internals.quant.fp8_act_quant_block_dynamic
+fp8_act_quant_tensor_wide = internals.quant.fp8_act_quant_tensor_wide
+mx_act_quant_inline = internals.quant.mx_act_quant_inline
+mxfp4_act_quant = internals.quant.mxfp4_act_quant
+mxfp8_act_quant = internals.quant.mxfp8_act_quant
+nvfp4_act_quant = internals.quant.nvfp4_act_quant
+nvfp4_quantize_two_level = internals.quant.nvfp4_quantize_two_level
 
 
 _FP8_DTYPE = torch.float8_e4m3fn
@@ -415,7 +421,7 @@ def test_the_grouped_quant_grid_admits_only_its_tile_height():
     ``BLOCK_T`` would cover fewer rows than the schedule holds and leave the tail unquantized.
     The dense grid has no such tie and keeps the whole range. Both scale stores reach the grouped
     grid, so the pin cannot hang off the swizzle."""
-    from finegrained_kernels.quant import _quant_block_k_pruner
+    _quant_block_k_pruner = internals.quant._quant_block_k_pruner
 
     configs = [
         triton.Config({"BLOCK_K": bk, "BLOCK_T": bt}, num_warps=4)

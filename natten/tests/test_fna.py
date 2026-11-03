@@ -26,34 +26,29 @@ import random
 import unittest
 from itertools import product
 
-import natten  # noqa: F401
 import pytest
 import torch
-from natten._environment import _NUM_RAND_SWEEP_TESTS as RAND_SWEEP_TESTS
-from natten.backends.configs.cutlass import (
-    get_all_backward_configs,
-    get_all_forward_configs,
-)
-from natten.utils.testing import (
-    skip_if_libnatten_is_not_supported,
-    skip_if_not_running_extended_tests,
-    supports_bfloat16,
-    supports_float16,
-)
+import kernels
 
 from .utils import logger, NattenBackendTester
 
+natten = kernels.get_kernel("shi-labs/natten", version=1)
+
+RAND_SWEEP_TESTS = natten._private_for_testing._environment._NUM_RAND_SWEEP_TESTS
+cutlass = natten._private_for_testing.cutlass
+get_all_backward_configs = cutlass.get_all_backward_configs
+get_all_forward_configs = cutlass.get_all_forward_configs
+testing = natten._private_for_testing.testing
+skip_if_libnatten_is_not_supported = testing.skip_if_libnatten_is_not_supported
+skip_if_not_running_extended_tests = testing.skip_if_not_running_extended_tests
+supports_bfloat16 = testing.supports_bfloat16
+supports_float16 = testing.supports_float16
+
 
 def _reset_everything(random_seed: int = 42, torch_seed: int = 42):
-    from natten.context import (
-        NattenContext,
-        set_memory_usage_preference,
-        use_kv_parallelism_in_fused_na,
-    )
-
-    NattenContext.reset()
-    set_memory_usage_preference("unrestricted")
-    use_kv_parallelism_in_fused_na(True)
+    natten._private_for_testing.context.NattenContext.reset()
+    natten.set_memory_usage_preference("unrestricted")
+    natten.use_kv_parallelism_in_fused_na(True)
 
     random.seed(random_seed)
     torch.manual_seed(torch_seed)
