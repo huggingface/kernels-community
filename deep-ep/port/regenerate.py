@@ -21,7 +21,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--deep-ep", type=Path, required=True)
     parser.add_argument("--deepjit", type=Path, required=True)
-    parser.add_argument("--nccl", type=Path, required=True)
     parser.add_argument("--kernel-port", default="kernel-port")
     parser.add_argument("--output", type=Path, help="Generated output outside the kernel directory")
     parser.add_argument("--check", action="store_true", help="Compare generated output with this kernel's src/")
@@ -33,14 +32,12 @@ def main():
     src = kernel / "src"
     with tempfile.TemporaryDirectory(prefix="deep-ep-port-") as temporary:
         output = (args.output or Path(temporary) / "deep-ep").resolve()
-        inputs = [kernel, args.deep_ep.resolve(), args.deepjit.resolve(),
-                  args.nccl.resolve()]
+        inputs = [kernel, args.deep_ep.resolve(), args.deepjit.resolve()]
         if any(output == source or output in source.parents or source in output.parents
                for source in inputs):
             parser.error("--output must not overlap this kernel or any source checkout")
         command = [args.kernel_port, str(port / "port.kdl"), "--dir", str(args.deep_ep),
                    "--vendor", f"python={args.deep_ep}", "--vendor", f"deepjit={args.deepjit}",
-                   "--vendor", f"nccl={args.nccl}",
                    "--out", str(output)]
         subprocess.run(command, check=True)
         if args.check:

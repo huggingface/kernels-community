@@ -7,7 +7,7 @@ toolkit or recent NCCL), so these checks run when the first buffer is created
 instead, and fail with an actionable message:
 
 - PyTorch and DeepEP must use the same NCCL library. The Hub kernel does not
-  link or ship NCCL: its NCCL symbols resolve to the library PyTorch loaded.
+  ship NCCL: its NCCL symbols resolve to the library PyTorch loaded.
 - That NCCL must be >= 2.32.3 (DeepEP 2.5 uses the NCCL device API and GIN
   features introduced in 2.31/2.32).
 - DeepEP compiles its kernels at runtime with DeepJIT, which needs the NCCL

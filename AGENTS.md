@@ -661,8 +661,8 @@ DeepEP's GPU kernels are JIT-compiled at runtime by DeepJIT. When the user asks
 to sync a DeepEP release, update `deep-ep/port/port.kdl` and its handwritten
 `overlay/` files, then regenerate and check the output with
 `deep-ep/port/regenerate.py` (see `deep-ep/port/README.md`). Do not make porting
-changes only in the generated tree. The recipe pins DeepEP, DeepJIT and NCCL
-and retains the existing Torch ops/custom-class bindings. The synchronization
+changes only in the generated tree. The recipe pins DeepEP and DeepJIT and
+retains the existing Torch ops/custom-class bindings. The synchronization
 requirements encoded in the recipe are:
 
 - Fetch https://github.com/deepseek-ai/DeepEP.git and check out the release
@@ -719,7 +719,10 @@ requirements encoded in the recipe are:
   `__version__`, and the NCCL/CUDA minimums in `_runtime.py` and `CARD.md` if
   upstream's README changed them.
 
-NCCL is a header-only dependency (`nccl` in `depends`): the extension must not
-link or ship libnccl. Its NCCL symbols are resolved from the library PyTorch
-loaded, which `_nccl_symbols.py` re-opens with `RTLD_GLOBAL | RTLD_NOLOAD`
-before the extension is loaded.
+NCCL is not vendored: the extension builds against the NCCL of the build's
+PyTorch, which `deep-ep/flake.nix` overrides through a kernel-builder overlay
+(`mkNccl`) because DeepEP needs a newer NCCL than kernel-builder's PyTorch
+ships. When upstream raises its NCCL minimum, bump that overlay's version and
+wheels. The extension must not ship libnccl: its NCCL symbols are resolved from
+the library PyTorch loaded, which `_nccl_symbols.py` re-opens with
+`RTLD_GLOBAL | RTLD_NOLOAD` before the extension is loaded.

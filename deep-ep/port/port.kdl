@@ -7,26 +7,7 @@ prune keep=".clang-format,.editorconfig,.gitignore,.gitmodules,.github/workflows
 vendor name="python" repo="https://github.com/deepseek-ai/DeepEP.git" commit="def865146e95aa9ea223e277c0a8a4c6b81e5ac7" path="deep_ep" to="torch-ext/deep_ep"
 vendor name="deepjit" repo="https://github.com/deepseek-ai/DeepJIT.git" commit="cba802df081985141eeee36803685775c183a047" path="." to="third-party/deep_jit"
 
-// Header-only NCCL dependency; reproduce the public headers from pinned source.
-vendor name="nccl" repo="https://github.com/NVIDIA/nccl.git" commit="12df1a11afad322be5a204a2db890161cbf8131d" path="." to="third-party/nccl-source"
-move from="third-party/nccl-source/src/nccl.h.in" to="third-party/nccl/include/nccl.h"
-move from="third-party/nccl-source/src/include/nccl_device.h" to="third-party/nccl/include/nccl_device.h"
-move from="third-party/nccl-source/src/include/nccl_device" to="third-party/nccl/include/nccl_device"
-move from="third-party/nccl-source/bindings/ir/nccl_device_wrapper.h" to="third-party/nccl/include/nccl_device_wrapper.h"
-move from="third-party/nccl-source/LICENSE.txt" to="third-party/nccl/LICENSE.txt"
-move from="third-party/nccl-source/src/transport/net_ib/gdaki/doca-gpunetio/include/common" to="third-party/nccl/include/nccl_device/gin/gdaki/doca_gpunetio/common"
-move from="third-party/nccl-source/src/transport/net_ib/gdaki/doca-gpunetio/include/device" to="third-party/nccl/include/nccl_device/gin/gdaki/doca_gpunetio/device"
-move from="third-party/nccl-source/src/transport/net_ib/gdaki/doca-gpunetio/include/doca_gpunetio_device.h" to="third-party/nccl/include/nccl_device/gin/gdaki/doca_gpunetio/doca_gpunetio_device.h"
-move from="third-party/nccl-source/src/transport/net_efa_gda/efa-dp-direct/include/common" to="third-party/nccl/include/nccl_device/transport/net_efa_gda/efa-dp-direct/include/common"
-move from="third-party/nccl-source/src/transport/net_efa_gda/efa-dp-direct/include/device" to="third-party/nccl/include/nccl_device/transport/net_efa_gda/efa-dp-direct/include/device"
-delete in="third-party/nccl/include/nccl_device/README.md"
-replace in="third-party/nccl/include/nccl.h" find="${nccl:Major}" with="2" count=1
-replace in="third-party/nccl/include/nccl.h" find="${nccl:Minor}" with="32" count=1
-replace in="third-party/nccl/include/nccl.h" find="${nccl:Patch}" with="3" count=1
-replace in="third-party/nccl/include/nccl.h" find="${nccl:Suffix}" with="" count=1
-replace in="third-party/nccl/include/nccl.h" find="${nccl:Version}" with="23203" count=1
-
-prune keep=".clang-format,.editorconfig,.gitignore,.gitmodules,.github/workflows/format.yml,third-party/tilelang_ops/**,LICENSE,README.md,format.sh,requirements-lint.txt,csrc/**,deep_ep/**,tests/**,figures/**,torch-ext/**,third-party/deep_jit/**,third-party/nccl/include/**,third-party/nccl/LICENSE.txt"
+prune keep=".clang-format,.editorconfig,.gitignore,.gitmodules,.github/workflows/format.yml,third-party/tilelang_ops/**,LICENSE,README.md,format.sh,requirements-lint.txt,csrc/**,deep_ep/**,tests/**,figures/**,torch-ext/**,third-party/deep_jit/**"
 
 // The Hub loader imports under a generated module name.
 convert_import in="torch-ext/deep_ep/**/*.py" prefix="deep_ep" changes=10
@@ -1342,16 +1323,16 @@ from .. import comm
 overlay from="overlay"
 
 // Only the three host translation units compile; GPU kernels retain runtime JIT.
-kernel name="deep_ep" backend="cuda" src="csrc/**/*.hpp,csrc/kernels/comm/context.cpp,csrc/kernels/driver/driver.cpp,deep_ep/include/**,third-party/deep_jit/include/deep_jit/{backend/cuda,cache,runtime,utils}/**,third-party/nccl/include/**,torch-ext/compat/**/*.h" \
+kernel name="deep_ep" backend="cuda" src="csrc/**/*.hpp,csrc/kernels/comm/context.cpp,csrc/kernels/driver/driver.cpp,deep_ep/include/**,third-party/deep_jit/include/deep_jit/{backend/cuda,cache,runtime,utils}/**,torch-ext/compat/**/*.h" \
     capabilities="9.0a,10.0a" depends="torch" \
-    include="torch-ext/compat,csrc,deep_ep/include,third-party/deep_jit/include,third-party/nccl/include" \
+    include="torch-ext/compat,csrc,deep_ep/include,third-party/deep_jit/include" \
     cxx_flags="-std=c++20,-O3,-DDEEP_EP_KERNELS,-Wno-deprecated-declarations,-Wno-unused-variable,-Wno-sign-compare,-Wno-reorder,-Wno-attributes"
 
 manifest name="deep-ep" version=1 edition=6 license="MIT" \
     upstream="https://github.com/deepseek-ai/DeepEP" backends="cuda" \
     repo_id="kernels-community/deep-ep" cuda_minver="13.0" \
     torch_src="torch-ext/*.{cpp,hpp}" torch_pyext="py,cuh" \
-    torch_include="torch-ext,torch-ext/compat,csrc,deep_ep/include,third-party/deep_jit/include,third-party/nccl/include"
+    torch_include="torch-ext,torch-ext/compat,csrc,deep_ep/include,third-party/deep_jit/include"
 
 // The experimental manifest op does not expose Torch binding flags directly.
 // Preserve the existing binding flags through a guarded generated-table edit.

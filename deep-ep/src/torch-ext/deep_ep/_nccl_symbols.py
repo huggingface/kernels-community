@@ -1,12 +1,13 @@
 """
 kernels-community: make PyTorch's NCCL symbols visible to the DeepEP extension.
 
-Upstream links `deep_ep._C` against NCCL. The Hub kernel must use the very
-same NCCL library as PyTorch (DeepEP shares PyTorch's communicators), so it
-neither links nor ships NCCL; its NCCL symbols are left undefined. PyTorch
-loads its NCCL privately (as a dependency of `libtorch_cuda`), so before the
-extension is loaded, re-open that already-loaded library with `RTLD_GLOBAL`
-(`RTLD_NOLOAD` guarantees that no second copy is ever loaded).
+The Hub kernel must use the very same NCCL library as PyTorch (DeepEP shares
+PyTorch's communicators), so it does not ship NCCL: it is built against the
+NCCL headers of the build's PyTorch, and its NCCL symbols must resolve to the
+library PyTorch loaded. PyTorch loads its NCCL privately (as a dependency of
+`libtorch_cuda`), so before the extension is loaded, re-open that already-loaded
+library with `RTLD_GLOBAL` (`RTLD_NOLOAD` guarantees that no second copy is ever
+loaded).
 
 This module must be imported before `._ops`, and must not import it.
 """

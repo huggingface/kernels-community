@@ -29,19 +29,17 @@ Prepare clean checkouts with these origins and commits:
 |---|---|---|
 | DeepEP | `https://github.com/deepseek-ai/DeepEP.git` | `def865146e95aa9ea223e277c0a8a4c6b81e5ac7` |
 | DeepJIT | `https://github.com/deepseek-ai/DeepJIT.git` | `cba802df081985141eeee36803685775c183a047` |
-| NCCL | `https://github.com/NVIDIA/nccl.git` | `12df1a11afad322be5a204a2db890161cbf8131d` |
 
 DeepEP is also supplied as the `python` vendor to derive the Hub Python package
-from the same source while retaining the upstream layout. NCCL's public headers,
-including DOCA/EFA device dependencies, are assembled from pinned Git sources
-and version-template substitutions. They match the previously vendored wheel
-headers; no installed wheel supplies recipe inputs.
+from the same source while retaining the upstream layout. NCCL is not vendored:
+the kernel builds against the NCCL headers of the build's PyTorch, which the
+flake's overlay pins to NCCL 2.32.3 (see `flake.nix`).
 
 ```sh
 python deep-ep/port/regenerate.py \
   --kernel-port /path/to/kernels/target/release/kernel-port \
   --deep-ep /path/to/DeepEP --deepjit /path/to/DeepJIT \
-  --nccl /path/to/nccl --output /tmp/deep-ep-generated --check
+  --output /tmp/deep-ep-generated --check
 ```
 
 `--check` compares every generated file, including provenance, with this kernel's
