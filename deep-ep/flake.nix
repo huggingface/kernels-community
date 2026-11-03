@@ -2,7 +2,6 @@
   description = "Flake for DeepEP kernel";
 
   inputs = {
-    self.submodules = true;
     kernel-builder.url = "github:huggingface/kernels";
   };
 
