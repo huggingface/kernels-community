@@ -6,6 +6,12 @@ import torch.nn.functional as F
 from .cpp_functions import causal_conv1d_fwd_function, causal_conv1d_bwd_function, causal_conv1d_update_function
 
 
+def _kernel_supports(x, weight):
+    """CUDA takes widths 2-4 for every dtype and 5-8 for 16-bit inputs; XPU takes 2-4."""
+    width = weight.shape[-1]
+    return 2 <= width <= (4 if x.dtype == torch.float32 or x.device.type == "xpu" else 8)
+
+
 class CausalConv1dFn(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -117,6 +123,13 @@ def causal_conv1d_fn(
 
     out: (batch, dim, seqlen)
     """
+    if not _kernel_supports(x, weight):
+        if seq_idx is not None:
+            assert initial_states is None and not return_final_states
+            return _segmented_causal_conv1d_ref(x, weight, bias, seq_idx, activation)
+        return causal_conv1d_ref(
+            x, weight, bias, initial_states, return_final_states, final_states_out, activation
+        )
     return CausalConv1dFn.apply(
         x,
         weight,
@@ -171,6 +184,21 @@ def causal_conv1d_ref(
     return out if not return_final_states else (out, final_states_out)
 
 
+
+def _segmented_causal_conv1d_ref(x, weight, bias, seq_idx, activation):
+    """`causal_conv1d_ref` with `seq_idx`: a position only reads taps from its own segment."""
+    dtype_in = x.dtype
+    x = x.to(weight.dtype)
+    width = weight.shape[1]
+    windows = F.pad(x, (width - 1, 0)).unfold(-1, width, 1)
+    idx = F.pad(seq_idx, (width - 1, 0), value=-1).unfold(-1, width, 1)
+    windows = windows * (idx == idx[..., -1:]).unsqueeze(1).to(windows.dtype)
+    out = torch.einsum("bdtk,dk->bdt", windows, weight)
+    if bias is not None:
+        out = out + bias[:, None]
+    return (out if activation is None else F.silu(out)).to(dtype=dtype_in)
+
+
 def causal_conv1d_update(x, conv_state, weight, bias=None, activation=None, cache_seqlens=None, conv_state_indices=None):
     """
     x: (batch, dim) or (batch, dim, seqlen)
@@ -190,6 +218,13 @@ def causal_conv1d_update(x, conv_state, weight, bias=None, activation=None, cach
     """
     if activation not in [None, "silu", "swish"]:
         raise NotImplementedError("activation must be None, silu, or swish")
+    if not _kernel_supports(x, weight):
+        if conv_state_indices is None:
+            return causal_conv1d_update_ref(x, conv_state, weight, bias, activation, cache_seqlens)
+        state = conv_state[conv_state_indices]
+        out = causal_conv1d_update_ref(x, state, weight, bias, activation, cache_seqlens)
+        conv_state[conv_state_indices] = state
+        return out
     activation = activation in ["silu", "swish"]
     unsqueeze = x.dim() == 2
     if unsqueeze:
