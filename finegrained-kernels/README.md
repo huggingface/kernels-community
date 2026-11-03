@@ -16,7 +16,7 @@ unvalidated.
 
 ## Benchmarks
 
-![MoE bench: finegrained-kernels vs references on B200](bench/bench_moe.png)
+![MoE bench: finegrained-kernels vs references on B200](https://huggingface.co/datasets/IlyasMoutawwakil/benchmarks/resolve/main/finegrained-kernels/cold-weight-timing/bench_moe.png)
 
 Real model shapes on an NVIDIA B200, against upstream `finegrained-fp8`, DeepGEMM, vLLM's fused
 MoE, FlashInfer's TRT-LLM routed-MoE kernels, transformers `grouped_mm`/`batched_mm`, SonicMoE,

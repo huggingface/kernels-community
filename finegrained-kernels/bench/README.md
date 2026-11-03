@@ -87,8 +87,8 @@ python bench/bench_moe.py --replot           # rebuild the figure from an existi
 python bench/bench_moe.py --mock             # no GPU: random latencies to validate the figure layout
 ```
 
-Outputs land beside the script (`bench/bench_moe.csv`, `bench/bench_moe.png`). The figure is
-committed (the top-level README embeds it), so refresh it in the same commit as a kernel change
-that moves the numbers; the CSV is git-ignored (`bench/*.csv` in the repo's `.gitignore`) and regenerated per machine. Requires the bench env: `transformers`
+Outputs land beside the script (`bench/bench_moe.csv`, `bench/bench_moe.png`). Neither is
+committed: upload a refreshed figure to the Hub and link it from the PR (the top-level README embeds
+the Hub copy); the CSV is git-ignored (`bench/*.csv` in the repo's `.gitignore`) and regenerated per machine. Requires the bench env: `transformers`
 (with the `integrations.{deepgemm,moe,sonicmoe,mxfp4}` helpers), `kernels`, DeepGEMM, and a
 Blackwell (sm_100) GPU. **Don't run under concurrent GPU load** — the latencies won't be trustworthy.
