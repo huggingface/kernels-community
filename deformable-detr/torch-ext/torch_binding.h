@@ -1,16 +1,20 @@
 #pragma once
 
-#include <torch/torch.h>
+#include <vector>
 
-at::Tensor ms_deform_attn_cuda_forward(const at::Tensor &value,
-                                       const at::Tensor &spatial_shapes,
-                                       const at::Tensor &level_start_index,
-                                       const at::Tensor &sampling_loc,
-                                       const at::Tensor &attn_weight,
-                                       const int64_t im2col_step);
+#include <torch/csrc/stable/tensor.h>
 
-std::vector<at::Tensor> ms_deform_attn_cuda_backward(
-    const at::Tensor &value, const at::Tensor &spatial_shapes,
-    const at::Tensor &level_start_index, const at::Tensor &sampling_loc,
-    const at::Tensor &attn_weight, const at::Tensor &grad_output,
-    const int64_t im2col_step);
+torch::stable::Tensor ms_deform_attn_cuda_forward(
+    const torch::stable::Tensor &value,
+    const torch::stable::Tensor &spatial_shapes,
+    const torch::stable::Tensor &level_start_index,
+    const torch::stable::Tensor &sampling_loc,
+    const torch::stable::Tensor &attn_weight, const int64_t im2col_step);
+
+std::vector<torch::stable::Tensor> ms_deform_attn_cuda_backward(
+    const torch::stable::Tensor &value,
+    const torch::stable::Tensor &spatial_shapes,
+    const torch::stable::Tensor &level_start_index,
+    const torch::stable::Tensor &sampling_loc,
+    const torch::stable::Tensor &attn_weight,
+    const torch::stable::Tensor &grad_output, const int64_t im2col_step);
