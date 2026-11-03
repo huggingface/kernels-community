@@ -6,18 +6,28 @@ import contextlib
 import io
 import statistics
 
+import kernels
 import pytest
 import torch
 
-from msa.fp4_indexer_interface import (
-    fp4_indexer_block_scores,
-    fp4_indexer_mma_scale_shape,
-    fp4_indexer_mma_scale_storage_shape,
-    fp4_indexer_mma_scale_storage_stride,
-    fp4_indexer_mma_scale_stride,
-    fp4_indexer_reorder_scales_for_mma_cute,
+# The kernel is only built for sm100; tests that launch kernels are gated by
+# `_has_sm100_cuda`, so skip the device-architecture check at load time.
+msa = kernels.get_kernel("MiniMaxAI/msa", version=0, check_arch=False)
+
+_fp4_indexer_interface = msa._private_for_testing.fp4_indexer_interface
+fp4_indexer_block_scores = _fp4_indexer_interface.fp4_indexer_block_scores
+fp4_indexer_mma_scale_shape = _fp4_indexer_interface.fp4_indexer_mma_scale_shape
+fp4_indexer_mma_scale_storage_shape = (
+    _fp4_indexer_interface.fp4_indexer_mma_scale_storage_shape
 )
-from msa.src.sm100.fp4_indexer import normalize_fp4_format
+fp4_indexer_mma_scale_storage_stride = (
+    _fp4_indexer_interface.fp4_indexer_mma_scale_storage_stride
+)
+fp4_indexer_mma_scale_stride = _fp4_indexer_interface.fp4_indexer_mma_scale_stride
+fp4_indexer_reorder_scales_for_mma_cute = (
+    _fp4_indexer_interface.fp4_indexer_reorder_scales_for_mma_cute
+)
+normalize_fp4_format = msa._private_for_testing.fp4_indexer.normalize_fp4_format
 
 
 def _has_sm100_cuda() -> bool:

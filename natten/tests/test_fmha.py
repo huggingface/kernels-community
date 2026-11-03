@@ -25,48 +25,45 @@ import random
 import unittest
 from typing import Optional, Tuple, Union
 
-import natten  # noqa: F401
+import kernels
 import pytest
 import torch
-from natten._environment import _NUM_RAND_SWEEP_TESTS as RAND_SWEEP_TESTS
-from natten.backends.configs.cutlass import (
-    get_all_fmha_backward_configs,
-    get_all_fmha_forward_configs,
-)
-from natten.backends.configs.cutlass_blackwell import (
-    get_all_fmha_backward_configs as get_all_blackwell_fmha_backward_configs,
-    get_all_fmha_forward_configs as get_all_blackwell_fmha_forward_configs,
-)
-from natten.backends.configs.cutlass_hopper import (
-    get_all_fmha_backward_configs as get_all_hopper_fmha_backward_configs,
-    get_all_fmha_forward_configs as get_all_hopper_fmha_forward_configs,
-)
-from natten.functional import attention
-from natten.types import KernelSchedule
-from natten.utils.dtype import is_fp8
-from natten.utils.testing import (
-    skip_if_blackwell_kernels_not_supported,
-    skip_if_hopper_kernels_not_supported,
-    skip_if_libnatten_is_not_supported,
-    skip_if_not_running_extended_tests,
-    supports_bfloat16,
-    supports_float16,
-)
 from torch import Tensor
 
 from .utils import logger
 
+natten = kernels.get_kernel("shi-labs/natten", version=1)
+
+RAND_SWEEP_TESTS = natten._private_for_testing._environment._NUM_RAND_SWEEP_TESTS
+cutlass = natten._private_for_testing.cutlass
+get_all_fmha_backward_configs = cutlass.get_all_fmha_backward_configs
+get_all_fmha_forward_configs = cutlass.get_all_fmha_forward_configs
+cutlass_blackwell = natten._private_for_testing.cutlass_blackwell
+get_all_blackwell_fmha_backward_configs = (
+    cutlass_blackwell.get_all_fmha_backward_configs
+)
+get_all_blackwell_fmha_forward_configs = cutlass_blackwell.get_all_fmha_forward_configs
+cutlass_hopper = natten._private_for_testing.cutlass_hopper
+get_all_hopper_fmha_backward_configs = cutlass_hopper.get_all_fmha_backward_configs
+get_all_hopper_fmha_forward_configs = cutlass_hopper.get_all_fmha_forward_configs
+attention = natten.attention
+KernelSchedule = natten._private_for_testing._types.KernelSchedule
+is_fp8 = natten._private_for_testing.dtype.is_fp8
+testing = natten._private_for_testing.testing
+skip_if_blackwell_kernels_not_supported = (
+    testing.skip_if_blackwell_kernels_not_supported
+)
+skip_if_hopper_kernels_not_supported = testing.skip_if_hopper_kernels_not_supported
+skip_if_libnatten_is_not_supported = testing.skip_if_libnatten_is_not_supported
+skip_if_not_running_extended_tests = testing.skip_if_not_running_extended_tests
+supports_bfloat16 = testing.supports_bfloat16
+supports_float16 = testing.supports_float16
+
 
 def _reset_everything(random_seed: int = 42, torch_seed: int = 42):
-    from natten.context import (
-        NattenContext,
-        set_memory_usage_preference,
-        use_kv_parallelism_in_fused_na,
-    )
-
-    NattenContext.reset()
-    set_memory_usage_preference("unrestricted")
-    use_kv_parallelism_in_fused_na(True)
+    natten._private_for_testing.context.NattenContext.reset()
+    natten.set_memory_usage_preference("unrestricted")
+    natten.use_kv_parallelism_in_fused_na(True)
 
     random.seed(random_seed)
     torch.manual_seed(torch_seed)

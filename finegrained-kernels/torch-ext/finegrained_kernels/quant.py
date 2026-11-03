@@ -19,7 +19,8 @@ from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
 from .bayesian_autotuner import bayesian_autotune
 from .formats import global_scale_stride, is_per_expert_global
-from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, compile_time_only_triton_wrap, device_context, is_blackwell, pdl_launch_kwargs
+from ._ops import add_op_namespace_prefix
+from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, is_blackwell, pdl_launch_kwargs
 from .swizzle import swizzle_store_block
 from .scheduling import build_tile_layout, resolve_tile_inline
 
@@ -708,6 +709,8 @@ def mx_act_quant_routed_rows(
     return y, scales, n_m_tiles
 
 
+# opaque, so torch.compile never reads the PDL inline asm, which its kernel analysis cannot parse
+@compile_time_only_triton_op(add_op_namespace_prefix("mx_act_quant_routed_scales"), mutates_args=(), opaque=True)
 def mx_act_quant_routed_scales(
     x: torch.Tensor,
     activation_format: str,

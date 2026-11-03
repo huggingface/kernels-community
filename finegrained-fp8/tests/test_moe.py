@@ -16,12 +16,13 @@ from utils import (  # type: ignore
     MX_SCALE_GROUP_K,
     TEST_DEVICE,
     accelerator_module,
+    finegrained_fp8,
     make_weights,
     maybe_compile,
 )
 
-import finegrained_fp8  # type: ignore
-from finegrained_fp8 import fused_batched, fused_grouped  # type: ignore
+fused_batched = finegrained_fp8._private_for_testing.fused_batched
+fused_grouped = finegrained_fp8._private_for_testing.fused_grouped
 
 
 BENCH_REPEATS = 10

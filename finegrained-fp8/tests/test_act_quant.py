@@ -3,9 +3,7 @@
 import pytest
 import torch
 
-from utils import TEST_DEVICE  # type: ignore
-
-import finegrained_fp8  # type: ignore
+from utils import TEST_DEVICE, finegrained_fp8  # type: ignore
 
 
 _FP8_DTYPE = torch.float8_e4m3fn

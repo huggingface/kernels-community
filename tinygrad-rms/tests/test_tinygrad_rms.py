@@ -1,7 +1,10 @@
+import kernels
 import torch
 import pytest
 
-import tinygrad_rms
+tinygrad_rms = kernels.get_kernel("kernels-community/tinygrad-rms", version=1)
+
+pytestmark = pytest.mark.kernels_ci
 
 
 def reference_rms_norm(x: torch.Tensor, epsilon: float = 1e-6) -> torch.Tensor:
