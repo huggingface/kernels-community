@@ -27,6 +27,7 @@
   "ggml-quantization": ["U0586KAH2E9"],
   "gpt-oss-metal-kernels": [],
   "gpt-oss-triton-kernels": [],
+  "grt": [],
   "layer-norm": [],
   "liger-kernels": ["U08Q42K8MGW"],
   "mamba-ssm": ["U08Q42K8MGW"],

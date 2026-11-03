@@ -1,0 +1,98 @@
+[general]
+name = "grt"
+version = 1
+edition = 6
+license = "Apache-2.0"
+backends = [
+    "cuda",
+    "rocm",
+]
+
+[general.hub]
+repo-id = "kernels-community/grt"
+
+[torch]
+src = [
+    "torch-ext/torch_binding.cpp",
+    "torch-ext/torch_binding.h",
+]
+
+[kernel.grt_cuda]
+language = "cpp-cuda"
+cuda-flags = [
+    "-O3",
+    "--use_fast_math",
+]
+depends = ["torch"]
+include = ["csrc"]
+src = [
+    "csrc/clifford_coupling_kernel.cu",
+    "csrc/clifford_coupling_kernel.cuh",
+    "csrc/fused_embedding_kernel.cu",
+    "csrc/fused_embedding_kernel.cuh",
+    "csrc/fused_gelu_kernel.cu",
+    "csrc/fused_gelu_kernel.cuh",
+    "csrc/fused_mixer_kernel.cu",
+    "csrc/fused_mixer_kernel.cuh",
+    "csrc/fused_norm_kernel.cu",
+    "csrc/fused_norm_kernel.cuh",
+    "csrc/fused_zloss_kernel.cu",
+    "csrc/fused_zloss_kernel.cuh",
+    "csrc/givens_backward.h",
+    "csrc/givens_common.h",
+    "csrc/givens_coupling_backward.h",
+    "csrc/givens_coupling_backward_chunked.h",
+    "csrc/givens_coupling_backward_warp.h",
+    "csrc/givens_coupling_forward.h",
+    "csrc/givens_coupling_forward_chunked.h",
+    "csrc/givens_coupling_forward_warp.h",
+    "csrc/givens_forward.h",
+    "csrc/givens_mor.h",
+    "csrc/givens_rotation_kernel.cu",
+]
+
+[kernel.grt_rocm]
+language = "cpp-rocm"
+depends = ["torch"]
+include = ["csrc"]
+rocm-archs = [
+    "gfx906",
+    "gfx908",
+    "gfx90a",
+    "gfx942",
+    "gfx950",
+    "gfx1030",
+    "gfx1100",
+    "gfx1101",
+    "gfx1102",
+    "gfx1103",
+    "gfx1150",
+    "gfx1151",
+    "gfx1200",
+    "gfx1201",
+]
+src = [
+    "csrc/clifford_coupling_kernel.cu",
+    "csrc/clifford_coupling_kernel.cuh",
+    "csrc/fused_embedding_kernel.cu",
+    "csrc/fused_embedding_kernel.cuh",
+    "csrc/fused_gelu_kernel.cu",
+    "csrc/fused_gelu_kernel.cuh",
+    "csrc/fused_mixer_kernel.cu",
+    "csrc/fused_mixer_kernel.cuh",
+    "csrc/fused_norm_kernel.cu",
+    "csrc/fused_norm_kernel.cuh",
+    "csrc/fused_zloss_kernel.cu",
+    "csrc/fused_zloss_kernel.cuh",
+    "csrc/givens_backward.h",
+    "csrc/givens_common.h",
+    "csrc/givens_coupling_backward.h",
+    "csrc/givens_coupling_backward_chunked.h",
+    "csrc/givens_coupling_backward_warp.h",
+    "csrc/givens_coupling_forward.h",
+    "csrc/givens_coupling_forward_chunked.h",
+    "csrc/givens_coupling_forward_warp.h",
+    "csrc/givens_forward.h",
+    "csrc/givens_mor.h",
+    "csrc/givens_rotation_kernel.cu",
+]
