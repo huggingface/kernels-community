@@ -256,53 +256,6 @@ jobs:
         env:
           USER: runner
 
-      - name: Install TPU prefetch tools
-        if: matrix.backend == 'tpu'
-        run: echo "$(nix build nixpkgs#jq --no-link --print-out-paths)/bin" >> "$GITHUB_PATH"
-
-      # Match the Windows workflow: use the kernel's pinned builder helpers.
-      - name: Kernel extract required builder version
-        if: matrix.backend == 'tpu'
-        id: extract-builder-version
-        env:
-          KERNEL: ${{ needs.setup.outputs.kernel }}
-        run: |
-          REVISION=$(jq -er '.nodes["kernel-builder"].locked.rev' "$KERNEL/flake.lock")
-          echo "revision=$REVISION" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout kernels
-        if: matrix.backend == 'tpu'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: huggingface/kernels
-          ref: ${{ steps.extract-builder-version.outputs.revision }}
-          path: kernels
-
-      - name: Resolve TPU wheel versions
-        if: matrix.backend == 'tpu'
-        env:
-          KERNEL: ${{ needs.setup.outputs.kernel }}
-        run: |
-          # requireFile names include the versions and ABI expected by this lockfile.
-          # Newer Nix wraps the output as {"derivations": {...}, "version": N};
-          # older versions emit the derivations as the top-level object.
-          cd "$KERNEL"
-          nix derivation show --recursive .#redistributable.torch-tpu | jq -er '
-            [(.derivations // .)[] | .env.name // "" |
-              capture("^(?<package>torch_tpu|libtpu)-(?<version>[A-Za-z0-9.]+)-(?<abi>cp[0-9]+)-\\k<abi>-manylinux_2_31_x86_64[.]whl$")]
-            | unique
-            | .[] | [.package, .version, .abi] | @tsv
-          ' > "$RUNNER_TEMP/tpu-wheels.tsv"
-
-      - name: Prefetch gated TPU wheels
-        if: matrix.backend == 'tpu'
-        env:
-          GCLOUD_ACCESS_TOKEN: ${{ secrets.GCLOUD_ACCESS_TOKEN }}
-        run: |
-          while IFS=$'\t' read -r package version abi; do
-            bash kernels/nix-builder/scripts/helpers/prefetch-tpu-wheel.sh "$package" "$version" "$abi"
-          done < "$RUNNER_TEMP/tpu-wheels.tsv"
-
       # PR mode builds backendCi (single representative variant);
       # release mode builds backendBundle (full set of variants).
       - name: Build kernel
