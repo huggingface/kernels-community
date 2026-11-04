@@ -130,7 +130,9 @@ struct bwd_policy_head256 {
   static constexpr int kBlockM = 64;
   static constexpr int kBlockN = 32;
   static constexpr int kHeadDim = 256;
-  static constexpr int kNSGs = 8;
+  // 16 subgroups: with 8, the per-subgroup dK/dV/dQ accumulators alone fill
+  // the 256-entry GRF and the kernel spills ~10-13 KB per thread.
+  static constexpr int kNSGs = 16;
   static constexpr int AtomLayoutMSdP = 4;
   static constexpr int AtomLayoutNdKV = 2;
   static constexpr int AtomLayoutMdQ = 2;
