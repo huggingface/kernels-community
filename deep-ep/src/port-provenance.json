@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "recipe": "sha256:a41ea71d40fe7e0a5e8ea55aac07408e2f06f7916c1b6523220111d445f0b4a8",
+  "recipe": "sha256:5740d41fa044050b3b24147551c62d47daa708606e1f9868e744735e86834055",
   "runner": "kernel-port 0.1.0",
   "sources": {
     "deepjit": {
@@ -16,5 +16,5 @@
       "commit": "def865146e95aa9ea223e277c0a8a4c6b81e5ac7"
     }
   },
-  "tree": "sha256:57c2d669ebcdd21cadc75f6875740ce55061d380f95a790f162f5071de6b2cb6"
+  "tree": "sha256:62fdd0777e40f1859cdf811ba47e71bc732c3d5811b9c2d865ef02083e9a5e13"
 }

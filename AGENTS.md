@@ -658,9 +658,15 @@ upstream layout, with the `third-party/deep_jit` submodule (DeepJIT) inlined at
 the commit the DeepEP release pins. Only the small host extension is built;
 DeepEP's GPU kernels are JIT-compiled at runtime by DeepJIT. When the user asks
 to sync a DeepEP release, update `deep-ep/port/port.kdl` and its handwritten
-`overlay/` files, then regenerate and check the output with
-`deep-ep/port/regenerate.py` (see `deep-ep/port/README.md`). Do not make porting
-changes only in the generated tree. The recipe pins DeepEP and DeepJIT and
+`overlay/` files, then regenerate `deep-ep/src` with
+`python3 scripts/check_ports.py --write deep-ep` (it clones the pins in the
+recipe; set `KERNEL_PORT` to a `kernel-port` binary, see
+`.github/workflows/check-ports.yaml`) and check it with
+`python3 scripts/check_ports.py deep-ep`. Do not make porting
+changes only in the generated tree. The recipe prunes the upstream files the
+kernel doesn't build (lint/CI config, figures, the top-level Python package,
+which the `python` vendor provides as `torch-ext/deep_ep`, and everything in
+DeepJIT except its headers). The recipe pins DeepEP and DeepJIT and
 retains the existing Torch ops/custom-class bindings. The synchronization
 requirements encoded in the recipe are:
 

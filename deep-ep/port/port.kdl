@@ -2,12 +2,12 @@ recipe version=1
 
 // DeepEP 2.5.0 and its exact DeepJIT dependency.
 source repo="https://github.com/deepseek-ai/DeepEP.git" commit="def865146e95aa9ea223e277c0a8a4c6b81e5ac7"
-prune keep=".clang-format,.editorconfig,.gitignore,.gitmodules,.github/workflows/format.yml,third-party/tilelang_ops/**,LICENSE,README.md,format.sh,requirements-lint.txt,csrc/**,deep_ep/**,tests/**,figures/**"
+prune keep=".gitignore,LICENSE,README.md,csrc/**,deep_ep/include/**,tests/**,third-party/tilelang_ops/**"
 // Retain the upstream layout, and derive the Hub Python package from the same pin.
 vendor name="python" repo="https://github.com/deepseek-ai/DeepEP.git" commit="def865146e95aa9ea223e277c0a8a4c6b81e5ac7" path="deep_ep" to="torch-ext/deep_ep"
 vendor name="deepjit" repo="https://github.com/deepseek-ai/DeepJIT.git" commit="cba802df081985141eeee36803685775c183a047" path="." to="third-party/deep_jit"
 
-prune keep=".clang-format,.editorconfig,.gitignore,.gitmodules,.github/workflows/format.yml,third-party/tilelang_ops/**,LICENSE,README.md,format.sh,requirements-lint.txt,csrc/**,deep_ep/**,tests/**,figures/**,torch-ext/**,third-party/deep_jit/**"
+prune keep=".gitignore,LICENSE,README.md,csrc/**,deep_ep/include/**,tests/**,third-party/tilelang_ops/**,torch-ext/**,third-party/deep_jit/include/**,third-party/deep_jit/README.md"
 
 // The Hub loader imports under a generated module name.
 convert_import in="torch-ext/deep_ep/**/*.py" prefix="deep_ep" changes=10
