@@ -16,7 +16,7 @@ unvalidated.
 
 ## Benchmarks
 
-![MoE bench: finegrained-kernels vs references on B200](bench/bench_moe.png)
+![MoE bench: finegrained-kernels vs references on B200](https://huggingface.co/datasets/IlyasMoutawwakil/benchmarks/resolve/main/finegrained-kernels/cold-weight-timing/bench_moe.png)
 
 Real model shapes on an NVIDIA B200, against upstream `finegrained-fp8`, DeepGEMM, vLLM's fused
 MoE, FlashInfer's TRT-LLM routed-MoE kernels, transformers `grouped_mm`/`batched_mm`, SonicMoE,
@@ -186,6 +186,15 @@ decode once with `decompress_nvfp4_csf_scales`.
 Every kernel is tuned by a Tree-structured Parzen Estimator (TPE, the Bayesian search Optuna
 uses) autotuner with per-shape disk caching, config pruners
 that fence compiler bugs and can't-win regions per (arch, format), and failed-compile memoization.
+
+> [!NOTE]
+> Kernels are tuned on cold weights, as in a model where each layer's weights come from HBM. A
+> kernel declaring `cold_banks` (the forward GEMMs, through `bench.gemm_cold_banks`) is timed in a
+> CUDA graph that cycles through more than twice L2 of distinct weights: a routed call is rerouted
+> to other experts of its stack, a dense weight is copied. When memory runs short, the tune runs
+> partly warm and its result is not cached. Other kernels, non-CUDA devices and user timing hooks
+> keep Triton's timing, which clears L2 before each measurement.
+
 `FINEGRAINED_AUTOTUNE_CONFIG` overrides the tuner for every kernel, read when the kernels are
 imported. For correctness runs, `FINEGRAINED_AUTOTUNE_CONFIG=fast` measures one configuration per
 shape (retrying failed candidates) and skips the search phases. For finer control it takes inline
@@ -199,6 +208,8 @@ Unknown modes or keys raise. Keys are the tuner's options:
 - `basin_probes`: measure one anchor per categorical basin before the TPE (default `true`).
 - `max_refine_iters`: coordinate-refinement iterations (default `5`; `0` disables it).
 - `log_path`: append every measured config's timing as JSONL.
+- `rotate_weights`: rotate weight banks so tuning sees cold weights (default `true`);
+  `false` times warm graph replay instead. The two keep separate on-disk tuning results.
 - Debugging: `key_log_path` (tune-cache key decisions), `call_count_path` (per-kernel host launch
   counts, written at exit), `tracebacks` (full failure tracebacks), `lock_timeout` (seconds to wait
   for another rank's tune, default `1800`).
