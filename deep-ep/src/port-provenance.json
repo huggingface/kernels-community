@@ -1,0 +1,20 @@
+{
+  "format": 1,
+  "recipe": "sha256:5740d41fa044050b3b24147551c62d47daa708606e1f9868e744735e86834055",
+  "runner": "kernel-port 0.1.0",
+  "sources": {
+    "deepjit": {
+      "repo": "https://github.com/deepseek-ai/DeepJIT.git",
+      "commit": "cba802df081985141eeee36803685775c183a047"
+    },
+    "python": {
+      "repo": "https://github.com/deepseek-ai/DeepEP.git",
+      "commit": "def865146e95aa9ea223e277c0a8a4c6b81e5ac7"
+    },
+    "upstream": {
+      "repo": "https://github.com/deepseek-ai/DeepEP.git",
+      "commit": "def865146e95aa9ea223e277c0a8a4c6b81e5ac7"
+    }
+  },
+  "tree": "sha256:377a741d81cc8751b07a64a6551a4156aa8eb97aa00c5241cf622af10d414d8b"
+}
