@@ -95,6 +95,14 @@ def _holds_rows(t: torch.Tensor, rows: int) -> bool:
 # unconditionally; only the two gates above have a real M=1 inline win.
 
 
+SPLIT_K_VALUES = (2, 4, 8)
+SPLIT_K_MAX_M = 16
+# the widest split-K N tile: the split-K partials buffers are sized for the tile grid at this width
+SPLIT_K_MAX_BLOCK_N = 64
+# the narrowest MX split-K N tile: mx_dynamic_matmul sizes its arrival counters for the tile grid at this width
+MX_SPLIT_K_MIN_BLOCK_N = 32
+
+
 def _block_dynamic_2d_configs():
     """The k_loop grid, plus its warp-specialized host-TMA prefill tiles over the output-tile
     pipelines (persistent, WS across tiles: one tile's epilogue overlaps the next tile's MMA)."""
@@ -107,9 +115,17 @@ def _block_dynamic_2d_configs():
         b_memory_modes=("descriptor", "pointer"),
         pre_hook=rebind_bd_descriptors,
     )
+    for c in configs:
+        c.kwargs["SPLIT_K"] = 1
     seeds = [c for c in configs if c.kwargs.get("WARP_SPEC") and c.kwargs.get("BLOCK_SIZE_M", 0) >= 64
              and c.kwargs.get("A_MEMORY_MODE") == c.kwargs.get("B_MEMORY_MODE") == "host_descriptor"]
-    return configs + pipeline_autotuning_configs(seeds, ("tile_loop", "flattened"))
+    # decode tiles split along K: a narrow N leaves most SMs idle on a deep K (DeepSeek-V3 kv_a, N=576, runs 9
+    # programs), and under one program per SM a single program streams too little of the weight to saturate HBM
+    # (BM=16 only: the partials buffer is sized for 16-row tiles)
+    decode = [c for c in configs if c.kwargs["BLOCK_SIZE_M"] == 16 and not c.kwargs["WARP_SPEC"]
+              and c.kwargs["BLOCK_SIZE_N"] <= SPLIT_K_MAX_BLOCK_N]
+    return (configs + pipeline_autotuning_configs(seeds, ("tile_loop", "flattened"))
+            + split_k_autotuning_configs(SPLIT_K_VALUES, configs=decode))
 
 
 @bayesian_autotune(
@@ -134,7 +150,7 @@ def _block_dynamic_2d_configs():
     ["N", "K", "m_bit_length", "GATE", "block_n", "block_k"],
     n_trials=100,
     cold_banks=gemm_cold_banks,
-    path_anchor_axes=PATH_ANCHOR_AXES,
+    path_anchor_axes=(*PATH_ANCHOR_AXES, "SPLIT_K"),
     # 2D outputs are fully written (no sentinel/padding contract), so the numerics veto is safe
     finite_check_args=("C", "Cs"),
     # WS compile guard + descriptor TMA-box limits (256/dim) + shared-memory fit (the big
@@ -152,6 +168,7 @@ def _block_dynamic_2d_configs():
             smem_pruner("block_k"),
             block_dynamic_mma_width_pruner(),
             block_dynamic_2d_warp_spec_pruner(),
+            int_split_k_pruner("M", SPLIT_K_MAX_M, block_k_arg="block_k"),
         )
     },
 )
@@ -165,6 +182,8 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     Bs,  # (N // block_n, K // block_k) weight scales (fp32 or uint8/UE8M0)
     C,  # (M, N) output
     Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
+    Partials,  # (SPLIT_K_MAX, tiles, BM, n_width) fp32 split-K partial sums; read iff SPLIT_K > 1
+    TileCounters,  # (tiles,) int32 split-K arrival counters, zero between launches; read iff SPLIT_K > 1
     # Shape
     M,
     N,
@@ -211,6 +230,8 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     # tile's epilogue overlaps the next tile's MMA (the grouped kernels' PIPELINE axis)
     PIPELINE: tl.constexpr = "k_loop",
     GROUP_SIZE_M: tl.constexpr = None,
+    # decode split-K: K split across SPLIT_K programs per output tile (grid axis 2), reduced in-kernel
+    SPLIT_K: tl.constexpr = 1,
 ):
     """Block-scale FP8 GEMM kernel.
 
@@ -281,8 +302,13 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
         # scale columns, a narrow one shares a column
         bs_ptrs = Bs + weight_scale_rows(offs_bn_lin, block_n, GATE) * stride_bs_n
         accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
+        split = tl.program_id(2) if SPLIT_K > 1 else 0
+        a_ptrs += split * block_k * stride_a_k
+        b_ptrs += split * block_k * stride_b_k
+        as_ptrs += split * stride_as_k
+        bs_ptrs += split * stride_bs_k
 
-        for k in tl.range(0, tl.cdiv(K, block_k), warp_specialize=WARP_SPEC and PIPELINE == "k_loop"):
+        for k in tl.range(split, tl.cdiv(K, block_k), SPLIT_K, warp_specialize=WARP_SPEC and PIPELINE == "k_loop"):
             a, a_s = load_act_block_dynamic(
                 a_ptrs, as_ptrs, None, as_mask, a_descriptor, pid_m * BLOCK_SIZE_M, k * block_k,
                 0, 0, A_MEMORY_MODE, False, False, SWAP_AB,
@@ -296,39 +322,47 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
             )
             a_ptrs, as_ptrs, b_ptrs, bs_ptrs, _, _ = advance_ptrs(
                 a_ptrs, as_ptrs, b_ptrs, bs_ptrs, b_ptrs, bs_ptrs,
-                block_k * stride_a_k, stride_as_k, block_k * stride_b_k, stride_bs_k,
+                SPLIT_K * block_k * stride_a_k, SPLIT_K * stride_as_k, SPLIT_K * block_k * stride_b_k, SPLIT_K * stride_bs_k,
                 A_MEMORY_MODE, B_MEMORY_MODE, True, True, False,
             )
 
         if PDL and PIPELINE == "k_loop":
             gdc_launch_dependents()
-        if GATE:
-            gemm_epilogue(
-                C, None, accumulator, offs_am_lin, pid_n, pid_m, as_mask,
-                stride_c_m, stride_c_n, 0, 0,
-                BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, block_k,
-                ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
-                COMPUTE_MODE="dot", SWAP_AB=SWAP_AB, N_COLS=N,
-                Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
+        if SPLIT_K > 1:
+            accumulator, last = split_k_reduce(
+                accumulator, Partials, TileCounters, tile_id, tl.num_programs(0) * tl.num_programs(1),
+                BLOCK_SIZE_M, n_width, SPLIT_K,
             )
         else:
-            accumulator = add_bias(
-                accumulator, Bias, stride_bias_e, stride_bias_n, 0, pid_n,
-                BLOCK_SIZE_N, N, SWAP_AB,
-            )
-            store_masked_oriented(
-                C,
-                accumulator,
-                pid_m,
-                pid_n,
-                M,
-                N,
-                stride_c_m,
-                stride_c_n,
-                BLOCK_SIZE_M,
-                BLOCK_SIZE_N,
-                SWAP_AB,
-            )
+            last = True
+        if last:
+            if GATE:
+                gemm_epilogue(
+                    C, None, accumulator, offs_am_lin, pid_n, pid_m, as_mask,
+                    stride_c_m, stride_c_n, 0, 0,
+                    BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, block_k,
+                    ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
+                    COMPUTE_MODE="dot", SWAP_AB=SWAP_AB, N_COLS=N,
+                    Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
+                )
+            else:
+                accumulator = add_bias(
+                    accumulator, Bias, stride_bias_e, stride_bias_n, 0, pid_n,
+                    BLOCK_SIZE_N, N, SWAP_AB,
+                )
+                store_masked_oriented(
+                    C,
+                    accumulator,
+                    pid_m,
+                    pid_n,
+                    M,
+                    N,
+                    stride_c_m,
+                    stride_c_n,
+                    BLOCK_SIZE_M,
+                    BLOCK_SIZE_N,
+                    SWAP_AB,
+                )
     if PDL and PIPELINE != "k_loop":
         gdc_launch_dependents()
 
@@ -658,12 +692,6 @@ def w8a8_block_static_fp8_matmul_kernel(
         )
 
 
-SPLIT_K_VALUES = (2, 4, 8)
-SPLIT_K_MAX_M = 16
-# the widest split-K N tile: the split-K partials buffers are sized for the tile grid at this width
-SPLIT_K_MAX_BLOCK_N = 64
-# the narrowest MX split-K N tile: mx_dynamic_matmul sizes its arrival counters for the tile grid at this width
-MX_SPLIT_K_MIN_BLOCK_N = 32
 _SPLIT_K_WORKSPACES: dict = {}
 
 
@@ -672,17 +700,20 @@ def _split_k_pool():
     return torch.cuda.MemPool()
 
 
-def split_k_workspace(device: torch.device, partials_numel: int, counters_numel: int):
+def split_k_workspace(device: torch.device, partials_numel: int, counters_numel: int, zero_counters: bool = True):
     """FP32 partials and INT32 arrival counters for ``split_k_reduce``. Each tile's last arrival re-zeroes its counter, so
     eager launches reuse one pair per (device, stream), zeroed once at creation and grown when a launch needs more: the
     stream orders the launches sharing it (the caching allocator also reuses a replaced pair in stream order), and a
-    concurrent stream has its own pair. Graph capture gets private scratch whose counter memset the graph replays, so a
-    graph never shares counters with eager launches or other graphs, whatever stream it is replayed on. The cached
-    pairs come from their own pool, out of a cudagraph-trees warmup's graph pool."""
+    concurrent stream has its own pair. Graph capture gets private scratch whose counters are zeroed on every replay, so
+    a graph never shares counters with eager launches or other graphs, whatever stream it is replayed on: by a memset,
+    or, with ``zero_counters=False``, by a kernel the caller launches before the GEMM (a memset node between two PDL
+    launches costs its own time and the overlap). The cached pairs come from their own pool, out of a cudagraph-trees
+    warmup's graph pool."""
     cuda = device.type == "cuda"
     if launches_skipped() or (cuda and torch.cuda.is_current_stream_capturing()):
+        counters = torch.zeros if zero_counters else torch.empty
         return (torch.empty(partials_numel, device=device, dtype=torch.float32),
-                torch.zeros(counters_numel, device=device, dtype=torch.int32))
+                counters(counters_numel, device=device, dtype=torch.int32))
     key = torch.accelerator.current_stream(device)
     pair = _SPLIT_K_WORKSPACES.get(key)
     if pair is None or pair[0].numel() < partials_numel or pair[1].numel() < counters_numel:
@@ -1676,9 +1707,20 @@ def w8a8_block_dynamic_fp8_matmul(
     # UE8M0 weight scales are the DeepGEMM-Blackwell format — quantize activations to UE8M0
     # too so the kernel folds both group scales into the tcgen05 dot_scaled MMA (else fp32).
     # rows padded to the largest M tile, so the A box reads in bounds (see the tensor-dynamic op)
+    # split-K scratch (decode band only, int_split_k_pruner): partials for the widest split over the split tiles'
+    # padded grid, counters for the narrowest tile's grid; the activation quant zeroes the counters
+    partials = counters = None
+    if M <= SPLIT_K_MAX_M:
+        partials, counters = split_k_workspace(
+            A.device,
+            SPLIT_K_VALUES[-1] * triton.cdiv(M, 16) * 16
+            * triton.cdiv(N, SPLIT_K_MAX_BLOCK_N) * SPLIT_K_MAX_BLOCK_N * (2 if gate else 1),
+            triton.cdiv(M, 16) * triton.cdiv(N, 16),
+            zero_counters=False,
+        )
     A_q, A_s = fp8_act_quant_block_dynamic(
         A.view(M, K), block_k, use_ue8m0=bs_u8.dtype == torch.uint8,
-        row_multiple=MATMUL_A_ROW_MULTIPLE,
+        row_multiple=MATMUL_A_ROW_MULTIPLE, zero=counters,
     )
     a_rows = _padded_rows(M)
     C = A.new_empty(A.shape[:-1] + (gate_out_cols(N, gate, act_fn),), dtype=output_dtype)
@@ -1696,6 +1738,7 @@ def w8a8_block_dynamic_fp8_matmul(
         return (
             triton.cdiv(M, META["BLOCK_SIZE_M"]),
             triton.cdiv(N, META["BLOCK_SIZE_N"]),
+            META.get("SPLIT_K", 1),
         )
 
     with device_context(A.device):
@@ -1709,6 +1752,8 @@ def w8a8_block_dynamic_fp8_matmul(
             bs_u8,
             C,
             bias,
+            partials,
+            counters,
             M,
             N,
             K,

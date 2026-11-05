@@ -1429,10 +1429,11 @@ def mx_auxiliary_pruner():
     return config_filter(ok)
 
 
-def int_split_k_pruner(m_arg: str, max_m: int):
+def int_split_k_pruner(m_arg: str, max_m: int, block_k_arg: str | None = None):
     """``early_config_prune`` for a split-K axis: splits only in the decode band (``m_arg`` <= ``max_m``, where the
     launch allocates the partials) and only where the split divides the K tiles. Sub-16 dot tiles cover the
-    launch's rows in one tile, keeping the counter grid within its allocation and avoiding repeated weight reads."""
+    launch's rows in one tile, keeping the counter grid within its allocation and avoiding repeated weight reads.
+    ``block_k_arg`` names the launch arg holding the K tile when the configs do not tune one (block FP8)."""
 
     def ok(c, args):
         bm = c.kwargs.get("BLOCK_SIZE_M", 16)
@@ -1441,7 +1442,7 @@ def int_split_k_pruner(m_arg: str, max_m: int):
         split = c.kwargs.get("SPLIT_K", 1)
         if split == 1:
             return True
-        k_tiles = args["K"] // c.kwargs["BLOCK_SIZE_K"]
+        k_tiles = args["K"] // (args[block_k_arg] if block_k_arg else c.kwargs["BLOCK_SIZE_K"])
         return args[m_arg] <= max_m and k_tiles % split == 0 and k_tiles >= split
 
     return config_filter(ok)

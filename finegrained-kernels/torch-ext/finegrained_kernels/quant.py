@@ -1131,6 +1131,8 @@ def _fp8_act_quant_block_dynamic_kernel(
     X,
     Y,
     S,
+    Zero,  # int32 buffer this launch zeroes (the consuming GEMM's split-K counters); None to skip
+    zero_numel,
     stride_x_t,
     stride_x_k,
     T,
@@ -1158,6 +1160,11 @@ def _fp8_act_quant_block_dynamic_kernel(
         gdc_wait()
     pid_t = tl.program_id(0)
     kb = tl.program_id(1)
+    if Zero is not None:
+        if (pid_t == 0) & (kb == 0):
+            for i in range(0, zero_numel, 1024):
+                offs_z = i + tl.arange(0, 1024)
+                tl.store(Zero + offs_z, tl.zeros((1024,), tl.int32), mask=offs_z < zero_numel)
     rows = (pid_t * BLOCK_T + tl.arange(0, BLOCK_T)).to(tl.int64)
     offs = kb * BLOCK_K + tl.arange(0, BLOCK_K)
     row_mask = rows < T
@@ -1180,7 +1187,8 @@ def _fp8_act_quant_block_dynamic_kernel(
 
 
 def fp8_act_quant_block_dynamic(
-    x: torch.Tensor, block_k: int, use_ue8m0: bool = False, row_multiple: int = 1, swizzled: bool = False
+    x: torch.Tensor, block_k: int, use_ue8m0: bool = False, row_multiple: int = 1, swizzled: bool = False,
+    zero: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``(T, K)`` activations to block-FP8 once (E4M3 + per-``block_k`` scales)
     instead of inline per weight-tile — same rationale and layout as ``mxfp8_act_quant`` (a
@@ -1189,7 +1197,8 @@ def fp8_act_quant_block_dynamic(
     for the tcgen05 ``dot_scaled`` path — the DeepGEMM-Blackwell format. ``row_multiple`` backs
     the E4M3 rows with storage rounded up to that many rows, as ``fp8_act_quant_tensor_wide``.
     ``swizzled`` (UE8M0 only) emits the scales as the group-32 SWIZZLE_32_4_4 operand of an MXFP8
-    GEMM instead, each block scale repeated over its ``block_k // 32`` groups."""
+    GEMM instead, each block scale repeated over its ``block_k // 32`` groups. ``zero`` (int32) is cleared by the same
+    launch: the consuming GEMM's split-K counters, without a memset between the two PDL launches."""
     T, K = x.shape
     assert use_ue8m0 or not swizzled, "only power-of-two (UE8M0) block scales are MX group scales"
     y = row_padded_empty(T, K, row_multiple, FP8_DTYPE, x.device)
@@ -1205,7 +1214,7 @@ def fp8_act_quant_block_dynamic(
 
     with device_context(x.device):
         compile_time_only_triton_wrap(_fp8_act_quant_block_dynamic_kernel)[grid](
-            x, y, s, x.stride(0), x.stride(1), T, T.bit_length(),
+            x, y, s, zero, 0 if zero is None else zero.numel(), x.stride(0), x.stride(1), T, T.bit_length(),
             K=K, BLOCK_K=block_k, UE8M0=use_ue8m0, SWIZZLED=swizzled,
             **pdl_launch_kwargs(),
         )
