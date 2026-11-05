@@ -130,7 +130,7 @@ _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_ROOT, "torch-ext"))
 sys.path.insert(0, os.path.join(_ROOT, "tests"))
 import finegrained_kernels as fgm  # noqa: E402  local branch
-from finegrained_kernels.bench import do_bench, free_device_bytes, rotation_count  # noqa: E402
+from finegrained_kernels.bench import active_experts, do_bench, free_device_bytes, rotation_count  # noqa: E402
 from kernels import get_kernel  # noqa: E402
 
 # kernels-community IS a trusted publisher, so the check passes whenever it can reach the Hub
@@ -1345,13 +1345,11 @@ def _routing_banks(cfg, weights, hidden, idx, w, logits):
     if DEVICE != "cuda":
         return None
     E = cfg["E"]
-    active = idx.unique().long()
+    active, idle = active_experts(idx.long(), None, E)
     n = active.numel()
     count = rotation_count(_tensor_bytes(weights) * n // E, 0)
     if count * n > E:
         return None
-    idle = torch.arange(E, device=idx.device)
-    idle = idle[~torch.isin(idle, active)]
     banks = [(hidden, idx, w, logits)]
     for k in range(1, count):
         block = idle[(k - 1) * n:k * n]

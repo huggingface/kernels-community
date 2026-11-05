@@ -36,6 +36,7 @@ block_within_dim_pruner = internals.pruners.block_within_dim_pruner
 mx_config_pruner = internals.pruners.mx_config_pruner
 gemm_cold_banks = internals.bench.gemm_cold_banks
 routed_banks = internals.bench.routed_banks
+active_experts = internals.bench.active_experts
 
 
 @pytest.fixture
@@ -256,12 +257,12 @@ def test_failed_configs_do_not_consume_trial_budget(full_search):
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
+@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="cold timing rotates banks in CUDA graphs")
 def test_routed_banks_read_disjoint_experts():
     """Cold routed tuning shares one expert stack: each bank sends the same rows to its own experts."""
     experts = 16
     ids = torch.tensor([3, 7, 3, -1, 9], device=TEST_DEVICE, dtype=torch.int32)
-    banks = routed_banks({"ExpertIds": ids}, experts, 4)
+    banks = routed_banks({"ExpertIds": ids}, *active_experts(ids, None, experts), 4)
     seen = set()
     for bank in banks:
         bank_ids = bank["ExpertIds"]
@@ -270,12 +271,12 @@ def test_routed_banks_read_disjoint_experts():
         assert len(routed) == 3 and not routed & seen
         assert bank_ids[0] == bank_ids[2]  # rows sharing an expert still share one
         seen |= routed
-    assert len(routed_banks({"ExpertIds": ids}, experts, 6)) == 5  # the stack holds 5 blocks of 3
+    assert len(routed_banks({"ExpertIds": ids}, *active_experts(ids, None, experts), 6)) == 5  # the stack holds 5 blocks of 3
 
     start = torch.tensor([0, 0, 4, 4, 9, 9, 9, 9, 10] + [10] * 8, device=TEST_DEVICE, dtype=torch.int32)
     counts = (start[1:] - start[:-1]).tolist()
     seen = set()
-    for bank in routed_banks({"ExpertStart": start}, experts, 5):
+    for bank in routed_banks({"ExpertStart": start}, *active_experts(None, start, experts), 5):
         bank_counts = (bank["ExpertStart"][1:] - bank["ExpertStart"][:-1]).tolist()
         assert sorted(c for c in bank_counts if c) == sorted(c for c in counts if c)
         assert bank["ExpertStart"][-1] == start[-1]
