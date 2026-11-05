@@ -341,8 +341,8 @@ How much of the MMA each tile uses.
 | batched | FP8 weight-only | ⚪ | 🟢 | 🔴 | ⚪ | ⚪ | ⚪ | ⚪ |
 | batched | INT2/4/8 (GPTQ, AWQ, SmoothQuant) | ⚪ | 🟠 | 🟢 | 🔴 | ⚪ | ⚪ | ⚪ |
 | batched | BF16 / FP16 | ⚪ | 🟢 | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
-| grouped | block FP8 (dynamic act) | 🟠 | ⚪ | ⚪ | ⚪ | 🔴 | ⚪ | ⚪ |
-| grouped | block FP8 (static act) | ⚪ | ⚪ | ⚪ | ⚪ | 🔴 | ⚪ | ⚪ |
+| grouped | block FP8 (dynamic act) | 🟠 | ⚪ | ⚪ | ⚪ | 🟢 | ⚪ | ⚪ |
+| grouped | block FP8 (static act) | ⚪ | ⚪ | ⚪ | ⚪ | 🟢 | ⚪ | ⚪ |
 | grouped | tensor / row-wise FP8 | ⚪ | ⚪ | ⚪ | ⚪ | 🟢 | ⚪ | ⚪ |
 | grouped | MXFP8 / MXFP4 / NVFP4 | 🟠 | ⚪ | ⚪ | ⚪ | 🟢 | ⚪ | 🔴 |
 | grouped | MX weight-only (W4A16 / W8A16) | 🟠 | ⚪ | ⚪ | ⚪ | 🟢 | 🟢 | ⚪ |

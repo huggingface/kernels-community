@@ -87,6 +87,7 @@ block_fp8_weight_only_matmul_grouped_kernel = internals.grouped.block_fp8_weight
 full_precision_matmul_grouped_kernel = internals.grouped.full_precision_matmul_grouped_kernel
 int_weight_only_matmul_grouped_kernel = internals.grouped.int_weight_only_matmul_grouped_kernel
 mx_dynamic_matmul_grouped_kernel = internals.grouped.mx_dynamic_matmul_grouped_kernel
+w8a8_block_dynamic_fp8_matmul_grouped_kernel = internals.grouped.w8a8_block_dynamic_fp8_matmul_grouped_kernel
 w8a8_block_static_fp8_matmul_grouped_kernel = internals.grouped.w8a8_block_static_fp8_matmul_grouped_kernel
 w8a8_tensor_dynamic_fp8_matmul_grouped_kernel = internals.grouped.w8a8_tensor_dynamic_fp8_matmul_grouped_kernel
 int_weight_only_matmul_2d_kernel = internals.matmul.int_weight_only_matmul_2d_kernel
@@ -1017,6 +1018,7 @@ _SWEEP_CELLS = [
     # is the lowering failure warp_spec_memory_mode_pruner(gather_only=True) fences
     (Problem(weights="bf16", gate=True), "grouped", full_precision_matmul_grouped_kernel),
     # the static block-scale kernel: its own three-stream K-loop under the block-dynamic fences
+    (Problem(weights="fp8_128x128", gate=True), "grouped", w8a8_block_dynamic_fp8_matmul_grouped_kernel),
     (Problem(weights="fp8_128x128", gate=True, static=True), "grouped", w8a8_block_static_fp8_matmul_grouped_kernel),
     # the calibrated (static) arm on per-tensor weights: it hands the kernel a RAW A to quantize
     # per tile, the one activation form that cannot ride the TMA gather, so its admitted set is
