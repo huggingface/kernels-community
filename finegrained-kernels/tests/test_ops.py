@@ -373,6 +373,8 @@ def scenarios() -> list[Problem]:
         Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, bias=True),
         Problem(weights="mxfp4", activation_format="bf16", gate=True, swiglu_alpha=1.702, swiglu_limit=7.0, bias=True),
         Problem(weights="mxfp4", activation_format="bf16", gate=True, swiglu_alpha=1.702, swiglu_limit=7.0, bias=True, S=8),
+        # >= 256 rows per expert: the gate|up stages BF16 weights (MX_WEIGHT_ONLY_GATE_DEQUANT_MIN_M)
+        Problem(weights="mxfp4", activation_format="bf16", gate=True, swiglu_alpha=1.702, swiglu_limit=7.0, bias=True, S=1024, compile=True),
         # int4 weight-only (the format matrix above gives each row its plain cell): the gated GLU with
         # a bias, decode (the batched swap reduce at S=1), a K off the BK grid (the batched tail tile
         # slides back) and fp16 activations, each with and without zero points

@@ -21,6 +21,8 @@ from .compat import MX_SCALE_GROUP_K, NIBBLES_PER_BYTE, NVFP4_SCALE_GROUP_K, UE8
 
 # Amortize weight conversion across this many activation rows per GEMM.
 FP8_WEIGHT_ONLY_DEQUANT_MIN_M = 1024
+# MX weight-only grouped gate|up stages BF16 weights from this many routed rows per expert (the down arm never gains).
+MX_WEIGHT_ONLY_GATE_DEQUANT_MIN_M = 256
 # The integer 2D prefill dequantizes once only at this many rows and above this weight size.
 INT_WEIGHT_ONLY_DEQUANT_MIN_M = 4096
 INT_WEIGHT_ONLY_DEQUANT_MIN_DIM = 2048

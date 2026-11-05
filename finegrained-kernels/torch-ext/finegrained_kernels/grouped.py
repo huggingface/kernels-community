@@ -27,10 +27,10 @@ from ._ops import add_op_namespace_prefix
 from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, persistent_program_count, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, pipeline_autotuning_configs, persistent_programs_per_sm, is_sm10x
 from .bench import gemm_cold_banks
 from .descriptors import build_grouped_operand_descriptors, rebind_grouped_descriptors, rebind_grouped_mx_descriptors
-from .formats import FP8_WEIGHT_ONLY_DEQUANT_MIN_M, block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, row_scale_stride, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, validate_int_operands, INT_WEIGHT_DTYPES
+from .formats import FP8_WEIGHT_ONLY_DEQUANT_MIN_M, MX_WEIGHT_ONLY_GATE_DEQUANT_MIN_M, block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, row_scale_stride, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, validate_int_operands, INT_WEIGHT_DTYPES
 from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, mx_act_quant_grouped, mx_act_quant_routed_rows, quantize_routed_rows_per_expert, static_expert_act_operands, swizzle_grouped_mx_scales, tensor_wide_act_operands, prepare_fp8_mx_inputs, permute_routed_rows
 from .swizzle import swizzled_scale_descriptor
-from .loading.scales import apply_row_scale, dequant_block_fp8_weight, csf_weight_scales
+from .loading.scales import apply_row_scale, dequant_block_fp8_weight, dequant_mx_weight, csf_weight_scales
 from .mma import block_dynamic_dot, fp8_dot, plain_dot, mx_compute, mx_weight_only_compute, static_dot, int_weight_only_compute
 from .scheduling import build_tile_layout, expand_gather_below_parity, expand_regime, load_packed_schedule, grouped_tile_order, prefetch_packed_entry, resolve_grouped_tile, resolve_grouped_tile_packed, fill_packed_schedule, packed_schedule_buffer
 from .loading.tiles import (
@@ -2920,6 +2920,18 @@ def mx_weight_only_matmul_grouped(
     b_global_scale = normalize_global_scale(b_global_scale, num_experts)
     a_global_scale = normalize_global_scale(a_global_scale, num_experts)
     S = routed_rows(A, gather_idx, scatter_idx, expert_start, num_experts)
+    # Large gate|up prefill stages exact BF16 weights (an E2M1/E4M3 value times a UE8M0 scale) once and runs the
+    # BF16 grouped GEMM: GPT-OSS-120B, B200, 256 / 512 rows per expert 0.83x / 0.64x; at 64 it is 2x slower, and
+    # the down arm loses at every size (1.2-1.5x), so it keeps the in-loop upcast.
+    if (
+        gate and mx_scale_family(Bs, K) == MX_SCALE_GROUP_K and b_global_scale is None and a_global_scale is None
+        and A.dtype != torch.float32 and S >= MX_WEIGHT_ONLY_GATE_DEQUANT_MIN_M * num_experts
+    ):
+        weights = dequant_mx_weight(B, Bs, A.dtype, expert_start=expert_start)
+        return full_precision_matmul_grouped(
+            A, weights, expert_start, gate, act_fn, swiglu_alpha, swiglu_limit,
+            simulate_unfused, None, False, output_dtype, gather_idx, scatter_idx, bias=bias,
+        )
     output_dtype = resolve_output_dtype(output_dtype, A, None)
     C = A.new_empty(S, gate_out_cols(N, gate, act_fn), dtype=output_dtype)
     b_u8 = e2m1_as_uint8(B)

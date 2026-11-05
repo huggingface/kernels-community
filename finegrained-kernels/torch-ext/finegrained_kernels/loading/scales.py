@@ -24,7 +24,7 @@ from ..compat import (
     device_context, sm_count,
 )
 from ..formats import block_fp8_weight_scale_grid, ue8m0_as_uint8
-from ..quant import fp8_act_quant_inline, mx_act_quant_inline
+from ..quant import e2m1_cols_to_f32, fp8_act_quant_inline, mx_act_quant_inline
 
 
 @triton.jit
@@ -457,6 +457,62 @@ def dequant_block_fp8_weight(B, Bs, dtype, *, gate=False, expert_start=None):
             BLOCK_N=block_n, BLOCK_K=block_k,
             GATE_SCALES=gate and Bs.shape[-2] > 1,
             BLOCK_SIZE=2048,
+        )
+    return output
+
+
+
+@triton.jit
+def _dequant_mx_weight_kernel(
+    B, Bs, Out, ExpertStart,
+    N, K,
+    stride_b_e, stride_b_n, stride_bs_e, stride_bs_n,
+    PACKED: tl.constexpr, SCALE_GROUP_K: tl.constexpr,
+    BLOCK_R: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    expert = tl.program_id(2).to(tl.int64)
+    active = True
+    if ExpertStart is not None:
+        active = tl.load(ExpertStart + expert) < tl.load(ExpertStart + expert + 1)
+    if active:
+        rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
+        offs_k = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
+        mask = (rows < N)[:, None] & (offs_k < K)[None, :]
+        row_ptrs = B + expert * stride_b_e + rows[:, None].to(tl.int64) * stride_b_n
+        if PACKED:  # two E2M1 values per byte along K, low nibble first
+            offs_byte = tl.program_id(1) * (BLOCK_K // 2) + tl.arange(0, BLOCK_K // 2)
+            packed = tl.load(row_ptrs + offs_byte[None, :], mask=(rows < N)[:, None] & (offs_byte < K // 2)[None, :], other=0)
+            w = e2m1_cols_to_f32(packed)
+        else:
+            w = tl.load(row_ptrs + offs_k[None, :], mask=mask, other=0.0).to(tl.float32)
+        scale = tl.load(
+            Bs + expert * stride_bs_e + rows[:, None].to(tl.int64) * stride_bs_n + (offs_k // SCALE_GROUP_K)[None, :],
+            mask=mask, other=0,
+        )
+        out = Out + expert * N * K + rows[:, None].to(tl.int64) * K + offs_k[None, :]
+        tl.store(out, (w * decode_group_scale(scale)).to(Out.dtype.element_ty), mask=mask)
+
+
+def dequant_mx_weight(B, Bs, dtype, *, expert_start=None):
+    """Materialize MXFP4 / MXFP8 / NVFP4 weights (``(E, N, K // 2)`` packed E2M1 or ``(E, N, K)`` E4M3, with
+    ``(E, N, K // group)`` UE8M0 or E4M3 group scales) for one prefill GEMM, each value times its group scale,
+    rounded once. An E2M1 or E4M3 value times a UE8M0 scale is exact in BF16. As with
+    ``dequant_block_fp8_weight``, planes of experts with no routed rows are allocated but left untouched."""
+    assert dtype in (torch.bfloat16, torch.float16) and B.ndim == 3 and Bs.ndim == 3
+    packed = B.dtype in (torch.int8, torch.uint8)
+    E, N, K_b = B.shape
+    K = 2 * K_b if packed else K_b
+    group = K // Bs.shape[-1]
+    Bs = ue8m0_as_uint8(Bs)
+    output = B.new_empty((E, N, K), dtype=dtype)
+    block_r, block_k = 32, 128
+    with device_context(B.device):
+        compile_time_only_triton_wrap(_dequant_mx_weight_kernel)[
+            (triton.cdiv(N, block_r), triton.cdiv(K, block_k), E)
+        ](
+            B.view(torch.uint8) if packed else B, Bs, output, expert_start, N, K,
+            B.stride(0), B.stride(1), Bs.stride(0), Bs.stride(1),
+            PACKED=packed, SCALE_GROUP_K=group, BLOCK_R=block_r, BLOCK_K=block_k,
         )
     return output
 
