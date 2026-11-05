@@ -135,7 +135,21 @@ def compile_time_only_triton_wrap(kernel):
                 return lambda *args, **kwargs: None
 
         return _NoLaunch()
-    return wrap_triton(kernel) if torch.compiler.is_compiling() else kernel
+    return _FusedLaunch(wrap_triton(kernel) if torch.compiler.is_compiling() else kernel)
+
+
+class _FusedLaunch:
+    """``kernel[grid](...)`` with FP fusion requested explicitly, in eager and through ``wrap_triton``.
+    Triton 3.9 warns when it is left unset and 3.10 turns it off by default, which costs ~6% on
+    block-scaled FP8 prefill (the per-K-block ``acc += dot * scale`` stops being one FMA)."""
+
+    __slots__ = ("kernel",)
+
+    def __init__(self, kernel):
+        self.kernel = kernel
+
+    def __getitem__(self, grid):
+        return functools.partial(self.kernel[grid], enable_fp_fusion=True)
 
 
 
