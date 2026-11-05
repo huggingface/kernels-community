@@ -18,6 +18,7 @@ from typing import List
 import torch
 import triton
 import triton.language as tl
+from packaging.version import Version
 
 
 from triton.tools.tensor_descriptor import TensorDescriptor
@@ -74,6 +75,7 @@ from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, raw_activation_point
             fp8_dot_warp_pruner(),
             packed_schedule_scope_pruner(),
             block_dynamic_grouped_matmul_pruner(),
+            warp_spec_compile_guard_pruner(),
             warp_spec_memory_mode_pruner(),
             descriptor_box_pruner(),
         )
@@ -279,6 +281,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
             fp8_dot_warp_pruner(),
             packed_schedule_scope_pruner(),
             block_dynamic_grouped_matmul_pruner(),
+            warp_spec_compile_guard_pruner(),
             descriptor_box_pruner(),
             raw_activation_pointer_pruner(),
         )
@@ -1909,7 +1912,10 @@ def mx_dynamic_matmul_grouped(
     # group-32, E4M3 group-16 NVFP4); only the column count (cb_cs) and scale byte dtype differ. The
     # swizzle needs contiguous 128-row blocks, i.e. an expert-sorted output (scatter_idx None — the
     # fused gate_up convention); a scattered requant keeps row-major Cs.
-    swizzled_out = requant and scatter_idx is None and swizzled_scales
+    # Triton 3.6 stores the swizzled requant scales wrong through CSDescriptor (as in matmul_2d): there they are written
+    # row-major (expert-sorted) and swizzled after.
+    swizzled_out = requant and scatter_idx is None and swizzled_scales and Version(triton.__version__) >= Version("3.7")
+    swizzle_after = requant and scatter_idx is None and swizzled_scales and not swizzled_out
     if output_format in ("mxfp4", "nvfp4"):  # packed E2M1 intermediate, feeds a W4A4 down as-is
         assert N % (2 * scale_group) == 0, (
             f"N (={N}) must be a multiple of {2 * scale_group} to pack E2M1 pairs"
@@ -2006,6 +2012,8 @@ def mx_dynamic_matmul_grouped(
             SWIZZLED_SCALES=swizzled_scales,
             SWIZZLED_OUT=swizzled_out,
         )
+    if swizzle_after:
+        cs_ret = swizzle_grouped_mx_scales(cs_ret, expert_start)[0].view(scale_dtype)
     return [C, cs_ret] if requant else [C]
 
 

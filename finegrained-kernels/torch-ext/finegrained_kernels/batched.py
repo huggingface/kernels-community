@@ -932,7 +932,7 @@ def full_precision_matmul_batched_kernel(
         A,
         B,
         C,
-        None,  # no scales on the full-precision path
+        B,  # no scales on the full-precision path: a placeholder, returned untouched (Triton 3.6 cannot return None)
         ExpertIds,
         top_k,
         ScatterIdx,
