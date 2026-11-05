@@ -1722,11 +1722,13 @@ def dequantize_int_weight(
     assert zeros is None or zeros.shape == scales.shape, "zero points are shaped like the scales"
     out = torch.empty(*words.shape[:-1], K, device=words.device, dtype=dtype or scales.dtype)
 
-    grid = (triton.cdiv(rows, 32), triton.cdiv(k_words, 16))
+    # 16 rows x 32 words, 4 warps: 4.0 TB/s vs 3.6 for 32 x 16 (B200 INT4 Qwen3-30B down/gate_up stacks, bit-identical);
+    # writing the bf16 output alone runs at ~4 TB/s here, so this is near the store roofline
+    grid = (triton.cdiv(rows, 16), triton.cdiv(k_words, 32))
     with device_context(words.device):
         compile_time_only_triton_wrap(_dequantize_int_kernel)[grid](
             words.contiguous(), scales.contiguous(), None if zeros is None else zeros.contiguous(), out,
-            rows, k_words, BITS=bits, SCALE_GROUP_K=group, BLOCK_SIZE_R=32, BLOCK_SIZE_W=16,
+            rows, k_words, BITS=bits, SCALE_GROUP_K=group, BLOCK_SIZE_R=16, BLOCK_SIZE_W=32, num_warps=4,
         )
     return out
 
