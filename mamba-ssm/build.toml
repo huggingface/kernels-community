@@ -1,6 +1,6 @@
 [general]
 name = "mamba-ssm"
-version = 4
+version = 5
 edition = 6
 license = "Apache-2.0"
 backends = [
