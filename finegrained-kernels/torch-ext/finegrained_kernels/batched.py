@@ -1446,12 +1446,15 @@ def mx_dynamic_matmul_batched(
         # top_k experts at once, so it quantizes per routed row, through the gather
         top_k = routed_rows_per_row(A, expert_ids)
         quantize_per_routed_row = is_per_expert_global(a_global_scale) and top_k > 1
-        routed_rows = torch.arange(expert_ids.shape[0], device=A.device, dtype=torch.int32) // top_k
+        routed_rows = (
+            torch.arange(expert_ids.shape[0], device=A.device, dtype=torch.int32) // top_k
+            if quantize_per_routed_row else None
+        )
         A, As = MX_ACT_QUANT["nvfp4"](
             A,
             global_scale=normalize_global_scale(a_global_scale, B.shape[0]),
             expert_index=expert_ids,
-            gather_idx=routed_rows if quantize_per_routed_row else None,
+            gather_idx=routed_rows,
         )
         pre_quantized = True
     # int8 A = caller-provided packed-E2M1 activations (W4A4, native mxf4 MMA): K is two

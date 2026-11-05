@@ -141,7 +141,8 @@ def compile_time_only_triton_wrap(kernel):
 class _FusedLaunch:
     """``kernel[grid](...)`` with FP fusion requested explicitly, in eager and through ``wrap_triton``.
     Triton 3.9 warns when it is left unset and 3.10 turns it off by default, which costs ~6% on
-    block-scaled FP8 prefill (the per-K-block ``acc += dot * scale`` stops being one FMA)."""
+    block-scaled FP8 prefill (the per-K-block ``acc += dot * scale`` stops being one FMA). A launch
+    that passes its own ``enable_fp_fusion`` keeps it (the embedding lookup turns fusion off)."""
 
     __slots__ = ("kernel",)
 
