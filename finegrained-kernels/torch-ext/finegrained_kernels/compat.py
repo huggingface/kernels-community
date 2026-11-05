@@ -139,10 +139,11 @@ def compile_time_only_triton_wrap(kernel):
 
 
 class _FusedLaunch:
-    """``kernel[grid](...)`` with FP fusion requested explicitly, in eager and through ``wrap_triton``.
-    Triton 3.9 warns when it is left unset and 3.10 turns it off by default, which costs ~6% on
-    block-scaled FP8 prefill (the per-K-block ``acc += dot * scale`` stops being one FMA). A launch
-    that passes its own ``enable_fp_fusion`` keeps it (the embedding lookup turns fusion off)."""
+    """``kernel[grid](...)`` with FP fusion requested explicitly, in eager and through ``wrap_triton``
+    (Triton 3.9 warns when it is left unset). The multiply-adds whose rounding matters are explicit
+    ``tl.fma`` (the scaled K-step accumulates in ``mma``, the MoE reduce), fused whatever the flag. The
+    flag still lets ptxas contract the rest (``--fmad``): off, FP8 block prefill is ~3% slower. Triton
+    3.10 ignores it unless ``TRITON_ALLOW_FP_FUSION=1``. A launch passing its own value keeps it."""
 
     __slots__ = ("kernel",)
 

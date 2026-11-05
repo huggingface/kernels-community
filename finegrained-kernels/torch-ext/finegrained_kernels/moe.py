@@ -133,10 +133,10 @@ def weighted_reduce_kernel(
             row = row * factor * tl.load(NormInv + flat, mask=valid, other=0.0)
             if SIMULATE_UNFUSED:  # the reference materializes the normalized row in Out's dtype
                 row = row.to(Out.dtype.element_ty).to(tl.float32)
-        contrib = weight * row
         if SIMULATE_UNFUSED:
-            contrib = contrib.to(Out.dtype.element_ty).to(tl.float32)
-        acc += contrib
+            acc += (weight * row).to(Out.dtype.element_ty).to(tl.float32)
+        else:
+            acc = tl.fma(weight, row, acc)
     if PDL:
         gdc_launch_dependents()
     tl.store(
