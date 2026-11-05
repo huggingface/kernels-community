@@ -235,10 +235,10 @@ def warp_spec_compile_guard_pruner():
             return True
         # Triton 3.6 compiles warp-specialized 4- and 8-warp configs that return WRONG results (every
         # admitted config, B200: 59/120 MX grouped with swizzled scales, 323/1536 tensor-wide FP8 grouped,
-        # 22/80 NVFP4 grouped, the 2D MX swizzled-scale gate|up), while every non-WS config is correct and
-        # the same configs are correct on 3.7.1 and 3.9. Speed is all the tuner measures, so a wrong
-        # one can win: no WS below 3.7.
-        if Version(triton.__version__) < Version("3.7"):
+        # 22/80 NVFP4 grouped, the 2D MX swizzled-scale gate|up), with no tile or memory-mode pattern
+        # separating them from the correct ones; no 16-warp WS config was wrong, and all are correct on
+        # 3.7.1 and 3.9. Speed is all the tuner measures, so a wrong one can win: no 4/8-warp WS below 3.7.
+        if Version(triton.__version__) < Version("3.7") and c.num_warps in (4, 8):
             return False
         # WS needs num_warps a multiple of 4 (its async producer/consumer partitions) and enough M
         # work — the MMA's M operand, which SWAP_AB moves to BLOCK_SIZE_N (so BM=1 decode can still
@@ -265,6 +265,21 @@ def nvfp4_requant_warps_pruner():
         when=lambda args: args.get("GATE") and args.get("OUTPUT_FORMAT") == "nvfp4"
         and Version(triton.__version__) < Version("3.7"),
     )
+
+
+def dgrad_grouped_warps_pruner():
+    """``early_config_prune`` for a Triton 3.6 miscompile in the grouped dgrad kernel's top-k accumulate launch: one
+    config, 2 warps / 3 stages with a BM=128 BN=128 BK=256 pointer-dY / descriptor-W tile, returns WRONG values (B200,
+    MXFP8 W, relative error 1.39 in 3/3 processes). Every other admitted config is correct on 3.6, and this one at
+    4 warps or on 3.7.1 / 3.9 is too. Applies below Triton 3.7 only."""
+    bad = {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 256, "A_MEMORY_MODE": "pointer",
+           "B_MEMORY_MODE": "host_descriptor", "num_warps": 2, "num_stages": 3}
+
+    def ok(c, args):
+        kw = c.all_kwargs()
+        return not all(kw.get(k) == v for k, v in bad.items())
+
+    return config_filter(ok, when=lambda args: Version(triton.__version__) < Version("3.7"))
 
 
 def gated_pointer_weight_warp_spec_pruner():
