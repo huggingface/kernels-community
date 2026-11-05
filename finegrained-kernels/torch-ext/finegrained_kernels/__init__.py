@@ -13,13 +13,11 @@
 # limitations under the License.
 
 import triton
+from packaging.version import Version
 
-# Older Triton cannot pass the kernels' string constexprs (memory modes, formats) into nested
-# jit helpers (3.6) or import the tensor-descriptor and autotuner APIs they use (3.3-3.4).
-if tuple(int(v) for v in triton.__version__.split(".")[:2]) < (3, 7):
-    raise ImportError(
-        f"finegrained-kernels requires Triton >= 3.7 (PyTorch >= 2.12), found Triton {triton.__version__}"
-    )
+# Triton 3.6 cannot compile the kernels (string constexprs passed to nested jit helpers)
+if Version(triton.__version__) < Version("3.7"):
+    raise ImportError(f"finegrained-kernels requires Triton >= 3.7 (PyTorch >= 2.12), found {triton.__version__}")
 
 from .matmul import matmul_2d
 from .batched import matmul_batched
