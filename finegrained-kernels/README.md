@@ -155,6 +155,8 @@ must use the usual interleaved order; independent gate/up down factors can be co
 matching zero-padded up factors. Fused gate/up also requires shared smoothing and global scales.
 This supports dense BF16 inference with ranks divisible by 32 and K divisible by 64;
 routed SVDQuant MoE and Nunchaku's INT4/packed checkpoint layouts are not implemented.
+`python bench/bench_moe.py SVDQuant` compares the complete linear on Gemma-4-31B up/down shapes
+against FlashInfer, including smoothing, activation quantization and the correction projections.
 
 `repack_ggml_int(payload, "Q4_0" | "Q8_0")` reads canonical little-endian uint8 GGML blocks
 `(..., N, K/32, 18 | 34)` and returns the same integer operand tuple with FP32 group scales.
