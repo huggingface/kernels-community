@@ -1,4 +1,4 @@
-"""Discover autotuning workloads, open Hub config PRs, and report runs."""
+"""Tune published kernels and propose source config updates for maintainer review."""
 
 import argparse
 import csv
@@ -20,14 +20,24 @@ def manifest(kernel: Path):
     output = Path(config["configs"])
     if output.is_absolute() or ".." in output.parts or output == Path("."):
         raise ValueError(f"Invalid config directory: {output}")
+    if not (kernel / output).resolve().is_relative_to(kernel.resolve()):
+        raise ValueError("Config directory escapes the kernel source tree")
     config_path(config)
     names = set()
+    gpus = set()
     for target in config["targets"]:
+        if (
+            not re.fullmatch(r"[A-Za-z0-9_-]+", target["name"])
+            or not re.fullmatch(r"[A-Za-z0-9 _.-]+", target["gpu"])
+            or target["gpu"] in {".", ".."}
+        ):
+            raise ValueError("Invalid target name or GPU directory")
         if target["backend"] != "cuda":
             raise ValueError("Autotuning only supports CUDA")
-        if target["name"] in names:
-            raise ValueError("Target names must be unique")
+        if target["name"] in names or target["gpu"] in gpus:
+            raise ValueError("Target names and GPUs must be unique")
         names.add(target["name"])
+        gpus.add(target["gpu"])
     if not names or not config["command"]:
         raise ValueError("An autotune manifest needs a command and at least one target")
     return config
@@ -42,65 +52,122 @@ def config_path(config):
     return Path(*parts[source + 2 :])
 
 
-def build_run(event_path: Path):
-    """Resolve a successful Build run whose source is on main."""
-    event = json.loads(event_path.read_text())
-    run = event.get("workflow_run")
-    if run is None:
-        run_id = int(event["inputs"]["build_run_id"])
-        run = json.loads(
+AUTOTUNE_MARKER = "<!-- kernels-community-autotune -->"
+
+
+def github_api(path):
+    return json.loads(subprocess.check_output(["gh", "api", path]))
+
+
+def is_autotune_pr(pr, repository):
+    """Recognize our own config PRs, including after squash merging."""
+    return (
+        pr["user"]["login"] == "github-actions[bot]"
+        and pr["head"]["repo"] is not None
+        and pr["head"]["repo"]["full_name"] == repository
+        and pr["head"]["ref"].startswith("autotune/")
+        and AUTOTUNE_MARKER in (pr.get("body") or "")
+    )
+
+
+def build_run(request, uploads):
+    """Validate the complete successful dispatch set and download publications."""
+    repository = os.environ["GITHUB_REPOSITORY"]
+    base = f"repos/{repository}"
+    pr = github_api(f"{base}/pulls/{int(request['pr_number'])}")
+    if not pr["merged"] or pr["base"]["ref"] != "main":
+        raise ValueError("Expected a merged PR targeting main")
+    runs = []
+    for build in request["builds"]:
+        run = github_api(f"{base}/actions/runs/{int(build['run_id'])}")
+        if (
+            build["workflow"]
+            not in {"build.yaml", "build-mac.yaml", "build-windows.yaml"}
+            or run["path"] != f".github/workflows/{build['workflow']}"
+            or run["event"] != "workflow_dispatch"
+            or run["status"] != "completed"
+            or run["conclusion"] != "success"
+            or run["head_branch"] != "main"
+            or run["head_repository"]["full_name"] != repository
+            or not run["display_title"].endswith(f"request={build['dispatch_key']}")
+            or " / mode=release / " not in run["display_title"]
+        ):
+            raise ValueError("Expected a successful merge-and-upload build from main")
+        runs.append(run)
+    sources = {run["head_sha"] for run in runs}
+    if len(sources) != 1:
+        raise ValueError(
+            "Builds must use the same source commit; rerun merge-and-upload"
+        )
+    source_sha = sources.pop()
+    for ancestor, descendant in [
+        (pr["merge_commit_sha"], source_sha),
+        (source_sha, "origin/main"),
+    ]:
+        subprocess.run(
+            ["git", "merge-base", "--is-ancestor", ancestor, descendant], check=True
+        )
+    if source_sha == pr["merge_commit_sha"] and is_autotune_pr(pr, repository):
+        # Do not skip if a maintainer added code changes to the generated PR.
+        pages = json.loads(
             subprocess.check_output(
                 [
                     "gh",
                     "api",
-                    f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{run_id}",
+                    "--paginate",
+                    "--slurp",
+                    f"{base}/pulls/{pr['number']}/files?per_page=100",
                 ]
             )
         )
-    if (
-        run["path"] != ".github/workflows/build.yaml"
-        or run["conclusion"] != "success"
-        or run["head_branch"] != "main"
-        or run["head_repository"]["full_name"] != os.environ["GITHUB_REPOSITORY"]
-    ):
-        raise ValueError(
-            "Expected a successful Build run from this repository's main branch"
-        )
-    subprocess.run(
-        ["git", "merge-base", "--is-ancestor", run["head_sha"], "origin/main"],
-        check=True,
-    )
-    return {"run_id": run["id"], "source_sha": run["head_sha"]}
+        files = [file["filename"] for page in pages for file in page]
+        prefixes = [
+            f"{path.parent}/{manifest(path.parent)['configs']}/"
+            for path in Path(".").glob("*/autotune.toml")
+        ]
+        if files and all(
+            name.endswith(".json") and any(name.startswith(p) for p in prefixes)
+            for name in files
+        ):
+            print("Autotuner config update was rebuilt; no further tuning needed.")
+            return {"source_sha": source_sha, "skip": "true"}
+    for run in runs:
+        if run["path"] == ".github/workflows/build.yaml":
+            subprocess.run(
+                [
+                    "gh",
+                    "run",
+                    "download",
+                    str(run["id"]),
+                    "--repo",
+                    repository,
+                    "--pattern",
+                    "hub-upload-*",
+                    "--dir",
+                    str(uploads / str(run["id"])),
+                ],
+                check=True,
+            )
+    return {"source_sha": source_sha, "skip": "false"}
 
 
-def plan(event_path: Path, uploads: Path):
+def plan(uploads: Path):
     from huggingface_hub import HfApi
 
-    event = json.loads(event_path.read_text())
-    selected = (event.get("inputs") or {}).get("kernel", "").strip()
     published = {
         (upload["repo_id"], upload["branch"])
-        for path in uploads.glob("hub-upload-cuda-*/*.json")
+        for path in uploads.glob("*/hub-upload-cuda-*/*.json")
         if (upload := json.loads(path.read_text()))["status"]
         in ("uploaded", "no_changes")
         and not upload["pull_requests"]
     }
     kernels, gpu_jobs, skipped = [], [], []
-    manifests = sorted(Path(".").glob("*/autotune.toml"))
-    if selected and selected not in {path.parent.name for path in manifests}:
-        raise ValueError(f"Kernel has no autotune.toml: {selected}")
-    for path in manifests:
+    for path in sorted(Path(".").glob("*/autotune.toml")):
         kernel = path.parent
         if not re.fullmatch(r"[A-Za-z0-9_-]+", kernel.name):
             raise ValueError(f"Invalid kernel directory: {kernel}")
-        if selected and selected != kernel.name:
-            continue
         info = kernel_info(kernel)
         if (info["repo_id"], info["branch"]) not in published:
-            if selected:
-                print(
-                    f"Skipping {kernel.name}: no release publication in this Build run."
-                )
             continue
         config = manifest(kernel)
         revision = (
@@ -113,8 +180,7 @@ def plan(event_path: Path, uploads: Path):
             job = {"kernel": kernel.name, **target, "revision": revision}
             if GPU_RUNNERS.get(target["gpu"]) != target["runner"]:
                 print(
-                    f"Skipping {kernel.name}/{target['name']}: unsupported GPU/runner "
-                    f"pair ({target['gpu']}, {target['runner']})."
+                    f"Skipping {kernel.name}/{target['name']}: unsupported GPU/runner pair."
                 )
                 skipped.append(
                     dict(
@@ -128,7 +194,7 @@ def plan(event_path: Path, uploads: Path):
                 gpu_jobs.append(job)
         print(kernel.name)
     if not kernels:
-        print("No published kernels with autotune.toml in this Build run.")
+        print("No published kernels with autotune.toml in these builds.")
     return {"kernels": kernels, "gpu_jobs": gpu_jobs, "skipped": skipped}
 
 
@@ -151,7 +217,7 @@ def probe(gpu: str):
             print(f"Skipped autotuning: {gpu} is not available on GPU 0.", file=summary)
 
 
-def collect(output: Path):
+def collect(output: Path, artifacts: Path):
     """Join planned targets to their actual job URLs and conclusions."""
     pages = json.loads(
         subprocess.check_output(
@@ -165,7 +231,7 @@ def collect(output: Path):
         )
     )
     jobs = {
-        job["name"]: job
+        job["name"].split(" / ")[-1]: job
         for job in sorted(
             (job for page in pages for job in page["jobs"]), key=lambda job: job["id"]
         )
@@ -180,7 +246,7 @@ def collect(output: Path):
         status = job["conclusion"] or "unknown"
         reason = ""
         if status == "success" and any(
-            step["name"] == "Tune and verify configs"
+            step["name"] == "Tune configs"
             and step["conclusion"] == "skipped"
             for step in job["steps"]
         ):
@@ -194,12 +260,18 @@ def collect(output: Path):
                 "skipped",
                 "No compatible published variant with matching source provenance",
             )
+        if status == "success":
+            artifact = artifacts / f"autotune-{target['kernel']}.{target['name']}"
+            report = json.loads((artifact / "source.json").read_text())
+            status = report["status"]
+            if status not in {"changed", "no_changes"}:
+                raise ValueError(f"Invalid autotuner outcome: {status}")
         results.append(dict(target, status=status, url=job["html_url"], reason=reason))
     output.write_text(json.dumps(results, indent=2) + "\n")
-    kernels = sorted({r["kernel"] for r in results if r["status"] == "success"})
+    kernels = sorted({r["kernel"] for r in results if r["status"] == "changed"})
     with open(os.environ["GITHUB_OUTPUT"], "a") as outputs:
         print(f"kernels={json.dumps(kernels)}", file=outputs)
-        print(f"has_success={str(bool(kernels)).lower()}", file=outputs)
+        print(f"has_changes={str(bool(kernels)).lower()}", file=outputs)
     with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
         print(result_table(results), file=summary)
 
@@ -267,10 +339,12 @@ def tune(target_name: str, artifacts: Path, revision: str, source_sha: str):
         LOCAL_KERNELS=f"{info['repo_id']}={variant}",
     )
     output = Path(config["configs"]) / target["gpu"]
+    previous = config_files(output)
     if output.exists():
         shutil.rmtree(output)
     subprocess.run(config["command"], env=env, check=True)
-    if not any(p.is_file() for p in output.rglob("*")):
+    current = config_files(output)
+    if not current:
         raise ValueError(f"Autotuning produced no configs in {output}")
     shutil.copytree(output, artifacts / target["gpu"])
     (artifacts / "source.json").write_text(
@@ -280,6 +354,7 @@ def tune(target_name: str, artifacts: Path, revision: str, source_sha: str):
                 "revision": revision,
                 "variant": variant.name,
                 "source_sha": source_sha,
+                "status": "no_changes" if previous == current else "changed",
             }
         )
         + "\n"
@@ -300,109 +375,141 @@ def kernel_info(kernel: Path) -> dict[str, str]:
     }
 
 
-def publish(
-    kernel: Path,
-    artifacts: Path,
-    results: Path,
-    run_url: str,
-    dry_run: bool = False,
-):
-    """Propose only configs from successful targets on the variants they tuned."""
-    from huggingface_hub import CommitOperationAdd, CommitOperationDelete, HfApi
+def config_files(directory):
+    """Compare JSON values, ignoring formatting, and reject non-config artifacts."""
+    files = {}
+    if directory.is_symlink():
+        raise ValueError(f"Symlink config directory: {directory}")
+    for path in sorted(directory.rglob("*")):
+        if path.is_symlink():
+            raise ValueError(f"Symlink config: {path}")
+        if path.is_file():
+            if path.suffix != ".json":
+                raise ValueError(f"Non-JSON config: {path}")
+            files[path.relative_to(directory).as_posix()] = json.loads(path.read_text())
+    return files
 
+
+def publish(
+    kernel: Path, artifacts: Path, results: Path, run_url: str, dry_run: bool = False
+):
+    """Open a GitHub source PR; the normal build packages and signs its configs."""
+    repository = os.environ["GITHUB_REPOSITORY"]
     info = kernel_info(kernel)
-    repo_id, branch = info["repo_id"], info["branch"]
     config = manifest(kernel)
     results = [r for r in json.loads(results.read_text()) if r["kernel"] == kernel.name]
-    successful = {r["name"] for r in results if r["status"] == "success"}
-    targets = [t for t in config["targets"] if t["name"] in successful]
+    changed = {r["name"] for r in results if r["status"] == "changed"}
+    targets = [t for t in config["targets"] if t["name"] in changed]
     if not targets:
+        print(f"{kernel}: configs unchanged")
         return
-    if os.environ.get("GITHUB_ACTIONS") == "true":
-        os.environ["HF_OIDC_RESOURCE"] = f"kernels/{repo_id}"
-    api = HfApi()
-    base = api.repo_info(repo_id, repo_type="kernel", revision=branch).sha
-    remote_files = set(api.list_repo_files(repo_id, repo_type="kernel", revision=base))
-    wanted, prefixes = {}, []
+    source_sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], text=True
+    ).strip()
+    directories = []
     for target in targets:
         artifact = artifacts / f"autotune-{kernel.name}.{target['name']}"
         source = json.loads((artifact / "source.json").read_text())
-        if source["repo_id"] != repo_id or source["revision"] != base:
-            raise ValueError("Hub revision changed since tuning; rerun autotuning")
-        variant = source["variant"]
-        if f"build/{variant}/metadata.json" not in remote_files:
-            raise ValueError(f"Tuned variant is no longer published: {variant}")
+        if (
+            source["repo_id"] != info["repo_id"]
+            or source["source_sha"] != source_sha
+            or source["status"] != "changed"
+        ):
+            raise ValueError("Config artifact does not match the tuned source")
         directory = artifact / target["gpu"]
-        files = sorted(directory.rglob("*.json"))
-        if not files:
+        if not config_files(directory):
             raise ValueError(f"Missing configs for {target['name']}")
-        prefix = f"build/{variant}/{config_path(config).as_posix()}/{target['gpu']}/"
-        prefixes.append(prefix)
-        wanted.update((prefix + p.relative_to(directory).as_posix(), p) for p in files)
-    remote = {
-        name
-        for name in remote_files
-        if name.endswith(".json")
-        and any(name.startswith(prefix) for prefix in prefixes)
-    }
-    operations = []
-    for name, path in sorted(wanted.items()):
-        if name in remote:
-            previous = api.hf_hub_download(
-                repo_id, name, repo_type="kernel", revision=base
-            )
-            if Path(previous).read_bytes() == path.read_bytes():
-                continue
-        operations.append(CommitOperationAdd(path_in_repo=name, path_or_fileobj=path))
-    operations.extend(
-        CommitOperationDelete(path_in_repo=name)
-        for name in sorted(remote - wanted.keys())
+        directories.append((directory, kernel / config["configs"] / target["gpu"]))
+    subprocess.run(["git", "fetch", "origin", "main"], check=True)
+    # Never propose stale settings over newer kernel code or newer tuning results.
+    subprocess.run(
+        ["git", "diff", "--exit-code", source_sha, "origin/main", "--", str(kernel)],
+        check=True,
     )
-    if not operations:
-        print(f"{repo_id}@{branch}: configs unchanged")
-        return
-    if dry_run:
-        print(
-            json.dumps(
-                {
-                    "repo_id": repo_id,
-                    "revision": branch,
-                    "add": [
-                        op.path_in_repo
-                        for op in operations
-                        if isinstance(op, CommitOperationAdd)
-                    ],
-                    "delete": [
-                        op.path_in_repo
-                        for op in operations
-                        if isinstance(op, CommitOperationDelete)
-                    ],
-                },
-                indent=2,
-            )
+    branch = f"autotune/{kernel.name}/{source_sha}"
+    existing = json.loads(
+        subprocess.check_output(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                repository,
+                "--head",
+                branch,
+                "--state",
+                "all",
+                "--json",
+                "url",
+            ]
         )
-        return
-    commit = api.create_commit(
-        repo_id=repo_id,
-        repo_type="kernel",
-        revision=branch,
-        parent_commit=base,
-        create_pr=True,
-        operations=operations,
-        commit_message=f"Refresh autotune configs ({branch})",
-        commit_description=(
-            "Config-only update. Rebuild integration and metadata/signature refresh are deferred to maintainers before use.\n\n"
-            + f"Tuned published revision: `{base}`.\n\n"
-            + "Existing configs for failed or skipped targets are preserved.\n\n"
-            + result_table(results)
-            + f"\n\nRun: {run_url}"
-        ),
     )
-    api.change_discussion_status(repo_id, commit.pr_num, "open", repo_type="kernel")
-    print(f"Opened PR for {kernel.name}: {commit.pr_url}.")
+    if existing:
+        print(f"Config PR already exists: {existing[0]['url']}")
+        return
+    subprocess.run(["git", "switch", "-c", branch, "origin/main"], check=True)
+    for directory, destination in directories:
+        if destination.exists():
+            shutil.rmtree(destination)
+        shutil.copytree(directory, destination)
+        subprocess.run(["git", "add", "--", str(destination)], check=True)
+    diff = subprocess.run(["git", "diff", "--cached", "--quiet"], check=False)
+    if diff.returncode == 0:
+        print(f"{kernel}: configs unchanged")
+        return
+    if diff.returncode != 1:
+        diff.check_returncode()
+    if dry_run:
+        subprocess.run(["git", "diff", "--cached", "--stat"], check=True)
+        return
+    title = f"{kernel.name}: refresh autotuning configs"
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=github-actions[bot]",
+            "-c",
+            "user.email=41898282+github-actions[bot]@users.noreply.github.com",
+            "commit",
+            "-m",
+            title,
+        ],
+        check=True,
+    )
+    subprocess.run(["git", "push", "origin", f"HEAD:refs/heads/{branch}"], check=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        body = Path(tmp) / "body.md"
+        body.write_text(
+            f"{AUTOTUNE_MARKER}\n\n"
+            f"Update the source configs tuned from `{source_sha}`. The normal kernel build packages these JSON files.\n\n"
+            "Failed and skipped GPU targets retain their existing configs.\n\n"
+            + result_table(results)
+            + f"\n\nRun: {run_url}\n\n"
+            f"After review, run `/kernel-bot merge-and-upload {kernel.name}` to rebuild and upload. "
+            "The autotuner recognizes this config PR and skips another tuning pass.\n"
+        )
+        url = subprocess.check_output(
+            [
+                "gh",
+                "pr",
+                "create",
+                "--repo",
+                repository,
+                "--base",
+                "main",
+                "--head",
+                branch,
+                "--title",
+                title,
+                "--body-file",
+                str(body),
+            ],
+            text=True,
+        ).strip()
+    print(f"Opened config PR: {url}")
     if summary := os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(summary, "a") as output:
-            print(f"Config PR: [{repo_id}]({commit.pr_url})", file=output)
+            print(f"Config PR: [{kernel.name}]({url})", file=output)
 
 
 def report(path: Path, repo_id: str, run_url: str):
@@ -453,13 +560,15 @@ def upload_report(dataset: str, results: Path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("build-run")
+    build_parser = sub.add_parser("build-run")
+    build_parser.add_argument("uploads", type=Path)
     plan_parser = sub.add_parser("plan")
     plan_parser.add_argument("uploads", type=Path)
     probe_parser = sub.add_parser("probe")
     probe_parser.add_argument("gpu")
     collect_parser = sub.add_parser("collect")
     collect_parser.add_argument("output", type=Path)
+    collect_parser.add_argument("artifacts", type=Path)
     tune_parser = sub.add_parser("tune")
     tune_parser.add_argument("target")
     tune_parser.add_argument("artifacts", type=Path)
@@ -476,12 +585,12 @@ if __name__ == "__main__":
     report_parser.add_argument("results", type=Path)
     args = parser.parse_args()
     if args.command == "build-run":
-        result = build_run(Path(os.environ["GITHUB_EVENT_PATH"]))
+        result = build_run(json.loads(os.environ["AUTOTUNE_REQUEST"]), args.uploads)
         with open(os.environ["GITHUB_OUTPUT"], "a") as output:
             for key, value in result.items():
                 print(f"{key}={value}", file=output)
     elif args.command == "plan":
-        result = plan(Path(os.environ["GITHUB_EVENT_PATH"]), args.uploads)
+        result = plan(args.uploads)
         with open(os.environ["GITHUB_OUTPUT"], "a") as output:
             for key, value in result.items():
                 print(f"{key}={json.dumps(value)}", file=output)
@@ -493,7 +602,7 @@ if __name__ == "__main__":
     elif args.command == "probe":
         probe(args.gpu)
     elif args.command == "collect":
-        collect(args.output)
+        collect(args.output, args.artifacts)
     elif args.command == "tune":
         tune(args.target, args.artifacts, args.revision, args.source_sha)
     elif args.command == "publish":

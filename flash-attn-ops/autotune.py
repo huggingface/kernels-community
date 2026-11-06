@@ -1,12 +1,10 @@
-"""Tune the existing LayerNorm/RMSNorm problem space and verify cache reuse."""
+"""Generate Triton configs for representative LayerNorm/RMSNorm workloads."""
 
 import argparse
 import json
 import math
 import os
 import shutil
-import subprocess
-import sys
 import tempfile
 import tomllib
 from pathlib import Path
@@ -31,53 +29,53 @@ def collect(cache_dir: Path, output: Path):
         target.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
 
 
-def tune(gpu: str):
+def tune_workloads(kernel):
+    """Exercise each tuning key; Triton's autotuner benchmarks the candidates."""
     import torch
-    from kernels import get_kernel
 
-    if torch.cuda.get_device_name() != gpu:
-        raise ValueError(f"This workload must be tuned on {gpu}")
-    general = tomllib.loads(Path("build.toml").read_text())["general"]
-    repo_id = general["hub"]["repo-id"]
-    branch = general["hub"].get("branch", f"v{general['version']}")
-    # The workflow pins a downloaded variant through LOCAL_KERNELS. Standalone
-    # runs can also use an existing local build, or the published version branch.
-    module = get_kernel(repo_id, revision=branch, backend="cuda")
-    variant = Path(module.__file__).parent
-    package = Path(
-        os.environ.get("AUTOTUNE_CONFIGS", "torch-ext/flash_attn_ops/configs")
-    )
+    for dtype in (torch.float16, torch.bfloat16, torch.float32):
+        for hidden in (192, 1024, 4096):
+            x = torch.randn(512, hidden, device="cuda", dtype=dtype)
+            weight = torch.randn(hidden, device="cuda", dtype=dtype)
+            bias = torch.randn_like(weight)
+            for layer_bias in (bias, None):
+                kernel.layer_norm_fn(x, weight, layer_bias, eps=1e-5)
+            kernel.rms_norm_fn(x, weight, None, eps=1e-6)
+        if dtype != torch.float32:
+            x = torch.randn(512, 1024, device="cuda", dtype=dtype)
+            residual = torch.randn_like(x)
+            weight = torch.randn(1024, device="cuda", dtype=dtype)
+            bias = torch.randn_like(weight)
+            kernel.layer_norm_fn(
+                x, weight, bias, residual=residual, prenorm=True, eps=1e-5
+            )
+    torch.cuda.synchronize()
+
+
+def tune(gpu: str):
+    # Set up a fresh cache before importing the kernel so existing shipped
+    # configs cannot seed this tuning run. The published variant stays read-only.
     with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        env = dict(
-            os.environ,
-            LOCAL_KERNELS=f"{repo_id}={variant}",
-            TRITON_CACHE_DIR=str(tmp / "tune"),
-            TRITON_CACHE_AUTOTUNING="1",
-            FLASH_ATTN_OPS_AUTOTUNE="1",
-        )
-        subprocess.run(
-            [sys.executable, "-m", "pytest", "tests/test_layer_norm.py", "-qx"],
-            env=env,
-            check=True,
-        )
-        collect(tmp / "tune", package / gpu)
+        os.environ["TRITON_CACHE_DIR"] = tmp
+        os.environ["TRITON_CACHE_AUTOTUNING"] = "1"
+        os.environ["FLASH_ATTN_OPS_AUTOTUNE"] = "1"
 
-        # Verify only the serialized configs in a fresh process. Packaging and
-        # loading configs from the distributed kernel are release-time work.
-        shutil.copytree(package / gpu, tmp / "verify")
-        env["TRITON_CACHE_DIR"] = str(tmp / "verify")
-        subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                "from unittest.mock import patch; import pytest; "
-                "p = patch('triton.runtime.autotuner.Autotuner._bench', side_effect=AssertionError('autotune cache miss')); "
-                "p.start(); raise SystemExit(pytest.main(['tests/test_layer_norm.py', '-qx']))",
-            ],
-            env=env,
-            check=True,
+        import torch
+        from kernels import get_kernel
+
+        if torch.cuda.get_device_name() != gpu:
+            raise ValueError(f"This workload must be tuned on {gpu}")
+        general = tomllib.loads(Path("build.toml").read_text())["general"]
+        repo_id = general["hub"]["repo-id"]
+        branch = general["hub"].get("branch", f"v{general['version']}")
+        # CI pins the published variant through LOCAL_KERNELS. Standalone runs
+        # can also use a local build, or the published version branch.
+        kernel = get_kernel(repo_id, revision=branch, backend="cuda")
+        tune_workloads(kernel)
+        output = Path(
+            os.environ.get("AUTOTUNE_CONFIGS", "torch-ext/flash_attn_ops/configs")
         )
+        collect(Path(tmp), output / gpu)
 
 
 if __name__ == "__main__":
