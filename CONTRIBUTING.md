@@ -49,8 +49,10 @@ einops/
   build.toml            # Generated, committed because Nix reads it during evaluation
   port-provenance.json  # Generated, has the hash of the generated tree
   port/port.kdl
-  port/overlay/
 ```
+
+A recipe that needs files with no upstream equivalent keeps them in
+`port/overlay/`.
 
 - Change the kernel by changing the recipe or overlay, then inspect the result
   with `nix build .#portedSrc`.
