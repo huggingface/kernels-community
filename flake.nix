@@ -25,13 +25,27 @@
       system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
+
+        kernel-status = pkgs.rustPlatform.buildRustPackage {
+          pname = "kernel-status";
+          version = "0.1.0";
+          src = ./scripts/kernel-status;
+          cargoLock.lockFile = ./scripts/kernel-status/Cargo.lock;
+          meta.mainProgram = "kernel-status";
+        };
       in
       {
+        packages = {
+          inherit kernel-status;
+          default = kernel-status;
+        };
+
         devShell =
           with pkgs;
           mkShell {
             name = "kernels-community-dev-shell";
             nativeBuildInputs = [
+              kernel-status
               pinact
             ];
           };
