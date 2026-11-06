@@ -413,3 +413,35 @@ def test_non_schema_exports_are_not_optional_additions(check, monkeypatch):
 def test_api_change_classification(check, old, new, expected):
     diff = check.report("k", old, new)
     assert (diff.breaking, diff.additive) == expected
+
+
+def test_generated_source_leaves_committed_trees_alone(check, tmp_path):
+    source = check.Source({"torch-ext/k/__init__.py": ""}, lambda content: content)
+    assert check.generated_source(source, tmp_path / "out", tmp_path) is source
+
+
+def test_generated_source_runs_the_recipe(check, tmp_path, monkeypatch):
+    calls = []
+
+    def generate(recipe, out, workdir):
+        calls.append(recipe.read_text())
+        (out / "torch-ext" / "k").mkdir(parents=True)
+        (out / "torch-ext" / "k" / "__init__.py").write_text("def run(x): pass\n")
+        return []
+
+    monkeypatch.setitem(sys.modules, "check_ports", SimpleNamespace(generate=generate))
+    source = check.Source({"port/port.kdl": "recipe"}, lambda content: content)
+    generated = check.generated_source(source, tmp_path / "head" / "k", tmp_path)
+    assert calls == ["recipe"]
+    assert generated.is_file("torch-ext/k/__init__.py")
+
+
+def test_generated_source_fails_when_the_recipe_fails(check, tmp_path, monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "check_ports",
+        SimpleNamespace(generate=lambda *args: ["kernel-port failed"]),
+    )
+    source = check.Source({"port/port.kdl": "recipe"}, lambda content: content)
+    with pytest.raises(SystemExit, match="kernel-port failed"):
+        check.generated_source(source, tmp_path / "head" / "k", tmp_path)

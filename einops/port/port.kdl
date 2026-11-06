@@ -70,7 +70,7 @@ mark_tests in="tests/test_*.py" marker="kernels_ci" changes=63
 manifest \
     name="einops" \
     version=1 \
-    edition=5 \
+    edition=6 \
     license="MIT" \
     upstream="https://github.com/arogozhnikov/einops.git" \
     backends="cpu,cuda,metal,rocm,xpu" \

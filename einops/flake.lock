@@ -72,7 +72,8 @@
     },
     "root": {
       "inputs": {
-        "kernel-builder": "kernel-builder"
+        "kernel-builder": "kernel-builder",
+        "upstream": "upstream"
       }
     },
     "rust-overlay": {
@@ -108,6 +109,23 @@
       "original": {
         "owner": "nix-systems",
         "repo": "default",
+        "type": "github"
+      }
+    },
+    "upstream": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1739070950,
+        "narHash": "sha256-J9m5LMOleHf2UziUbOtwf+DFpu/wBDcAyHUor4kqrR8=",
+        "owner": "arogozhnikov",
+        "repo": "einops",
+        "rev": "ad2c8d67d08cbebb45e1aff2be21dc88635fc695",
+        "type": "github"
+      },
+      "original": {
+        "owner": "arogozhnikov",
+        "repo": "einops",
+        "rev": "ad2c8d67d08cbebb45e1aff2be21dc88635fc695",
         "type": "github"
       }
     }

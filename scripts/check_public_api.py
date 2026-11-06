@@ -21,6 +21,7 @@ import ast
 import enum
 import json
 import sys
+import tempfile
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -94,6 +95,28 @@ class Source:
 
         walk(obj, "")
         return Source(files, lambda oid: repo[oid].data.decode("utf-8", "replace"))
+
+
+# A src-less port commits its recipe but not the tree it generates, so its API
+# only exists after running the recipe. Kernels that commit src/ resolve to that
+# tree in `Source`, where no recipe is visible, and are returned as they are.
+def generated_source(src: Source, out: Path, workdir: Path) -> Source:
+    if not src.is_file("port/port.kdl"):
+        return src
+
+    # Beside this script; imported here since only src-less ports need it.
+    import check_ports
+
+    port = workdir / f"recipe-{out.parent.name}-{out.name}"
+    for rel in src.files:
+        if rel.startswith("port/"):
+            dest = port / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(src.read(rel))
+    problems = check_ports.generate(port / "port" / "port.kdl", out, workdir)
+    if problems:
+        raise SystemExit("\n".join(problems))
+    return Source.from_disk(out)
 
 
 # Public API extraction from Python AST and C++ binding sources.
@@ -566,12 +589,17 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    tmp = tempfile.TemporaryDirectory()
+    workdir = Path(tmp.name)
+
     if args.dump:
         if not args.kernels:
             parser.error("--dump requires explicit kernel name(s).")
         for kernel in args.kernels:
             print(f"# {kernel}")
-            src = Source.from_disk(Path(kernel))
+            src = generated_source(
+                Source.from_disk(Path(kernel)), workdir / "head" / kernel, workdir
+            )
             print(json.dumps(extract_api(src), indent=2, sort_keys=True))
         return 0
 
@@ -609,6 +637,9 @@ def main() -> int:
         if not base_src.is_file("build.toml"):
             print(f"  [new] {kernel}: not in the base tree, nothing to compare")
             continue
+
+        base_src = generated_source(base_src, workdir / "base" / kernel, workdir)
+        head_src = generated_source(head_src, workdir / "head" / kernel, workdir)
 
         diff = report(kernel, extract_api(base_src), extract_api(head_src))
         if not (diff.breaking or diff.additive):

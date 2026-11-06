@@ -1,7 +1,7 @@
 [general]
 name = "einops"
 version = 1
-edition = 5
+edition = 6
 license = "MIT"
 upstream = "https://github.com/arogozhnikov/einops.git"
 backends = [

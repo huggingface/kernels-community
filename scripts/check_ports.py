@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import filecmp
+import json
 import os
 import re
 import shlex
@@ -9,15 +10,29 @@ import sys
 import tempfile
 from pathlib import Path
 
-# Extract source arguments; kernel-port validates them.
+# Extract source and vendor arguments; kernel-port validates them.
 SOURCE_RE = re.compile(
     r"^source\b(?P<body>(?:[^\n\\]|\\\s*\n)*)", re.MULTILINE
+)
+VENDOR_RE = re.compile(
+    r"^vendor\b(?P<body>(?:[^\n\\]|\\\s*\n)*)", re.MULTILINE
 )
 ARG_RE = re.compile(r'(\w+)="([^"]*)"')
 
 DEFAULT_RUNNER = "kernel-port"
 
+TEST_VERSIONS_CHECK = (
+    Path(__file__).resolve().parents[1] / ".github/scripts/check_kernel_test_versions.py"
+)
+
 CHECKER_FILES = {"scripts/check_ports.py", ".github/workflows/check-ports.yaml"}
+
+# Generated files that a src-less port commits. port-provenance.json holds the
+# hash of the generated tree, which stands in for comparing a committed tree.
+SRCLESS_GENERATED = ("build.toml", "port-provenance.json")
+
+# Files beside the recipe that a src-less port has to keep in sync with it.
+SRCLESS_FILES = {*SRCLESS_GENERATED, "flake.lock", "flake.nix"}
 
 
 def runner_cmd() -> list:
@@ -43,6 +58,8 @@ def changed_ports(root: Path, ref: str) -> list:
         parts = line.split("/")
         if len(parts) >= 3 and parts[1] in ("port", "src"):
             touched.add(parts[0])
+        elif len(parts) == 2 and parts[1] in SRCLESS_FILES:
+            touched.add(parts[0])
     return sorted(k for k in find_ports(root) if k in touched)
 
 
@@ -56,6 +73,18 @@ def parse_source(recipe: Path) -> tuple:
         return args["repo"], args["commit"]
     except KeyError as exc:
         raise SystemExit(f"{recipe}: source is missing {exc}") from exc
+
+
+def parse_vendors(recipe: Path) -> list:
+    """Return (name, repo, commit) for each `vendor` op, one per name."""
+    vendors = {}
+    for m in VENDOR_RE.finditer(recipe.read_text()):
+        args = dict(ARG_RE.findall(m.group("body").replace("\\\n", " ")))
+        try:
+            vendors.setdefault(args["name"], (args["repo"], args["commit"]))
+        except KeyError as exc:
+            raise SystemExit(f"{recipe}: vendor is missing {exc}") from exc
+    return [(name, repo, commit) for name, (repo, commit) in vendors.items()]
 
 
 def checkout(repo: str, commit: str, dest: Path) -> None:
@@ -87,28 +116,98 @@ def compare(generated: Path, committed: Path) -> list:
     return problems
 
 
-def check(kernel: str, root: Path, workdir: Path) -> list:
-    recipe = root / kernel / "port" / "port.kdl"
+def generate(recipe: Path, out: Path, workdir: Path) -> list:
+    """Run a recipe into `out`, returning problems. Upstreams are cached in `workdir`."""
     repo, commit = parse_source(recipe)
-    print(f"  {kernel}: {repo} @ {commit[:12]}")
 
     # Reuse checkouts for kernels sharing an upstream commit.
-    src = workdir / f"upstream-{commit[:12]}"
-    if not src.exists():
-        checkout(repo, commit, src)
+    def fetch(repo: str, commit: str) -> Path:
+        dest = workdir / f"upstream-{commit[:12]}"
+        if not dest.exists():
+            checkout(repo, commit, dest)
+        return dest
 
-    out = workdir / f"out-{kernel}"
+    src = fetch(repo, commit)
+    vendor_args = []
+    for name, vendor_repo, vendor_commit in parse_vendors(recipe):
+        print(f"    vendor {name}: {vendor_repo} @ {vendor_commit[:12]}")
+        vendor_args += ["--vendor", f"{name}={fetch(vendor_repo, vendor_commit)}"]
+
     shutil.rmtree(out, ignore_errors=True)
+    out.parent.mkdir(parents=True, exist_ok=True)
     proc = subprocess.run(
-        [*runner_cmd(), str(recipe), "--dir", str(src), "--out", str(out)],
+        [*runner_cmd(), str(recipe), "--dir", str(src), *vendor_args, "--out", str(out)],
         capture_output=True,
         text=True,
     )
     if proc.returncode != 0:
         tail = (proc.stderr or proc.stdout).strip().splitlines()[-8:]
         return [f"kernel-port failed:\n    " + "\n    ".join(tail)]
+    return []
 
-    return compare(out, root / kernel / "src")
+
+def locked_revs(kernel_dir: Path) -> dict:
+    """Return the locked revision of each direct input of a kernel's flake."""
+    lock = kernel_dir / "flake.lock"
+    if not lock.is_file():
+        return {}
+    nodes = json.loads(lock.read_text())["nodes"]
+    return {
+        name: nodes[node]["locked"].get("rev")
+        for name, node in nodes["root"]["inputs"].items()
+        if isinstance(node, str)
+    }
+
+
+def check_srcless(kernel_dir: Path, generated: Path, pins: dict) -> list:
+    """Check what a src-less port commits, given its pins by flake input name."""
+    problems = []
+    for name in SRCLESS_GENERATED:
+        if not (kernel_dir / name).is_file():
+            problems.append(f"no src/ and no committed {name}")
+        elif not filecmp.cmp(generated / name, kernel_dir / name, shallow=False):
+            problems.append(f"differs: {name}")
+
+    locked = locked_revs(kernel_dir)
+    for name, commit in pins.items():
+        if locked.get(name) != commit:
+            problems.append(
+                f"flake.lock pins {name} at {locked.get(name)}, the recipe at {commit}"
+            )
+
+    # The generated tests are not in the repository, so the check that scans
+    # committed tests never sees them.
+    versions = subprocess.run(
+        [
+            sys.executable,
+            str(TEST_VERSIONS_CHECK),
+            "--root",
+            str(generated.parent),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if versions.returncode != 0:
+        problems.append(f"test versions:\n    {versions.stderr.strip()}")
+    return problems
+
+
+def check(kernel: str, root: Path, workdir: Path) -> list:
+    recipe = root / kernel / "port" / "port.kdl"
+    repo, commit = parse_source(recipe)
+    print(f"  {kernel}: {repo} @ {commit[:12]}")
+
+    out = workdir / f"out-{kernel}" / kernel
+    problems = generate(recipe, out, workdir)
+    if problems:
+        return problems
+
+    committed = root / kernel / "src"
+    if committed.is_dir():
+        return compare(out, committed)
+    pins = {"upstream": commit}
+    pins.update((name, commit) for name, _, commit in parse_vendors(recipe))
+    return check_srcless(root / kernel, out, pins)
 
 
 def main() -> int:
@@ -139,7 +238,7 @@ def main() -> int:
             if problems:
                 failed[kernel] = problems
             else:
-                print("     ok - regenerates byte for byte")
+                print("     ok - reproduces")
 
     if failed:
         print("\nERROR: committed tree does not match the recipe.\n", file=sys.stderr)
@@ -149,10 +248,17 @@ def main() -> int:
                 print(f"    - {p}", file=sys.stderr)
         print(
             "\nRegenerate with:\n"
-            "  kernel-port <kernel>/port/port.kdl --dir <upstream> --out <kernel>/src\n"
+            "  kernel-port <kernel>/port/port.kdl --dir <upstream> \\\n"
+            "      [--vendor <name>=<checkout>]... --out <kernel>/src\n"
             "If an overlay file went stale, refresh it from <kernel>/src first.\n"
             "If only port-provenance.json differs, the recipe changed and the\n"
-            "port was not rerun.",
+            "port was not rerun.\n"
+            "For a kernel without src/, review the change, then update with:\n"
+            "  cd <kernel> && out=$(nix build --no-link --print-out-paths .#portedSrc)\n"
+            "  install -m 644 $out/build.toml $out/port-provenance.json .\n"
+            "and keep the commits in flake.nix equal to the recipe's. A change in\n"
+            "port-provenance.json alone means the generated tree changed: if the\n"
+            "recipe did not, kernel-port did.",
             file=sys.stderr,
         )
         return 1

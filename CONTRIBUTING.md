@@ -35,6 +35,43 @@ For more details check [writing hub kernels](https://github.com/huggingface/kern
 
 When you are done, you can open a PR to the `kernels-community` repository. Please make sure to title the PR with the kernel name, followed by a semicolon and a short description, for example: `example: add example kernel`, and do not include build outputs in the PR.
 
+## How do ported kernels work?
+
+A kernel can be generated from an upstream repository by a
+[`kernel-port`](https://github.com/huggingface/kernels/tree/main/kernel-port)
+recipe in `<kernel>/port/port.kdl`, in place of committing a copy of upstream.
+Such a kernel directory only has what cannot be derived:
+
+```
+einops/
+  flake.nix             # Pins `upstream` and passes `port = { ... }`
+  flake.lock
+  build.toml            # Generated, committed because Nix reads it during evaluation
+  port-provenance.json  # Generated, has the hash of the generated tree
+  port/port.kdl
+  port/overlay/
+```
+
+- Change the kernel by changing the recipe or overlay, then inspect the result
+  with `nix build .#portedSrc`.
+- `flake.nix` and the recipe both pin upstream, and must agree. An input for a
+  `vendor` operation has the same name as that operation.
+- The build and `scripts/check_ports.py` fail when `build.toml` or
+  `port-provenance.json` differ from what the recipe generates. Review the
+  change, then update them:
+
+  ```bash
+  cd <kernel>
+  out=$(nix build --no-link --print-out-paths .#portedSrc)
+  install -m 644 $out/build.toml $out/port-provenance.json .
+  ```
+
+  If `port-provenance.json` changes without a change to the recipe, a new
+  `kernel-port` changed the generated code. Compare `.#portedSrc` before and
+  after to see how.
+
+Older ports commit the generated tree in `<kernel>/src` instead.
+
 ## How to benchmark a kernel?
 
 #TODO: Add benchmarking instructions after https://github.com/huggingface/kernels-uvnotes is ready.
