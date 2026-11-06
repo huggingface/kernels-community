@@ -1,0 +1,20 @@
+{
+  "format": 1,
+  "recipe": "sha256:1ee26e2835902ce464b6ff8a61bcc36b52f706115959f2894c447f3b803befa7",
+  "runner": "kernel-port 0.1.0",
+  "sources": {
+    "immutabledict": {
+      "repo": "https://github.com/corenting/immutabledict.git",
+      "commit": "5ee713e7ab8f4fc7bebd7c39080ba30bf0fe234e"
+    },
+    "qwix": {
+      "repo": "https://github.com/google/qwix.git",
+      "commit": "76a3831e600696204244f6016db771e1c0c9f938"
+    },
+    "upstream": {
+      "repo": "https://github.com/openxla/tokamax.git",
+      "commit": "468db816d80073eef113fc0289ceeb151f854c9d"
+    }
+  },
+  "tree": "sha256:6b9f22a33ea386e2cbce36b88a66b0af97f4ab56b4de94fdb1777349117cda0e"
+}
