@@ -21,6 +21,7 @@ from contextlib import contextmanager
 import os
 
 import torch
+from packaging.version import Version
 import triton
 import triton.language as tl
 from torch.library import triton_op, wrap_triton
@@ -74,6 +75,8 @@ except ImportError:
 
 # FP8 (E4M3) is the main format for weights and activations;
 FP8_DTYPE = torch.float8_e4m3fn
+# torch < 2.12 casts out-of-range values to E4M3 NaN; clamping first saturates as the kernels and newer torch do
+FP8_MAX = torch.finfo(FP8_DTYPE).max
 
 # UE8M0 MX scales are a torch dtype (``float8_e8m0fnu``) only from torch 2.7. Older torch carries
 # them as raw ``uint8`` exponent bytes, which the kernels decode the same way, so this is ``None``
@@ -103,6 +106,11 @@ _SKIP_LAUNCHES = contextvars.ContextVar("finegrained_kernels_skip_launches", def
 # set/reset (nesting, async isolation) — this only mirrors it for the read.
 _SKIP_LAUNCHES_MIRROR = False
 
+
+
+# torch 2.10 / 2.11 report is_compiling() False inside a triton_op that torch.compile traces (2.13 reports True; 2.12
+# unchecked), so there an active fake mode marks the trace instead; newer torch skips the check (~1.5us per eager launch)
+_FAKE_MODE_MEANS_TRACING = Version(torch.__version__.split("+")[0]) < Version("2.13")
 
 
 def compile_time_only_triton_wrap(kernel):
@@ -135,7 +143,24 @@ def compile_time_only_triton_wrap(kernel):
                 return lambda *args, **kwargs: None
 
         return _NoLaunch()
-    return wrap_triton(kernel) if torch.compiler.is_compiling() else kernel
+    tracing = torch.compiler.is_compiling() or (_FAKE_MODE_MEANS_TRACING and torch._guards.detect_fake_mode() is not None)
+    return _FusedLaunch(wrap_triton(kernel) if tracing else kernel)
+
+
+class _FusedLaunch:
+    """``kernel[grid](...)`` with FP fusion requested explicitly, in eager and through ``wrap_triton``
+    (Triton 3.9 warns when it is left unset). The multiply-adds whose rounding matters are explicit
+    ``tl.fma`` (the scaled K-step accumulates in ``mma``, the MoE reduce), fused whatever the flag. The
+    flag still lets ptxas contract the rest (``--fmad``): off, FP8 block prefill is ~3% slower. Triton
+    3.10 ignores it unless ``TRITON_ALLOW_FP_FUSION=1``. A launch passing its own value keeps it."""
+
+    __slots__ = ("kernel",)
+
+    def __init__(self, kernel):
+        self.kernel = kernel
+
+    def __getitem__(self, grid):
+        return functools.partial(self.kernel[grid], enable_fp_fusion=True)
 
 
 
