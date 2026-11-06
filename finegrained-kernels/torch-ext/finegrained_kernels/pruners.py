@@ -82,6 +82,8 @@ from .mma import MMA_N_ATOM_WIDTH
 #                               M<=16) — swap loses everywhere else (18-cell sweep)
 #     packed_schedule_scope_pruner  PACKED_SCHEDULE rows only at BM>=128 (register relief
 #                               is the whole win) — full-precision grouped
+#     weight_only_dot_scaled_warps_pruner  non-WS dot_scaled only at 4 warps (the anchor
+#                               lands on 2/8 and writes the basin off) — weight-only grouped
 #     swizzled_scales_bm_pruner grouped mx swizzled arm pinned to BM=BN=128 (slab layout);
 #                               affine arm keeps every BM/BN
 #     swizzled_scale_config_pruner  swizzled-arm BK%128, BN<=128, GATE block pairs —
@@ -861,6 +863,28 @@ def packed_schedule_scope_pruner(min_bm: int = 128):
         return config_dim(c, args, "BLOCK_SIZE_M") >= min_bm
 
     return config_filter(ok)
+
+
+def weight_only_dot_scaled_warps_pruner():
+    """``early_config_prune`` keeping the weight-only grouped kernel's non-warp-specialized
+    ``dot_scaled`` rows at ``num_warps=4``, the only count where that basin wins. On sm_10x the
+    basin is a sharp peak, and the tuner's anchor for it lands on 2 or 8 warps (the interior-anchor
+    rule ties 4 against 8, and 2 against 4), measures it 2-3x slow, and the TPE writes the whole
+    branch off. GPT-OSS-120B MXFP4 gate|up at T=2048 (B200, Triton 3.9), BM=32 BN=64 BK=128,
+    pointer A, TMA weight: 836 us at 4 warps, 1314 us at 2, 2097 us at 8; every tuned
+    ``dot_scaled`` crown on these shapes is at 4 warps. Real tunes with and without it::
+
+        gate|up MXFP4  T=512   982 -> 358 us     T=2048  1462 -> 924 us    T=8192 unchanged (dot)
+        down    MXFP4  T=2048  848 -> 461 us     gate|up MXFP8  T=2048  1089 -> 1039 us
+
+    Warp-specialized ``dot_scaled`` rows keep their counts: the partitioner sets their warps."""
+
+    def ok(c, args):
+        if c.kwargs.get("COMPUTE_MODE") != "dot_scaled" or c.kwargs.get("WARP_SPEC"):
+            return True
+        return c.num_warps == 4
+
+    return config_filter(ok, when=lambda args: is_sm10x())
 
 
 def group_size_m_pruner():
