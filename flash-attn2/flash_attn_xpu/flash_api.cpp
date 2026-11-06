@@ -3,10 +3,16 @@
 #include <cute/util/compat/device.hpp>
 #include <ATen/xpu/XPUGeneratorImpl.h>
 #include <sycl/sycl.hpp>
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <limits>
+#include <mutex>
+#include <unordered_map>
 
 #include "src/fmha_fwd.hpp"
 #include "src/fmha_bwd.hpp"
+#include "src/decode/splitkv_decode.hpp"
 
 namespace FLASH_NAMESPACE {
 
@@ -32,6 +38,244 @@ inline at::Tensor ensure_contiguous(const at::Tensor& tensor) {
 }
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_xpu(), #x " must be on XPU")
+
+// ---------------------------------------------------------------------------
+// Split-KV decode (seqlen_q == 1). Used when the inputs are supported and
+// the plan below expects it to beat the generic forward kernels.
+// FLASH_ATTN_XPU_DISABLE_SPLITKV_DECODE=1 forces the generic kernels,
+// FLASH_ATTN_XPU_DECODE_NUM_SPLITS=N forces split-KV with N splits.
+// ---------------------------------------------------------------------------
+namespace splitkv {
+
+using flash_xpu_splitkv::decode_args_t;
+
+inline int env_int(const char* name, int dflt) {
+    const char* s = std::getenv(name);
+    return (s != nullptr && *s != '\0') ? std::atoi(s) : dflt;
+}
+
+inline bool disabled() {
+    return env_int("FLASH_ATTN_XPU_DISABLE_SPLITKV_DECODE", 0) != 0;
+}
+
+inline int head_bucket(int d) {
+    for (int b : {64, 96, 128, 192, 256, 512}) {
+        if (d <= b) return b;
+    }
+    return 0;
+}
+
+inline int xe_core_count(sycl::queue& queue) {
+    static std::mutex mu;
+    static std::unordered_map<size_t, int> cache;
+    auto dev = queue.get_device();
+    const size_t key = std::hash<sycl::device>{}(dev);
+    std::lock_guard<std::mutex> lock(mu);
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+    int cores = 0;
+    if (dev.has(sycl::aspect::ext_intel_gpu_slices) &&
+        dev.has(sycl::aspect::ext_intel_gpu_subslices_per_slice)) {
+        cores = dev.get_info<sycl::ext::intel::info::device::gpu_slices>() *
+                dev.get_info<sycl::ext::intel::info::device::gpu_subslices_per_slice>();
+    }
+    if (cores <= 0) cores = 20;
+    cache[key] = cores;
+    return cores;
+}
+
+// Split-count plan, measured against the generic kernel on Arc Pro B60
+// (20 Xe cores) and an Intel Data Center GPU (32 Xe cores), fp16/bf16, page
+// size 64. Indexed by [paged KV][head class][w + 3][t], with
+//   w = floor(log2(batch * num_heads_kv / xe_cores)) clamped to [-3, 3],
+//   t = floor(log2(ceil(seqlen_k / 64))) clamped to [0, 8].
+// Each cell holds the split count that was never slower than the generic
+// kernel (by more than 1.5% and 2 us) on any measured shape of either
+// device: '-' = generic kernel, 'k' = split-KV with 2^k splits. Unmeasured
+// cells copy the nearest measured one (the more conservative on ties).
+// clang-format off
+constexpr const char* kPlan[2][4][7] = {
+    {  // contiguous KV
+        {  // GQA, head_dim <= 128
+            "0000000-3",  // w = -3
+            "00000--23",  // w = -2
+            "000000123",  // w = -1
+            "000000121",  // w = 0
+            "000000011",  // w = 1
+            "000000000",  // w = 2
+            "000000001",  // w = 3
+        },
+        {  // GQA, head_dim > 128
+            "------234",  // w = -3
+            "000001222",  // w = -2
+            "000011111",  // w = -1
+            "000000000",  // w = 0
+            "000000000",  // w = 1
+            "000000000",  // w = 2
+            "000000000",  // w = 3
+        },
+        {  // MHA, head_dim <= 256
+            "0000000--",  // w = -3
+            "0000000--",  // w = -2
+            "0000000--",  // w = -1
+            "----00---",  // w = 0
+            "00000-234",  // w = 1
+            "000000045",  // w = 2
+            "000023454",  // w = 3
+        },
+        {  // MHA, head_dim > 256
+            "000001-11",  // w = -3
+            "000001-11",  // w = -2
+            "000000001",  // w = -1
+            "----00000",  // w = 0
+            "000000005",  // w = 1
+            "000003455",  // w = 2
+            "000023444",  // w = 3
+        },
+    },
+    {  // paged KV
+        {  // GQA, head_dim <= 128
+            "00000-235",  // w = -3
+            "00000-244",  // w = -2
+            "000001333",  // w = -1
+            "000002222",  // w = 0
+            "000000111",  // w = 1
+            "000000000",  // w = 2
+            "0000---01",  // w = 3
+        },
+        {  // GQA, head_dim > 128
+            "0000-2344",  // w = -3
+            "000012322",  // w = -2
+            "000012111",  // w = -1
+            "000000000",  // w = 0
+            "000000022",  // w = 1
+            "000000001",  // w = 2
+            "000000001",  // w = 3
+        },
+        {  // MHA, head_dim <= 256
+            "00000-234",  // w = -3
+            "00000-234",  // w = -2
+            "00000--33",  // w = -1
+            "0000-----",  // w = 0
+            "00-------",  // w = 1
+            "00-------",  // w = 2
+            "------355",  // w = 3
+        },
+        {  // MHA, head_dim > 256
+            "000011113",  // w = -3
+            "000011113",  // w = -2
+            "00-----33",  // w = -1
+            "------000",  // w = 0
+            "000001000",  // w = 1
+            "---003455",  // w = 2
+            "000123455",  // w = 3
+        },
+    },
+};
+// clang-format on
+
+inline int floor_log2(int x) {
+    int r = -1;
+    while (x > 0) { x >>= 1; ++r; }
+    return r;
+}
+
+// Number of KV splits for a decode batch (>= 1), or 0 for the generic kernel.
+inline int plan_num_splits(sycl::queue& queue, int batch, int num_heads_q,
+                           int num_heads_kv, int head_size, int max_seqlen_k,
+                           bool paged) {
+    int env = env_int("FLASH_ATTN_XPU_DECODE_NUM_SPLITS", 0);
+    if (env > 0) return std::min(env, flash_xpu_splitkv::kMaxSplits);
+
+    const int kv_tiles = (max_seqlen_k + flash_xpu_splitkv::kKVTile - 1) /
+                         flash_xpu_splitkv::kKVTile;
+    const int wgs = std::max(1, batch * num_heads_kv);
+    const int w = std::clamp(
+        int(std::floor(std::log2(double(wgs) / xe_core_count(queue)))), -3, 3);
+    const int t = std::clamp(floor_log2(std::max(1, kv_tiles)), 0, 8);
+    const bool mha = num_heads_q == num_heads_kv;
+    const int cls = mha ? (head_size <= 256 ? 2 : 3) : (head_size <= 128 ? 0 : 1);
+    const char c = kPlan[paged ? 1 : 0][cls][w + 3][t];
+    if (c == '-') return 0;
+    // At least 4 KV tiles per split.
+    const int cap = 1 << floor_log2(std::max(1, kv_tiles / 4));
+    return std::min({1 << (c - '0'), cap, flash_xpu_splitkv::kMaxSplits});
+}
+
+inline bool stride_ok(int64_t s) {
+    // Xe 2D block messages: pitch a multiple of 16 bytes, below 2^24 bytes.
+    return s > 0 && s % 8 == 0 && s * 2 < (int64_t(1) << 24);
+}
+
+// Common checks. q: (rows, Hq, D); k/v: (..., seq, Hkv, D) with the seq and
+// head dims at -3 and -2.
+inline bool supported(const at::Tensor& q, const at::Tensor& k,
+                      const at::Tensor& v, bool paged) {
+    if (disabled()) return false;
+    auto dt = q.scalar_type();
+    if (dt != at::kHalf && dt != at::kBFloat16) return false;
+    if (k.scalar_type() != dt || v.scalar_type() != dt) return false;
+    const int hq = q.size(-2), hkv = k.size(-2), d = q.size(-1);
+    if (hkv <= 0 || hq % hkv != 0 || v.size(-2) != hkv) return false;
+    if (k.size(-1) != d || v.size(-1) != d) return false;
+    if (d < 32 || d % 8 != 0 || head_bucket(d) == 0) return false;
+    if (q.stride(-1) != 1 || k.stride(-1) != 1 || v.stride(-1) != 1) return false;
+    if (!stride_ok(q.stride(-2))) return false;
+    if (!stride_ok(k.stride(-3)) || !stride_ok(v.stride(-3))) return false;
+    if (paged) {
+        const int64_t page = k.size(1);
+        if (page <= 0 || page % flash_xpu_splitkv::kKVTile != 0) return false;
+        if (v.size(1) != page) return false;
+        if (k.stride(0) % k.stride(1) != 0 || v.stride(0) % v.stride(1) != 0)
+            return false;
+        const int64_t rows = k.stride(0) / k.stride(1);
+        if (rows % flash_xpu_splitkv::kKVTile != 0 ||
+            v.stride(0) / v.stride(1) != rows)
+            return false;
+        if (rows * k.size(0) >= (int64_t(1) << 31)) return false;
+    }
+    return true;
+}
+
+inline void launch(sycl::queue& queue, at::ScalarType dt, int head_size,
+                   const decode_args_t& args) {
+    using namespace flash_xpu_splitkv;
+    const bool fp16 = dt == at::kHalf;
+#define SPLITKV_CASE(HD)                                                       \
+    case HD:                                                                   \
+        if (fp16) splitkv_decode_fp16<HD>(queue, args);                        \
+        else      splitkv_decode_bf16<HD>(queue, args);                        \
+        return;
+    switch (head_bucket(head_size)) {
+        SPLITKV_CASE(64)
+        SPLITKV_CASE(96)
+        SPLITKV_CASE(128)
+        SPLITKV_CASE(192)
+        SPLITKV_CASE(256)
+        SPLITKV_CASE(512)
+        default:
+            TORCH_CHECK(false, "split-KV decode: unsupported head size ", head_size);
+    }
+#undef SPLITKV_CASE
+}
+
+// Allocates the split workspace (kept alive by the caller until the kernels
+// are enqueued; the caching allocator is stream-ordered) and launches.
+inline void run(sycl::queue& queue, const at::Tensor& q, int rows,
+                decode_args_t args) {
+    at::Tensor oaccum, lse_accum;
+    if (args.num_splits > 1) {
+        auto fopts = q.options().dtype(at::kFloat);
+        oaccum = at::empty({rows, args.num_splits, args.num_heads_q, args.head_size_v}, fopts);
+        lse_accum = at::empty({rows, args.num_heads_q, args.num_splits}, fopts);
+        args.oaccum = oaccum.data_ptr<float>();
+        args.lse_accum = lse_accum.data_ptr<float>();
+    }
+    args.min_tiles_per_split = env_int("FLASH_ATTN_XPU_DECODE_MIN_TILES", 4);
+    launch(queue, q.scalar_type(), args.head_size, args);
+}
+
+}  // namespace splitkv
 
 std::vector<at::Tensor>
 mha_fwd(
@@ -77,6 +321,64 @@ mha_fwd(
     CHECK_DEVICE(q);
     CHECK_DEVICE(k);
     CHECK_DEVICE(v);
+
+    // Decode: split-KV kernel. Causal masking is a no-op for one query
+    // (bottom-right aligned) and window_size_right cannot mask anything.
+    if (seqlen_q == 1 && p_dropout == 0.0f && !return_softmax &&
+        !alibi_slopes_.has_value() && softcap == 0.0f &&
+        seqlen_k > 0 && seqlen_k < (1 << 24) &&
+        splitkv::supported(q, k, v, /*paged=*/false)) {
+        auto queue = c10::xpu::getCurrentXPUStream(device_idx).queue();
+        int num_splits = splitkv::plan_num_splits(
+            queue, batch_size, num_heads, num_heads_k, q.size(-1), seqlen_k,
+            /*paged=*/false);
+        if (num_splits > 0) {
+            at::Tensor out;
+            if (out_.has_value() && out_->is_contiguous() &&
+                out_->sizes() == q.sizes() && out_->dtype() == q_dtype) {
+                out = out_.value();
+            } else {
+                out = at::empty_like(q);
+            }
+            auto opts = q.options().dtype(torch::kFloat32);
+            at::Tensor softmax_lse = at::empty({batch_size, num_heads, 1}, opts);
+
+            splitkv::decode_args_t a;
+            a.q = q.data_ptr();
+            a.k = k.data_ptr();
+            a.v = v.data_ptr();
+            a.out = out.data_ptr();
+            a.softmax_lse = softmax_lse.data_ptr<float>();
+            a.seqlen_k = seqlen_k;
+            a.batch = batch_size;
+            a.num_heads_q = num_heads;
+            a.num_heads_kv = num_heads_k;
+            a.head_size = head_size_og;
+            a.head_size_v = head_size_og;
+            a.q_row_stride = q.stride(0);
+            a.q_head_stride = q.stride(2);
+            a.k_batch_stride = k.stride(0);
+            a.k_seq_stride = k.stride(1);
+            a.k_head_stride = k.stride(2);
+            a.v_batch_stride = v.stride(0);
+            a.v_seq_stride = v.stride(1);
+            a.v_head_stride = v.stride(2);
+            a.lse_head_stride = 1;
+            a.lse_row_stride = num_heads;
+            a.softmax_scale = softmax_scale;
+            a.window_size_left =
+                (window_size_left >= 0 && window_size_left < seqlen_k) ? window_size_left : -1;
+            a.num_splits = num_splits;
+            splitkv::run(queue, q, batch_size, a);
+
+            if (out_.has_value() && !out.is_same(out_.value())) {
+                out_.value().copy_(out);
+            }
+            at::Tensor S_dmask = torch::empty({0}, q.options());
+            at::Tensor rng_state = at::empty({2}, q.options().dtype(at::kLong));
+            return {out, softmax_lse, S_dmask, rng_state};
+        }
+    }
 
     // XPU requires head_size to be a multiple of 32
     const int head_size_padded = round_multiple(head_size_og, 32);
@@ -416,6 +718,98 @@ mha_varlen_fwd(
     CHECK_DEVICE(q);
     CHECK_DEVICE(k);
     CHECK_DEVICE(v);
+
+    // Decode: split-KV kernel (see mha_fwd).
+    {
+        const bool paged = block_table_.has_value() && block_table_->defined();
+        auto int_dev = [&](const at::Tensor& t) {
+            return t.is_xpu() && t.scalar_type() == at::kInt && t.dim() == 1;
+        };
+        if (max_seqlen_q == 1 && p_dropout == 0.0f && !return_softmax &&
+            !alibi_slopes_.has_value() && softcap == 0.0f &&
+            !(seqused_k.has_value() && seqused_k->defined()) &&
+            !(leftpad_k_.has_value() && leftpad_k_->defined()) &&
+            max_seqlen_k > 0 && (paged || max_seqlen_k < (1 << 24)) &&
+            int_dev(cu_seqlens_q) && int_dev(cu_seqlens_k) &&
+            cu_seqlens_k.numel() == batch_size + 1 &&
+            (!paged || (block_table_->is_xpu() && block_table_->dim() == 2 &&
+                        block_table_->scalar_type() == at::kInt &&
+                        block_table_->size(0) >= batch_size)) &&
+            k.dim() == (paged ? 4 : 3) && v.dim() == k.dim() &&
+            splitkv::supported(q, k, v, paged)) {
+            auto queue = c10::xpu::getCurrentXPUStream(device_idx).queue();
+            // k is [total_k, Hkv, D] or, paged, [num_blocks, page, Hkv, D].
+            const int hkv = k.size(-2);
+            int num_splits = splitkv::plan_num_splits(
+                queue, batch_size, num_heads, hkv, q.size(-1), max_seqlen_k,
+                paged);
+            if (num_splits > 0) {
+                at::Tensor out;
+                if (out_.has_value() && out_->is_contiguous() &&
+                    out_->sizes() == q.sizes() && out_->dtype() == q_dtype) {
+                    out = out_.value();
+                } else {
+                    out = at::zeros_like(q);
+                }
+                auto opts = q.options().dtype(torch::kFloat32);
+                at::Tensor softmax_lse = torch::zeros({num_heads, total_q}, opts);
+                at::Tensor cu_q = cu_seqlens_q.contiguous();
+                at::Tensor cu_k = cu_seqlens_k.contiguous();
+                at::Tensor block_table;
+
+                splitkv::decode_args_t a;
+                a.q = q.data_ptr();
+                a.k = k.data_ptr();
+                a.v = v.data_ptr();
+                a.out = out.data_ptr();
+                a.softmax_lse = softmax_lse.data_ptr<float>();
+                a.cu_seqlens_q = cu_q.data_ptr<int>();
+                a.cu_seqlens_k = cu_k.data_ptr<int>();
+                a.seqlen_k = max_seqlen_k;
+                a.batch = batch_size;
+                a.num_heads_q = num_heads;
+                a.num_heads_kv = hkv;
+                a.head_size = head_size_og;
+                a.head_size_v = head_size_og;
+                a.q_row_stride = q.stride(0);
+                a.q_head_stride = q.stride(1);
+                if (paged) {
+                    block_table = block_table_->contiguous();
+                    a.block_table = block_table.data_ptr<int>();
+                    a.block_table_batch_stride = block_table.stride(0);
+                    a.page_size = k.size(1);
+                    a.max_pages_per_seq = block_table.size(1);
+                    a.page_stride_rows = k.stride(0) / k.stride(1);
+                    a.total_rows_kv = int64_t(k.size(0)) * a.page_stride_rows;
+                    a.k_batch_stride = k.stride(0);
+                    a.k_seq_stride = k.stride(1);
+                    a.k_head_stride = k.stride(2);
+                    a.v_batch_stride = v.stride(0);
+                    a.v_seq_stride = v.stride(1);
+                    a.v_head_stride = v.stride(2);
+                } else {
+                    a.k_seq_stride = k.stride(0);
+                    a.k_head_stride = k.stride(1);
+                    a.v_seq_stride = v.stride(0);
+                    a.v_head_stride = v.stride(1);
+                }
+                a.lse_head_stride = total_q;
+                a.lse_row_stride = 1;
+                a.softmax_scale = softmax_scale;
+                a.window_size_left =
+                    (window_size_left >= 0 && window_size_left < max_seqlen_k) ? window_size_left : -1;
+                a.num_splits = num_splits;
+                splitkv::run(queue, q, total_q, a);
+
+                if (out_.has_value() && !out.is_same(out_.value())) {
+                    out_.value().copy_(out);
+                }
+                at::Tensor S_dmask = torch::empty({0}, q.options());
+                at::Tensor rng_state = at::empty({2}, q.options().dtype(at::kLong));
+                return {out, softmax_lse, S_dmask, rng_state};
+            }
+        }
+    }
 
     // XPU requires head_size to be a multiple of 32
     const int head_size_padded = round_multiple(head_size_og, 32);
@@ -771,6 +1165,125 @@ mha_fwd_kvcache(
     if (is_causal) { window_size_right = 0; }
     if (window_size_left >= seqlen_k) { window_size_left = -1; }
     if (window_size_right >= seqlen_k) { window_size_right = -1; }
+
+    // Decode: split-KV kernel. num_splits: 0 = heuristic, 1 = generic
+    // kernel, N > 1 = N splits.
+    if (seqlen_q == 1 && num_splits != 1 && softcap == 0.0f &&
+        !rotary_cos_.has_value() && !cache_batch_idx_.has_value() &&
+        !leftpad_k_.has_value() && seqlen_k > 0 &&
+        (paged_KV || seqlen_k < (1 << 24)) &&
+        (!out_.has_value() ||
+         (out_->is_contiguous() && out_->sizes() == q.sizes() &&
+          out_->dtype() == q_dtype && out_->is_xpu())) &&
+        (!seqlens_k_.has_value() ||
+         (seqlens_k_->is_xpu() && seqlens_k_->scalar_type() == at::kInt &&
+          seqlens_k_->numel() == batch_size)) &&
+        (!paged_KV || block_table.size(0) >= batch_size) &&
+        (paged_KV || kcache.size(0) >= batch_size) &&
+        splitkv::supported(q, kcache, vcache, paged_KV)) {
+        bool knew_ok = true;
+        at::Tensor knew, vnew;
+        if (k_.has_value()) {
+            knew = k_.value();
+            vnew = v_.has_value() ? v_.value() : at::Tensor();
+            knew_ok = vnew.defined() && seqlens_k_.has_value() &&
+                knew.is_xpu() && vnew.is_xpu() &&
+                knew.dim() == 4 && knew.sizes() == vnew.sizes() &&
+                knew.size(0) == batch_size && knew.size(2) == num_heads_k &&
+                knew.size(3) == head_size_og &&
+                knew.scalar_type() == q_dtype && vnew.scalar_type() == q_dtype &&
+                knew.stride(-1) == 1 && vnew.stride(-1) == 1;
+        }
+        auto queue = c10::xpu::getCurrentXPUStream(device_idx).queue();
+        int splits = num_splits > 1
+            ? std::min(num_splits, flash_xpu_splitkv::kMaxSplits)
+            : splitkv::plan_num_splits(queue, batch_size, num_heads,
+                                       num_heads_k, head_size_og, seqlen_k,
+                                       paged_KV);
+        if (knew_ok && splits > 0) {
+            at::Tensor out = out_.has_value() ? out_.value() : at::zeros_like(q);
+            auto softmax_lse = torch::full({batch_size, num_heads, 1},
+                                           -std::numeric_limits<float>::infinity(),
+                                           q.options().dtype(at::kFloat));
+            at::Tensor seqlens_k = seqlens_k_.has_value()
+                ? seqlens_k_->contiguous() : at::Tensor();
+            at::Tensor block_table_c = paged_KV ? block_table.contiguous() : at::Tensor();
+
+            const int seqlen_new = knew.defined() ? knew.size(1) : 0;
+            if (seqlen_new > 0) {
+                flash_xpu_splitkv::append_args_t ap;
+                ap.k_new = knew.data_ptr();
+                ap.v_new = vnew.data_ptr();
+                ap.k_cache = kcache.data_ptr();
+                ap.v_cache = vcache.data_ptr();
+                ap.cache_seqlens = seqlens_k.data_ptr<int>();
+                if (paged_KV) {
+                    ap.block_table = block_table_c.data_ptr<int>();
+                    ap.block_table_batch_stride = block_table_c.stride(0);
+                    ap.page_size = page_block_size;
+                    ap.max_pages_per_seq = max_num_blocks_per_seq;
+                }
+                ap.batch = batch_size;
+                ap.seqlen_new = seqlen_new;
+                ap.num_heads_kv = num_heads_k;
+                ap.head_size = head_size_og;
+                ap.seqlen_cache = seqlen_k;
+                ap.kn_batch_stride = knew.stride(0);
+                ap.kn_seq_stride = knew.stride(1);
+                ap.kn_head_stride = knew.stride(2);
+                ap.vn_batch_stride = vnew.stride(0);
+                ap.vn_seq_stride = vnew.stride(1);
+                ap.vn_head_stride = vnew.stride(2);
+                ap.kc_batch_stride = kcache.stride(0);
+                ap.kc_seq_stride = kcache.stride(1);
+                ap.kc_head_stride = kcache.stride(2);
+                ap.vc_batch_stride = vcache.stride(0);
+                ap.vc_seq_stride = vcache.stride(1);
+                ap.vc_head_stride = vcache.stride(2);
+                flash_xpu_splitkv::splitkv_append_kv(queue, ap);
+            }
+
+            splitkv::decode_args_t a;
+            a.q = q.data_ptr();
+            a.k = kcache.data_ptr();
+            a.v = vcache.data_ptr();
+            a.out = out.data_ptr();
+            a.softmax_lse = softmax_lse.data_ptr<float>();
+            if (seqlens_k.defined()) {
+                a.seqused_k = seqlens_k.data_ptr<int>();
+                a.seqlen_k_add = seqlen_new;
+            }
+            a.seqlen_k = seqlen_k;
+            if (paged_KV) {
+                a.block_table = block_table_c.data_ptr<int>();
+                a.block_table_batch_stride = block_table_c.stride(0);
+                a.page_size = page_block_size;
+                a.max_pages_per_seq = max_num_blocks_per_seq;
+                a.page_stride_rows = kcache.stride(0) / kcache.stride(1);
+                a.total_rows_kv = int64_t(kcache.size(0)) * a.page_stride_rows;
+            }
+            a.batch = batch_size;
+            a.num_heads_q = num_heads;
+            a.num_heads_kv = num_heads_k;
+            a.head_size = head_size_og;
+            a.head_size_v = head_size_og;
+            a.q_row_stride = q.stride(0);
+            a.q_head_stride = q.stride(2);
+            a.k_batch_stride = kcache.stride(0);
+            a.k_seq_stride = kcache.stride(1);
+            a.k_head_stride = kcache.stride(2);
+            a.v_batch_stride = vcache.stride(0);
+            a.v_seq_stride = vcache.stride(1);
+            a.v_head_stride = vcache.stride(2);
+            a.lse_head_stride = 1;
+            a.lse_row_stride = num_heads;
+            a.softmax_scale = softmax_scale;
+            a.window_size_left = window_size_left;
+            a.num_splits = splits;
+            splitkv::run(queue, q, batch_size, a);
+            return {out, softmax_lse};
+        }
+    }
 
     const int head_size_padded = round_multiple(head_size_og, 32);
     const bool needs_padding = (head_size_og != head_size_padded);
