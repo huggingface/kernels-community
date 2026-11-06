@@ -1,0 +1,152 @@
+recipe version=1
+
+// Pin the exact clean upstream tree this recipe transforms (version 0.0.17;
+// upstream has no tags, this is the version bump commit).
+source \
+    repo="https://github.com/openxla/tokamax.git" \
+    commit="468db816d80073eef113fc0289ceeb151f854c9d"
+
+// Keep only the Pallas Mosaic TPU kernel bodies and the helpers they import.
+// Tokamax's `Op`, autotuning and benchmarking layers are dropped: they need
+// pydantic, jaxtyping, absl, xprof, ... at import time, and the kernel must
+// need nothing beyond JAX.
+prune keep="LICENSE,tokamax/_src/{mosaic_tpu,precision,quantization,version}.py,tokamax/_src/ops/{csa_gather,deepseek_rope,dsv4_compressor,grouped_lowrank_proj,masked_dense_mla,proj_and_save_state,ragged_dot,ragged_gather,ragged_gather_reduce,router_topk,sparse_mla,topk}/pallas_mosaic_tpu_kernel.py,tokamax/_src/ops/dsv4_compressor/{buffered_ref,compute,config,csa_cache_layout}.py,tokamax/_src/ops/masked_dense_mla/csa_mask.py,tokamax/_src/ops/mhc/{pre_kernel,post_kernel,fused_post_pre_kernel,utils}.py,tokamax/_src/ops/gmm_v2/{gmm_v2,tgmm_v2}.py,tokamax/_src/ops/experimental/{fused_fp8_matmul,mla,mla_swa}/pallas_mosaic_tpu_kernel.py,tokamax/_src/ops/experimental/fused_moe_decode/fused_moe_decode_kernel.py,tokamax/_src/ops/experimental/tpu/splash_attention/{splash_attention_kernel,ring_attention_kernel,splash_attention_mask,splash_attention_mask_info,reference}.py"
+
+// The file set reviewed for this version.
+expect in="tokamax/**/*.py" files=36
+
+// Place the distributable package in the torch extension tree.
+move \
+    from="tokamax" \
+    to="torch-ext/tokamax"
+
+// Vendor the part of qwix that Tokamax uses (`QArray`, `quantize`,
+// `dequantize`), so the quantized ragged dot needs no qwix (and flax) install.
+vendor \
+    name="qwix" \
+    repo="https://github.com/google/qwix.git" \
+    commit="76a3831e600696204244f6016db771e1c0c9f938" \
+    path="" \
+    to="qwix-upstream"
+
+move from="qwix-upstream/LICENSE" to="torch-ext/tokamax/_vendor/qwix/LICENSE"
+move from="qwix-upstream/qwix/_src/core/qarray.py" to="torch-ext/tokamax/_vendor/qwix/qarray.py"
+move from="qwix-upstream/qwix/_src/core/numerics.py" to="torch-ext/tokamax/_vendor/qwix/numerics.py"
+move from="qwix-upstream/qwix/_src/core/sparsity.py" to="torch-ext/tokamax/_vendor/qwix/sparsity.py"
+delete in="qwix-upstream/**"
+
+// flax is only used to make `QArray` a pytree dataclass and to register it
+// with flax nnx. Use plain JAX for the former and drop the latter.
+replace in="torch-ext/tokamax/_vendor/qwix/qarray.py" \
+    find="from flax import nnx\nimport flax.struct\n" \
+    with=""
+
+replace in="torch-ext/tokamax/_vendor/qwix/qarray.py" \
+    find="@flax.struct.dataclass\n" \
+    with="@jax.tree_util.register_dataclass\n@dataclasses.dataclass(frozen=True)\n"
+
+replace in="torch-ext/tokamax/_vendor/qwix/qarray.py" \
+    find="flax.struct.field(\n      pytree_node=False, default=None\n  )" \
+    with="dataclasses.field(\n      default=None, metadata=dict(static=True)\n  )"
+
+replace in="torch-ext/tokamax/_vendor/qwix/qarray.py" \
+    find="\n\n# Register as NNX data to allow JAX arrays in Module attributes.\nnnx.register_data_type(QArray)\n" \
+    with=""
+
+remap_module \
+    in="torch-ext/tokamax/_vendor/qwix/*.py" \
+    from="qwix._src.core" \
+    to="tokamax._vendor.qwix" \
+    changes=2
+
+// Vendor immutabledict, which keeps `AsQArray.tiled_axes` hashable as pytree
+// metadata.
+vendor \
+    name="immutabledict" \
+    repo="https://github.com/corenting/immutabledict.git" \
+    commit="5ee713e7ab8f4fc7bebd7c39080ba30bf0fe234e" \
+    path="" \
+    to="immutabledict-upstream"
+
+move from="immutabledict-upstream/LICENSE" to="torch-ext/tokamax/_vendor/immutabledict/LICENSE"
+move from="immutabledict-upstream/immutabledict/__init__.py" to="torch-ext/tokamax/_vendor/immutabledict/__init__.py"
+delete in="immutabledict-upstream/**"
+
+// Use the vendored packages.
+replace in="torch-ext/tokamax/_src/{mosaic_tpu,quantization,ops/ragged_dot/pallas_mosaic_tpu_kernel}.py" \
+    find="\nimport qwix\n" \
+    with="\nfrom tokamax._vendor import qwix\n" \
+    count=3
+
+replace in="torch-ext/tokamax/_src/quantization.py" \
+    find="\nimport immutabledict\n" \
+    with="\nfrom tokamax._vendor import immutabledict\n"
+
+// The ragged dot kernel only takes a type alias from the `Op` layer's base.
+replace in="torch-ext/tokamax/_src/ops/ragged_dot/pallas_mosaic_tpu_kernel.py" \
+    find="from tokamax._src.ops.ragged_dot import base\n" \
+    with=""
+
+replace in="torch-ext/tokamax/_src/ops/ragged_dot/pallas_mosaic_tpu_kernel.py" \
+    find="base.ActivationFunction | None" \
+    with="Callable[[jax.Array], jax.Array] | None" \
+    count=2
+
+// The splash attention kernels only use names that `base` re-exports from
+// `reference`; the rest of `base` is the `Op` layer.
+replace in="torch-ext/tokamax/_src/ops/experimental/tpu/splash_attention/{splash_attention_kernel,ring_attention_kernel}.py" \
+    find="from tokamax._src.ops.experimental.tpu.splash_attention import base\n" \
+    with="from tokamax._src.ops.experimental.tpu.splash_attention import reference as base\n" \
+    count=2
+
+// The splash attention kernel uses `jax.extend` without importing it; upstream
+// gets it from modules that this port drops.
+replace in="torch-ext/tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_kernel.py" \
+    find="import jax\nfrom jax import ad_checkpoint\n" \
+    with="import jax\nfrom jax import ad_checkpoint\nimport jax.extend\n"
+
+// GMM v2 reads one absl flag, a temporary fallback for vmap on older JAX.
+// Without absl it takes the flag's default (multi-core mode enabled).
+replace in="torch-ext/tokamax/_src/ops/gmm_v2/{gmm_v2,tgmm_v2}.py" \
+    find="from tokamax._src import config\n" \
+    with="" \
+    count=2
+
+replace in="torch-ext/tokamax/_src/ops/gmm_v2/{gmm_v2,tgmm_v2}.py" \
+    find="config.disable_multi_core_mode.value" \
+    with="False" \
+    count=6
+
+// Several kernel directories have no `__init__.py` upstream.
+ensure_init under="torch-ext/tokamax" changes=26
+
+// Make package-internal imports work under the Hub-generated module name.
+relativize_imports \
+    in="torch-ext/tokamax/**/*.py" \
+    package_root="torch-ext/tokamax" \
+    changes=37
+
+// Guard against an upstream bump bringing a dependency back.
+expect in="torch-ext/tokamax/**/*.py" find="import pydantic" count=0
+expect in="torch-ext/tokamax/**/*.py" find="from pydantic" count=0
+expect in="torch-ext/tokamax/**/*.py" find="jaxtyping" count=0
+expect in="torch-ext/tokamax/**/*.py" find="absl" count=0
+expect in="torch-ext/tokamax/**/*.py" find="flax" count=0
+expect in="torch-ext/tokamax/**/*.py" find="from qwix" count=0
+// The only qwix imports are the three rewritten to the vendored copy.
+expect in="torch-ext/tokamax/**/*.py" find="import qwix\n" count=3
+expect in="torch-ext/tokamax/**/*.py" find="\nimport immutabledict" count=0
+
+// The public API and the smoke tests.
+overlay from="overlay"
+
+// Emit the noarch kernel manifest.
+manifest \
+    name="tokamax" \
+    version=1 \
+    edition=6 \
+    license="Apache-2.0" \
+    upstream="https://github.com/openxla/tokamax.git" \
+    backends="tpu" \
+    repo_id="kernels-community/tokamax" \
+    noarch=#true
