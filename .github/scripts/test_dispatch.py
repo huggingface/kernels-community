@@ -239,6 +239,14 @@ def test_bot_comment_id_threads_to_build_inputs_only_when_set():
     assert all("bot_comment_id" not in a.body["inputs"] for a in no_upload)
 
 
+def test_requested_by_threads_to_build_inputs_only_when_set():
+    without = _build_actions(_plan(backends=["cuda", "metal"]))
+    assert all("requested_by" not in a.body["inputs"] for a in without)
+
+    with_user = _build_actions(_plan(backends=["cuda", "metal"], requested_by="someone"))
+    assert all(a.body["inputs"]["requested_by"] == "someone" for a in with_user)
+
+
 # select_workflows: backend-union and Windows-gate cases (single-backend rows omitted).
 ROUTING_TRUTH_TABLE = [
     (["cuda"], False, {"build.yaml"}),

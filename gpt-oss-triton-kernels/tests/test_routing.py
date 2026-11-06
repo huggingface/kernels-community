@@ -1,8 +1,15 @@
 import pytest
 import torch
-from triton_kernels.routing import routing, routing_torch
-from triton_kernels.testing import assert_close
-from triton_kernels.testing import assert_equal
+import kernels
+
+triton_kernels = kernels.get_kernel("kernels-community/gpt-oss-triton-kernels", version=1)
+
+_private = triton_kernels._private_for_testing
+
+routing = _private.routing.routing
+routing_torch = _private.routing.routing_torch
+assert_close = _private.testing.assert_close
+assert_equal = _private.testing.assert_equal
 
 
 def init_data(n_tokens, n_expts_tot, dtype=torch.float16, device="cuda"):

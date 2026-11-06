@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from urllib import error, request
@@ -18,6 +19,10 @@ def parse_args() -> argparse.Namespace:
         "--slack-webhook",
         default=os.getenv("SLACK_WEBHOOK_URL"),
         help="Slack incoming webhook URL. If not set and checks fail, no notification is sent.",
+    )
+    parser.add_argument(
+        "--results-json",
+        help="Write per-kernel check results to this file (read by kernel_status_snapshot.py).",
     )
     return parser.parse_args()
 
@@ -50,6 +55,16 @@ def _post_to_slack(webhook_url: str, message: str) -> None:
         response.read()
 
 
+def _write_results(path: str, directories: list[str], failures: list[str]) -> None:
+    checked_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    results = {
+        name: {"result": "fail" if name in failures else "pass", "checked_at": checked_at}
+        for name in directories
+    }
+    with open(path, "w") as f:
+        json.dump(results, f, indent=2)
+
+
 def main() -> int:
     args = parse_args()
 
@@ -74,6 +89,8 @@ def main() -> int:
     logging.info(f"🧪 Checking {len(directories)} kernel directories: {directories=}.")
 
     failures = run_kernels_checks.run_kernels_checks(directories, args.dry_run, args.clear_cache)
+    if args.results_json and not args.dry_run:
+        _write_results(args.results_json, directories, failures)
     if not failures:
         logging.info("✅ All kernels checks completed successfully.")
         return 0

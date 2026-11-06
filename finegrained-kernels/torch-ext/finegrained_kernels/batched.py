@@ -24,8 +24,10 @@ import triton.language as tl
 from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
 from .bayesian_autotuner import bayesian_autotune
+from .bench import gemm_cold_banks
 
-from .compat import add_op_namespace_prefix, FP8_DTYPE, MX_SCALE_GROUP_K, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype, pdl_launch_kwargs
+from ._ops import add_op_namespace_prefix
+from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype, pdl_launch_kwargs
 from .descriptors import rebind_batched_mx_bs_descriptor
 from .formats import check_activation_format, global_scale_stride, gate_out_cols, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, is_per_expert_global, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
 from .epilogue import fused_glu
@@ -107,6 +109,7 @@ def expert_setup(
     # two checkpoints at one shape with different blocks must not share a winner.
     ["N", "K", "S", "OUTPUT_FORMAT", "GATE", "BLOCK_N", "BLOCK_K"],
     n_trials=100,
+    cold_banks=gemm_cold_banks,
     path_anchor_axes=PATH_ANCHOR_AXES,
     prune_configs_by={
         "early_config_prune": compose_pruners(
@@ -251,6 +254,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     # keyed like the block-dynamic sibling: requant narrows the legal tiles to the quant block
     ["N", "K", "S", "OUTPUT_FORMAT", "GATE", "BLOCK_N", "BLOCK_K"],
     n_trials=100,
+    cold_banks=gemm_cold_banks,
     path_anchor_axes=PATH_ANCHOR_AXES,
     prune_configs_by={
         "early_config_prune": compose_pruners(
@@ -385,6 +389,7 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
     get_accelerator_autotuning_configs(tune_block_nk=True, swap_ab=True),
     ["N", "K", "S"],
     n_trials=100,
+    cold_banks=gemm_cold_banks,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # BLOCK_SIZE_K/N are tuned axes; the K-loop is maskless and the N-tile store is
     # row-masked only — veto non-dividing tiles on both.
@@ -535,6 +540,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     # incidentally today; this kernel's requant Cs is always row-major — no SWIZZLED_OUT axis).
     ["N", "K", "S", "ACTIVATION_FORMAT", "SWIZZLED_SCALES", "GATE", "OUTPUT_FORMAT"],
     n_trials=100,
+    cold_banks=gemm_cold_banks,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # BK-within-K + the sm_10x MMA-shape guards (swapped dot_scaled needs BN >= 128 for the
     # native scaled-MMA; smaller-BN swap configs never win and mislead the TPE).
@@ -730,6 +736,7 @@ def mx_dynamic_matmul_batched_kernel(
     ),
     ["N", "K", "S", "GATE"],
     n_trials=100,
+    cold_banks=gemm_cold_banks,
     path_anchor_axes=PATH_ANCHOR_AXES,
     prune_configs_by={
         # No BK-within-K veto: this kernel's tail tile slides back in bounds (see the K-loop),
@@ -870,6 +877,7 @@ def mx_weight_only_matmul_batched_kernel(
     # GATE keys the gate|up arm separately (its stacked dot is 2*BN wide).
     ["N", "K", "S", "GATE"],
     n_trials=100,
+    cold_banks=gemm_cold_banks,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # BLOCK_SIZE_K/N are tuned axes; the K-loop is maskless and the N-tile store is
     # row-masked only — veto non-dividing tiles on both.

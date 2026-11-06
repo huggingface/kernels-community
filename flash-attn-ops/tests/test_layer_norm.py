@@ -4,14 +4,16 @@
 # reference is computed directly with PyTorch rather than imported from the
 # kernel package.
 
+import kernels
 import pytest
 import torch
 import torch.nn.functional as F
 from kernels import get_kernel
 
-kernel = get_kernel("kernels-community/flash-attn-ops", version=1)
-layer_norm_fn = kernel.layer_norm_fn
-rms_norm_fn = kernel.rms_norm_fn
+flash_attn_ops = kernels.get_kernel("kernels-community/flash-attn-ops", version=1)
+
+layer_norm_fn = flash_attn_ops.layer_norm_fn
+rms_norm_fn = flash_attn_ops.rms_norm_fn
 
 
 def rms_norm_ref(x, weight, bias, eps):

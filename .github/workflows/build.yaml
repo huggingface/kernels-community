@@ -57,6 +57,11 @@ on:
         required: false
         type: string
         default: ""
+      requested_by:
+        description: "GitHub login that requested the build (recorded in the kernel-status dataset)"
+        required: false
+        type: string
+        default: ""
 
 
 # These build workflows are reachable only via workflow_dispatch, so `github.head_ref`
@@ -250,53 +255,6 @@ jobs:
           name: huggingface
         env:
           USER: runner
-
-      - name: Install TPU prefetch tools
-        if: matrix.backend == 'tpu'
-        run: echo "$(nix build nixpkgs#jq --no-link --print-out-paths)/bin" >> "$GITHUB_PATH"
-
-      # Match the Windows workflow: use the kernel's pinned builder helpers.
-      - name: Kernel extract required builder version
-        if: matrix.backend == 'tpu'
-        id: extract-builder-version
-        env:
-          KERNEL: ${{ needs.setup.outputs.kernel }}
-        run: |
-          REVISION=$(jq -er '.nodes["kernel-builder"].locked.rev' "$KERNEL/flake.lock")
-          echo "revision=$REVISION" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout kernels
-        if: matrix.backend == 'tpu'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: huggingface/kernels
-          ref: ${{ steps.extract-builder-version.outputs.revision }}
-          path: kernels
-
-      - name: Resolve TPU wheel versions
-        if: matrix.backend == 'tpu'
-        env:
-          KERNEL: ${{ needs.setup.outputs.kernel }}
-        run: |
-          # requireFile names include the versions and ABI expected by this lockfile.
-          # Newer Nix wraps the output as {"derivations": {...}, "version": N};
-          # older versions emit the derivations as the top-level object.
-          cd "$KERNEL"
-          nix derivation show --recursive .#redistributable.torch-tpu | jq -er '
-            [(.derivations // .)[] | .env.name // "" |
-              capture("^(?<package>torch_tpu|libtpu)-(?<version>[A-Za-z0-9.]+)-(?<abi>cp[0-9]+)-\\k<abi>-manylinux_2_31_x86_64[.]whl$")]
-            | unique
-            | .[] | [.package, .version, .abi] | @tsv
-          ' > "$RUNNER_TEMP/tpu-wheels.tsv"
-
-      - name: Prefetch gated TPU wheels
-        if: matrix.backend == 'tpu'
-        env:
-          GCLOUD_ACCESS_TOKEN: ${{ secrets.GCLOUD_ACCESS_TOKEN }}
-        run: |
-          while IFS=$'\t' read -r package version abi; do
-            bash kernels/nix-builder/scripts/helpers/prefetch-tpu-wheel.sh "$package" "$version" "$abi"
-          done < "$RUNNER_TEMP/tpu-wheels.tsv"
 
       # PR mode builds backendCi (single representative variant);
       # release mode builds backendBundle (full set of variants).
@@ -509,10 +467,179 @@ jobs:
           CI_TEST_PATH="${{ needs.build-ci-test.outputs.ci-test-path }}"
           "$CI_TEST_PATH/bin/ci-test"
 
+  # Stable-ABI planning and builds have their own jobs so their failures cannot
+  # prevent the normal build matrix or current-Torch tests from running.
+  plan-minimum-torch-test-stable-abi:
+    permissions:
+      contents: read
+    needs: setup
+    if: needs.setup.outputs.skip == 'false' && needs.setup.outputs.tpu-kernel != 'true' && inputs.skip_build != true && (inputs.mode == 'pr' || inputs.mode == 'stage')
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.minimum-torch.outputs.enabled }}
+      torch: ${{ steps.minimum-torch.outputs.torch }}
+      python: ${{ steps.minimum-torch.outputs.python }}
+      index: ${{ steps.minimum-torch.outputs.index }}
+      variant: ${{ steps.minimum-torch.outputs.variant }}
+    steps:
+      - name: Checkout kernel
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.pr_number != '' && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
+
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        with:
+          extra-conf: |
+            max-jobs = 2
+            cores = 4
+            sandbox-fallback = false
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: huggingface
+        env:
+          USER: runner
+
+      - name: Plan minimum-Torch tests for Stable ABI
+        id: minimum-torch
+        env:
+          KERNEL: ${{ needs.setup.outputs.kernel }}
+          BACKENDS_FILTER: ${{ inputs.backends }}
+        run: |
+          python3 .github/scripts/stable_abi_ci.py plan "$KERNEL" --backends "$BACKENDS_FILTER"
+
+  build-minimum-torch-test:
+    permissions:
+      contents: read
+    needs: [setup, plan-minimum-torch-test-stable-abi]
+    if: needs.plan-minimum-torch-test-stable-abi.outputs.enabled == 'true'
+    runs-on:
+      group: aws-highmemory-32-plus-nix
+    timeout-minutes: 600 # 10h
+    steps:
+      - name: Checkout kernel
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.pr_number != '' && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
+
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        with:
+          extra-conf: |
+            max-jobs = 2
+            cores = 12
+            sandbox-fallback = false
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: huggingface
+        env:
+          USER: runner
+
+      # This current-built redistributable can load against the minimum Torch
+      # wheel without library paths pointing back into the Nix build environment.
+      - name: Build redistributable kernel for minimum-Torch testing
+        env:
+          KERNEL: ${{ needs.setup.outputs.kernel }}
+          VARIANT: ${{ needs.plan-minimum-torch-test-stable-abi.outputs.variant }}
+        run: |
+          KERNEL_BUILD_PATH=$(cd "$KERNEL" && nix build -L --no-link --print-out-paths ".#redistributable.$VARIANT")
+          tar -chf minimum-torch-kernel.tar -C "$KERNEL_BUILD_PATH" .
+
+      - name: Upload minimum-Torch test artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: minimum-torch-kernel
+          path: minimum-torch-kernel.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  # Run the Stable-ABI branch independently of the normal builds and tests.
+  test-kernel-minimum-torch:
+    permissions:
+      contents: read
+    needs: [setup, plan-minimum-torch-test-stable-abi, build-minimum-torch-test]
+    if: needs.plan-minimum-torch-test-stable-abi.outputs.enabled == 'true'
+    runs-on:
+      group: aws-g6-12xlarge-plus
+    timeout-minutes: 30
+    steps:
+      - name: Checkout tests
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.pr_number != '' && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
+
+      # Match the loader source used by the kernel's Nix ci-test environment.
+      - name: Resolve pinned kernels revision
+        id: kernels-revision
+        env:
+          KERNEL: ${{ needs.setup.outputs.kernel }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          lock = json.loads((Path(os.environ["KERNEL"]) / "flake.lock").read_text())
+          revision = lock["nodes"]["kernel-builder"]["locked"]["rev"]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"revision={revision}\n")
+          PY
+
+      - name: Checkout pinned kernels source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: huggingface/kernels
+          ref: ${{ steps.kernels-revision.outputs.revision }}
+          path: kernels-source
+
+      - name: Download minimum-Torch test artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: minimum-torch-kernel
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+
+      # kernels includes Rust bindings; use the toolchain from its upstream CI.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+
+      - name: Install minimum Torch and test dependencies
+        env:
+          TORCH_VERSION: ${{ needs.plan-minimum-torch-test-stable-abi.outputs.torch }}
+          TORCH_INDEX: ${{ needs.plan-minimum-torch-test-stable-abi.outputs.index }}
+          PYTHON_VERSION: ${{ needs.plan-minimum-torch-test-stable-abi.outputs.python }}
+        run: |
+          uv venv --python "$PYTHON_VERSION" "$RUNNER_TEMP/minimum-torch-venv"
+          echo "torch==$TORCH_VERSION" > "$RUNNER_TEMP/torch-constraint.txt"
+          uv pip install --python "$RUNNER_TEMP/minimum-torch-venv/bin/python" \
+            --index-url "$TORCH_INDEX" "torch==$TORCH_VERSION"
+          uv pip install --python "$RUNNER_TEMP/minimum-torch-venv/bin/python" \
+            --constraint "$RUNNER_TEMP/torch-constraint.txt" \
+            --requirement .github/scripts/stable-abi-requirements.txt \
+            ./kernels-source/kernels
+
+      - name: Run minimum-Torch tests
+        env:
+          KERNEL: ${{ needs.setup.outputs.kernel }}
+          TORCH_VERSION: ${{ needs.plan-minimum-torch-test-stable-abi.outputs.torch }}
+        run: |
+          mkdir "$RUNNER_TEMP/minimum-torch-build"
+          tar -xf minimum-torch-kernel.tar -C "$RUNNER_TEMP/minimum-torch-build"
+          unset PYTHONPATH LD_LIBRARY_PATH
+          "$RUNNER_TEMP/minimum-torch-venv/bin/python" .github/scripts/stable_abi_ci.py test \
+            "$KERNEL" "$RUNNER_TEMP/minimum-torch-build" \
+            --torch "$TORCH_VERSION"
+
   # Report the final build/test outcome as a commit status on the PR head SHA.
   report-status:
     if: always() && inputs.head_sha != ''
-    needs: [build-kernel, test-kernel-gpu]
+    needs:
+      - setup
+      - build-kernel
+      - build-ci-test
+      - test-kernel-gpu
+      - plan-minimum-torch-test-stable-abi
+      - build-minimum-torch-test
+      - test-kernel-minimum-torch
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -531,17 +658,16 @@ jobs:
           STATUS_CONTEXT: ${{ github.workflow }} / ${{ inputs.kernel_name }}
         run: |
           BUILD="${{ needs.build-kernel.result }}"
-          TEST="${{ needs.test-kernel-gpu.result }}"
 
-          if [ "$BUILD" = "success" ] && { [ "$TEST" = "success" ] || [ "$TEST" = "skipped" ]; }; then
+          if [ "${{ contains(needs.*.result, 'failure') }}" = "true" ]; then
+            STATE="failure"
+            DESC="Build or tests failed"
+          elif [ "$BUILD" = "success" ] && [ "${{ contains(needs.*.result, 'cancelled') }}" != "true" ]; then
             STATE="success"
             DESC="Build passed"
-          elif [ "$BUILD" = "failure" ] || [ "$TEST" = "failure" ]; then
-            STATE="failure"
-            DESC="Build failed (build: ${BUILD}, test: ${TEST})"
           else
             STATE="error"
-            DESC="Build did not complete (build: ${BUILD}, test: ${TEST})"
+            DESC="Build or tests did not complete"
           fi
 
           gh api "repos/$REPO/statuses/$HEAD_SHA" \
@@ -574,3 +700,66 @@ jobs:
           BODY=$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$BOT_COMMENT_ID" --jq .body)
           BODY=$(python3 .github/scripts/format_hub_upload_comment.py --base "$BODY" "$KERNEL" "$REPO_PREFIX" hub-uploads)
           gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$BOT_COMMENT_ID" -f body="$BODY"
+
+  # Record this run in the kernel-status dataset (`kernels-community/kernel-status`).
+  # PR code never runs here: the PR head is fetched as data (build.toml,
+  # flake.lock), never executed, because this job holds a Hub write token.
+  emit-status-event:
+    if: always() && inputs.skip_build != true && needs.setup.outputs.skip != 'true'
+    needs: [setup, build-kernel, build-ci-test, test-kernel-gpu]
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Fetch PR head as data
+        id: data-ref
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          case "$PR_NUMBER" in
+            '') echo "ref=HEAD" >> "$GITHUB_OUTPUT"; exit 0 ;;
+            *[!0-9]*) echo "Invalid pr_number input: must be numeric"; exit 1 ;;
+          esac
+          # Prefer the dispatched head SHA, the PR ref may have moved during the build.
+          case "$HEAD_SHA" in
+            '') git fetch --depth=1 origin "refs/pull/$PR_NUMBER/head" ;;
+            *[!0-9a-f]*) echo "Invalid head_sha input: must be a hex SHA"; exit 1 ;;
+            *) git fetch --depth=1 origin "$HEAD_SHA" ;;
+          esac
+          echo "ref=FETCH_HEAD" >> "$GITHUB_OUTPUT"
+
+      - name: Download Hub upload summaries
+        if: inputs.mode != 'pr' && inputs.upload != false
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: hub-upload-*
+          path: hub-uploads
+
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+
+      - name: Emit build event
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          KERNEL: ${{ inputs.kernel_name }}
+          MODE: ${{ inputs.mode }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          DISPATCH_KEY: ${{ inputs.dispatch_key }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          REPO_PREFIX: ${{ inputs.repo_prefix }}
+          UPLOAD: ${{ inputs.upload }}
+          REQUESTED_BY: ${{ inputs.requested_by }}
+          DATA_REF: ${{ steps.data-ref.outputs.ref }}
+        run: |
+          uv run --no-project --python 3.11 --with 'huggingface_hub>=0.34,<2' \
+            .github/scripts/emit_build_event.py linux --uploads hub-uploads

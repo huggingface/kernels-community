@@ -14,10 +14,9 @@ from utils import (  # type: ignore
     make_static_activation_scale,
     make_weights,
     maybe_compile,
+    finegrained_fp8,
     ref_matmul,
 )
-
-import finegrained_fp8  # type: ignore
 
 
 @dataclass(frozen=True)
