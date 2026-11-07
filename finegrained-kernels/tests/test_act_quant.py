@@ -21,6 +21,7 @@ from utils import internals, TEST_DEVICE  # type: ignore
 import triton
 import triton.language as tl
 
+_quant_block_k_pruner = internals.quant._quant_block_k_pruner
 fp8_act_quant_block_dynamic = internals.quant.fp8_act_quant_block_dynamic
 fp8_act_quant_tensor_wide = internals.quant.fp8_act_quant_tensor_wide
 mx_act_quant_inline = internals.quant.mx_act_quant_inline
@@ -419,10 +420,8 @@ def test_the_grouped_quant_grid_admits_only_its_tile_height():
     """The expert-sorted grid launches one program per 128-row tile (``build_tile_layout``'s pad
     granularity), and its row count is computed host-side from that, so a config with any other
     ``BLOCK_T`` would cover fewer rows than the schedule holds and leave the tail unquantized.
-    The dense grid has no such tie and keeps the whole range. Both scale stores reach the grouped
-    grid, so the pin cannot hang off the swizzle."""
-    _quant_block_k_pruner = internals.quant._quant_block_k_pruner
-
+    The dense grid has no such tie: with enough rows to fill the SMs it keeps both heights. Both
+    scale stores reach the grouped grid, so the pin cannot hang off the swizzle."""
     configs = [
         triton.Config({"BLOCK_K": bk, "BLOCK_T": bt}, num_warps=4)
         for bk in (32, 64)
@@ -434,6 +433,8 @@ def test_the_grouped_quant_grid_admits_only_its_tile_height():
         )
         assert grouped and all(c.kwargs["BLOCK_T"] == 128 for c in grouped)
         dense = _quant_block_k_pruner(
-            configs, {"K": 256, "SCALE_GROUP_K": 16, "SWIZZLED": swizzled, "GROUPED": False}
+            configs,
+            {"K": 256, "SCALE_GROUP_K": 16, "SWIZZLED": swizzled, "GROUPED": False, "T": 16384,
+             "X": torch.empty(1, device="cuda")},
         )
         assert {c.kwargs["BLOCK_T"] for c in dense} == {32, 128}
