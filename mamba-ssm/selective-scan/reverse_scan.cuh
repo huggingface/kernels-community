@@ -100,6 +100,8 @@ struct WarpReverseScan {
     // While in cub, it's defined as a macro that takes a redundant unused argument.
     #ifndef USE_ROCM
         #define WARP_THREADS CUB_WARP_THREADS(0)
+    #elif defined(HIPCUB_DEVICE_WARP_THREADS)
+        #define WARP_THREADS HIPCUB_DEVICE_WARP_THREADS
     #else
         #define WARP_THREADS HIPCUB_WARP_THREADS
     #endif
