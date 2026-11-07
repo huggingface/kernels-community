@@ -131,7 +131,7 @@ struct WarpReverseScan {
     /// Constructor
     explicit __device__ __forceinline__
     WarpReverseScan()
-        : lane_id(threadIdx.x & 0x1f)
+        : lane_id(threadIdx.x & (WARP_THREADS - 1))
         , warp_id(IS_ARCH_WARP ? 0 : (lane_id / LOGICAL_WARP_THREADS))
         , member_mask(cub::WarpMask<LOGICAL_WARP_THREADS>(warp_id))
     {
