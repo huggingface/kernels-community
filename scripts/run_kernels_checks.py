@@ -106,13 +106,13 @@ def _download_kernel_build(repo_id: str) -> Path:
     Hub before handing the path to the checker.
     """
     # Imported lazily so that `--dry-run` does not require the `kernels` package.
-    from kernels.utils import CACHE_DIR, _get_hf_api
+    from kernels.hf_hub import _get_cache_dir, _get_hf_api
 
     snapshot = _get_hf_api().snapshot_download(
         repo_id,
         repo_type="kernel",
         allow_patterns=["build/*"],
-        cache_dir=CACHE_DIR,
+        cache_dir=_get_cache_dir(),
     )
     return Path(snapshot)
 
