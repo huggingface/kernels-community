@@ -40,8 +40,9 @@ inline at::Tensor ensure_contiguous(const at::Tensor& tensor) {
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_xpu(), #x " must be on XPU")
 
 // ---------------------------------------------------------------------------
-// Split-KV decode (seqlen_q == 1). Used when the inputs are supported and
-// the plan below expects it to beat the generic forward kernels.
+// Split-KV decode (up to kMaxQueries queries per batch, each run as its own
+// decode row). Used when the inputs are supported and the plan below expects
+// it to beat the generic forward kernels.
 // FLASH_ATTN_XPU_DISABLE_SPLITKV_DECODE=1 forces the generic kernels,
 // FLASH_ATTN_XPU_DECODE_NUM_SPLITS=N forces split-KV with N splits.
 // ---------------------------------------------------------------------------
@@ -202,6 +203,20 @@ inline int plan_num_splits(sycl::queue& queue, int batch, int num_heads_q,
     return std::min({1 << (c - '0'), cap, flash_xpu_splitkv::kMaxSplits});
 }
 
+// Longest per-batch query the split-KV path takes (speculative decoding);
+// each query of the batch becomes its own decode row.
+constexpr int kMaxQueries = 16;
+
+// Masks the split-KV kernel can apply to a batch with several queries: none,
+// or bottom-right causal with an optional left window. window_size_* follow
+// the generic kernels (-1 = unbounded; causal folds into window_size_right
+// = 0). Sets `causal` on success.
+inline bool multi_query_mask(bool is_causal, int window_size_left,
+                             int window_size_right, bool& causal) {
+    causal = is_causal || window_size_right == 0;
+    return causal || (window_size_left == -1 && window_size_right == -1);
+}
+
 inline bool stride_ok(int64_t s) {
     // Xe 2D block messages: pitch a multiple of 16 bytes, below 2^24 bytes.
     return s > 0 && s % 8 == 0 && s * 2 < (int64_t(1) << 24);
@@ -322,16 +337,23 @@ mha_fwd(
     CHECK_DEVICE(k);
     CHECK_DEVICE(v);
 
-    // Decode: split-KV kernel. Causal masking is a no-op for one query
-    // (bottom-right aligned) and window_size_right cannot mask anything.
-    if (seqlen_q == 1 && p_dropout == 0.0f && !return_softmax &&
+    // Decode and short queries: split-KV kernel, one decode row per query.
+    // With one query causal masking is a no-op (bottom-right aligned) and
+    // window_size_right cannot mask anything.
+    bool skv_causal = false;
+    if (seqlen_q >= 1 && seqlen_q <= splitkv::kMaxQueries &&
+        (seqlen_q == 1 ||
+         (splitkv::multi_query_mask(is_causal, window_size_left,
+                                    window_size_right, skv_causal) &&
+          (!skv_causal || seqlen_k >= seqlen_q))) &&
+        p_dropout == 0.0f && !return_softmax &&
         !alibi_slopes_.has_value() && softcap == 0.0f &&
         seqlen_k > 0 && seqlen_k < (1 << 24) &&
         splitkv::supported(q, k, v, /*paged=*/false)) {
         auto queue = c10::xpu::getCurrentXPUStream(device_idx).queue();
         int num_splits = splitkv::plan_num_splits(
-            queue, batch_size, num_heads, num_heads_k, q.size(-1), seqlen_k,
-            /*paged=*/false);
+            queue, batch_size * seqlen_q, num_heads, num_heads_k, q.size(-1),
+            seqlen_k, /*paged=*/false);
         if (num_splits > 0) {
             at::Tensor out;
             if (out_.has_value() && out_->is_contiguous() &&
@@ -341,7 +363,7 @@ mha_fwd(
                 out = at::empty_like(q);
             }
             auto opts = q.options().dtype(torch::kFloat32);
-            at::Tensor softmax_lse = at::empty({batch_size, num_heads, 1}, opts);
+            at::Tensor softmax_lse = at::empty({batch_size, num_heads, seqlen_q}, opts);
 
             splitkv::decode_args_t a;
             a.q = q.data_ptr();
@@ -349,13 +371,16 @@ mha_fwd(
             a.v = v.data_ptr();
             a.out = out.data_ptr();
             a.softmax_lse = softmax_lse.data_ptr<float>();
+            a.q_per_batch = seqlen_q;
+            a.causal = skv_causal;
             a.seqlen_k = seqlen_k;
             a.batch = batch_size;
             a.num_heads_q = num_heads;
             a.num_heads_kv = num_heads_k;
             a.head_size = head_size_og;
             a.head_size_v = head_size_og;
-            a.q_row_stride = q.stride(0);
+            // stride(1) is arbitrary when seqlen_q == 1.
+            a.q_row_stride = seqlen_q == 1 ? q.stride(0) : q.stride(1);
             a.q_head_stride = q.stride(2);
             a.k_batch_stride = k.stride(0);
             a.k_seq_stride = k.stride(1);
@@ -363,13 +388,15 @@ mha_fwd(
             a.v_batch_stride = v.stride(0);
             a.v_seq_stride = v.stride(1);
             a.v_head_stride = v.stride(2);
-            a.lse_head_stride = 1;
-            a.lse_row_stride = num_heads;
+            // softmax_lse is [batch, Hq, seqlen_q]; row = b * seqlen_q + j.
+            a.lse_batch_stride = int64_t(num_heads - 1) * seqlen_q;
+            a.lse_head_stride = seqlen_q;
+            a.lse_row_stride = 1;
             a.softmax_scale = softmax_scale;
             a.window_size_left =
                 (window_size_left >= 0 && window_size_left < seqlen_k) ? window_size_left : -1;
             a.num_splits = num_splits;
-            splitkv::run(queue, q, batch_size, a);
+            splitkv::run(queue, q, batch_size * seqlen_q, a);
 
             if (out_.has_value() && !out.is_same(out_.value())) {
                 out_.value().copy_(out);
@@ -719,96 +746,130 @@ mha_varlen_fwd(
     CHECK_DEVICE(k);
     CHECK_DEVICE(v);
 
-    // Decode: split-KV kernel (see mha_fwd).
+    // Decode and short queries: split-KV kernel, one decode row per query
+    // (see mha_fwd). With longer queries (chunked prefill mixed with decode)
+    // the split-KV kernel takes the one-query batches and the generic kernel
+    // skips them.
+    const bool skv_paged = block_table_.has_value() && block_table_->defined();
+    int skv_q_per_batch = 0;  // 0: split-KV kernel not used
+    bool skv_mixed = false;
+    bool skv_causal = false;
+    int skv_splits = 0;
     {
-        const bool paged = block_table_.has_value() && block_table_->defined();
         auto int_dev = [&](const at::Tensor& t) {
             return t.is_xpu() && t.scalar_type() == at::kInt && t.dim() == 1;
         };
-        if (max_seqlen_q == 1 && p_dropout == 0.0f && !return_softmax &&
+        if (max_seqlen_q >= 1 && p_dropout == 0.0f && !return_softmax &&
             !alibi_slopes_.has_value() && softcap == 0.0f &&
             !(seqused_k.has_value() && seqused_k->defined()) &&
             !(leftpad_k_.has_value() && leftpad_k_->defined()) &&
-            max_seqlen_k > 0 && (paged || max_seqlen_k < (1 << 24)) &&
+            max_seqlen_k > 0 && (skv_paged || max_seqlen_k < (1 << 24)) &&
             int_dev(cu_seqlens_q) && int_dev(cu_seqlens_k) &&
             cu_seqlens_k.numel() == batch_size + 1 &&
-            (!paged || (block_table_->is_xpu() && block_table_->dim() == 2 &&
-                        block_table_->scalar_type() == at::kInt &&
-                        block_table_->size(0) >= batch_size)) &&
-            k.dim() == (paged ? 4 : 3) && v.dim() == k.dim() &&
-            splitkv::supported(q, k, v, paged)) {
-            auto queue = c10::xpu::getCurrentXPUStream(device_idx).queue();
-            // k is [total_k, Hkv, D] or, paged, [num_blocks, page, Hkv, D].
-            const int hkv = k.size(-2);
-            int num_splits = splitkv::plan_num_splits(
-                queue, batch_size, num_heads, hkv, q.size(-1), max_seqlen_k,
-                paged);
-            if (num_splits > 0) {
-                at::Tensor out;
-                if (out_.has_value() && out_->is_contiguous() &&
-                    out_->sizes() == q.sizes() && out_->dtype() == q_dtype) {
-                    out = out_.value();
-                } else {
-                    out = at::zeros_like(q);
-                }
-                auto opts = q.options().dtype(torch::kFloat32);
-                at::Tensor softmax_lse = torch::zeros({num_heads, total_q}, opts);
-                at::Tensor cu_q = cu_seqlens_q.contiguous();
-                at::Tensor cu_k = cu_seqlens_k.contiguous();
-                at::Tensor block_table;
-
-                splitkv::decode_args_t a;
-                a.q = q.data_ptr();
-                a.k = k.data_ptr();
-                a.v = v.data_ptr();
-                a.out = out.data_ptr();
-                a.softmax_lse = softmax_lse.data_ptr<float>();
-                a.cu_seqlens_q = cu_q.data_ptr<int>();
-                a.cu_seqlens_k = cu_k.data_ptr<int>();
-                a.seqlen_k = max_seqlen_k;
-                a.batch = batch_size;
-                a.num_heads_q = num_heads;
-                a.num_heads_kv = hkv;
-                a.head_size = head_size_og;
-                a.head_size_v = head_size_og;
-                a.q_row_stride = q.stride(0);
-                a.q_head_stride = q.stride(1);
-                if (paged) {
-                    block_table = block_table_->contiguous();
-                    a.block_table = block_table.data_ptr<int>();
-                    a.block_table_batch_stride = block_table.stride(0);
-                    a.page_size = k.size(1);
-                    a.max_pages_per_seq = block_table.size(1);
-                    a.page_stride_rows = k.stride(0) / k.stride(1);
-                    a.total_rows_kv = int64_t(k.size(0)) * a.page_stride_rows;
-                    a.k_batch_stride = k.stride(0);
-                    a.k_seq_stride = k.stride(1);
-                    a.k_head_stride = k.stride(2);
-                    a.v_batch_stride = v.stride(0);
-                    a.v_seq_stride = v.stride(1);
-                    a.v_head_stride = v.stride(2);
-                } else {
-                    a.k_seq_stride = k.stride(0);
-                    a.k_head_stride = k.stride(1);
-                    a.v_seq_stride = v.stride(0);
-                    a.v_head_stride = v.stride(1);
-                }
-                a.lse_head_stride = total_q;
-                a.lse_row_stride = 1;
-                a.softmax_scale = softmax_scale;
-                a.window_size_left =
-                    (window_size_left >= 0 && window_size_left < max_seqlen_k) ? window_size_left : -1;
-                a.num_splits = num_splits;
-                splitkv::run(queue, q, total_q, a);
-
-                if (out_.has_value() && !out.is_same(out_.value())) {
-                    out_.value().copy_(out);
-                }
-                at::Tensor S_dmask = torch::empty({0}, q.options());
-                at::Tensor rng_state = at::empty({2}, q.options().dtype(at::kLong));
-                return {out, softmax_lse, S_dmask, rng_state};
+            (!skv_paged || (block_table_->is_xpu() && block_table_->dim() == 2 &&
+                            block_table_->scalar_type() == at::kInt &&
+                            block_table_->size(0) >= batch_size)) &&
+            k.dim() == (skv_paged ? 4 : 3) && v.dim() == k.dim() &&
+            splitkv::supported(q, k, v, skv_paged)) {
+            if (max_seqlen_q == 1 ||
+                (max_seqlen_q <= splitkv::kMaxQueries &&
+                 splitkv::multi_query_mask(is_causal, window_size_left,
+                                           window_size_right, skv_causal))) {
+                skv_q_per_batch = max_seqlen_q;
+            } else if (skv_paged || total_q != total_k) {
+                // Without paging, total_q == total_k means every batch
+                // attends only to its own queries: nothing to decode.
+                skv_q_per_batch = 1;
+                skv_mixed = true;
+                skv_causal = false;
             }
         }
+        if (skv_q_per_batch > 0) {
+            auto queue = c10::xpu::getCurrentXPUStream(device_idx).queue();
+            // k is [total_k, Hkv, D] or, paged, [num_blocks, page, Hkv, D].
+            skv_splits = splitkv::plan_num_splits(
+                queue, batch_size * skv_q_per_batch, num_heads, k.size(-2),
+                q.size(-1), max_seqlen_k, skv_paged);
+            // The generic kernel runs the one-query batches of a mixed batch
+            // with its prefill tiles; the split-KV kernel is always cheaper.
+            if (skv_mixed) skv_splits = std::max(skv_splits, 1);
+            if (skv_splits == 0) skv_q_per_batch = 0;
+        }
+    }
+
+    // Runs the split-KV kernel into out ([total_q, Hq, D], contiguous) and
+    // softmax_lse ([Hq, total_q]).
+    auto run_splitkv = [&](at::Tensor& out, at::Tensor& softmax_lse) {
+        auto queue = c10::xpu::getCurrentXPUStream(device_idx).queue();
+        at::Tensor cu_q = cu_seqlens_q.contiguous();
+        at::Tensor cu_k = cu_seqlens_k.contiguous();
+        at::Tensor block_table;
+
+        splitkv::decode_args_t a;
+        a.q = q.data_ptr();
+        a.k = k.data_ptr();
+        a.v = v.data_ptr();
+        a.out = out.data_ptr();
+        a.softmax_lse = softmax_lse.data_ptr<float>();
+        a.cu_seqlens_q = cu_q.data_ptr<int>();
+        a.q_per_batch = skv_q_per_batch;
+        a.causal = skv_causal;
+        a.cu_seqlens_k = cu_k.data_ptr<int>();
+        a.seqlen_k = max_seqlen_k;
+        a.batch = batch_size;
+        a.num_heads_q = num_heads;
+        a.num_heads_kv = k.size(-2);
+        a.head_size = head_size_og;
+        a.head_size_v = head_size_og;
+        a.q_row_stride = q.stride(0);
+        a.q_head_stride = q.stride(1);
+        if (skv_paged) {
+            block_table = block_table_->contiguous();
+            a.block_table = block_table.data_ptr<int>();
+            a.block_table_batch_stride = block_table.stride(0);
+            a.page_size = k.size(1);
+            a.max_pages_per_seq = block_table.size(1);
+            a.page_stride_rows = k.stride(0) / k.stride(1);
+            a.total_rows_kv = int64_t(k.size(0)) * a.page_stride_rows;
+            a.k_batch_stride = k.stride(0);
+            a.k_seq_stride = k.stride(1);
+            a.k_head_stride = k.stride(2);
+            a.v_batch_stride = v.stride(0);
+            a.v_seq_stride = v.stride(1);
+            a.v_head_stride = v.stride(2);
+        } else {
+            a.k_seq_stride = k.stride(0);
+            a.k_head_stride = k.stride(1);
+            a.v_seq_stride = v.stride(0);
+            a.v_head_stride = v.stride(1);
+        }
+        a.lse_head_stride = total_q;
+        a.lse_row_stride = 1;
+        a.softmax_scale = softmax_scale;
+        a.window_size_left =
+            (window_size_left >= 0 && window_size_left < max_seqlen_k) ? window_size_left : -1;
+        a.num_splits = skv_splits;
+        splitkv::run(queue, q, total_q, a);
+    };
+
+    if (skv_q_per_batch > 0 && !skv_mixed) {
+        at::Tensor out;
+        if (out_.has_value() && out_->is_contiguous() &&
+            out_->sizes() == q.sizes() && out_->dtype() == q_dtype) {
+            out = out_.value();
+        } else {
+            out = at::zeros_like(q);
+        }
+        auto opts = q.options().dtype(torch::kFloat32);
+        at::Tensor softmax_lse = torch::zeros({num_heads, total_q}, opts);
+        run_splitkv(out, softmax_lse);
+
+        if (out_.has_value() && !out.is_same(out_.value())) {
+            out_.value().copy_(out);
+        }
+        at::Tensor S_dmask = torch::empty({0}, q.options());
+        at::Tensor rng_state = at::empty({2}, q.options().dtype(at::kLong));
+        return {out, softmax_lse, S_dmask, rng_state};
     }
 
     // XPU requires head_size to be a multiple of 32
@@ -879,7 +940,8 @@ mha_varlen_fwd(
         true, is_paged, is_causal, is_local,
         p_dropout, philox_seed, philox_offset, nullptr,
         return_softmax ? S_dmask.data_ptr() : nullptr,
-        seqlen_q_rounded, seqlen_k_rounded);
+        seqlen_q_rounded, seqlen_k_rounded,
+        /*min_seqlen_q=*/skv_mixed ? 2 : 0);
 
     // Strip padding from output back to original head_size
     at::Tensor out = needs_padding
@@ -887,6 +949,10 @@ mha_varlen_fwd(
                             torch::indexing::Slice(0, head_size_og)})
                     .contiguous()
         : ensure_contiguous(out_padded);
+
+    if (skv_mixed) {
+        run_splitkv(out, softmax_lse);
+    }
 
     return {out, softmax_lse, S_dmask, rng_state};
   }
@@ -1166,9 +1232,18 @@ mha_fwd_kvcache(
     if (window_size_left >= seqlen_k) { window_size_left = -1; }
     if (window_size_right >= seqlen_k) { window_size_right = -1; }
 
-    // Decode: split-KV kernel. num_splits: 0 = heuristic, 1 = generic
-    // kernel, N > 1 = N splits.
-    if (seqlen_q == 1 && num_splits != 1 && softcap == 0.0f &&
+    // Decode and short queries: split-KV kernel (see mha_fwd). num_splits:
+    // 0 = heuristic, 1 = generic kernel, N > 1 = N splits.
+    bool skv_causal = false;
+    if (seqlen_q >= 1 && seqlen_q <= splitkv::kMaxQueries &&
+        (seqlen_q == 1 ||
+         // The generic kernel ignores window_size_right without a left
+         // window.
+         splitkv::multi_query_mask(
+             is_causal, window_size_left,
+             window_size_left < 0 && !is_causal ? -1 : window_size_right,
+             skv_causal)) &&
+        num_splits != 1 && softcap == 0.0f &&
         !rotary_cos_.has_value() && !cache_batch_idx_.has_value() &&
         !leftpad_k_.has_value() && seqlen_k > 0 &&
         (paged_KV || seqlen_k < (1 << 24)) &&
@@ -1197,12 +1272,17 @@ mha_fwd_kvcache(
         auto queue = c10::xpu::getCurrentXPUStream(device_idx).queue();
         int splits = num_splits > 1
             ? std::min(num_splits, flash_xpu_splitkv::kMaxSplits)
-            : splitkv::plan_num_splits(queue, batch_size, num_heads,
+            : splitkv::plan_num_splits(queue, batch_size * seqlen_q, num_heads,
                                        num_heads_k, head_size_og, seqlen_k,
                                        paged_KV);
         if (knew_ok && splits > 0) {
-            at::Tensor out = out_.has_value() ? out_.value() : at::zeros_like(q);
-            auto softmax_lse = torch::full({batch_size, num_heads, 1},
+            // Several queries: rows of q must be evenly spaced and out
+            // contiguous; one query: zeros_like keeps q's batch stride.
+            at::Tensor qc = (seqlen_q == 1 || q.stride(0) == seqlen_q * q.stride(1))
+                ? q : q.contiguous();
+            at::Tensor out = out_.has_value() ? out_.value()
+                : seqlen_q == 1 ? at::zeros_like(q) : at::zeros(q.sizes(), q.options());
+            auto softmax_lse = torch::full({batch_size, num_heads, seqlen_q},
                                            -std::numeric_limits<float>::infinity(),
                                            q.options().dtype(at::kFloat));
             at::Tensor seqlens_k = seqlens_k_.has_value()
@@ -1244,11 +1324,13 @@ mha_fwd_kvcache(
             }
 
             splitkv::decode_args_t a;
-            a.q = q.data_ptr();
+            a.q = qc.data_ptr();
             a.k = kcache.data_ptr();
             a.v = vcache.data_ptr();
             a.out = out.data_ptr();
             a.softmax_lse = softmax_lse.data_ptr<float>();
+            a.q_per_batch = seqlen_q;
+            a.causal = skv_causal;
             if (seqlens_k.defined()) {
                 a.seqused_k = seqlens_k.data_ptr<int>();
                 a.seqlen_k_add = seqlen_new;
@@ -1267,20 +1349,21 @@ mha_fwd_kvcache(
             a.num_heads_kv = num_heads_k;
             a.head_size = head_size_og;
             a.head_size_v = head_size_og;
-            a.q_row_stride = q.stride(0);
-            a.q_head_stride = q.stride(2);
+            a.q_row_stride = seqlen_q == 1 ? qc.stride(0) : qc.stride(1);
+            a.q_head_stride = qc.stride(2);
             a.k_batch_stride = kcache.stride(0);
             a.k_seq_stride = kcache.stride(1);
             a.k_head_stride = kcache.stride(2);
             a.v_batch_stride = vcache.stride(0);
             a.v_seq_stride = vcache.stride(1);
             a.v_head_stride = vcache.stride(2);
-            a.lse_head_stride = 1;
-            a.lse_row_stride = num_heads;
+            a.lse_batch_stride = int64_t(num_heads - 1) * seqlen_q;
+            a.lse_head_stride = seqlen_q;
+            a.lse_row_stride = 1;
             a.softmax_scale = softmax_scale;
             a.window_size_left = window_size_left;
             a.num_splits = splits;
-            splitkv::run(queue, q, batch_size, a);
+            splitkv::run(queue, qc, batch_size * seqlen_q, a);
             return {out, softmax_lse};
         }
     }

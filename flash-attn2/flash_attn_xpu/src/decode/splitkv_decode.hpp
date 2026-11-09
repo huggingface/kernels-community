@@ -2,7 +2,7 @@
  * Copyright (C) 2026 Intel Corporation, All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  **************************************************************************************************/
-// Host-visible interface of the split-KV decode path (seqlen_q == 1).
+// Host-visible interface of the split-KV decode path (short queries).
 // Kept free of CUTLASS/CuTe so flash_api.cpp can include it.
 
 #pragma once
@@ -26,9 +26,16 @@ struct decode_args_t {
   float* oaccum = nullptr;        // [rows, splits, Hq, Dv] (num_splits > 1)
   float* lse_accum = nullptr;     // [rows, Hq, splits]     (num_splits > 1)
 
-  // Query row of batch b: cu_seqlens_q ? cu_seqlens_q[b] : b. A batch whose
-  // cu_seqlens_q range is empty is skipped. Only one query per batch is read.
+  // Every batch b has up to q_per_batch queries; each query j is handled as
+  // its own decode row (row = cu_seqlens_q ? cu_seqlens_q[b] + j
+  // : b * q_per_batch + j). With cu_seqlens_q, batches with more than
+  // q_per_batch queries are skipped (left to the generic kernel), as are
+  // positions past the batch's query count.
   const int* cu_seqlens_q = nullptr;
+  int q_per_batch = 1;
+  // Bottom-right causal: query j of a batch with n queries sees the first
+  // seq_len - (n - 1 - j) keys. Without it every query sees all keys.
+  bool causal = false;
   // KV length of batch b:
   //   seqused_k   ? seqused_k[b] + seqlen_k_add
   //   cu_seqlens_k? cu_seqlens_k[b + 1] - cu_seqlens_k[b]
@@ -59,8 +66,9 @@ struct decode_args_t {
   int64_t k_batch_stride = 0, k_seq_stride = 0, k_head_stride = 0;
   int64_t v_batch_stride = 0, v_seq_stride = 0, v_head_stride = 0;
 
-  // softmax_lse[hq * lse_head_stride + row * lse_row_stride]
-  int64_t lse_head_stride = 0, lse_row_stride = 0;
+  // softmax_lse[b * lse_batch_stride + hq * lse_head_stride
+  //             + row * lse_row_stride]
+  int64_t lse_batch_stride = 0, lse_head_stride = 0, lse_row_stride = 0;
 
   float softmax_scale = 1.f;
   int window_size_left = -1;  // < 0: no local mask

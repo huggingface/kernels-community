@@ -21,11 +21,12 @@ namespace flash_xpu_splitkv {
 
 using namespace cute;
 
-// Per-batch work split, shared by the attention and combine kernels so both
+// Per-query work split, shared by the attention and combine kernels so both
 // agree on which splits exist.
 struct BatchSplit {
+  int b;          // batch
   int row;        // query row
-  int seq_len;    // KV length
+  int seq_len;    // KV length visible to the query
   int k_block0;   // first KV tile inside the window
   int windowed;   // # KV tiles inside the window
   int splits;     // # non-empty splits (>= 1)
@@ -33,15 +34,22 @@ struct BatchSplit {
   bool valid;
 };
 
-CUTLASS_DEVICE BatchSplit get_batch_split(decode_args_t const& a, int b) {
+// pb indexes (batch, query) pairs: b = pb / q_per_batch.
+CUTLASS_DEVICE BatchSplit get_batch_split(decode_args_t const& a, int pb) {
   BatchSplit s{};
   s.valid = false;
+  int b = pb / a.q_per_batch;
+  int j = pb - b * a.q_per_batch;
+  s.b = b;
+  int q_len;
   if (a.cu_seqlens_q != nullptr) {
-    s.row = a.cu_seqlens_q[b];
-    if (a.cu_seqlens_q[b + 1] <= s.row) return s;
+    s.row = a.cu_seqlens_q[b] + j;
+    q_len = a.cu_seqlens_q[b + 1] - a.cu_seqlens_q[b];
   } else {
-    s.row = b;
+    s.row = pb;
+    q_len = a.q_per_batch;
   }
+  if (j >= q_len || q_len > a.q_per_batch) return s;
   if (a.seqused_k != nullptr) {
     s.seq_len = a.seqused_k[b] + a.seqlen_k_add;
     s.seq_len = s.seq_len < a.seqlen_k ? s.seq_len : a.seqlen_k;
@@ -50,6 +58,7 @@ CUTLASS_DEVICE BatchSplit get_batch_split(decode_args_t const& a, int b) {
   } else {
     s.seq_len = a.seqlen_k;
   }
+  if (a.causal) s.seq_len -= q_len - 1 - j;
   if (s.seq_len <= 0) return s;
 
   int k_blocks = (s.seq_len + kKVTile - 1) / kKVTile;
@@ -117,7 +126,7 @@ struct SplitKVDecodeKernel {
     return dim3(
         (a.head_size_v + tile_v - 1) / tile_v,
         (group + tile_q - 1) / tile_q,
-        a.batch * a.num_heads_kv * a.num_splits);
+        a.batch * a.q_per_batch * a.num_heads_kv * a.num_splits);
   }
 
   static dim3 get_block_shape() {
@@ -133,14 +142,15 @@ struct SplitKVDecodeKernel {
     int blk_v = int(BlockIdxX());
     int blk_q = int(BlockIdxY());
     int flat = int(BlockIdxZ());
-    int bh = a.batch * a.num_heads_kv;
+    int bh = a.batch * a.q_per_batch * a.num_heads_kv;
     int idx_split = flat / bh;
     int rem = flat - idx_split * bh;
-    int idx_b = rem / a.num_heads_kv;
-    int head = rem - idx_b * a.num_heads_kv;
+    int idx_pb = rem / a.num_heads_kv;
+    int head = rem - idx_pb * a.num_heads_kv;
 
-    BatchSplit s = get_batch_split(a, idx_b);
+    BatchSplit s = get_batch_split(a, idx_pb);
     if (!s.valid || idx_split >= s.splits) return;
+    int idx_b = s.b;
 
     int group = a.num_heads_q / a.num_heads_kv;
     int head_q0 = head * group;
@@ -224,7 +234,8 @@ struct SplitKVDecodeKernel {
       Tensor O_2D = make_tensor(
           make_gmem_ptr(o_ptr),
           make_layout(make_shape(group, Dv), make_stride(int64_t(Dv), _1{})));
-      float* lse_ptr = a.softmax_lse + int64_t(head_q0) * a.lse_head_stride +
+      float* lse_ptr = a.softmax_lse + int64_t(idx_b) * a.lse_batch_stride +
+          int64_t(head_q0) * a.lse_head_stride +
           int64_t(s.row) * a.lse_row_stride;
       epilogue(
           O_2D, tArA, tA_max, tA_sum, blk_qv, thr_id, group, 1, nullptr,
@@ -245,8 +256,8 @@ struct SplitKVDecodeKernel {
   }
 };
 
-// Merges the per-split partial outputs of batches that used more than one
-// split. Grid (1, Hq, batch).
+// Merges the per-split partial outputs of queries that used more than one
+// split. Grid (1, Hq, batch * q_per_batch).
 template <class ElementO_>
 struct SplitKVCombineKernel {
   using ElementO = ElementO_;
@@ -263,7 +274,7 @@ struct SplitKVCombineKernel {
   };
 
   static dim3 get_grid_shape(decode_args_t const& a) {
-    return dim3(1, a.num_heads_q, a.batch);
+    return dim3(1, a.num_heads_q, a.batch * a.q_per_batch);
   }
   static dim3 get_block_shape() { return dim3(kThreads, 1, 1); }
 
@@ -309,7 +320,8 @@ struct SplitKVCombineKernel {
       o[d] = ElementO(acc);
     }
     if (t == 0) {
-      a.softmax_lse[int64_t(hq) * a.lse_head_stride +
+      a.softmax_lse[int64_t(s.b) * a.lse_batch_stride +
+                    int64_t(hq) * a.lse_head_stride +
                     int64_t(s.row) * a.lse_row_stride] =
           lse_max + sycl::log(sum);
     }

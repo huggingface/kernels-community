@@ -61,6 +61,10 @@ struct fmha_fwd_args_t {
   void* rotary_sin = nullptr;
   int rotary_dim = 0;
   bool is_rotary_interleaved = true;
+
+  // Varlen: batches with fewer than min_seqlen_q queries are skipped (their
+  // out / softmax_lse rows are left untouched).
+  int min_seqlen_q = 0;
 };
 
 enum class CutlassType {

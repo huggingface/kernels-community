@@ -225,7 +225,8 @@ void cutlass_fmha_fwd_varlen_impl(
     void* rng_state,
     void* s_dmask,
     int seqlen_q_rounded,
-    int seqlen_k_rounded) {
+    int seqlen_k_rounded,
+    int min_seqlen_q) {
   int batch_size, num_heads_q, num_heads_kv, head_size;
   int total_seqlen_q, total_seqlen_k;
   int num_blocks, block_size, max_blocks_per_seq;
@@ -308,6 +309,7 @@ void cutlass_fmha_fwd_varlen_impl(
       s_dmask,
       seqlen_q_rounded,
       seqlen_k_rounded};
+  args.min_seqlen_q = min_seqlen_q;
 
   const CutlassType cuType = aten_to_Cutlass_dtype(query);
   if (args.max_queries == 1) {

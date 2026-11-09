@@ -112,6 +112,8 @@ class XeFMHAFwdKernelXe2 {
     int64_t vnew_head_stride = 0;
     int64_t vnew_row_stride = 0;
     int seqlen_knew = 0;
+    // Varlen: skip batches with fewer queries (0 = none).
+    int min_seqlen_q = 0;
   };
   using KernelParams = KernelArguments;
 
@@ -224,6 +226,11 @@ class XeFMHAFwdKernelXe2 {
       auto [seq_len_qo, seq_len_kv] = sequence_length_shape;
       if (blk_q * get<0>(TileShapeQK{}) >= seq_len_qo)
         continue;
+      // Varlen: batches with fewer queries are left to another kernel.
+      if constexpr (is_var_len) {
+        if (seq_len_qo < p.min_seqlen_q)
+          continue;
+      }
 
       // KV Cache: override seq_len_kv with per-batch effective length
       int effective_seq_kv = seq_len_kv;
