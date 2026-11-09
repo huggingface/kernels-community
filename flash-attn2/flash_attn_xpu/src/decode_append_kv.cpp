@@ -1,3 +1,7 @@
+/***************************************************************************************************
+ * Copyright (C) 2026 Intel Corporation, All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ **************************************************************************************************/
 #include <sycl/sycl.hpp>
 
 #include "decode/splitkv_decode.hpp"
