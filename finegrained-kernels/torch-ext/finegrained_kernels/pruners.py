@@ -266,6 +266,27 @@ def nvfp4_requant_warps_pruner():
     )
 
 
+def mxfp4_requant_warps_pruner():
+    """``early_config_prune`` for a Triton 3.6 trap in the grouped MX kernel's fused MXFP4 requant of the gate|up GLU:
+    non-warp-specialized ``dot_scaled`` configs with a TMA-descriptor A and a 128-row tile at 4 or 8 warps hit an
+    illegal instruction, which poisons the context for every later launch. Measured by running every admitted config
+    in order on B200 (MXFP8 weights, N=128 K=256): 32 of 200 trap with swizzled output scales, 116 of 1200 with
+    row-major ones, all inside this set. Pointer A, BM <= 64, warp specialization, 2 and 16 warps all run. Some 8-warp
+    5-6 stage configs also run, but which ones moves with BN and the scale layout, so all of 8 warps is fenced. MXFP8
+    and NVFP4 requant and the non-requant launches run the same configs. Applies below Triton 3.7 only."""
+
+    def ok(c, args):
+        if c.kwargs.get("COMPUTE_MODE") != "dot_scaled" or c.kwargs.get("WARP_SPEC"):
+            return True
+        if c.kwargs.get("A_MEMORY_MODE", "pointer") == "pointer":
+            return True
+        return c.kwargs["BLOCK_SIZE_M"] < 128 or c.num_warps not in (4, 8)
+
+    return config_filter(
+        ok, when=lambda args: args.get("OUTPUT_FORMAT") == "mxfp4" and not is_triton_greater_or_equal("3.7")
+    )
+
+
 def dgrad_grouped_warps_pruner():
     """``early_config_prune`` for a Triton 3.6 miscompile in the grouped dgrad kernel's top-k accumulate launch: one
     config, 2 warps / 3 stages with a BM=128 BN=128 BK=256 pointer-dY / descriptor-W tile, returns WRONG values (B200,
