@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (C) 2026 Intel Corporation, All rights reserved.
+ * Copyright (C) 2025 - 2026 Intel Corporation, All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -32,8 +32,8 @@
 // Split-KV decode mainloop (seqlen_q == 1, GQA head group packed into the Q
 // tile). Adapted from vllm-xpu-kernels
 // csrc/xpu/attn/xe_2/collective/chunk_prefill_mainloop.hpp (DecodeFwdMainloop).
-// Lives in its own namespace so its symbols can never bind to the identically
-// named vLLM or flash-attn prefill templates loaded in the same process.
+// Kept in its own namespace to avoid clashing with same-named templates of
+// other extensions loaded in the same process.
 
 #pragma once
 

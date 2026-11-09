@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (C) 2026 Intel Corporation, All rights reserved.
+ * Copyright (C) 2025 - 2026 Intel Corporation, All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  **************************************************************************************************/
 // Split-KV decode kernels: one work-group per (V tile, Q tile of the GQA

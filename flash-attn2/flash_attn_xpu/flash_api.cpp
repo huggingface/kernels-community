@@ -271,7 +271,7 @@ inline void run(sycl::queue& queue, const at::Tensor& q, int rows,
         args.oaccum = oaccum.data_ptr<float>();
         args.lse_accum = lse_accum.data_ptr<float>();
     }
-    args.min_tiles_per_split = env_int("FLASH_ATTN_XPU_DECODE_MIN_TILES", 4);
+    args.min_tiles_per_split = 4;
     launch(queue, q.scalar_type(), args.head_size, args);
 }
 
