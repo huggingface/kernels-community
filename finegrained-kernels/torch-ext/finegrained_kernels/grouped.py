@@ -18,7 +18,6 @@ from typing import List
 import torch
 import triton
 import triton.language as tl
-from packaging.version import Version
 
 
 from triton.tools.tensor_descriptor import TensorDescriptor
@@ -26,7 +25,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from .bayesian_autotuner import bayesian_autotune
 from ._ops import add_op_namespace_prefix
 from .bench import gemm_cold_banks
-from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, persistent_program_count, tl_dtype
+from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, is_triton_greater_or_equal, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, persistent_program_count, tl_dtype
 from .descriptors import build_grouped_operand_descriptors, rebind_grouped_descriptors, rebind_grouped_mx_descriptors
 from .formats import check_activation_format, global_scale_stride, gate_out_cols, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
 from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, mx_act_quant_grouped, mx_act_quant_routed_rows, quantize_routed_rows_per_expert, static_expert_act_operands, swizzle_grouped_mx_scales, tensor_wide_act_operands
@@ -1921,7 +1920,7 @@ def mx_dynamic_matmul_grouped(
     # fused gate_up convention); a scattered requant keeps row-major Cs.
     # Triton 3.6 stores the swizzled requant scales wrong through CSDescriptor (as in matmul_2d): there they are written
     # row-major (expert-sorted) and swizzled after.
-    swizzled_out = requant and scatter_idx is None and swizzled_scales and Version(triton.__version__) >= Version("3.7")
+    swizzled_out = requant and scatter_idx is None and swizzled_scales and is_triton_greater_or_equal("3.7")
     swizzle_after = requant and scatter_idx is None and swizzled_scales and not swizzled_out
     if output_format in ("mxfp4", "nvfp4"):  # packed E2M1 intermediate, feeds a W4A4 down as-is
         assert N % (2 * scale_group) == 0, (

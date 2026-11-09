@@ -14,9 +14,8 @@
 
 import torch
 import triton
-from packaging.version import Version
 
-from .compat import FP8_DTYPE, get_active_device_type, is_sm10x, is_sm90, sm_count, sm_shared_memory_limit
+from .compat import FP8_DTYPE, get_active_device_type, is_sm10x, is_triton_greater_or_equal, is_sm90, sm_count, sm_shared_memory_limit
 from .mma import MMA_N_ATOM_WIDTH
 
 # ── config pruners ────────────────────────────────────────────────────────────
@@ -238,7 +237,7 @@ def warp_spec_compile_guard_pruner():
         # 22/80 NVFP4 grouped, the 2D MX swizzled-scale gate|up), with no tile or memory-mode pattern
         # separating them from the correct ones; no 16-warp WS config was wrong, and all are correct on
         # 3.7.1 and 3.9. Speed is all the tuner measures, so a wrong one can win: no 4/8-warp WS below 3.7.
-        if Version(triton.__version__) < Version("3.7") and c.num_warps in (4, 8):
+        if not is_triton_greater_or_equal("3.7") and c.num_warps in (4, 8):
             return False
         # WS needs num_warps a multiple of 4 (its async producer/consumer partitions) and enough M
         # work — the MMA's M operand, which SWAP_AB moves to BLOCK_SIZE_N (so BM=1 decode can still
@@ -263,7 +262,7 @@ def nvfp4_requant_warps_pruner():
     return config_filter(
         ok,
         when=lambda args: args.get("GATE") and args.get("OUTPUT_FORMAT") == "nvfp4"
-        and Version(triton.__version__) < Version("3.7"),
+        and not is_triton_greater_or_equal("3.7"),
     )
 
 
@@ -279,7 +278,7 @@ def dgrad_grouped_warps_pruner():
         kw = c.all_kwargs()
         return not all(kw.get(k) == v for k, v in bad.items())
 
-    return config_filter(ok, when=lambda args: Version(triton.__version__) < Version("3.7"))
+    return config_filter(ok, when=lambda args: not is_triton_greater_or_equal("3.7"))
 
 
 def gated_pointer_weight_warp_spec_pruner():
@@ -826,7 +825,7 @@ _WEIGHT_ONLY_POINTER_TRAPS = {
 
 def _warp_spec_needs_descriptor_tile() -> bool:
     """Triton >= 3.8, where a TMA-descriptor operand narrows WS to one tile (see the pruner)."""
-    return tuple(int(n) for n in triton.__version__.split(".")[:2]) >= (3, 8)
+    return is_triton_greater_or_equal("3.8")
 
 
 def warp_spec_memory_mode_pruner(weight_only: bool = False):

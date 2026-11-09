@@ -26,6 +26,20 @@ import triton
 import triton.language as tl
 from torch.library import triton_op, wrap_triton
 
+
+@functools.cache
+def is_triton_greater_or_equal(version: str) -> bool:
+    """Whether the installed Triton is at least ``version``, local and dev suffixes ignored. Cached: launch paths and
+    pruners ask on every call."""
+    return Version(Version(triton.__version__).base_version) >= Version(version)
+
+
+@functools.cache
+def is_torch_greater_or_equal(version: str) -> bool:
+    """Whether the installed PyTorch is at least ``version``, local and dev suffixes ignored. Cached."""
+    return Version(Version(torch.__version__).base_version) >= Version(version)
+
+
 # Programmatic dependent launch for the decode chain (batched GEMMs, GLU, act quant, reduce): each
 # kernel waits on its grid dependency at the top and releases its dependents just before the
 # epilogue. The LATE trigger is load-bearing: released early, the next kernel's CTAs co-reside and
@@ -81,7 +95,7 @@ FP8_MAX = torch.finfo(FP8_DTYPE).max
 # UE8M0 MX scales are a torch dtype (``float8_e8m0fnu``) only from torch 2.7. Older torch carries
 # them as raw ``uint8`` exponent bytes, which the kernels decode the same way, so this is ``None``
 # there and the format checks accept ``uint8`` alone.
-UE8M0_DTYPE = torch.float8_e8m0fnu if torch.__version__ >= "2.7" else None
+UE8M0_DTYPE = torch.float8_e8m0fnu if is_torch_greater_or_equal("2.7") else None
 
 # FP4 (E2M1) packs two 4-bit nibbles per byte. MX formats (MXFP4 weights, MXFP8
 # E4M3 weights/activations) share one UE8M0 scale per 32-element K-group — the OCP
@@ -110,7 +124,7 @@ _SKIP_LAUNCHES_MIRROR = False
 
 # torch 2.10 / 2.11 report is_compiling() False inside a triton_op that torch.compile traces (2.13 reports True; 2.12
 # unchecked), so there an active fake mode marks the trace instead; newer torch skips the check (~1.5us per eager launch)
-_FAKE_MODE_MEANS_TRACING = Version(torch.__version__.split("+")[0]) < Version("2.13")
+_FAKE_MODE_MEANS_TRACING = not is_torch_greater_or_equal("2.13")
 
 
 def compile_time_only_triton_wrap(kernel):

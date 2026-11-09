@@ -19,13 +19,12 @@ from typing import List
 import torch
 import triton
 import triton.language as tl
-from packaging.version import Version
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .bayesian_autotuner import bayesian_autotune
 from ._ops import add_op_namespace_prefix
 from .bench import gemm_cold_banks
-from .compat import FP8_DTYPE, is_sm10x, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype, FP8_MAX
+from .compat import FP8_DTYPE, is_sm10x, is_triton_greater_or_equal, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype, FP8_MAX
 from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_weight_only_descriptors
 from .formats import check_activation_format, global_scale_stride, gate_out_cols, normalize_global_scale, e2m1_as_uint8, is_mx, mx_scale_family, resolve_activation_format, resolve_output_dtype, ue8m0_as_uint8, validate_dense_2d_operands, weight_format
 from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
@@ -1495,7 +1494,7 @@ def mx_dynamic_matmul(
     # swizzle is a byte-tiling over the N // out_g scale grid (mxfp8/mxfp4 group-32, nvfp4 group-16).
     # Triton 3.6 stores the swizzled requant scales wrong through CSDescriptor (all configs, B200, 2D NVFP4 gate|up:
     # 130% mean error; correct on 3.7.1 and 3.9): there the kernel writes them row-major and they are swizzled after.
-    swizzled_out = requant and swizzled_scales and Version(triton.__version__) >= Version("3.7")
+    swizzled_out = requant and swizzled_scales and is_triton_greater_or_equal("3.7")
     swizzle_after = requant and swizzled_scales and not swizzled_out
     if output_format in ("mxfp4", "nvfp4"):
         C = A.new_empty(A.shape[:-1] + (N // 2,), dtype=torch.int8)
