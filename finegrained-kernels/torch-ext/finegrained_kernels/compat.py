@@ -27,17 +27,23 @@ import triton.language as tl
 from torch.library import triton_op, wrap_triton
 
 
-@functools.cache
+# installed versions as release tuples, parsed once (local and dev suffixes dropped). Launch paths and pruners ask
+# on every call: a tuple compare is cheap without a functools cache, which torch.compile warns about even when the
+# wrapped function is marked constant. Marked constant so torch.compile folds the answer instead of tracing it.
+_TRITON_VERSION = Version(triton.__version__).release
+_TORCH_VERSION = Version(torch.__version__).release
+
+
+@torch.compiler.assume_constant_result
 def is_triton_greater_or_equal(version: str) -> bool:
-    """Whether the installed Triton is at least ``version``, local and dev suffixes ignored. Cached: launch paths and
-    pruners ask on every call."""
-    return Version(Version(triton.__version__).base_version) >= Version(version)
+    """Whether the installed Triton is at least ``version`` (e.g. ``"3.7"``)."""
+    return _TRITON_VERSION >= tuple(map(int, version.split(".")))
 
 
-@functools.cache
+@torch.compiler.assume_constant_result
 def is_torch_greater_or_equal(version: str) -> bool:
-    """Whether the installed PyTorch is at least ``version``, local and dev suffixes ignored. Cached."""
-    return Version(Version(torch.__version__).base_version) >= Version(version)
+    """Whether the installed PyTorch is at least ``version`` (e.g. ``"2.13"``)."""
+    return _TORCH_VERSION >= tuple(map(int, version.split(".")))
 
 
 # Programmatic dependent launch for the decode chain (batched GEMMs, GLU, act quant, reduce): each
