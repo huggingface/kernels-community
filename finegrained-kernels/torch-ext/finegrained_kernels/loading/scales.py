@@ -145,6 +145,25 @@ def load_swizzled_scale_tile(
 
 
 @triton.jit
+def load_swizzled_rows_scale(ptr, rows, row_mask, k_idx, K, SCALE_COLS: tl.constexpr, SCALE_GROUP_K: tl.constexpr):
+    """The SWIZZLE_32_4_4 scales of arbitrary logical ``rows`` for K-tile ``k_idx``: ``load_swizzled_scale_tile``'s
+    gather byte map with the rows given rather than one contiguous block — a swapped grouped token tile's rows sit
+    at an offset inside their expert's 128-padded slab. Masked rows read nothing (their tokens are zero and their
+    output columns are dropped)."""
+    cols4 = (K // SCALE_GROUP_K + 3) // 4
+    blk = rows // 128
+    row = rows % 128
+    col = k_idx * SCALE_COLS + tl.arange(0, SCALE_COLS)
+    off = (
+        (blk[:, None] * cols4 + col[None, :] // 4) * 512
+        + (row[:, None] % 32) * 16
+        + (row[:, None] // 32) * 4
+        + col[None, :] % 4
+    )
+    return tl.load(ptr + off, mask=row_mask[:, None])
+
+
+@triton.jit
 def load_weight_scale_tile(
     SWIZZLED_SCALES: tl.constexpr,
     bs_descriptor,

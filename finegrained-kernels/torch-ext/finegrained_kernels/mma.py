@@ -71,6 +71,17 @@ def mx_dot_scaled(
 
 
 @triton.jit
+def mx_dot_scaled_tokens(acc, a, a_scale, w, w_scale):
+    """Swapped scaled MMA over a token tile: the weight ``w`` ``[ROWS, BK]`` (``ROWS`` = 128, the native microscaled
+    M operand) is the lhs and the ``[BM, BK]`` token tile the transposed rhs, so a batch with a few rows per expert
+    fills N=BM instead of padding the tokens to a 128-row M (DeepSeek-V4 W4A8 at T=64: ~1.5 rows per expert). The
+    scales keep their ``[rows, K // group]`` shape on either side. ``acc`` is ``[ROWS, BM]``."""
+    a_fmt: tl.constexpr = "e2m1" if a.dtype == tl.uint8 else "e4m3"
+    w_fmt: tl.constexpr = "e2m1" if w.dtype == tl.uint8 else "e4m3"
+    return tl.dot_scaled(w, w_scale, w_fmt, tl.trans(a), a_scale, a_fmt, acc)
+
+
+@triton.jit
 def mx_dot_rescale(
     acc,
     a,

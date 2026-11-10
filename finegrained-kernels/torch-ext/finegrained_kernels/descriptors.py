@@ -227,7 +227,8 @@ def rebind_grouped_mx_descriptors(nargs):
     # shape (a 0-block box traps the descriptor-encoding pass).
     rep_k = max((nargs["BLOCK_SIZE_K"] // nargs["SCALE_GROUP_K"]) // 4, 1)
     if nargs["ASDescriptor"] is not None:
-        nargs["ASDescriptor"].block_shape = [1, nargs["BLOCK_SIZE_M"] // 128, rep_k, 2, 256]
+        # a swapped token tile (BM < 128) gathers its act scales by row and leaves this descriptor unread: keep one block
+        nargs["ASDescriptor"].block_shape = [1, max(nargs["BLOCK_SIZE_M"] // 128, 1), rep_k, 2, 256]
     if nargs["BSDescriptor"] is not None:
         # One bulk-load spans (2 if GATE) * BN//128 blocks: GATE reads the block-interleaved gate|up
         # pair ([g,u] adjacent) as one 2*BN tile. BN<128 (non-gate, non-128 N) reads via the per-row

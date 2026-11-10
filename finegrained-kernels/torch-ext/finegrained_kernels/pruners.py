@@ -1201,6 +1201,32 @@ def swizzled_out_bm_pruner():
     return config_filter(ok, when=lambda args: args.get("SWIZZLED_OUT"))
 
 
+def grouped_mx_swap_scope_pruner():
+    """``early_config_prune`` scoping the grouped MX kernel's ``SWAP_AB`` tiles (weight rows on the scaled MMA's M
+    operand, the token tile on N): ``dot_scaled`` only, the weight tile exactly the native 128 rows (``2 * BN`` under
+    GATE), ``BK >= 128`` (swapped scaled MMAs below it trap on UE8M0 scales, ``mx_config_pruner``), and affine scales:
+    the pre-swizzled activation-scale slab is laid out in 128-row expert tiles, which a BM < 128 token tile cannot
+    index yet. Non-swapped configs pass untouched."""
+
+    def ok(c, args):
+        if not c.kwargs.get("SWAP_AB"):
+            return True
+        rows = (2 if args.get("GATE") else 1) * config_dim(c, args, "BLOCK_SIZE_N")
+        if args.get("SWIZZLED_SCALES"):
+            # whole 128-row swizzled weight blocks: the gate|up tile is its two blocks (256 rows, two native MMAs)
+            rows_ok = config_dim(c, args, "BLOCK_SIZE_N") % 128 == 0 and rows <= 256
+        else:
+            rows_ok = rows == 128
+        return (
+            c.kwargs.get("COMPUTE_MODE") == "dot_scaled"
+            and rows_ok
+            and config_dim(c, args, "BLOCK_SIZE_K") >= 128
+            and not c.kwargs.get("PACKED_SCHEDULE")
+        )
+
+    return config_filter(ok)
+
+
 def swizzled_scales_bm_pruner():
     """``early_config_prune`` pinning the grouped MX pre-swizzled (``SWIZZLED_SCALES``) arm to
     ``BLOCK_SIZE_M == 128`` and a whole-128-block ``BLOCK_SIZE_N``. BM: the offline act-quant lays each expert's scale
@@ -1217,8 +1243,9 @@ def swizzled_scales_bm_pruner():
     indexed by the gathered row, not ``pid_m``."""
 
     def ok(c, args):
+        # a swapped token tile gathers its act scales by row (grouped_mx_swap_scope_pruner): only BN is pinned
         return (
-            config_dim(c, args, "BLOCK_SIZE_M") == 128
+            (c.kwargs.get("SWAP_AB") or config_dim(c, args, "BLOCK_SIZE_M") == 128)
             and config_dim(c, args, "BLOCK_SIZE_N") % 128 == 0
         )
 

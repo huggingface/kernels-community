@@ -30,14 +30,15 @@ from .descriptors import build_grouped_operand_descriptors, rebind_grouped_descr
 from .formats import FP8_WEIGHT_ONLY_DEQUANT_MIN_M, MX_WEIGHT_ONLY_GATE_DEQUANT_MIN_M, block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, row_scale_stride, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, validate_int_operands, INT_WEIGHT_DTYPES
 from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, mx_act_quant_grouped, mx_act_quant_routed_rows, quantize_routed_rows_per_expert, static_expert_act_operands, swizzle_grouped_mx_scales, tensor_wide_act_operands, prepare_fp8_mx_inputs, permute_routed_rows
 from .swizzle import swizzled_scale_descriptor
-from .loading.scales import apply_row_scale, dequant_block_fp8_weight, dequant_mx_weight, csf_weight_scales
-from .mma import block_dynamic_dot, fp8_dot, plain_dot, mx_compute, mx_weight_only_compute, static_dot, int_weight_only_compute
+from .loading.scales import apply_row_scale, dequant_block_fp8_weight, dequant_mx_weight, csf_weight_scales, load_swizzled_rows_scale
+from .mma import block_dynamic_dot, fp8_dot, plain_dot, mx_compute, mx_dot_scaled_tokens, mx_weight_only_compute, static_dot, int_weight_only_compute
 from .scheduling import build_tile_layout, expand_gather_below_parity, expand_regime, load_packed_schedule, grouped_tile_order, prefetch_packed_entry, resolve_grouped_tile, resolve_grouped_tile_packed, fill_packed_schedule, packed_schedule_buffer
 from .loading.tiles import (
     load_act_block_dynamic,
     load_act_mx,
     load_act_plain,
     load_act_static,
+    load_grouped_act_tile,
     load_weight_block_dynamic,
     load_weight_block_fp8,
     load_weight_int_group,
@@ -49,7 +50,7 @@ from .loading.tiles import (
     weight_tile_ptrs,
 )
 from .epilogue import acc_init, bias_strides, gemm_epilogue
-from .pruners import PATH_ANCHOR_AXES, int_scale_group_tile_pruner, fp8_dot_warp_pruner, raw_activation_pointer_pruner, warp_spec_memory_mode_pruner, packed_schedule_scope_pruner, tile_order_pruner, affine_scale_warp_spec_pruner, block_dynamic_grouped_matmul_pruner, block_static_grouped_matmul_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gate_stacked_tmem_trap_pruner, gated_pointer_weight_warp_spec_pruner, mx_config_pruner, require_moe_dims_aligned, smem_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, swizzled_scales_bm_pruner, warp_spec_compile_guard_pruner, weight_only_dot_scaled_warps_pruner
+from .pruners import PATH_ANCHOR_AXES, int_scale_group_tile_pruner, fp8_dot_warp_pruner, raw_activation_pointer_pruner, warp_spec_memory_mode_pruner, packed_schedule_scope_pruner, tile_order_pruner, affine_scale_warp_spec_pruner, block_dynamic_grouped_matmul_pruner, block_static_grouped_matmul_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gate_stacked_tmem_trap_pruner, gated_pointer_weight_warp_spec_pruner, grouped_mx_swap_scope_pruner, mx_config_pruner, require_moe_dims_aligned, smem_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, swizzled_scales_bm_pruner, warp_spec_compile_guard_pruner, weight_only_dot_scaled_warps_pruner
 
 
 def grouped_pre_hook(nargs):
@@ -92,7 +93,19 @@ def _mx_grouped_configs():
         and c.kwargs["A_MEMORY_MODE"] == c.kwargs["B_MEMORY_MODE"] == "host_descriptor"
         and c.kwargs["BLOCK_SIZE_N"] >= 128 and c.kwargs["BLOCK_SIZE_K"] in (128, 256) and c.num_warps == 4
     ] if is_sm10x() else []
-    return configs + pipeline_autotuning_configs(seeds, ("tile_loop", "flattened"))
+    for config in configs:
+        config.kwargs["SWAP_AB"] = False
+    swapped = [
+        triton.Config(
+            dict(BLOCK_SIZE_M=bm, BLOCK_SIZE_N=bn, BLOCK_SIZE_K=bk, COMPUTE_MODE="dot_scaled", WARP_SPEC=False,
+                 GROUP_SIZE_M=1, PACKED_SCHEDULE=False, A_MEMORY_MODE=a_mode, B_MEMORY_MODE=b_mode, PIPELINE="k_loop",
+                 SWAP_AB=True),
+            num_warps=4, num_stages=stages, pre_hook=grouped_mx_pre_hook,
+        )
+        for bm in (16, 32, 64) for bn in (64, 128) for bk in (128, 256) for stages in (2, 3, 4)
+        for a_mode in ("pointer", "host_descriptor") for b_mode in ("pointer", "host_descriptor")
+    ] if is_sm10x() else []
+    return configs + pipeline_autotuning_configs(seeds, ("tile_loop", "flattened")) + swapped
 
 
 def _grouped_dot_configs():
@@ -806,6 +819,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
             warp_spec_compile_guard_pruner(),
             affine_scale_warp_spec_pruner(),
             warp_spec_memory_mode_pruner(),
+            grouped_mx_swap_scope_pruner(),
         )
     },
 )
@@ -882,6 +896,9 @@ def mx_dynamic_matmul_grouped_kernel(
     PACKED_SCHEDULE: tl.constexpr = False,
     PIPELINE: tl.constexpr = "k_loop",  # tuner axis: warp-specialize the K loop, or the tile loop ("tile_loop"/"flattened")
     GROUP_SIZE_M: tl.constexpr = 1,
+    # tuner axis: the 128 weight rows on the scaled MMA's M operand and the BM-token tile on N (a batch with a few
+    # rows per expert); scoped by grouped_mx_swap_scope_pruner
+    SWAP_AB: tl.constexpr = False,
 ):
     """Unified grouped microscaled expert matmul (MXFP8/MXFP4/NVFP4; a ``uint8`` ``A``
     is caller-packed E2M1 — W4A4 on the native fp4 MMA) — persistent grid-stride.
@@ -906,6 +923,11 @@ def mx_dynamic_matmul_grouped_kernel(
         exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = build_tile_layout(
             ExpertStart, NUM_EXPERTS_POW2, BLOCK_SIZE_M
         )
+        if SWAP_AB and SWIZZLED_SCALES:
+            # the swizzled act-scale slab pads each expert to whole 128-row blocks: a swapped token tile (BM < 128)
+            # finds its rows at the expert's padded start plus its offset inside the expert
+            blocks_128 = (freqs + 127) // 128
+            padded_start = (tl.cumsum(blocks_128, 0) - blocks_128) * 128
     # uint8 A = caller-provided packed-E2M1 activations (W4A4, native mxf4 MMA — the
     # dtype IS the activation format and keys the autotune cache); else one value per byte.
     ACT_VALUES_PER_BYTE: tl.constexpr = 2 if A.dtype.element_ty == tl.uint8 else 1
@@ -973,41 +995,61 @@ def mx_dynamic_matmul_grouped_kernel(
             offs_kb,
             stride_b_n,
             stride_b_k,
-            False,
+            SWAP_AB,
         )
 
         # Accumulator is 2*BN under GATE (the stacked gate|up dot), BN otherwise — split in the
-        # epilogue for GATE.
-        acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
+        # epilogue for GATE. SWAP_AB holds it transposed (weight rows x tokens) until the epilogue.
+        acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, SWAP_AB)
         # Pre-swizzled scales (SWIZZLE_32_4_4, emitted by the offline act-quant / requant): the M
         # tile's expert-sorted, 128-padded scale block is the flat tile index pid_m; the weight scale
         # block (descriptor bulk-load, BN=128) is expert*num_n_tiles + pid_n. Each expert's swizzled
         # slab is num_n_tiles REP-blocks (REP=2 under GATE, whose tile spans both).
         pid_m = tile_id // num_n_tiles
         weight_blk = (expert_id64 * num_n_tiles + pid_n).to(tl.int32)
-        for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC and PIPELINE == "k_loop"):
-            a, a_s = load_act_mx(
-                a_ptrs, As, None, 0, row_mask, row_mask, ADescriptor, m_start, ka_off,
-                ASDescriptor, As, in_row, stride_as_m, pid_m, k, 0, K,
-                A_MEMORY_MODE, GatherIdx is not None, True, SWIZZLED_SCALES,
-                BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K, "mxfp8",
+        if SWAP_AB and SWIZZLED_SCALES:
+            in_expert = e_offs == expert_id64.to(tl.int32)
+            first_tile = tl.sum(tl.where(in_expert, tile_start_excl, 0), 0)
+            scale_rows = (
+                tl.sum(tl.where(in_expert, padded_start, 0), 0)
+                + (pid_m - first_tile) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
             )
+        for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC and PIPELINE == "k_loop"):
+            if SWAP_AB and SWIZZLED_SCALES:
+                a = load_grouped_act_tile(
+                    a_ptrs, ADescriptor, m_start, ka_off, row_mask, in_row, A_MEMORY_MODE, GatherIdx is not None
+                )
+                a_s = load_swizzled_rows_scale(
+                    As, scale_rows, row_mask, k, K, BLOCK_SIZE_K // SCALE_GROUP_K, SCALE_GROUP_K
+                )
+            else:
+                a, a_s = load_act_mx(
+                    a_ptrs, As, None, 0, row_mask, row_mask, ADescriptor, m_start, ka_off,
+                    ASDescriptor, As, in_row, stride_as_m, pid_m, k, 0, K,
+                    A_MEMORY_MODE, GatherIdx is not None, True, SWIZZLED_SCALES,
+                    BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K, "mxfp8",
+                )
             w, w_s = load_weight_mx(
                 b_ptrs, BDescriptor, Bs, None, BSDescriptor, 0, row0, n_off, kb_off,
                 weight_blk, expert_id64, pid_n, k, N, K,
                 stride_bs_e, stride_bs_n, stride_bs_k,
-                GATE, True, False, B_MEMORY_MODE, False, SWIZZLED_SCALES,
+                GATE, True, False, B_MEMORY_MODE, SWAP_AB, SWIZZLED_SCALES,
                 BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, WEIGHT_VALUES_PER_BYTE,
             )
-            acc = mx_compute(
-                acc, a, a_s, w, w_s, COMPUTE_MODE,
-                (2 if GATE else 1) * BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, False,
-            )
+            if SWAP_AB:
+                acc = mx_dot_scaled_tokens(acc, a, a_s, w, w_s)
+            else:
+                acc = mx_compute(
+                    acc, a, a_s, w, w_s, COMPUTE_MODE,
+                    (2 if GATE else 1) * BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, False,
+                )
             a_ptrs += (BLOCK_SIZE_K // ACT_VALUES_PER_BYTE) * stride_a_k
             ka_off += BLOCK_SIZE_K // ACT_VALUES_PER_BYTE
             b_ptrs += (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE) * stride_b_k
             kb_off += BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE
 
+        if SWAP_AB:
+            acc = tl.trans(acc)
         # NVFP4 two-level: block e4m3 scales rode through dot_scaled; recover the combined per-tensor
         gemm_epilogue(
             C,
