@@ -2,7 +2,7 @@
   description = "Flake for activation kernels";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/flatten-before-kernel-flake";
+    kernel-builder.url = "github:huggingface/kernels";
   };
 
   outputs =

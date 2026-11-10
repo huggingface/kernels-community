@@ -30,6 +30,25 @@ Every cell runs in three modes: `eager`, `cudagraph` (decode's deployment mode),
 `compile` (`torch.compile(max-autotune, fullgraph)`). A cell that raises is a red ✕ marker;
 the others still run.
 
+On CUDA, every mode cycles through banks whose **active** weights exceed **twice the device's
+L2 cache**. For MoE, active bytes count only the routed experts, including weight scales, and
+a bank swaps the routed experts with unrouted ones of the same stack (routing logits permuted
+alike), so every arm keeps one checkpoint; a stack too small for disjoint expert sets rotates
+copies instead. Dense layers count the whole matrix and rotate copies. Each bank has
+independent copies of the inputs, so compilation cannot share activation quantization or
+routing across invocations. The timed callback returns every bank's output;
+reported latency is its elapsed time divided by the bank count. Reuse inside one forward is
+preserved. Prepared weight views and scales keep static addresses so compiled replay does not
+warm them with staging copies. No cache-flush kernel or profiler time is included in graph latency.
+Under eager timing, consecutive banks also overlap one launch's host overhead with the previous
+bank's GPU work, so eager latency is a steady-state per-call figure, not a cold single call.
+
+CSV rows record `cache_policy`; logs show bank counts, active bytes and checkpoint
+storage. Insufficient memory fails explicitly; it never falls back to warm weights. Replotting
+or merging old CSVs without matching cache metadata requires rerunning the benchmark. XPU
+retains its existing backend timing behavior and is labeled `backend_default`, not CUDA cold.
+Previously generated figures used warm CUDA graph timing; regenerate them for cold-weight comparisons.
+
 ## The pre-swizzled fast path
 
 By default the finegrained-kernels arm feeds **pre-swizzled** (`SWIZZLE_32_4_4`) MX weight scales,
@@ -68,8 +87,8 @@ python bench/bench_moe.py --replot           # rebuild the figure from an existi
 python bench/bench_moe.py --mock             # no GPU: random latencies to validate the figure layout
 ```
 
-Outputs land beside the script (`bench/bench_moe.csv`, `bench/bench_moe.png`). The figure is
-committed (the top-level README embeds it), so refresh it in the same commit as a kernel change
-that moves the numbers; the CSV is git-ignored (`bench/*.csv` in the repo's `.gitignore`) and regenerated per machine. Requires the bench env: `transformers`
+Outputs land beside the script (`bench/bench_moe.csv`, `bench/bench_moe.png`). Neither is
+committed: upload a refreshed figure to the Hub and link it from the PR (the top-level README embeds
+the Hub copy); the CSV is git-ignored (`bench/*.csv` in the repo's `.gitignore`) and regenerated per machine. Requires the bench env: `transformers`
 (with the `integrations.{deepgemm,moe,sonicmoe,mxfp4}` helpers), `kernels`, DeepGEMM, and a
 Blackwell (sm_100) GPU. **Don't run under concurrent GPU load** — the latencies won't be trustworthy.

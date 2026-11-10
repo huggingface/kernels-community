@@ -89,10 +89,10 @@ def mx_dot_rescale(
     w_s = decode_group_scale(w_scale)
     if SWAP_AB:
         wq = e2m1_cols_to_e4m3(w) if w.dtype == tl.uint8 else w
-        acc = acc + tl.dot(wq, swap_pad_rhs(aq, BLOCK_SIZE_K)) * w_s * a_s
+        acc = tl.fma(tl.dot(wq, swap_pad_rhs(aq, BLOCK_SIZE_K)) * w_s, a_s, acc)
     else:
         wq = e2m1_to_e4m3(w) if w.dtype == tl.uint8 else w
-        acc = acc + tl.dot(aq, wq) * a_s * tl.trans(w_s)
+        acc = tl.fma(tl.dot(aq, wq) * a_s, tl.trans(w_s), acc)
     return acc
 
 
@@ -342,13 +342,13 @@ def block_dynamic_dot(
         if FAKE_BATCH:
             d = fp8_dot(a, b, SWAP_AB, block_k)
             if SWAP_AB:  # [BN, N-atom]: weight-row scale down the M=BN dim, act scalar broadcasts
-                acc = acc + d * a_sd[:, None] * b_sd[:, None]
+                acc = tl.fma(d * a_sd[:, None], b_sd[:, None], acc)
             else:  # no-swap [BM, BN] GEVM: act scale down M, weight-N scale across N (upstream form)
-                acc = acc + d * a_sd[:, None] * b_sd[None, :]
+                acc = tl.fma(d * a_sd[:, None], b_sd[None, :], acc)
         elif SWAP_AB:
-            acc = acc + tl.dot(b, a) * b_sd[:, None] * a_sd[None, :]
+            acc = tl.fma(tl.dot(b, a) * b_sd[:, None], a_sd[None, :], acc)
         else:
-            acc = acc + tl.dot(a, b) * a_sd[:, None] * b_sd[None, :]
+            acc = tl.fma(tl.dot(a, b) * a_sd[:, None], b_sd[None, :], acc)
     return acc
 
 
@@ -360,9 +360,9 @@ def static_dot(acc, a, b, b_s, SWAP_AB: tl.constexpr, BLOCK_SIZE_K: tl.constexpr
     b_sd = decode_group_scale(b_s)
     d = fp8_dot(a, b, SWAP_AB, BLOCK_SIZE_K)
     if FAKE_BATCH:
-        acc = acc + d * b_sd[:, None]
+        acc = tl.fma(d, b_sd[:, None], acc)
     else:
-        acc = acc + d * b_sd[None, :]
+        acc = tl.fma(d, b_sd[None, :], acc)
     return acc
 
 

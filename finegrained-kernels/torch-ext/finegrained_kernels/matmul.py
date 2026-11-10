@@ -23,7 +23,8 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .bayesian_autotuner import bayesian_autotune
 from ._ops import add_op_namespace_prefix
-from .compat import FP8_DTYPE, is_sm10x, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype
+from .bench import gemm_cold_banks
+from .compat import FP8_DTYPE, is_sm10x, is_triton_greater_or_equal, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype, FP8_MAX
 from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_weight_only_descriptors
 from .formats import check_activation_format, global_scale_stride, gate_out_cols, normalize_global_scale, e2m1_as_uint8, is_mx, mx_scale_family, resolve_activation_format, resolve_output_dtype, ue8m0_as_uint8, validate_dense_2d_operands, weight_format
 from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
@@ -46,7 +47,7 @@ from .loading.tiles import (
     swizzle_offsets,
 )
 from .epilogue import acc_init, add_bias, bias_strides, gemm_epilogue, store_masked, store_masked_oriented
-from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, gate_stacked_tmem_trap_pruner, block_dynamic_2d_warp_spec_pruner, block_dynamic_mma_width_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, descriptor_needs_prequant_pruner, matched_memory_modes_pruner, mx_2d_swap_scope_pruner, mx_config_pruner, scalar_max_m_pruner, smem_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, warp_spec_compile_guard_pruner
+from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, gate_stacked_tmem_trap_pruner, block_dynamic_2d_warp_spec_pruner, block_dynamic_mma_width_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, descriptor_needs_prequant_pruner, matched_memory_modes_pruner, mx_2d_swap_scope_pruner, mx_config_pruner, scalar_max_m_pruner, smem_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, warp_spec_compile_guard_pruner, nvfp4_requant_warps_pruner
 
 # The 2D-grid kernels' L2-locality swizzle depth is derived per-tile inside
 # ``swizzle_offsets`` (see SWIZZLE_GROUP_A_BYTES there) — no per-kernel constant here.
@@ -95,6 +96,7 @@ STATIC_MATMUL_ACT_PREQUANT_MIN_M = 16
     # at one shape with different blocks must not share a winner.
     ["N", "K", "m_bit_length", "GATE", "block_n", "block_k"],
     n_trials=100,
+    cold_banks=gemm_cold_banks,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # 2D outputs are fully written (no sentinel/padding contract), so the numerics veto is safe
     finite_check_args=("C", "Cs"),
@@ -284,6 +286,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     # GATE keys the gate|up arm separately (its stacked dot is 2*BN wide, a distinct config space).
     ["N", "K", "m_bit_length", "GATE"],
     n_trials=100,
+    cold_banks=gemm_cold_banks,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # 2D outputs are fully written (no sentinel/padding contract), so the numerics veto is safe
     finite_check_args=("C", "Cs"),
@@ -416,6 +419,7 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
     # block_n/block_k (the launch-pinned quant block) gate descriptor-box legality and the K tile.
     ["N", "K", "m_bit_length", "GATE", "block_n", "block_k"],
     n_trials=100,
+    cold_banks=gemm_cold_banks,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # 2D outputs are fully written (no sentinel/padding contract), so the numerics veto is safe
     finite_check_args=("C", "Cs"),
@@ -589,6 +593,7 @@ def w8a8_block_static_fp8_matmul_kernel(
     # dtype token, so don't lean on the append).
     ["N", "K", "m_bit_length", "ACTIVATION_FORMAT", "SWIZZLED_SCALES", "GATE", "OUTPUT_FORMAT", "SWIZZLED_OUT"],
     n_trials=100,
+    cold_banks=gemm_cold_banks,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # 2D outputs are fully written (no sentinel/padding contract), so the numerics veto is safe
     finite_check_args=("C", "Cs"),
@@ -606,6 +611,7 @@ def w8a8_block_static_fp8_matmul_kernel(
             smem_pruner(),
             descriptor_box_pruner("BLOCK_SIZE_K"),
             swizzled_scale_config_pruner(),
+            nvfp4_requant_warps_pruner(),
             warp_spec_compile_guard_pruner(),
         )
     },
@@ -702,10 +708,14 @@ def mx_dynamic_matmul_kernel(
     # Scales read affine off row/col offsets + bounds masks (the %-wrapped operand offsets would
     # make the scale load a non-affine gather); the SWIZZLED arm reads them via the SA/BS
     # descriptors in the loop instead, so its pointer tiles are dead (base scalars + null masks).
-    as_ptrs, bs_ptrs, as_mask, bs_mask = mx_2d_scale_ptrs(
-        As, Bs, pid_m, pid_n, M, N, stride_as_m, stride_bs_n, stride_bs_k,
-        BLOCK_SIZE_M, BLOCK_SIZE_N, SCALE_COLS, SWIZZLED_SCALES, GATE,
-    )
+    # (chosen here, not in the helper: Triton 3.6 cannot return None from a jit function)
+    if SWIZZLED_SCALES:
+        as_ptrs, bs_ptrs, as_mask, bs_mask = As, Bs, None, None
+    else:
+        as_ptrs, bs_ptrs, as_mask, bs_mask = mx_2d_scale_ptrs(
+            As, Bs, pid_m, pid_n, M, N, stride_as_m, stride_bs_n, stride_bs_k,
+            BLOCK_SIZE_M, BLOCK_SIZE_N, SCALE_COLS, GATE,
+        )
     # Operand tiles: activation + the (GATE-stacked-aware) weight, both single leaf calls (the
     # descriptor-vs-pointer and gate|up-stack branches fold inside the leaves). The swap arm
     # loads both naturally — mx_compute reorients at the dot under SWAP_AB, flattening the token tile.
@@ -788,6 +798,7 @@ def mx_dynamic_matmul_kernel(
     ),
     ["N", "K", "m_bit_length", "GATE"],
     n_trials=100,
+    cold_banks=gemm_cold_banks,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # 2D outputs are fully written (no sentinel/padding contract), so the numerics veto is safe
     finite_check_args=("C", "Cs"),
@@ -928,6 +939,7 @@ def mx_weight_only_matmul_2d_kernel(
     # GATE keys the gate|up arm separately (its stacked dot is 2*BN wide).
     ["N", "K", "m_bit_length", "GATE"],
     n_trials=100,
+    cold_banks=gemm_cold_banks,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # 2D outputs are fully written (no sentinel/padding contract), so the numerics veto is safe
     finite_check_args=("C", "Cs"),
@@ -1195,7 +1207,7 @@ def w8a8_block_static_fp8_matmul(
     # pure added latency. The kernel picks its arm off A's dtype.
     A_q, _ = maybe_act_quant(
         A.view(M, K),
-        lambda x: ((x.to(torch.float32) / As).to(FP8_DTYPE), As),
+        lambda x: ((x.to(torch.float32) / As).clamp(-FP8_MAX, FP8_MAX).to(FP8_DTYPE), As),
         STATIC_MATMUL_ACT_PREQUANT_MIN_M,
     )
     # Host-TMA descriptors over (M, K)/(N, K); placeholder boxes re-bound per config by
@@ -1480,7 +1492,10 @@ def mx_dynamic_matmul(
     # SWIZZLE_32_4_4 layout (CSDescriptor), so the fused down reads it on the fast path. 2D dense
     # output rows are contiguous (no scatter), so it's always swizzle-able. Format-general — the
     # swizzle is a byte-tiling over the N // out_g scale grid (mxfp8/mxfp4 group-32, nvfp4 group-16).
-    swizzled_out = requant and swizzled_scales
+    # Triton 3.6 stores the swizzled requant scales wrong through CSDescriptor (all configs, B200, 2D NVFP4 gate|up:
+    # 130% mean error; correct on 3.7.1 and 3.9): there the kernel writes them row-major and they are swizzled after.
+    swizzled_out = requant and swizzled_scales and is_triton_greater_or_equal("3.7")
+    swizzle_after = requant and swizzled_scales and not swizzled_out
     if output_format in ("mxfp4", "nvfp4"):
         C = A.new_empty(A.shape[:-1] + (N // 2,), dtype=torch.int8)
     elif output_format == "mxfp8":
@@ -1571,6 +1586,8 @@ def mx_dynamic_matmul(
         )
     # NVFP4's block scales are already normalized by the provided output global (CsGlobal =
     # output_global_scale) at requant, so the caller pairs cs_ret with that global as the down's As.
+    if swizzle_after:
+        cs_ret = swizzle_mx_scales(cs_ret)
     return [C, cs_ret] if cs_ret is not None else [C]
 
 

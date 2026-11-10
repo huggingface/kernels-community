@@ -39,18 +39,14 @@ def _is_banded(attention_mask, hidden_states) -> bool:
     if attention_mask is None:
         return False
     num_blocks, block_size, key_length = attention_mask.shape
-    return (
-        key_length == 3 * block_size
-        and hidden_states.ndim == 4
-        and (
-            hidden_states.shape[1] == num_blocks
-            or (
-                isinstance(attention_mask, torch.Tensor)
-                and hidden_states.shape[0] * hidden_states.shape[1] == num_blocks
-            )
-        )
-        and hidden_states.shape[2] == block_size
-    )
+    if key_length != 3 * block_size or hidden_states.ndim != 4 or hidden_states.shape[2] != block_size:
+        return False
+
+    # One mask shared by the batch, or (unpacked only) one per batch entry.
+    batch, blocks = hidden_states.shape[:2]
+    if blocks == num_blocks:
+        return True
+    return isinstance(attention_mask, torch.Tensor) and batch * blocks == num_blocks
 
 
 def _needs_grad(*tensors: torch.Tensor) -> bool:
@@ -124,18 +120,14 @@ class WeatherNext2MeshEncoder(nn.Module):
     can_torch_compile = True
 
     def forward(self, hidden_states, attention_mask, conditioning, **kwargs):
-        if (
-            not isinstance(attention_mask, dict)
-            and not self.training
-            and not torch.is_grad_enabled()
-            and not hidden_states.is_cpu
-            and self.config._attn_implementation == "sdpa"
-        ):
+        kernel_path = not self.training and not torch.is_grad_enabled() and not hidden_states.is_cpu
+        if isinstance(attention_mask, torch.Tensor) and kernel_path and self.config._attn_implementation == "sdpa":
             num_nodes = hidden_states.shape[1]
             block_size = min(self.config.attention_bandwidth, num_nodes)
             num_blocks = (num_nodes + block_size - 1) // block_size
             if attention_mask.shape == (num_blocks, 1, block_size, 3 * block_size):
-                attention_mask = {"full_attention": _prepare_mask(attention_mask[:, 0])}
+                attention_mask = _prepare_mask(attention_mask[:, 0])
+
         return type(self).forward(self, hidden_states, attention_mask, conditioning, **kwargs)
 
 

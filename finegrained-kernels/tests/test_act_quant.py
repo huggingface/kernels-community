@@ -299,7 +299,7 @@ def _run_mx_inline(x, fmt):
         dtype=torch.uint8 if fmt == "mxfp4" else torch.float8_e4m3fn,
     )
     s = torch.empty(M, N // 32, device=x.device, dtype=torch.uint8)
-    _mx_inline_harness[(1,)](x, q, s, M=M, N=N, FORMAT=fmt, num_warps=4)
+    _mx_inline_harness[(1,)](x, q, s, M=M, N=N, FORMAT=fmt, num_warps=4, enable_fp_fusion=True)
     torch.accelerator.synchronize()
     return q, s
 
@@ -349,7 +349,7 @@ def test_nvfp4_inline_matches_offline():
     M, N = x.shape
     q = torch.empty(M, N // 2, device=TEST_DEVICE, dtype=torch.uint8)
     s = torch.empty(M, N // 16, device=TEST_DEVICE, dtype=torch.float8_e4m3fn)
-    _nv_inline_harness[(1,)](x, q, s, M=M, N=N, num_warps=4)
+    _nv_inline_harness[(1,)](x, q, s, M=M, N=N, num_warps=4, enable_fp_fusion=True)
     torch.accelerator.synchronize()
     q_ref, s_ref = nvfp4_act_quant(x)
     assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8))
