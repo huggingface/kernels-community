@@ -2,21 +2,20 @@
 
 from types import MethodType, SimpleNamespace
 
-import kernels
 import pytest
 import torch
 from torch import nn
 
-
-kernel = kernels.get_kernel("kernels-community/weathernext2-banded-attention", version=3)
-DEVICE = kernel.infer_device()
-requires_accelerator = pytest.mark.skipif(DEVICE == "cpu", reason="the kernel needs an accelerator")
+from .utils import DEVICE, kernel, prepare_mask, requires_accelerator
 
 
 class MeshEncoder(nn.Module):
+    """Returns the mask its layers would receive, with the kernel's forward in front."""
+
     def __init__(self):
         super().__init__()
         self.config = SimpleNamespace(_attn_implementation="sdpa", attention_bandwidth=65)
+        self.forward = MethodType(kernel.WeatherNext2MeshEncoder.forward, self)
 
     def forward(self, hidden_states, attention_mask, conditioning, **kwargs):
         return attention_mask
@@ -50,7 +49,6 @@ def decode_mask(mask):
 @pytest.mark.parametrize("inference_mode", [False, True])
 def test_inference_prepares_one_shared_mask(device, inference_mode):
     layer = MeshEncoder().eval()
-    layer.forward = MethodType(kernel.WeatherNext2MeshEncoder.forward, layer)
     hidden_states = torch.randn(2, 195, 32, device=device)
     conditioning = torch.randn(2, 4, device=device)
     mask = torch.rand(3, 1, 65, 195, device=device) > 0.5
@@ -61,7 +59,7 @@ def test_inference_prepares_one_shared_mask(device, inference_mode):
     if device == "cpu":
         assert prepared is mask
     else:
-        banded = prepared["full_attention"]
+        banded = prepared
         assert banded.shape == (3, 65, 195)
         assert banded.packed.dtype == torch.uint32
         torch.testing.assert_close(decode_mask(banded), mask[:, 0].cpu())
@@ -79,7 +77,7 @@ def test_packed_mask_roundtrip(empty):
     mask[-1, :, 130:] = False
     if empty:
         mask.zero_()
-    prepared = kernel.layers._prepare_mask(mask)
+    prepared = prepare_mask(mask)
     assert prepared.tiles.ndim == 1
     assert prepared.tiles.numel() == prepared.packed.shape[0] == int(prepared.offsets[-1])
     assert prepared.offsets.numel() == 3 * 2 * 3 + 1
@@ -94,7 +92,7 @@ def test_sparse_mask_stores_only_active_tiles():
     blocks, block_size = 3, 129
     mask = torch.zeros(blocks, block_size, 3 * block_size, dtype=torch.bool, device=DEVICE)
     mask[:, :, block_size : 2 * block_size] = torch.eye(block_size, dtype=torch.bool, device=DEVICE)
-    prepared = kernel.layers._prepare_mask(mask)
+    prepared = prepare_mask(mask)
     assert prepared.tiles.numel() == blocks * ((block_size + 31) // 32)
     assert prepared.packed.shape == (prepared.tiles.numel(), 64)
     assert prepared.offsets[0] == 0
@@ -108,7 +106,6 @@ def test_sparse_mask_stores_only_active_tiles():
 @pytest.mark.parametrize("reason", ["training", "gradients", "flex", "geometry"])
 def test_standard_mask_fallback(reason):
     layer = MeshEncoder().eval()
-    layer.forward = MethodType(kernel.WeatherNext2MeshEncoder.forward, layer)
     if reason == "training":
         layer.train()
     if reason == "flex":
