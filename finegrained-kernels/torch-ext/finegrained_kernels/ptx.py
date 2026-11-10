@@ -165,12 +165,11 @@ def f32x2_to_e2m1x2(hi, lo):
 
 
 @triton.jit
-def e2m1x2_to_f16x2(packed):
-    """One packed E2M1 byte (in a 16-bit register; PTX has no 8-bit operand) as its two fp16 values in a uint32,
-    low half the low nibble, exact: ONE convert per pair against the bit-twiddle form's ~10 integer ops (gpt-oss W4A16
-    decode weight stream: 39.6us bit-twiddle, either axis, vs 11.6us here, against an 8.0us load-only floor)."""
+def e2m1x2_to_bf16x2(packed):
+    """One packed E2M1 byte as its two bf16 values in a uint32, low half the low nibble, exact: one sm_100 convert per
+    pair, with no fp16 -> bf16 widening after it."""
     return tl.inline_asm_elementwise(
-        "{ .reg .b8 t; cvt.u8.u16 t, $1; cvt.rn.f16x2.e2m1x2 $0, t; }",
+        "{ .reg .b8 t; cvt.u8.u16 t, $1; cvt.rn.bf16x2.e2m1x2 $0, t; }",
         "=r,h", [packed.to(tl.uint16)], dtype=tl.uint32, is_pure=True, pack=1,
     )
 

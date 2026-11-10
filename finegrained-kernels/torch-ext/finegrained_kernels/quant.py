@@ -21,7 +21,7 @@ from .bayesian_autotuner import bayesian_autotune
 from .formats import global_scale_stride, int_weight_bits, is_per_expert_global, normalize_global_scale
 from ._ops import add_op_namespace_prefix
 from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, is_blackwell, is_sm10x, pdl_launch_kwargs, sm_count
-from .ptx import e2m1x2_to_e4m3x2, e2m1x2_to_f16x2, f32x2_to_e2m1x2
+from .ptx import e2m1x2_to_bf16x2, e2m1x2_to_e4m3x2, f32x2_to_e2m1x2
 from .swizzle import swizzle_store_block
 from .scheduling import build_tile_layout, resolve_tile_inline
 
@@ -202,17 +202,14 @@ def e2m1_to_bf16(b_packed):
     reshape) instead of the three 2D transposes ``e2m1_to_e4m3`` needs — the weight-only unpack hot path
     (fp4 weight upcast in-loop, the caller widening to the activation dtype). K order low-nibble-first, matching
     ``e2m1_to_e4m3``: ``[byte0_lo, byte0_hi, byte1_lo, ...]``. On Blackwell the codes decode through
-    the hardware CVT (``ptx.e2m1x2_to_f16x2``, fp16 being exact for the grid); elsewhere the integer
+    the hardware CVT (``ptx.e2m1x2_to_bf16x2``, exact for the grid); elsewhere the integer
     bit-build. Only the taken arm compiles."""
     if _E2M1_HW_CVT:
-        pair = e2m1x2_to_f16x2(b_packed)
+        pair = e2m1x2_to_bf16x2(b_packed)
         lo = (pair & 0xFFFF).to(tl.uint16)
         hi = (pair >> 16).to(tl.uint16)
         paired = tl.trans(tl.join(lo, hi), 0, 2, 1)
-        f16 = tl.reshape(
-            paired, (2 * b_packed.shape[0], b_packed.shape[1])
-        ).to(tl.float16, bitcast=True)
-        return f16.to(tl.bfloat16)
+        return tl.reshape(paired, (2 * b_packed.shape[0], b_packed.shape[1])).to(tl.bfloat16, bitcast=True)
     lo = _e2m1_code_to_bf16_bits(b_packed & 0xF)  # [R, C] int32 (bf16 bits)
     hi = _e2m1_code_to_bf16_bits(b_packed >> 4)   # [R, C]
     paired = tl.join(lo, hi)                       # [R, C, 2]  (pair in last dim)
@@ -228,11 +225,10 @@ def e2m1_cols_to_bf16(packed):
     tile (output rows leading, K contiguous). Same sm_100 hardware decode; the pair lands in
     adjacent columns, so ``tl.interleave`` places it (no axis swap)."""
     if _E2M1_HW_CVT:
-        pair = e2m1x2_to_f16x2(packed)
+        pair = e2m1x2_to_bf16x2(packed)
         lo = (pair & 0xFFFF).to(tl.uint16)
         hi = (pair >> 16).to(tl.uint16)
-        f16 = tl.interleave(lo, hi).to(tl.float16, bitcast=True)
-        return f16.to(tl.bfloat16)
+        return tl.interleave(lo, hi).to(tl.bfloat16, bitcast=True)
     bits = tl.interleave(
         _e2m1_code_to_bf16_bits(packed & 0xF), _e2m1_code_to_bf16_bits(packed >> 4)
     )
@@ -247,11 +243,11 @@ def e2m1_cols_to_f32(packed):
     15.4us on the gpt-oss decode tile for the bf16 round trip alone. Bit-identical to going via
     either: every E2M1 value is exact in f16, bf16, E4M3 and fp32."""
     if _E2M1_HW_CVT:
-        pair = e2m1x2_to_f16x2(packed)
-        lo = (pair & 0xFFFF).to(tl.uint16)
-        hi = (pair >> 16).to(tl.uint16)
-        f16 = tl.interleave(lo, hi).to(tl.float16, bitcast=True)
-        return f16.to(tl.float32)
+        # bf16 is the top half of an fp32: placing each half of the bf16 pair high widens it with no convert
+        pair = e2m1x2_to_bf16x2(packed)
+        lo = (pair << 16).to(tl.float32, bitcast=True)
+        hi = (pair & 0xFFFF0000).to(tl.float32, bitcast=True)
+        return tl.interleave(lo, hi)
     bits = tl.interleave(
         _e2m1_code_to_bf16_bits(packed & 0xF), _e2m1_code_to_bf16_bits(packed >> 4)
     )
@@ -279,13 +275,12 @@ def e2m1_cols_to_e4m3(packed):
 def e2m1_to_f32(b_packed):
     """Row-doubling counterpart of ``e2m1_cols_to_f32``: ``(R, C) uint8 -> (2R, C)`` fp32, for the
     non-swapped CUDA-core reduce. Skips the E4M3 hop ``e2m1_to_e4m3`` owes its ``tl.dot`` callers;
-    bit-identical, since every E2M1 value is exact in E4M3, f16 and fp32."""
+    bit-identical, since every E2M1 value is exact in E4M3, bf16 and fp32."""
     if _E2M1_HW_CVT:
-        pair = e2m1x2_to_f16x2(b_packed)
-        lo = (pair & 0xFFFF).to(tl.uint16)
-        hi = (pair >> 16).to(tl.uint16)
-        unpacked = tl.trans(tl.interleave(tl.trans(lo), tl.trans(hi)))
-        return unpacked.to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
+        pair = e2m1x2_to_bf16x2(b_packed)
+        lo = (pair << 16).to(tl.float32, bitcast=True)
+        hi = (pair & 0xFFFF0000).to(tl.float32, bitcast=True)
+        return tl.trans(tl.interleave(tl.trans(lo), tl.trans(hi)))
     lo = _e2m1_code_to_bf16_bits(b_packed & 0xF)
     hi = _e2m1_code_to_bf16_bits(b_packed >> 4)
     unpacked = tl.trans(tl.interleave(tl.trans(lo), tl.trans(hi)))
