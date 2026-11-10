@@ -12,12 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import triton
-from packaging.version import Version
-
-# tested from Triton 3.6 (PyTorch 2.10) up; Triton 3.3 and 3.4 cannot import the kernels
-if Version(triton.__version__) < Version("3.6"):
-    raise ImportError(f"finegrained-kernels requires Triton >= 3.6 (PyTorch >= 2.10), found {triton.__version__}")
 
 from .matmul import matmul_2d
 from .batched import matmul_batched

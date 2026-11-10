@@ -21,30 +21,9 @@ from contextlib import contextmanager
 import os
 
 import torch
-from packaging.version import Version
 import triton
 import triton.language as tl
 from torch.library import triton_op, wrap_triton
-
-
-# installed versions as release tuples, parsed once (local and dev suffixes dropped). Launch paths and pruners ask
-# on every call: a tuple compare is cheap without a functools cache, which torch.compile warns about even when the
-# wrapped function is marked constant. Marked constant so torch.compile folds the answer instead of tracing it.
-_TRITON_VERSION = Version(triton.__version__).release
-_TORCH_VERSION = Version(torch.__version__).release
-
-
-@torch.compiler.assume_constant_result
-def is_triton_greater_or_equal(version: str) -> bool:
-    """Whether the installed Triton is at least ``version`` (e.g. ``"3.7"``)."""
-    return _TRITON_VERSION >= tuple(map(int, version.split(".")))
-
-
-@torch.compiler.assume_constant_result
-def is_torch_greater_or_equal(version: str) -> bool:
-    """Whether the installed PyTorch is at least ``version`` (e.g. ``"2.13"``)."""
-    return _TORCH_VERSION >= tuple(map(int, version.split(".")))
-
 
 # Programmatic dependent launch for the decode chain (batched GEMMs, GLU, act quant, reduce): each
 # kernel waits on its grid dependency at the top and releases its dependents just before the
@@ -95,13 +74,11 @@ except ImportError:
 
 # FP8 (E4M3) is the main format for weights and activations;
 FP8_DTYPE = torch.float8_e4m3fn
-# torch < 2.12 casts out-of-range values to E4M3 NaN; clamping first saturates as the kernels and newer torch do
-FP8_MAX = torch.finfo(FP8_DTYPE).max
 
 # UE8M0 MX scales are a torch dtype (``float8_e8m0fnu``) only from torch 2.7. Older torch carries
 # them as raw ``uint8`` exponent bytes, which the kernels decode the same way, so this is ``None``
 # there and the format checks accept ``uint8`` alone.
-UE8M0_DTYPE = torch.float8_e8m0fnu if is_torch_greater_or_equal("2.7") else None
+UE8M0_DTYPE = torch.float8_e8m0fnu if torch.__version__ >= "2.7" else None
 
 # FP4 (E2M1) packs two 4-bit nibbles per byte. MX formats (MXFP4 weights, MXFP8
 # E4M3 weights/activations) share one UE8M0 scale per 32-element K-group — the OCP
@@ -126,11 +103,6 @@ _SKIP_LAUNCHES = contextvars.ContextVar("finegrained_kernels_skip_launches", def
 # set/reset (nesting, async isolation) — this only mirrors it for the read.
 _SKIP_LAUNCHES_MIRROR = False
 
-
-
-# torch 2.10 / 2.11 report is_compiling() False inside a triton_op that torch.compile traces (2.13 reports True; 2.12
-# unchecked), so there an active fake mode marks the trace instead; newer torch skips the check (~1.5us per eager launch)
-_FAKE_MODE_MEANS_TRACING = not is_torch_greater_or_equal("2.13")
 
 
 def compile_time_only_triton_wrap(kernel):
@@ -163,24 +135,7 @@ def compile_time_only_triton_wrap(kernel):
                 return lambda *args, **kwargs: None
 
         return _NoLaunch()
-    tracing = torch.compiler.is_compiling() or (_FAKE_MODE_MEANS_TRACING and torch._guards.detect_fake_mode() is not None)
-    return _FusedLaunch(wrap_triton(kernel) if tracing else kernel)
-
-
-class _FusedLaunch:
-    """``kernel[grid](...)`` with FP fusion requested explicitly, in eager and through ``wrap_triton``
-    (Triton 3.9 warns when it is left unset). The multiply-adds whose rounding matters are explicit
-    ``tl.fma`` (the scaled K-step accumulates in ``mma``, the MoE reduce), fused whatever the flag. The
-    flag still lets ptxas contract the rest (``--fmad``): off, FP8 block prefill is ~3% slower. Triton
-    3.10 ignores it unless ``TRITON_ALLOW_FP_FUSION=1``. A launch passing its own value keeps it."""
-
-    __slots__ = ("kernel",)
-
-    def __init__(self, kernel):
-        self.kernel = kernel
-
-    def __getitem__(self, grid):
-        return functools.partial(self.kernel[grid], enable_fp_fusion=True)
+    return wrap_triton(kernel) if torch.compiler.is_compiling() else kernel
 
 
 

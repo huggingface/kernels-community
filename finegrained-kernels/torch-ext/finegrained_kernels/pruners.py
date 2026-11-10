@@ -15,7 +15,7 @@
 import torch
 import triton
 
-from .compat import FP8_DTYPE, get_active_device_type, is_sm10x, is_triton_greater_or_equal, is_sm90, sm_count, sm_shared_memory_limit
+from .compat import FP8_DTYPE, get_active_device_type, is_sm10x, is_sm90, sm_count, sm_shared_memory_limit
 from .mma import MMA_N_ATOM_WIDTH
 
 # ── config pruners ────────────────────────────────────────────────────────────
@@ -232,13 +232,6 @@ def warp_spec_compile_guard_pruner():
     def ok(c, args):
         if not c.kwargs.get("WARP_SPEC"):
             return True
-        # Triton 3.6 compiles warp-specialized 4- and 8-warp configs that return WRONG results (every
-        # admitted config, B200: 59/120 MX grouped with swizzled scales, 323/1536 tensor-wide FP8 grouped,
-        # 22/80 NVFP4 grouped, the 2D MX swizzled-scale gate|up), with no tile or memory-mode pattern
-        # separating them from the correct ones; no 16-warp WS config was wrong, and all are correct on
-        # 3.7.1 and 3.9. Speed is all the tuner measures, so a wrong one can win: no 4/8-warp WS below 3.7.
-        if not is_triton_greater_or_equal("3.7") and c.num_warps in (4, 8):
-            return False
         # WS needs num_warps a multiple of 4 (its async producer/consumer partitions) and enough M
         # work — the MMA's M operand, which SWAP_AB moves to BLOCK_SIZE_N (so BM=1 decode can still
         # WS when swapped). dot_scaled + WS + TMA DOES compile here (measured 1995 on a clean
@@ -248,58 +241,6 @@ def warp_spec_compile_guard_pruner():
         return config_dim(c, args, mma_m) >= 64 and c.num_warps % 4 == 0
 
     return config_filter(ok, when=lambda args: get_active_device_type() == "cuda")
-
-
-def nvfp4_requant_warps_pruner():
-    """``early_config_prune`` for a Triton 3.6 miscompile in the 2D MX kernel's fused NVFP4 requant of the gate|up GLU:
-    every 4-warp config returns WRONG values (B200, N=256 K=512, BM=BN=128 ``dot_scaled``: 32/32 wrong, mean error
-    0.68-0.97), every 8-warp one is correct, and all are correct on 3.7.1 and 3.9. MXFP4 / MXFP8 requant are not
-    affected. Applies below Triton 3.7 only."""
-
-    def ok(c, args):
-        return c.num_warps != 4
-
-    return config_filter(
-        ok,
-        when=lambda args: args.get("GATE") and args.get("OUTPUT_FORMAT") == "nvfp4"
-        and not is_triton_greater_or_equal("3.7"),
-    )
-
-
-def mxfp4_requant_warps_pruner():
-    """``early_config_prune`` for a Triton 3.6 trap in the grouped MX kernel's fused MXFP4 requant of the gate|up GLU:
-    non-warp-specialized ``dot_scaled`` configs with a TMA-descriptor A and a 128-row tile at 4 or 8 warps hit an
-    illegal instruction, which poisons the context for every later launch. Measured by running every admitted config
-    in order on B200 (MXFP8 weights, N=128 K=256): 32 of 200 trap with swizzled output scales, 116 of 1200 with
-    row-major ones, all inside this set. Pointer A, BM <= 64, warp specialization, 2 and 16 warps all run. Some 8-warp
-    5-6 stage configs also run, but which ones moves with BN and the scale layout, so all of 8 warps is fenced. MXFP8
-    and NVFP4 requant and the non-requant launches run the same configs. Applies below Triton 3.7 only."""
-
-    def ok(c, args):
-        if c.kwargs.get("COMPUTE_MODE") != "dot_scaled" or c.kwargs.get("WARP_SPEC"):
-            return True
-        if c.kwargs.get("A_MEMORY_MODE", "pointer") == "pointer":
-            return True
-        return c.kwargs["BLOCK_SIZE_M"] < 128 or c.num_warps not in (4, 8)
-
-    return config_filter(
-        ok, when=lambda args: args.get("OUTPUT_FORMAT") == "mxfp4" and not is_triton_greater_or_equal("3.7")
-    )
-
-
-def dgrad_grouped_warps_pruner():
-    """``early_config_prune`` for a Triton 3.6 miscompile in the grouped dgrad kernel's top-k accumulate launch: one
-    config, 2 warps / 3 stages with a BM=128 BN=128 BK=256 pointer-dY / descriptor-W tile, returns WRONG values (B200,
-    MXFP8 W, relative error 1.39 in 3/3 processes). Every other admitted config is correct on 3.6, and this one at
-    4 warps or on 3.7.1 / 3.9 is too. Applies below Triton 3.7 only."""
-    bad = {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 256, "A_MEMORY_MODE": "pointer",
-           "B_MEMORY_MODE": "host_descriptor", "num_warps": 2, "num_stages": 3}
-
-    def ok(c, args):
-        kw = c.all_kwargs()
-        return not all(kw.get(k) == v for k, v in bad.items())
-
-    return config_filter(ok, when=lambda args: not is_triton_greater_or_equal("3.7"))
 
 
 def gated_pointer_weight_warp_spec_pruner():
@@ -846,7 +787,7 @@ _WEIGHT_ONLY_POINTER_TRAPS = {
 
 def _warp_spec_needs_descriptor_tile() -> bool:
     """Triton >= 3.8, where a TMA-descriptor operand narrows WS to one tile (see the pruner)."""
-    return is_triton_greater_or_equal("3.8")
+    return tuple(int(n) for n in triton.__version__.split(".")[:2]) >= (3, 8)
 
 
 def warp_spec_memory_mode_pruner(weight_only: bool = False):

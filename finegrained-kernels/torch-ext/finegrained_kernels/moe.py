@@ -27,14 +27,15 @@ kernels live in this module:
 
 grouped (prefill) shares one on-device routing pass (``compute_grouped_scheduling``): gate_up
 gathers hidden by routed row and leaves its output expert-ordered; down reads it in place and
-scatters to routed rows. batched (decode) dispatches per token: routed row ``s`` reads token ``s // top_k``
-from the unexpanded hidden in-kernel (no copy), and EP-sentinel rows (an id outside ``[0, num_experts)``)
+scatters to routed rows. batched (decode) dispatches per token: ``gather_idx`` reads each routed
+row from the unexpanded hidden in-kernel (no copy), and EP-sentinel rows (an id outside ``[0, num_experts)``)
 are left uninit by the GEMM and skipped in ``weighted_reduce``. ``moe_fused_*`` / ``moe_unfused_*`` are format-neutral:
 the base ops dispatch on the weight dtypes / scale layout (block-dynamic FP8, MXFP4/MXFP8,
 NVFP4), and every forward takes ``activation_format`` naming the block's activation quantization
 (``None`` = the weights' own format, ``"bf16"`` = weight-only, or an explicit format such as
 ``"mxfp8"`` on MXFP4 weights for W4A8)."""
 
+import functools
 from collections.abc import Callable
 
 import torch
@@ -133,10 +134,10 @@ def weighted_reduce_kernel(
             row = row * factor * tl.load(NormInv + flat, mask=valid, other=0.0)
             if SIMULATE_UNFUSED:  # the reference materializes the normalized row in Out's dtype
                 row = row.to(Out.dtype.element_ty).to(tl.float32)
+        contrib = weight * row
         if SIMULATE_UNFUSED:
-            acc += (weight * row).to(Out.dtype.element_ty).to(tl.float32)
-        else:
-            acc = tl.fma(weight, row, acc)
+            contrib = contrib.to(Out.dtype.element_ty).to(tl.float32)
+        acc += contrib
     if PDL:
         gdc_launch_dependents()
     tl.store(
@@ -211,6 +212,26 @@ def _validate_moe(gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale):
     if is_mxfp4(gate_up_proj, gate_up_proj_scale) != is_mxfp4(down_proj, down_proj_scale):
         raise ValueError("gate_up_proj and down_proj must use the same MX format (both MXFP4 or both MXFP8).")
     return gate_up_is_mx
+
+
+def _gather_idx(top_k_index: torch.Tensor) -> torch.Tensor:
+    """The batched routed-row gather: routed row ``s`` (``= t*K + k``) reads token ``s // num_top_k``
+    of the unexpanded hidden. ``matmul_batched`` applies it in-kernel, so no ``(S, H)`` copy.
+    The map depends only on the SHAPE, so it is cached per (tokens, top_k, device) — its two
+    elementwise launches (~3µs) were the largest non-GEMM cost of the fp8 decode chain."""
+    return _gather_idx_cached(
+        top_k_index.shape[0], top_k_index.shape[1], top_k_index.device
+    )
+
+
+@functools.lru_cache(maxsize=64)
+def _gather_idx_cached(
+    num_tokens: int, num_top_k: int, device: torch.device
+) -> torch.Tensor:
+    return (
+        torch.arange(num_tokens * num_top_k, device=device, dtype=torch.int32)
+        // num_top_k
+    )
 
 
 def _torch_weighted_reduce(down_out, top_k_index, top_k_weights, num_experts):
@@ -531,9 +552,11 @@ def moe_fused_batched(
     )
     glu = _fused_glu(act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, gate)
     fused = glu["act_fn"] is not None
+    gather_idx = _gather_idx(top_k_index)
+
     # Phase 1: gate_up + SiLU + requant in the block format -> per-row quantized
-    # intermediate (the op quantizes the raw activations), reading each routed row's token
-    # from the unexpanded hidden in-kernel (no copy).
+    # intermediate (the op quantizes the raw activations). gather_idx reads each routed
+    # row from the unexpanded hidden in-kernel (no copy).
     # (C, Cs) under a requant format; a bare Tensor on the full-precision path
     static_act = gate_up_proj_activation_scale is not None or down_proj_activation_scale is not None
     gate_up_out = matmul_batched(
@@ -563,6 +586,7 @@ def moe_fused_batched(
             and not static_act
         ),
         output_dtype=hidden_states.dtype,
+        gather_idx=gather_idx,
     )
     inter, inter_scale = (
         gate_up_out if isinstance(gate_up_out, tuple) else (gate_up_out, None)
@@ -946,6 +970,8 @@ def moe_unfused_batched(
     fmt = _block_format(
         gate_up_proj, gate_up_proj_scale_inv, down_proj, down_proj_scale_inv, activation_format
     )
+    gather_idx = _gather_idx(top_k_index)
+
     # gate_up as a plain GEMM (no gate epilogue) over gathered hidden -> (S, 2I).
     gate_up_out = matmul_batched(
         hidden_states,
@@ -960,6 +986,7 @@ def moe_unfused_batched(
         act_fn=None,  # raw gate|up output, the GLU runs on the host
         activation_format=fmt,
         output_dtype=hidden_states.dtype,
+        gather_idx=gather_idx,
     )
     inter = _host_glu(gate_up_out, act_fn, swiglu_alpha, swiglu_limit, gate)
     # down over the intermediate (quantized in the same format), routed-order output.
