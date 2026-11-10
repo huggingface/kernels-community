@@ -2,7 +2,7 @@
   description = "Flake for the UCCL kernel (repackaged upstream wheels)";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels";
+    kernel-builder.url = "github:huggingface/kernels/sdk-variants";
   };
 
   outputs =
@@ -27,14 +27,17 @@
 
       wheelFor = {
         cu12 = {
+          variant = "sdk-cuda-12.6-abi3-x86_64-linux";
           name = "uccl-${version}-cp312-abi3-manylinux_2_35_x86_64.whl";
           hash = "sha256-OQwTIJGJciBlRuRNebEymI8oGOwH4jr80FlfcYORbOw=";
         };
         cu13 = {
+          variant = "sdk-cuda-13.0-abi3-x86_64-linux";
           name = "uccl-${version}+cu13-cp312-abi3-manylinux_2_35_x86_64.whl";
           hash = "sha256-wlHJ0sLM25Omm+DwQzW5JLSnLcjApqyEusQznzQMzHw=";
         };
         rocm = {
+          variant = "sdk-rocm-7.1-abi3-x86_64-linux";
           name = "uccl-${version}+rocm-cp312-abi3-manylinux_2_35_x86_64.whl";
           hash = "sha256-+f+pTq35ZeWsQbEUBSRysjfSWJ56QG7uw8l+Nu5dqw8=";
         };
@@ -59,12 +62,19 @@
         })
         mkBuildSets
         ;
-      torchVersions = import (kernel-builder + "/nix-builder/versions.nix");
+      inherit (import (builderLib + "/torch-version-utils.nix") { inherit lib; }) flattenSystems;
+      torchVersions = flattenSystems (import (kernel-builder + "/nix-builder/versions.nix"));
 
-      variantName = buildSet: buildSet.variants.torch.arch;
+      wheelKeyOf =
+        buildSet:
+        if buildSet.torch.cudaSupport then
+          "cu${buildSet.torch.cudaPackages.cudaMajorVersion}"
+        else
+          "rocm";
 
-      # Order build sets by how suitable they are as the single variant that is
-      # built/tested by default (same logic as `genKernelFlakeOutputs`):
+      # Order build sets by how suitable they are as the build set that is used
+      # to load-check and test an SDK variant (Torch is only needed for that,
+      # the first build set for each wheel is used):
       #
       # - Prefer CUDA over ROCm.
       # - Prefer newer Torch versions over older.
@@ -93,13 +103,22 @@
           # Only x86_64-linux CUDA and ROCm build sets get a UCCL variant (the
           # upstream wheels are x86_64-linux only). Other systems get empty
           # outputs.
-          buildSets = lib.optionals (system == "x86_64-linux") (
+          allBuildSets = lib.optionals (system == "x86_64-linux") (
             lib.sort buildSetCompare (
               builtins.filter (
                 buildSet: builtins.elem buildSet.buildConfig.backend (builtins.attrNames backendOrder)
               ) (mkBuildSets [ ] torchVersions [ system ])
             )
           );
+
+          # The most suitable build set for each wheel, i.e. one per SDK variant.
+          buildSets = lib.filter (buildSet: buildSet != null) (
+            lib.mapAttrsToList (
+              key: _: lib.findFirst (buildSet: wheelKeyOf buildSet == key) null allBuildSets
+            ) wheelFor
+          );
+
+          variantOf = buildSet: wheelFor.${wheelKeyOf buildSet}.variant;
 
           mkVariant =
             buildSet:
@@ -110,10 +129,8 @@
                 torch
                 overrideTorch
                 ;
-              variant = variantName buildSet;
-
-              wheelKey = if torch.cudaSupport then "cu${torch.cudaPackages.cudaMajorVersion}" else "rocm";
-              wheelInfo = wheelFor.${wheelKey} or (throw "No UCCL wheel for ${wheelKey}");
+              wheelInfo = wheelFor.${wheelKeyOf buildSet};
+              inherit (wheelInfo) variant;
               wheel = pkgs.fetchurl {
                 inherit (wheelInfo) name hash;
                 url = "${releaseUrl}/${builtins.replaceStrings [ "+" ] [ "%2B" ] wheelInfo.name}";
@@ -149,18 +166,18 @@
 
           variantSets = builtins.listToAttrs (
             map (buildSet: {
-              name = variantName buildSet;
+              name = variantOf buildSet;
               value = mkVariant buildSet;
             }) buildSets
           );
           variantDrvs = lib.mapAttrs (_: set: set.kernel) variantSets;
 
-          bundleBuildSets = builtins.filter (buildSet: buildSet.bundleBuild) buildSets;
+          bundleBuildSets = buildSets;
 
           backends = lib.unique (map (buildSet: buildSet.buildConfig.backend) bundleBuildSets);
           buildSetsOfBackend =
             backend: builtins.filter (buildSet: buildSet.buildConfig.backend == backend) bundleBuildSets;
-          bestVariant = variantName (builtins.head bundleBuildSets);
+          bestVariant = variantOf (builtins.head bundleBuildSets);
 
           pkgs = (builtins.head buildSets).pkgs;
 
@@ -174,7 +191,7 @@
               ''
                 mkdir -p $out
                 ${lib.concatMapStringsSep "\n" (
-                  buildSet: "cp -r ${variantDrvs.${variantName buildSet}}/* $out/"
+                  buildSet: "cp -r ${variantDrvs.${variantOf buildSet}}/* $out/"
                 ) buildSets}
 
                 ${pkgs.kernel-builder}/bin/kernel-builder fill-card ${cardSource} $out/CARD.md

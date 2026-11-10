@@ -20,7 +20,7 @@
   wheel,
   version,
 
-  # The build variant to produce, e.g. `torch213-cu130-x86_64-linux`.
+  # The build variant to produce, e.g. `sdk-cuda-13.0-abi3-x86_64-linux`.
   variant,
 
   # The (short) Git revision of the kernel, with dashes replaced by underscores
@@ -44,7 +44,7 @@ let
 
   kernelName = "uccl";
 
-  kernelId = "_${kernelName}_${backend}_${rev}";
+  kernelId = "_${kernelName}_${lib.replaceStrings [ "-" "." ] [ "_" "_" ] variant}_${rev}";
 
   dependencies = [ torch ];
 
