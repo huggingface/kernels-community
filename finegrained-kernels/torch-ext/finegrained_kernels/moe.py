@@ -335,6 +335,9 @@ def _fused_glu(act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, gate) -> di
 # ── Fused (gate_up epilogue owns SwiGLU + intermediate requant) ──────────────
 
 
+_BLOCK_FORMATS: dict = {}
+
+
 def _block_format(
     gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale, activation_format,
     gate, gate_up_zero, down_zero,
@@ -343,7 +346,34 @@ def _block_format(
     explicit ``activation_format`` (``"bf16"`` weight-only, or a format) is respected as-is,
     ``None`` follows the weights (fp8 / mxfp8 / mxfp4 / nvfp4 — mxfp4 weights default to mxfp4
     activations, the all-fp4 W4A4 chain; unquantized BF16/FP16 weights carry no scales, so their
-    activations stay ``"bf16"``, the full-precision path; nor do int4 weights, which run weight-only)."""
+    activations stay ``"bf16"``, the full-precision path; nor do int4 weights, which run weight-only).
+    The answer depends only on dtypes, shapes and flags, so eager calls memoize it per recipe: every
+    MoE forward asks, and the detection and validation cost ~20us of an eager decode's host time."""
+    if torch.compiler.is_compiling():
+        return _resolve_block_format(
+            gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale, activation_format,
+            gate, gate_up_zero, down_zero,
+        )
+    key = (
+        activation_format, gate,
+        *(None if t is None else (t.dtype, t.shape) for t in (
+            gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale, gate_up_zero, down_zero,
+        )),
+    )
+    fmt = _BLOCK_FORMATS.get(key)
+    if fmt is None:
+        fmt = _BLOCK_FORMATS[key] = _resolve_block_format(
+            gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale, activation_format,
+            gate, gate_up_zero, down_zero,
+        )
+    return fmt
+
+
+def _resolve_block_format(
+    gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale, activation_format,
+    gate, gate_up_zero, down_zero,
+):
+    """``_block_format`` without the memo."""
     _validate_moe(
         gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale, gate, gate_up_zero, down_zero,
     )

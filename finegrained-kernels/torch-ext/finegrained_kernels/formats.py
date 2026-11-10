@@ -110,11 +110,26 @@ def is_preswizzled_mx(weight: torch.Tensor, scale: torch.Tensor) -> bool:
         and scale.element_size() == 1
     )
 
+_IS_MX: dict = {}
+
+
 def is_mx(weight: torch.Tensor, scale: torch.Tensor) -> bool:
     """Any microscaled weight/scale pair — MXFP8 (``float8_e4m3fn`` values), MXFP4
     (``int8``, two E2M1 codes/byte), both UE8M0 group-32, or NVFP4 (packed E2M1 + E4M3
     group-16); also an already-swizzled MX scale (``is_preswizzled_mx``). The dispatchers route
-    on this into the ``mx_*`` kernels; the op picks the format from the dtypes."""
+    on this into the ``mx_*`` kernels; the op picks the format from the dtypes. Eager calls memoize
+    the answer per dtypes and shapes: dispatch asks it several times per launch, ~1.5us each."""
+    if scale is None or torch.compiler.is_compiling():
+        return _is_mx(weight, scale)
+    key = (weight.dtype, weight.shape, scale.dtype, scale.shape)
+    answer = _IS_MX.get(key)
+    if answer is None:
+        answer = _IS_MX[key] = _is_mx(weight, scale)
+    return answer
+
+
+def _is_mx(weight: torch.Tensor, scale: torch.Tensor) -> bool:
+    """``is_mx`` without the memo."""
     return (
         is_mxfp8(weight, scale)
         or is_mxfp4(weight, scale)
