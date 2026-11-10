@@ -89,6 +89,34 @@ CUTLASS_DEVICE BatchSplit get_batch_split(decode_args_t const& a, int b, int j) 
   return s;
 }
 
+// Rows [p0, p1) of the (query, GQA head) rows of a batch whose first Q head
+// is head_q0 see no key: LSE empty_lse and, with cols > 0, output 0 in
+// columns [d0, d0 + cols).
+template <class ElementO, int Threads>
+CUTLASS_DEVICE void write_empty_rows(
+    decode_args_t const& a, int b, int row, int head_q0, int group, int p0,
+    int p1, bool lse, int d0, int cols, int thr_id) {
+  int64_t Hq = a.num_heads_q;
+  if (cols > 0) {
+    auto* o = static_cast<ElementO*>(a.out);
+    for (int i = thr_id; i < (p1 - p0) * cols; i += Threads) {
+      int p = p0 + i / cols;
+      int query = p / group;
+      o[(int64_t(row + query) * Hq + head_q0 + p - query * group) *
+            a.head_size_v +
+        d0 + i % cols] = ElementO(0);
+    }
+  }
+  if (lse) {
+    for (int p = p0 + thr_id; p < p1; p += Threads) {
+      int query = p / group;
+      a.softmax_lse[int64_t(b) * a.lse_batch_stride +
+                    int64_t(head_q0 + p - query * group) * a.lse_head_stride +
+                    int64_t(row + query) * a.lse_row_stride] = a.empty_lse;
+    }
+  }
+}
+
 template <class T>
 using Tensor2D = decltype(make_tensor(
     make_gmem_ptr(static_cast<T*>(nullptr)),
@@ -160,14 +188,29 @@ struct SplitKVDecodeKernel {
     int head = rem - idx_b * a.num_heads_kv;  // KV head
 
     BatchSplit s = get_batch_split(a, idx_b, 0);
-    if (!s.valid || idx_split >= s.splits) return;
     // Tile rows p = query * group + head of the GQA group (PackGQA).
     constexpr int tile_q = get<0>(TileShapeO{});
+    constexpr int tile_v = get<1>(TileShapeO{});
+    constexpr int kThreads = SGPerWG::value * intel::sg_size;
     int row0 = blk_q * tile_q;
-    if (row0 >= s.q_len * group) return;
+    int row1 = row0 + tile_q < s.q_len * group ? row0 + tile_q : s.q_len * group;
+    if (!s.valid) {
+      // With q_len <= q_per_batch the batch has no key: the first split
+      // writes its rows.
+      if (idx_split == 0 && s.q_len <= a.q_per_batch && row0 < row1) {
+        int d0 = blk_v * tile_v;
+        int cols = a.head_size_v - d0 < tile_v ? a.head_size_v - d0 : tile_v;
+        write_empty_rows<ElementO, kThreads>(
+            a, idx_b, s.row, head * group, group, row0, row1, blk_v == 0, d0,
+            cols, thr_id);
+      }
+      return;
+    }
+    if (idx_split >= s.splits || row0 >= row1) return;
 
     // Causal: query j sees kv_len - (q_len - 1 - j) keys. Leading queries
-    // that see no key at all keep their LSE untouched.
+    // that see no key at all get output 0 (epilogue / combine) and LSE
+    // empty_lse.
     int causal_rows = a.causal ? s.q_len : 0;
     int first_query = causal_rows > s.kv_len ? causal_rows - s.kv_len : 0;
     int blk_k0 = s.k_block0 + idx_split * s.nbps;
@@ -240,14 +283,20 @@ struct SplitKVDecodeKernel {
     if constexpr (PagedKV) {
       has_large_surface = a.total_rows_kv > (int64_t(1) << 24);
     }
+    // Q spans several surfaces only when a tile holds GQA heads of more
+    // than one query. Huge paged caches are rare and take the general path.
     if (has_large_surface) {
       if constexpr (PagedKV) {
-        mainloop.template operator()<true>(
+        mainloop.template operator()<true, true>(
             Q, K_2D, V_2D, tArA, tA_max, tA_sum, blk_qv, idx_b, blk_k0,
             blk_k1, thr_id, s.kv_len, causal_rows, group);
       }
+    } else if (Q.n > 1) {
+      mainloop.template operator()<false, true>(
+          Q, K_2D, V_2D, tArA, tA_max, tA_sum, blk_qv, idx_b, blk_k0,
+          blk_k1, thr_id, s.kv_len, causal_rows, group);
     } else {
-      mainloop.template operator()<false>(
+      mainloop.template operator()<false, false>(
           Q, K_2D, V_2D, tArA, tA_max, tA_sum, blk_qv, idx_b, blk_k0,
           blk_k1, thr_id, s.kv_len, causal_rows, group);
     }
@@ -273,6 +322,12 @@ struct SplitKVDecodeKernel {
           row_surfaces(o_ptr, Hq * Dv, Dv, Dv), tArA, tA_max, tA_sum, blk_qv,
           thr_id, group, s.q_len, first_query, lse_ptr, a.lse_row_stride,
           a.lse_head_stride);
+      int empty1 = first_query * group < row1 ? first_query * group : row1;
+      if (blk_v == 0 && row0 < empty1) {
+        write_empty_rows<ElementO, kThreads>(
+            a, idx_b, s.row, head_q0, group, row0, empty1, true, 0, 0,
+            thr_id);
+      }
     } else {
       int S = a.num_splits;
       float* o_ptr = a.oaccum +
@@ -294,8 +349,10 @@ struct SplitKVCombineKernel {
   static constexpr int kThreads = 64;
   static_assert(kThreads >= kMaxSplits, "one thread per split");
 
+  // Normalized weight of every split, computed once per split like
+  // vllm-xpu-kernels' ReduceSplitK.
   struct SharedStorage {
-    float lse[kMaxSplits];
+    float weight[kMaxSplits];
   };
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
@@ -317,43 +374,43 @@ struct SplitKVCombineKernel {
     int pb = int(BlockIdxZ());
 
     BatchSplit s = get_batch_split(a, pb / a.q_per_batch, pb % a.q_per_batch);
-    if (!s.valid || s.splits <= 1 || s.seq_len <= 0) return;
+    if (!s.valid || s.splits <= 1) return;
 
     int S = a.num_splits;
     int Hq = a.num_heads_q;
     int Dv = a.head_size_v;
-    if (t < s.splits) {
-      shared.lse[t] = a.lse_accum[(int64_t(s.row) * Hq + hq) * S + t];
+    ElementO* o = static_cast<ElementO*>(a.out) + (int64_t(s.row) * Hq + hq) * Dv;
+    float* lse_out = a.softmax_lse + int64_t(s.b) * a.lse_batch_stride +
+        int64_t(hq) * a.lse_head_stride + int64_t(s.row) * a.lse_row_stride;
+    if (s.seq_len <= 0) {
+      // Leading causal query without a visible key.
+      for (int d = t; d < Dv; d += kThreads) o[d] = ElementO(0);
+      if (t == 0) *lse_out = a.empty_lse;
+      return;
     }
-    sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_work_group<3>());
 
-    float lse_max = -INFINITY;
-    for (int i = 0; i < s.splits; i++) {
-      lse_max = sycl::fmax(lse_max, shared.lse[i]);
-    }
+    auto wg = sycl::ext::oneapi::this_work_item::get_work_group<3>();
+    bool active = t < s.splits;
+    float lse = active ? a.lse_accum[(int64_t(s.row) * Hq + hq) * S + t]
+                       : -INFINITY;
+    float lse_max = sycl::reduce_over_group(wg, lse, sycl::maximum<float>());
     if (lse_max == -INFINITY) lse_max = 0.f;
-    float sum = 0.f;
-    for (int i = 0; i < s.splits; i++) {
-      sum += sycl::exp(shared.lse[i] - lse_max);
-    }
-    float inv_sum = 1.f / sum;
+    float w = active ? sycl::exp(lse - lse_max) : 0.f;
+    float sum = sycl::reduce_over_group(wg, w, sycl::plus<float>());
+    if (active) shared.weight[t] = w * (1.f / sum);
+    sycl::group_barrier(wg);
 
     const float* oacc = a.oaccum + (int64_t(s.row) * S * Hq + hq) * Dv;
     int64_t split_stride = int64_t(Hq) * Dv;
-    ElementO* o = static_cast<ElementO*>(a.out) + (int64_t(s.row) * Hq + hq) * Dv;
     for (int d = t; d < Dv; d += kThreads) {
       float acc = 0.f;
       for (int i = 0; i < s.splits; i++) {
-        float w = sycl::exp(shared.lse[i] - lse_max) * inv_sum;
-        acc += w * oacc[i * split_stride + d];
+        acc += shared.weight[i] * oacc[i * split_stride + d];
       }
       o[d] = ElementO(acc);
     }
     if (t == 0) {
-      a.softmax_lse[int64_t(s.b) * a.lse_batch_stride +
-                    int64_t(hq) * a.lse_head_stride +
-                    int64_t(s.row) * a.lse_row_stride] =
-          lse_max + sycl::log(sum);
+      *lse_out = lse_max + sycl::log(sum);
     }
   }
 };

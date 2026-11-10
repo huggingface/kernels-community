@@ -85,9 +85,9 @@ inline int xe_core_count(sycl::queue& queue) {
     return cores;
 }
 
-// Split-count plan, measured against the generic kernel on Arc Pro B60
-// (20 Xe cores) and an Intel Data Center GPU (32 Xe cores), fp16/bf16, page
-// size 64. Indexed by [paged KV][head class][w + 3][t], with
+// Split-count plan for contiguous KV, measured against the generic kernel on
+// Arc Pro B60 (20 Xe cores) and an Intel Data Center GPU (32 Xe cores),
+// fp16/bf16. Indexed by [head class][w + 3][t], with
 //   w = floor(log2(batch * num_heads_kv / xe_cores)) clamped to [-3, 3],
 //   t = floor(log2(ceil(seqlen_k / 64))) clamped to [0, 8].
 // Each cell holds the split count that was never slower than the generic
@@ -95,82 +95,42 @@ inline int xe_core_count(sycl::queue& queue) {
 // device: '-' = generic kernel, 'k' = split-KV with 2^k splits. Unmeasured
 // cells copy the nearest measured one (the more conservative on ties).
 // clang-format off
-constexpr const char* kPlan[2][4][7] = {
-    {  // contiguous KV
-        {  // GQA, head_dim <= 128
-            "0000000-3",  // w = -3
-            "00000--23",  // w = -2
-            "000000123",  // w = -1
-            "000000121",  // w = 0
-            "000000011",  // w = 1
-            "000000000",  // w = 2
-            "000000001",  // w = 3
-        },
-        {  // GQA, head_dim > 128
-            "------234",  // w = -3
-            "000001222",  // w = -2
-            "000011111",  // w = -1
-            "000000000",  // w = 0
-            "000000000",  // w = 1
-            "000000000",  // w = 2
-            "000000000",  // w = 3
-        },
-        {  // MHA, head_dim <= 256
-            "0000000--",  // w = -3
-            "0000000--",  // w = -2
-            "0000000--",  // w = -1
-            "----00---",  // w = 0
-            "00000-234",  // w = 1
-            "000000045",  // w = 2
-            "000023454",  // w = 3
-        },
-        {  // MHA, head_dim > 256
-            "000001-11",  // w = -3
-            "000001-11",  // w = -2
-            "000000001",  // w = -1
-            "----00000",  // w = 0
-            "000000005",  // w = 1
-            "000003455",  // w = 2
-            "000023444",  // w = 3
-        },
+constexpr const char* kPlan[4][7] = {
+    {  // GQA, head_dim <= 128
+        "0000000-3",  // w = -3
+        "00000--23",  // w = -2
+        "000000123",  // w = -1
+        "000000121",  // w = 0
+        "000000011",  // w = 1
+        "000000000",  // w = 2
+        "000000001",  // w = 3
     },
-    {  // paged KV
-        {  // GQA, head_dim <= 128
-            "00000-235",  // w = -3
-            "00000-244",  // w = -2
-            "000001333",  // w = -1
-            "000002222",  // w = 0
-            "000000111",  // w = 1
-            "000000000",  // w = 2
-            "0000---01",  // w = 3
-        },
-        {  // GQA, head_dim > 128
-            "0000-2344",  // w = -3
-            "000012322",  // w = -2
-            "000012111",  // w = -1
-            "000000000",  // w = 0
-            "000000022",  // w = 1
-            "000000001",  // w = 2
-            "000000001",  // w = 3
-        },
-        {  // MHA, head_dim <= 256
-            "00000-234",  // w = -3
-            "00000-234",  // w = -2
-            "00000--33",  // w = -1
-            "0000-----",  // w = 0
-            "00-------",  // w = 1
-            "00-------",  // w = 2
-            "------355",  // w = 3
-        },
-        {  // MHA, head_dim > 256
-            "000011113",  // w = -3
-            "000011113",  // w = -2
-            "00-----33",  // w = -1
-            "------000",  // w = 0
-            "000001000",  // w = 1
-            "---003455",  // w = 2
-            "000123455",  // w = 3
-        },
+    {  // GQA, head_dim > 128
+        "------234",  // w = -3
+        "000001222",  // w = -2
+        "000011111",  // w = -1
+        "000000000",  // w = 0
+        "000000000",  // w = 1
+        "000000000",  // w = 2
+        "000000000",  // w = 3
+    },
+    {  // MHA, head_dim <= 256
+        "0000000--",  // w = -3
+        "0000000--",  // w = -2
+        "0000000--",  // w = -1
+        "----00---",  // w = 0
+        "00000-234",  // w = 1
+        "000000045",  // w = 2
+        "000023454",  // w = 3
+    },
+    {  // MHA, head_dim > 256
+        "000001-11",  // w = -3
+        "000001-11",  // w = -2
+        "000000001",  // w = -1
+        "----00000",  // w = 0
+        "000000005",  // w = 1
+        "000003455",  // w = 2
+        "000023444",  // w = 3
     },
 };
 // clang-format on
@@ -179,6 +139,21 @@ inline int floor_log2(int x) {
     int r = -1;
     while (x > 0) { x >>= 1; ++r; }
     return r;
+}
+
+// Paged KV: the split count of vllm-xpu-kernels (csrc/flash_attn/flash_api.cpp
+// get_num_splits, 64-key tiles with 4 subgroups per work-group), whose
+// decode kernel is the same as this one, plus that kernel's single-split
+// rule below 32 KV tiles.
+inline int vllm_num_splits(int xe_cores, int batch, int num_heads_q,
+                           int num_heads_kv, int kv_tiles) {
+    if (kv_tiles < 32) return 1;
+    const int wgs = std::max(1, batch * num_heads_kv);
+    if (wgs >= xe_cores && kv_tiles < 64) return 1;
+    int splits = std::max((4 * xe_cores + wgs - 1) / wgs, kv_tiles / 12);
+    splits = std::min(
+        splits, std::max(2, 128 * xe_cores / std::max(1, batch * num_heads_q)));
+    return std::max(1, std::min({splits, kv_tiles / 4, 32}));
 }
 
 // Number of KV splits for a decode batch (>= 1), or 0 for the generic kernel.
@@ -190,13 +165,17 @@ inline int plan_num_splits(sycl::queue& queue, int batch, int num_heads_q,
 
     const int kv_tiles = (max_seqlen_k + flash_xpu_splitkv::kKVTile - 1) /
                          flash_xpu_splitkv::kKVTile;
+    if (paged) {
+        return vllm_num_splits(xe_core_count(queue), batch, num_heads_q,
+                               num_heads_kv, kv_tiles);
+    }
     const int wgs = std::max(1, batch * num_heads_kv);
     const int w = std::clamp(
         int(std::floor(std::log2(double(wgs) / xe_core_count(queue)))), -3, 3);
     const int t = std::clamp(floor_log2(std::max(1, kv_tiles)), 0, 8);
     const bool mha = num_heads_q == num_heads_kv;
     const int cls = mha ? (head_size <= 256 ? 2 : 3) : (head_size <= 128 ? 0 : 1);
-    const char c = kPlan[paged ? 1 : 0][cls][w + 3][t];
+    const char c = kPlan[cls][w + 3][t];
     if (c == '-') return 0;
     // At least 4 KV tiles per split.
     const int cap = 1 << floor_log2(std::max(1, kv_tiles / 4));
@@ -887,10 +866,10 @@ mha_varlen_fwd(
             out_->sizes() == q.sizes() && out_->dtype() == q_dtype) {
             out = out_.value();
         } else {
-            out = at::zeros_like(q);
+            out = at::empty_like(q);
         }
         auto opts = q.options().dtype(torch::kFloat32);
-        at::Tensor softmax_lse = torch::zeros({num_heads, total_q}, opts);
+        at::Tensor softmax_lse = torch::empty({num_heads, total_q}, opts);
         run_splitkv(out, softmax_lse);
 
         if (out_.has_value() && !out.is_same(out_.value())) {
@@ -1309,14 +1288,13 @@ mha_fwd_kvcache(
             num_splits > 1 ? num_splits : 0);
         if (knew_ok && splits > 0) {
             // Several queries: rows of q must be evenly spaced and out
-            // contiguous; one query: zeros_like keeps q's batch stride.
+            // contiguous; one query: empty_like keeps q's batch stride.
             at::Tensor qc = (seqlen_q == 1 || q.stride(0) == seqlen_q * q.stride(1))
                 ? q : q.contiguous();
             at::Tensor out = out_.has_value() ? out_.value()
-                : seqlen_q == 1 ? at::zeros_like(q) : at::zeros(q.sizes(), q.options());
-            auto softmax_lse = torch::full({batch_size, num_heads, seqlen_q},
-                                           -std::numeric_limits<float>::infinity(),
-                                           q.options().dtype(at::kFloat));
+                : seqlen_q == 1 ? at::empty_like(q) : at::empty(q.sizes(), q.options());
+            auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q},
+                                            q.options().dtype(at::kFloat));
             at::Tensor seqlens_k = seqlens_k_.has_value()
                 ? seqlens_k_->contiguous() : at::Tensor();
             at::Tensor block_table_c = paged_KV ? block_table.contiguous() : at::Tensor();
@@ -1393,6 +1371,7 @@ mha_fwd_kvcache(
             a.lse_head_stride = seqlen_q;
             a.lse_row_stride = 1;
             a.softmax_scale = softmax_scale;
+            a.empty_lse = -std::numeric_limits<float>::infinity();
             a.window_size_left = window_size_left;
             a.num_splits = splits;
             splitkv::run(queue, qc, batch_size * seqlen_q, a);

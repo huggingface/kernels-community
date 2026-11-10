@@ -204,7 +204,10 @@ struct DecodeMainloop {
   // seq_len: keys visible to the last query. causal_rows > 0: query m is
   // one of causal_rows bottom-right aligned ones and sees
   // seq_len - (causal_rows - 1 - m) keys; otherwise every query sees seq_len.
-  template <bool has_large_surface, typename QVCoord>
+  // MultiQ: Q.n may be > 1. With a single Q surface the Q block load feeds
+  // the MMA directly (no merge), which keeps the Q and K loads in flight
+  // together.
+  template <bool has_large_surface, bool MultiQ, typename QVCoord>
   CUTLASS_DEVICE void operator()(
       RowSurfaces<ElementQ> const& Q,
       TensorK2D const& K_2D,
@@ -437,32 +440,35 @@ struct DecodeMainloop {
       /* GEMM 1: S = K * Q */
       clear(tSrS);
       for (int D = 0; D < size<4>(tKgK); D++) {
+        copy(copy_k, tKgK_cache(_, _, _, D), tKrK);
         copy(copy_q, tQgQ(_, _, _, D), tQrQ);
         // Rows of the other Q surfaces; each load leaves the rows outside
         // its surface zero, so OR-ing the bits merges them.
-        for (int i = 1; i < Q.n; i++) {
-          auto Q_i = Q.tensor(i);
-          int x_shift_i;
-          auto Q_i_al = align_block_2d_base<1>(Q_i, x_shift_i);
-          TiledCopyQ copy_q_i{Q_i_al};
-          Tensor gQ_i = local_tile(
-              Q.coords(i, Q_i.shape(), x_shift_i), TileShapeQK{},
-              append(blk_qv, _), Step<_1, X, _1>{});
-          auto thr_copy_q_i = copy_q_i.get_slice(thr_id);
-          auto tQgQ_i = thr_copy_q_i.partition_S(gQ_i);
-          auto tQrQ_i = thr_copy_q_i.partition_sg_fragment_D(gQ_i(_, _, 0));
-          copy(copy_q_i, tQgQ_i(_, _, _, D), tQrQ_i);
-          CUTLASS_PRAGMA_UNROLL
-          for (int j = 0; j < tQrQ.size(); j++) {
-            using QBits = uint16_t;
-            using QElem = cute::remove_cvref_t<decltype(tQrQ(j))>;
-            static_assert(sizeof(QElem) == sizeof(QBits), "16-bit Q expected");
-            tQrQ(j) = sycl::bit_cast<QElem>(QBits(
-                sycl::bit_cast<QBits>(QElem(tQrQ(j))) |
-                sycl::bit_cast<QBits>(QElem(tQrQ_i(j)))));
+        if constexpr (MultiQ) {
+          for (int i = 1; i < Q.n; i++) {
+            auto Q_i = Q.tensor(i);
+            int x_shift_i;
+            auto Q_i_al = align_block_2d_base<1>(Q_i, x_shift_i);
+            TiledCopyQ copy_q_i{Q_i_al};
+            Tensor gQ_i = local_tile(
+                Q.coords(i, Q_i.shape(), x_shift_i), TileShapeQK{},
+                append(blk_qv, _), Step<_1, X, _1>{});
+            auto thr_copy_q_i = copy_q_i.get_slice(thr_id);
+            auto tQgQ_i = thr_copy_q_i.partition_S(gQ_i);
+            auto tQrQ_i = thr_copy_q_i.partition_sg_fragment_D(gQ_i(_, _, 0));
+            copy(copy_q_i, tQgQ_i(_, _, _, D), tQrQ_i);
+            CUTLASS_PRAGMA_UNROLL
+            for (int j = 0; j < tQrQ.size(); j++) {
+              using QBits = uint16_t;
+              using QElem = cute::remove_cvref_t<decltype(tQrQ(j))>;
+              static_assert(
+                  sizeof(QElem) == sizeof(QBits), "16-bit Q expected");
+              tQrQ(j) = sycl::bit_cast<QElem>(QBits(
+                  sycl::bit_cast<QBits>(QElem(tQrQ(j))) |
+                  sycl::bit_cast<QBits>(QElem(tQrQ_i(j)))));
+            }
           }
         }
-        copy(copy_k, tKgK_cache(_, _, _, D), tKrK);
 
         reorder(tQrQ, tSrQ);
         reorder(tKrK, tSrK);

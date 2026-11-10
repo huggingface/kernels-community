@@ -43,7 +43,8 @@ struct decode_args_t {
   //   seqused_k   ? seqused_k[b] + seqlen_k_add
   //   cu_seqlens_k? cu_seqlens_k[b + 1] - cu_seqlens_k[b]
   //   otherwise     seqlen_k
-  // Batches with length <= 0 are skipped (out / softmax_lse untouched).
+  // Rows without a visible key (batches with length <= 0, leading causal
+  // queries) get output 0 and LSE empty_lse.
   // With seqused_k the length is clamped to seqlen_k (the cache capacity).
   const int* seqused_k = nullptr;
   int seqlen_k_add = 0;
@@ -74,6 +75,7 @@ struct decode_args_t {
   int64_t lse_batch_stride = 0, lse_head_stride = 0, lse_row_stride = 0;
 
   float softmax_scale = 1.f;
+  float empty_lse = 0.f;      // LSE of a row without a visible key
   int window_size_left = -1;  // < 0: no local mask
   // Upper bound on KV splits. A batch whose windowed KV has fewer than
   // num_splits * min_tiles_per_split tiles uses fewer splits; a batch that
