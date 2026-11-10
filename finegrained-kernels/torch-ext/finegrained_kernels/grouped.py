@@ -2612,7 +2612,7 @@ def mx_dynamic_matmul_grouped(
     # host TMA descriptor over the (E, 2N|N, K_bytes) view — a gate tile is one contiguous
     # 2*BN row span; the placeholder box is re-bound per tuned config by the pre_hook
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
-        a_u8, b_u8.view(num_experts, 2 * N if gate else N, b_u8.shape[2])
+        a_u8, b_u8.view(num_experts, 2 * N if gate else N, b_u8.shape[2]), B
     )
     # (the SA/SB swizzled-scale descriptors and their placeholder boxes — re-bound per tuned
     # config by rebind_grouped_mx_descriptors — are built above with the scales.)
@@ -2941,7 +2941,7 @@ def mx_weight_only_matmul_grouped(
     # placeholder boxes rebound per config by rebind_grouped_descriptors, read only by descriptor
     # configs the tuner picks. Scales stay affine (3D pointer) — no scale descriptor.
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
-        A, b_u8.view(num_experts, 2 * N if gate else N, K_b)
+        A, b_u8.view(num_experts, 2 * N if gate else N, K_b), B
     )
 
     schedule = packed_schedule_buffer(S, num_experts, expert_start.device)

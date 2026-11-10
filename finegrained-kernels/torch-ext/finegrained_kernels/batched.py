@@ -1905,7 +1905,7 @@ def mx_dynamic_matmul_batched(
             a_u8,
             as_u8,  # None when raw (A quantized inline)
             b_u8,
-            batched_weight_descriptor(b_u8),
+            batched_weight_descriptor(b_u8, B),
             bs_u8,
             bs_descriptor,
             C,
@@ -2190,7 +2190,7 @@ def mx_weight_only_matmul_batched(
         compile_time_only_triton_wrap(mx_weight_only_matmul_batched_kernel)[grid](
             A,
             b_u8,
-            batched_weight_descriptor(b_u8),
+            batched_weight_descriptor(b_u8, B),
             bs_u8,
             b_global_scale,
             C,

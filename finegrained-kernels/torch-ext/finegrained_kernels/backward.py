@@ -74,7 +74,7 @@ from .compat import (
     get_accelerator_autotuning_configs,
     sm_count,
 )
-from .descriptors import maybe_descriptor, rebind_dgrad_descriptors, rebind_dgrad_grouped_descriptors
+from .descriptors import maybe_descriptor, rebind_dgrad_descriptors, rebind_dgrad_grouped_descriptors, weight_descriptor
 from .matmul import matmul_2d
 from .pruners import (
     PATH_ANCHOR_AXES,
@@ -315,7 +315,7 @@ def dgrad_matmul_2d(
         # caller's device is not the active one. Boxes are placeholders; the pre_hook rebinds
         # them to the tuned tile per config.
         a_descriptor = maybe_descriptor(dY, [1, 128])
-        b_descriptor = maybe_descriptor(W, [1, 128])
+        b_descriptor = weight_descriptor(W, [1, 128])
         compile_time_only_triton_wrap(dgrad_matmul_2d_kernel)[grid](
             dY,
             a_descriptor,
@@ -590,7 +590,7 @@ def dgrad_matmul_grouped(
     with device_context(dY.device):
         # inside the context — see dgrad_matmul_2d; placeholder boxes, rebound by the pre_hook
         a_descriptor = maybe_descriptor(dY, [1, 128])
-        b_descriptor = maybe_descriptor(W, [1, 1, 128])
+        b_descriptor = weight_descriptor(W, [1, 1, 128])
         compile_time_only_triton_wrap(dgrad_matmul_grouped_kernel)[(num_sms,)](
             dY,
             a_descriptor,

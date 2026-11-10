@@ -15,7 +15,7 @@
 
 import contextvars
 import functools
-from contextlib import contextmanager
+from contextlib import nullcontext
 
 
 import os
@@ -41,22 +41,28 @@ def decode_pdl() -> bool:
     (extra copies, no fusion). Deployment decode runs eager launches under cudagraphs, where PDL
     applies. ``griddepcontrol`` is an NVIDIA primitive, so every other backend reads False and the
     ``gdc_*`` intrinsics stay behind their ``PDL`` constexpr. ``griddepcontrol`` also needs sm_90."""
-    return (
-        DECODE_PDL
-        and not torch.compiler.is_compiling()
-        and get_active_device_type() == "cuda"
-        and _griddepcontrol_supported()
-    )
+    return _pdl_capable() and not torch.compiler.is_compiling()
 
 
 @functools.cache
-def _griddepcontrol_supported() -> bool:
-    return torch.version.hip is None and torch.cuda.get_device_capability() >= (9, 0)
+def _pdl_capable() -> bool:
+    """The launch-independent part of ``decode_pdl``, resolved once: it is asked on every launch."""
+    return (
+        DECODE_PDL
+        and get_active_device_type() == "cuda"
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability() >= (9, 0)
+    )
+
+
+_PDL_ON = {"PDL": True, "launch_pdl": True}
+_PDL_OFF = {"PDL": False}
 
 
 def pdl_launch_kwargs() -> dict:
-    """Only works on CUDA, and not under torch.compile (Dynamo cannot read the inline asm)."""
-    return {"PDL": True, "launch_pdl": True} if decode_pdl() else {"PDL": False}
+    """Only works on CUDA, and not under torch.compile (Dynamo cannot read the inline asm). The
+    returned dict is shared: callers splat it into the launch and never mutate it."""
+    return _PDL_ON if decode_pdl() else _PDL_OFF
 
 # The scaled_grouped_mm scaling enums the torch MoE baseline hands its scale operands. Older
 # torch has neither them nor the op, and only that one baseline reads them, so a missing pair is
@@ -199,15 +205,19 @@ def compile_time_only_triton_op(name, mutates_args=(), opaque=False):
 
 
 
-@contextmanager
+_NO_DEVICE_SWITCH = nullcontext()
+
+
 def device_context(device: torch.device):
-    """Context manager that sets the active device for any backend (cuda, xpu, etc.)."""
+    """Context manager that sets the active device for any backend (cuda, xpu, etc.). Every launch
+    enters it, and eager decode is host-bound: on the device already current it is a shared no-op
+    instead of a device exchange in and out (~2.5us per launch)."""
+    if device.type == "cuda" and (device.index is None or device.index == torch.cuda.current_device()):
+        return _NO_DEVICE_SWITCH
     backend = getattr(torch, device.type, None)
     if backend is not None and hasattr(backend, "device"):
-        with backend.device(device):
-            yield
-    else:
-        yield
+        return backend.device(device)
+    return _NO_DEVICE_SWITCH
 
 
 

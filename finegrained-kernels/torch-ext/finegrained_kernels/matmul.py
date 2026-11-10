@@ -27,7 +27,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from .bayesian_autotuner import bayesian_autotune
 from ._ops import add_op_namespace_prefix
 from .compat import FP8_DTYPE, is_sm10x, launches_skipped, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, pdl_launch_kwargs, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, narrow_dot_autotuning_configs, narrow_scalar_autotuning_configs, split_k_autotuning_configs, persistent_program_count, pipeline_autotuning_configs
-from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_tiled_descriptors, rebind_weight_only_descriptors
+from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_tiled_descriptors, rebind_weight_only_descriptors, weight_descriptor
 from .formats import FP8_WEIGHT_ONLY_DEQUANT_MIN_M, INT_WEIGHT_ONLY_DEQUANT_MIN_DIM, INT_WEIGHT_ONLY_DEQUANT_MIN_M, block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, normalize_global_scale, e2m1_as_uint8, is_mx, is_rowwise, mx_scale_family, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_2d_operands, weight_format, validate_int_operands, validate_svdquant_operands, INT_WEIGHT_DTYPES
 from .bench import gemm_cold_banks
 from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
@@ -1729,7 +1729,7 @@ def w8a8_block_dynamic_fp8_matmul(
     # (host-TMA) configs the tuner picks for wide-N prefill; pointer configs never touch
     # them (the constexpr arm folds out in the load helpers).
     a_descriptor = TensorDescriptor(A_q, [a_rows, K], [K, 1], [1, block_k])
-    b_descriptor = maybe_descriptor(B, [1, block_k])
+    b_descriptor = weight_descriptor(B, [1, block_k])
 
     def grid(META):
         if META.get("PIPELINE", "k_loop") != "k_loop":
@@ -1862,7 +1862,7 @@ def w8a8_block_static_fp8_matmul(
     # rebind_bd_descriptors. Read only by the descriptor configs the tuner picks for wide-N
     # prefill (offline fp8 A); pointer/inline configs never touch them.
     a_descriptor = maybe_descriptor(A_q, [1, block_k])
-    b_descriptor = maybe_descriptor(B, [1, block_k])
+    b_descriptor = weight_descriptor(B, [1, block_k])
 
     with device_context(A.device):
         bias_stride_e, bias_stride_n = bias_strides(bias)
@@ -1980,7 +1980,7 @@ def w8a8_tensor_dynamic_fp8_matmul(
     C = A.new_empty(A.shape[:-1] + (gate_out_cols(N, gate, act_fn),), dtype=output_dtype)
     # placeholder boxes, re-bound per tuned config by rebind_tiled_descriptors
     a_descriptor = TensorDescriptor(qA, [a_rows, K], [K, 1], [1, 16])
-    b_descriptor = maybe_descriptor(B, [1, 16])
+    b_descriptor = weight_descriptor(B, [1, 16])
 
     def grid(META):
         return (
@@ -2219,7 +2219,7 @@ def mx_dynamic_matmul(
     if not _holds_rows(A_q, a_rows):
         a_rows = M
     a_descriptor = TensorDescriptor(A_q, [a_rows, A_q.shape[1]], [A_q.stride(0), 1], [1, 32])
-    b_descriptor = TensorDescriptor.from_tensor(b_u8, [1, 32])
+    b_descriptor = weight_descriptor(b_u8, [1, 32], B)
     # One scale pointer per operand (as_u8/bs_u8) — the swizzled buffer on the fast path (also the
     # base for the BM<128 / BN<128 scalar gather), the affine scale otherwise — plus its descriptor,
     # built only on the swizzled path (dummy off the operand descriptor when un-swizzled, unread).
@@ -2343,7 +2343,7 @@ def full_precision_matmul_2d(
     C = A.new_empty(A.shape[:-1] + (gate_out_cols(N, gate, act_fn),), dtype=output_dtype)
 
     a_descriptor = maybe_descriptor(A.view(M, K), [16, 32])
-    b_descriptor = maybe_descriptor(B, [16, 32])
+    b_descriptor = weight_descriptor(B, [16, 32])
 
     def grid(META):
         return (
@@ -2441,7 +2441,7 @@ def mx_weight_only_matmul_2d(
     # rebound per tuned config by rebind_weight_only_descriptors, read only by the descriptor configs the
     # tuner picks (pointer configs never touch them). Scales stay affine (no scale descriptor).
     a_descriptor = maybe_descriptor(A_2d, [1, 32])
-    b_descriptor = TensorDescriptor.from_tensor(b_u8, [1, 32])
+    b_descriptor = weight_descriptor(b_u8, [1, 32], B)
 
     def grid(META):
         return (
@@ -2532,7 +2532,7 @@ def block_fp8_weight_only_matmul_2d(
     dtype = resolve_output_dtype(output_dtype, A, None)
     C = A.new_empty(A.shape[:-1] + (gate_out_cols(N, gate, act_fn),), dtype=dtype)
     a_descriptor = maybe_descriptor(A.view(M, K), [1, 32])
-    b_descriptor = maybe_descriptor(B, [1, 32])
+    b_descriptor = weight_descriptor(B, [1, 32])
     with device_context(A.device):
         bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(block_fp8_weight_only_matmul_2d_kernel)[
@@ -2614,7 +2614,7 @@ def int_weight_only_matmul_2d(
     C = A.new_empty(A.shape[:-1] + (gate_out_cols(N, gate, act_fn),), dtype=output_dtype)
     # placeholder boxes, rebound per tuned config by rebind_weight_only_descriptors
     a_descriptor = maybe_descriptor(A.view(M, K), [1, 32])
-    b_descriptor = maybe_descriptor(B, [1, 32])
+    b_descriptor = weight_descriptor(B, [1, 32])
 
     def grid(META):
         return (triton.cdiv(M, META["BLOCK_SIZE_M"]), triton.cdiv(N, META["BLOCK_SIZE_N"]), META.get("SPLIT_K", 1))

@@ -49,6 +49,33 @@ def maybe_descriptor(t: torch.Tensor, box: list[int]) -> TensorDescriptor | None
     return TensorDescriptor.from_tensor(t, box)
 
 
+_WEIGHT_DESCRIPTORS = "_finegrained_descriptors"
+_MISSING = object()
+
+
+def weight_descriptor(t: torch.Tensor, box: list[int], owner: torch.Tensor | None = None) -> TensorDescriptor | None:
+    """``maybe_descriptor`` for a weight, memoized on the tensor ``t`` views (``t`` itself when it is no view):
+    eager decode is host-bound and rebuilding the same descriptor every launch costs ~7us. The entry keys on the
+    address, shape, strides and dtype it encodes, so a weight moved or reloaded in place rebuilds. Its descriptor
+    reads a storage alias with no ``_base`` link back to the weight, so the cache holds no reference cycle and
+    dies with the weight. Fake tensors (torch.compile) and tensor subclasses take the uncached path; the per-config
+    ``rebind_*`` hooks still set the box before every launch. A dtype reinterpret (``int8`` packed E2M1 read as
+    ``uint8``) does not chain ``_base`` back to the weight, so callers holding one pass the weight as ``owner``."""
+    if owner is None:
+        owner = t._base if t._base is not None else t
+    if type(owner) not in (torch.Tensor, torch.nn.Parameter) or torch.compiler.is_compiling():
+        return maybe_descriptor(t, box)
+    key = (t.data_ptr(), t.shape, t.stride(), t.dtype, tuple(box))
+    cache = owner.__dict__.get(_WEIGHT_DESCRIPTORS)
+    if cache is None:
+        cache = owner.__dict__[_WEIGHT_DESCRIPTORS] = {}
+    desc = cache.get(key, _MISSING)
+    if desc is _MISSING:
+        alias = t.new_empty(0).set_(t.untyped_storage(), t.storage_offset(), t.shape, t.stride())
+        desc = cache[key] = maybe_descriptor(alias, box)
+    return desc
+
+
 def rebind_bd_descriptors(nargs):
     """Per-config pre_hook: set the A and B host-TMA boxes to the tuned tile over the
     ``(rows, K)`` matrices — ``[BLOCK_SIZE_M, block_k]`` and ``[BLOCK_SIZE_N, block_k]``."""
@@ -118,12 +145,12 @@ def rebind_batched_mx_bs_descriptor(nargs):
     nargs["BSDescriptor"].block_shape = [1, rep, rep_k, 2, 256]
 
 
-def batched_weight_descriptor(b: torch.Tensor) -> TensorDescriptor | None:
+def batched_weight_descriptor(b: torch.Tensor, owner: torch.Tensor | None = None) -> TensorDescriptor | None:
     """Host TMA descriptor over a batched kernel's ``(E, rows, K_stored)`` weight stack viewed as one
     ``(E * rows, K_stored)`` matrix, so an expert is a row offset (``batched_weight_row``). Placeholder
     box, re-bound per config by ``rebind_batched_weight_descriptor``; None where the stack cannot be
     viewed without a copy (``descriptor_box_pruner`` then keeps the pointer configs)."""
-    return maybe_descriptor(b.view(-1, b.shape[-1]), [128, 64]) if b.is_contiguous() else None
+    return weight_descriptor(b.view(-1, b.shape[-1]), [128, 64], owner) if b.is_contiguous() else None
 
 
 def rebind_batched_weight_descriptor(nargs):
@@ -176,13 +203,13 @@ def rebind_grouped_descriptors(nargs):
     rebind_grouped_act_descriptor(nargs)
 
 
-def build_grouped_operand_descriptors(a_operand, b_operand):
+def build_grouped_operand_descriptors(a_operand, b_operand, b_owner=None):
     """Operand host-TMA descriptors for a grouped launch: A box ``[16, 64]``, B box
     ``[1, 128, 64]`` over the ``(E, 2N|N, K_bytes)`` weight view. Placeholder boxes, re-bound to
     the tuned tile per config by ``rebind_grouped_descriptors``."""
     return (
         TensorDescriptor.from_tensor(a_operand, block_shape=[16, 64]),
-        TensorDescriptor.from_tensor(b_operand, block_shape=[1, 128, 64]),
+        weight_descriptor(b_operand, [1, 128, 64], b_owner),
     )
 
 
