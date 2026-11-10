@@ -1193,8 +1193,10 @@ def swizzled_out_bm_pruner():
     entirely swizzled). Un-swizzled requant keeps every BM/BN — it stores Cs row-major."""
 
     def ok(c, args):
+        # a swapped token tile (grouped MX) scatters its scales by row instead of the 128-row block store: only BN
+        # is pinned
         return (
-            config_dim(c, args, "BLOCK_SIZE_M") == 128
+            (c.kwargs.get("SWAP_AB") or config_dim(c, args, "BLOCK_SIZE_M") == 128)
             and config_dim(c, args, "BLOCK_SIZE_N") == 128
         )
 

@@ -500,7 +500,7 @@ def _epilogue_requant_mx(
     CSDescriptor, CsGlobal, cs_global_row,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, SCALE_GROUP_K: tl.constexpr,
     OUTPUT_FORMAT: tl.constexpr, SWIZZLED_OUT: tl.constexpr, FAKE_BATCH: tl.constexpr,
-    N_COLS: tl.constexpr,
+    N_COLS: tl.constexpr, scale_rows=None,
 ):
     """Requantize the SwiGLU intermediate to MX group-``SCALE_GROUP_K`` (mxfp8 UE8M0 / mxfp4 / nvfp4
     E4M3 — the fp4 formats pack nibble pairs so ``C`` halves). ``SWIZZLED_OUT`` writes ``Cs`` straight
@@ -517,7 +517,19 @@ def _epilogue_requant_mx(
     width: tl.constexpr = BLOCK_SIZE_N if OUTPUT_FORMAT == "mxfp8" else BLOCK_SIZE_N // 2
     _store_out(C, q, out_row, pid_n, row_mask, stride_c_m, stride_c_n, BLOCK_SIZE_M, width, FAKE_BATCH,
                N_COLS if OUTPUT_FORMAT == "mxfp8" else N_COLS // 2)
-    if SWIZZLED_OUT:
+    if SWIZZLED_OUT and BLOCK_SIZE_M < 128:
+        # a swapped token tile scatters its rows' scales into the swizzled slab by byte address (the
+        # load_swizzled_rows_scale map): ``scale_rows`` are its rows inside their expert's 128-padded slab
+        cols = pid_n * (BLOCK_SIZE_N // SCALE_GROUP_K) + tl.arange(0, BLOCK_SIZE_N // SCALE_GROUP_K)
+        cols4 = (N_COLS // SCALE_GROUP_K + 3) // 4
+        off = (
+            ((scale_rows // 128)[:, None] * cols4 + cols[None, :] // 4) * 512
+            + (scale_rows % 32)[:, None] * 16
+            + ((scale_rows % 128) // 32)[:, None] * 4
+            + cols[None, :] % 4
+        )
+        tl.store(Cs + off, q_s, mask=row_mask[:, None] & (cols < N_COLS // SCALE_GROUP_K)[None, :])
+    elif SWIZZLED_OUT:
         # group scales straight into the down proj's SWIZZLE_32_4_4 layout (inverse of
         # load_swizzled_scale) at block (pid_m, pid_n) — BM/BN pinned 128.
         REP_K_CS: tl.constexpr = (BLOCK_SIZE_N // SCALE_GROUP_K) // 4
@@ -587,7 +599,7 @@ def add_low_rank(
 @triton.jit
 def gemm_epilogue(
     C,
-    Cs,  # row-major requant-scale pointer (None under SWIZZLED_OUT — CSDescriptor writes instead)
+    Cs,  # row-major requant-scale pointer; under SWIZZLED_OUT the swizzled buffer itself (BM < 128 tiles scatter into it, 128-row tiles store via CSDescriptor)
     acc,
     out_row,
     pid_n,
@@ -613,6 +625,7 @@ def gemm_epilogue(
     FAKE_BATCH: tl.constexpr = False,
     N_COLS: tl.constexpr = 0,  # >0 masks the column tail (2D dense N isn't BN-aligned); 0 = no mask
     CSDescriptor=0,  # SWIZZLE_32_4_4 requant-scale descriptor; read only under SWIZZLED_OUT (else dummy)
+    scale_rows=None,  # a swapped (BM < 128) tile's rows inside their expert's 128-padded slab; SWIZZLED_OUT scatters there
     CsGlobal=None,  # fp32 NVFP4 output global (the NEXT proj's provided input_scale), per tensor or per expert; normalizes the requant, None folds out
     stride_cs_global=0,  # expert stride of CsGlobal (0 broadcasts a scalar)
     GlobalScale=None,  # weight global or per-channel pointer tile; applied before bias/GLU, None folds out
@@ -697,6 +710,7 @@ def gemm_epilogue(
                     C, Cs, out, out_row, pid_n, pid_m, row_mask, stride_c_m, stride_c_n, stride_cs_m,
                     stride_cs_n, CSDescriptor, CsGlobal, global_row * stride_cs_global,
                     BLOCK_SIZE_M, BLOCK_SIZE_N, SCALE_GROUP_K, OUTPUT_FORMAT, SWIZZLED_OUT, FAKE_BATCH, N_COLS,
+                    scale_rows=scale_rows,
                 )
             else:  # bf16 (unquantized) SwiGLU output
                 _store_out(C, out, out_row, pid_n, row_mask, stride_c_m, stride_c_n, BLOCK_SIZE_M, BLOCK_SIZE_N, FAKE_BATCH, N_COLS)

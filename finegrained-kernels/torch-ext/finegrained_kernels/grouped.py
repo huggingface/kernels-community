@@ -923,7 +923,7 @@ def mx_dynamic_matmul_grouped_kernel(
         exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = build_tile_layout(
             ExpertStart, NUM_EXPERTS_POW2, BLOCK_SIZE_M
         )
-        if SWAP_AB and SWIZZLED_SCALES:
+        if SWAP_AB and (SWIZZLED_SCALES or SWIZZLED_OUT):
             # the swizzled act-scale slab pads each expert to whole 128-row blocks: a swapped token tile (BM < 128)
             # finds its rows at the expert's padded start plus its offset inside the expert
             blocks_128 = (freqs + 127) // 128
@@ -1007,7 +1007,7 @@ def mx_dynamic_matmul_grouped_kernel(
         # slab is num_n_tiles REP-blocks (REP=2 under GATE, whose tile spans both).
         pid_m = tile_id // num_n_tiles
         weight_blk = (expert_id64 * num_n_tiles + pid_n).to(tl.int32)
-        if SWAP_AB and SWIZZLED_SCALES:
+        if SWAP_AB and (SWIZZLED_SCALES or SWIZZLED_OUT):
             in_expert = e_offs == expert_id64.to(tl.int32)
             first_tile = tl.sum(tl.where(in_expert, tile_start_excl, 0), 0)
             scale_rows = (
@@ -1050,6 +1050,10 @@ def mx_dynamic_matmul_grouped_kernel(
 
         if SWAP_AB:
             acc = tl.trans(acc)
+        if SWAP_AB and SWIZZLED_OUT:
+            out_scale_rows = scale_rows
+        else:
+            out_scale_rows = None
         # NVFP4 two-level: block e4m3 scales rode through dot_scaled; recover the combined per-tensor
         gemm_epilogue(
             C,
@@ -1075,6 +1079,7 @@ def mx_dynamic_matmul_grouped_kernel(
             INTERMEDIATE_DTYPE,
             SWIZZLED_OUT=SWIZZLED_OUT,  # single source: the wrapper decided it and built Cs to match
             CSDescriptor=CSDescriptor,
+            scale_rows=out_scale_rows,
             CsGlobal=CsGlobal,
             stride_cs_global=stride_cs_global,
             N_COLS=N,  # mask the partial last N-tile's column tail (non-128 N; inert when N % BN == 0)
@@ -2639,7 +2644,7 @@ def mx_dynamic_matmul_grouped(
         cb_cs = triton.cdiv(N // scale_group, 4)
         cs_ret = torch.empty(1, n_m_tiles, cb_cs, 2, 256, device=A.device, dtype=scale_dtype)
         CSDescriptor = TensorDescriptor.from_tensor(cs_ret, [1, 1, 1, 2, 256])
-        Cs = None  # row-major pointer unread here; CSDescriptor does the store
+        Cs = cs_ret  # 128-row tiles store through CSDescriptor; swapped token tiles scatter into the buffer
     elif requant:  # un-swizzled block (or scattered output) -> row-major Cs pointer
         cs_ret = torch.empty(S, N // scale_group, device=A.device, dtype=scale_dtype)
         Cs, CSDescriptor = cs_ret, None
