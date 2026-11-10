@@ -614,7 +614,9 @@ jobs:
           TORCH_INDEX: ${{ needs.plan-minimum-torch-test-stable-abi.outputs.index }}
           PYTHON_VERSION: ${{ needs.plan-minimum-torch-test-stable-abi.outputs.python }}
         run: |
-          uv venv --python "$PYTHON_VERSION" "$RUNNER_TEMP/minimum-torch-venv"
+          # Use a uv-managed Python: the runner's system Python has no headers, and
+          # Triton needs Python.h to compile its launcher at test time.
+          uv venv --managed-python --python "$PYTHON_VERSION" "$RUNNER_TEMP/minimum-torch-venv"
           echo "torch==$TORCH_VERSION" > "$RUNNER_TEMP/torch-constraint.txt"
           uv pip install --python "$RUNNER_TEMP/minimum-torch-venv/bin/python" \
             --index-url "$TORCH_INDEX" "torch==$TORCH_VERSION"
