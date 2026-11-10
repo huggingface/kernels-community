@@ -125,33 +125,37 @@ class DecodeEpilogue {
   CUTLASS_HOST_DEVICE
   DecodeEpilogue(Params const&, SharedStorage& shared_) : shared(shared_) {}
 
-  // O:           (q, v) output surface of the tile rows, final (q dtype)
-  //              when not splitting, fp32 partial output of this split
-  //              otherwise.
-  // ptr_lse:     LSE of tile row 0 (natural log; the per-split LSE when
-  //              splitting), rows lse_stride apart. Rows below first_row
-  //              see no key and leave it untouched.
-  template <class TensorO2D, typename QVCoord>
+  // O:           output surfaces of the tile rows (see RowSurfaces), final
+  //              (q dtype) when not splitting, fp32 partial output of this
+  //              split otherwise.
+  // Tile row p is head p % group of query p / group.
+  // ptr_lse:     LSE of query 0, head 0 (natural log; the per-split LSE
+  //              when splitting). Queries outside [first_query, num_queries)
+  //              see no key or do not exist and leave it untouched.
+  template <class ElementO, typename QVCoord>
   CUTLASS_DEVICE void operator()(
-      TensorO2D const& O,
+      RowSurfaces<ElementO> const& O,
       FragA& tArA,
       FragARow& tA_max,
       FragARow& tA_sum,
       QVCoord blk_qv,
       int thr_id,
-      int num_rows,
-      int first_row,
+      int group,
+      int num_queries,
+      int first_query,
       float* ptr_lse,
-      int64_t lse_stride) {
+      int64_t lse_query_stride,
+      int64_t lse_head_stride) {
     using namespace cute;
     constexpr float kLn2 = 0.6931471805599453f;
 
-    // The grid's Q dimension (blk_qv[0]) tiles the num_rows rows.
+    // The grid's Q dimension (blk_qv[0]) tiles the rows.
     // This work-item reports statistics for row q_row.
     constexpr int q_tile_rows = cute::size<0>(TileShapeO{});
     int q_row = get<0>(blk_qv) * q_tile_rows + thr_id;
-    bool row_valid = (thr_id < q_tile_rows) && (q_row < num_rows) &&
-                     (q_row >= first_row);
+    int query = q_row / group;
+    bool row_valid = (thr_id < q_tile_rows) && (query < num_queries) &&
+                     (query >= first_query);
 
     auto [rA, rA_max, rA_sum, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
 
@@ -160,14 +164,15 @@ class DecodeEpilogue {
     if (row_valid && get<1>(blk_qv) == 0) {
       float row_lse = static_cast<float>(rA_max(0)) * kLn2 +
                       sycl::log(static_cast<float>(rA_sum(0)));
-      ptr_lse[q_row * lse_stride] = row_lse;
+      ptr_lse[query * lse_query_stride +
+              (q_row - query * group) * lse_head_stride] = row_lse;
     }
 
     if (!active) return;
 
     // Normalize every split independently; the combine kernel weights the
     // normalized partial outputs with exp(LSE_i - LSE). A row that sees no
-    // key of this split (packed queries) has sum 0 and LSE -inf: output 0.
+    // key of this split (causal queries) has sum 0 and LSE -inf: output 0.
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < rA_sum.size(); i++) {
       rA_sum(i) = rA_sum(i) > ElementA(0) ? ElementA(1) / rA_sum(i)
@@ -179,19 +184,21 @@ class DecodeEpilogue {
       rA(i) *= broadcast<0>(rA_sum, rA, i);
     }
 
-    int x_shift_o;
-    auto O_al = align_block_2d_base<1>(O, x_shift_o);
-    Tensor cO = make_shifted_identity_tensor<1>(O.shape(), x_shift_o);  // (q,v)
-    Tensor gO = local_tile(cO, TileShapeO{}, blk_qv);                   // (q,v)
-
-    using TiledCopyO = decltype(tiled_copy_O_helper<decltype(O_al)>());
-    TiledCopyO copy_o{O_al};
-    auto thr_copy_o = copy_o.get_slice(thr_id);
-    auto tOgO = thr_copy_o.partition_D(gO);
-    auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
-
-    reorder(rA, tOrO);
-    copy(copy_o, tOrO, tOgO);
+    using TensorO2D = decltype(O.tensor(0));
+    using TiledCopyO = decltype(tiled_copy_O_helper<TensorO2D>());
+    for (int i = 0; i < O.n; i++) {
+      auto O_i = O.tensor(i);
+      int x_shift_o;
+      auto O_al = align_block_2d_base<1>(O_i, x_shift_o);
+      Tensor gO = local_tile(
+          O.coords(i, O_i.shape(), x_shift_o), TileShapeO{}, blk_qv);  // (q,v)
+      TiledCopyO copy_o{O_al};
+      auto thr_copy_o = copy_o.get_slice(thr_id);
+      auto tOgO = thr_copy_o.partition_D(gO);
+      auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
+      reorder(rA, tOrO);
+      copy(copy_o, tOrO, tOgO);
+    }
   }
 
   // Reduce k-blocks of A and A_sum across WG, if needed.

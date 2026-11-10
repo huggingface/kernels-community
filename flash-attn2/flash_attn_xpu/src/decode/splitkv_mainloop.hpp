@@ -29,8 +29,8 @@
  *POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
-// Split-KV decode mainloop (seqlen_q == 1, GQA head group packed into the Q
-// tile). Adapted from vllm-xpu-kernels
+// Split-KV decode mainloop (short queries; the queries and GQA heads of one
+// KV head packed into the Q tile). Adapted from vllm-xpu-kernels
 // csrc/xpu/attn/xe_2/collective/chunk_prefill_mainloop.hpp (DecodeFwdMainloop).
 // Kept in its own namespace to avoid clashing with same-named templates of
 // other extensions loaded in the same process.
@@ -89,6 +89,40 @@ make_shifted_identity_tensor(Shape const& shape, int x_shift) {
         cute::make_coord(0, x_shift), cute::make_identity_tensor(shape));
   }
 }
+
+// Rows of a work-group tile spread over n 2D surfaces of one shape and
+// pitch: surface i starts at base + i * sub_stride, and tile row p is its
+// row p + y0 + i * y_step. Block loads read rows outside a surface as zero
+// and block stores drop them, so each surface moves only its own rows.
+// Used for the (query, GQA head) rows of PackGQA: one surface per query
+// (its heads, pitch = head stride), or with one head per KV head a single
+// surface of all queries (pitch = query stride).
+template <class T>
+struct RowSurfaces {
+  T* base;
+  int64_t sub_stride;
+  int64_t pitch;
+  int rows;
+  int cols;
+  int n;
+  int y0;
+  int y_step;
+
+  CUTLASS_DEVICE auto tensor(int i) const {
+    return cute::make_tensor(
+        cute::make_gmem_ptr(base + i * sub_stride),
+        cute::make_layout(
+            cute::make_shape(rows, cols), cute::make_stride(pitch, cute::_1{})));
+  }
+
+  // Coordinates of surface i (aligned with align_block_2d_base<1>).
+  template <class Shape>
+  CUTLASS_DEVICE auto coords(int i, Shape const& shape, int x_shift) const {
+    return cute::domain_offset(
+        cute::make_coord(y0 + i * y_step, x_shift),
+        cute::make_identity_tensor(shape));
+  }
+};
 
 template <typename SGLayoutQK>
 CUTLASS_HOST_DEVICE constexpr auto get_sg_layout_pv(SGLayoutQK const&) {
@@ -162,16 +196,17 @@ struct DecodeMainloop {
   CUTLASS_DEVICE
   DecodeMainloop(Params const& params_, SharedStorage&) : params(params_) {}
 
-  // Q_2D:   (q, d)  tile rows: GQA heads of one query or queries of one head
+  // Q:      tile rows p = query * group + head of the GQA group, see
+  //         RowSurfaces
   // K_2D:   (k, d)  one KV head; whole cache when paged, one sequence else
   // V_2D:   (v, k)
   // [blk_k0, blk_k1): logical KV tiles handled by this work-group.
-  // seq_len: keys visible to the last row. causal_rows > 0: row r is query
-  // r of causal_rows bottom-right aligned ones and sees
-  // seq_len - (causal_rows - 1 - r) keys; otherwise every row sees seq_len.
+  // seq_len: keys visible to the last query. causal_rows > 0: query m is
+  // one of causal_rows bottom-right aligned ones and sees
+  // seq_len - (causal_rows - 1 - m) keys; otherwise every query sees seq_len.
   template <bool has_large_surface, typename QVCoord>
   CUTLASS_DEVICE void operator()(
-      TensorQ2D const& Q_2D,
+      RowSurfaces<ElementQ> const& Q,
       TensorK2D const& K_2D,
       TensorV2D const& V_2D,
       FragA& tArA,
@@ -183,18 +218,20 @@ struct DecodeMainloop {
       int blk_k1,
       int thr_id,
       int seq_len,
-      int causal_rows) {
+      int causal_rows,
+      int group) {
     using namespace sycl::ext::oneapi::this_work_item;
 
     auto tile_shape_v =
         make_shape(get<1>(TileShapePV{}) * C<VTiles>{}, get<2>(TileShapePV{}));
 
+    TensorQ2D Q_2D = Q.tensor(0);
     int x_shift_q, x_shift_k, x_shift_v;
     auto Q_2D_al = align_block_2d_base<1>(Q_2D, x_shift_q);
     auto K_2D_al = align_block_2d_base<1>(K_2D, x_shift_k);
     auto V_2D_al = align_block_2d_base<0>(V_2D, x_shift_v);
 
-    Tensor cQ = make_shifted_identity_tensor<1>(Q_2D.shape(), x_shift_q);
+    Tensor cQ = Q.coords(0, Q_2D.shape(), x_shift_q);
     Tensor cK = make_shifted_identity_tensor<1>(K_2D.shape(), x_shift_k);
     Tensor cV = make_shifted_identity_tensor<0>(V_2D.shape(), x_shift_v);
     Tensor cP = make_identity_tensor(take<0, 2>(TileShapeQK{}));
@@ -401,6 +438,30 @@ struct DecodeMainloop {
       clear(tSrS);
       for (int D = 0; D < size<4>(tKgK); D++) {
         copy(copy_q, tQgQ(_, _, _, D), tQrQ);
+        // Rows of the other Q surfaces; each load leaves the rows outside
+        // its surface zero, so OR-ing the bits merges them.
+        for (int i = 1; i < Q.n; i++) {
+          auto Q_i = Q.tensor(i);
+          int x_shift_i;
+          auto Q_i_al = align_block_2d_base<1>(Q_i, x_shift_i);
+          TiledCopyQ copy_q_i{Q_i_al};
+          Tensor gQ_i = local_tile(
+              Q.coords(i, Q_i.shape(), x_shift_i), TileShapeQK{},
+              append(blk_qv, _), Step<_1, X, _1>{});
+          auto thr_copy_q_i = copy_q_i.get_slice(thr_id);
+          auto tQgQ_i = thr_copy_q_i.partition_S(gQ_i);
+          auto tQrQ_i = thr_copy_q_i.partition_sg_fragment_D(gQ_i(_, _, 0));
+          copy(copy_q_i, tQgQ_i(_, _, _, D), tQrQ_i);
+          CUTLASS_PRAGMA_UNROLL
+          for (int j = 0; j < tQrQ.size(); j++) {
+            using QBits = uint16_t;
+            using QElem = cute::remove_cvref_t<decltype(tQrQ(j))>;
+            static_assert(sizeof(QElem) == sizeof(QBits), "16-bit Q expected");
+            tQrQ(j) = sycl::bit_cast<QElem>(QBits(
+                sycl::bit_cast<QBits>(QElem(tQrQ(j))) |
+                sycl::bit_cast<QBits>(QElem(tQrQ_i(j)))));
+          }
+        }
         copy(copy_k, tKgK_cache(_, _, _, D), tKrK);
 
         reorder(tQrQ, tSrQ);
@@ -412,8 +473,9 @@ struct DecodeMainloop {
       /* V prefetch for GEMM 2 */
       prefetch(prefetch_v, pVgV(_, _, _, tile_idx));
 
-      /* Per-row key range: causal end (packed queries) and sliding window
-         start. The window is relative to the row's last visible key. */
+      /* Per-row key range: causal end of the row's query and sliding
+         window start. The window is relative to the row's last visible
+         key. */
       bool row_causal =
           causal_rows > 1 && (K + 1) * tile_k > seq_len - (causal_rows - 1);
       if (LocalMask || row_causal) {
@@ -425,8 +487,9 @@ struct DecodeMainloop {
         for (int i = 0; i < tSrS.size(); ++i) {
           int row = get<0>(cS_thread(i));
           int col = get<1>(cS_thread(i));
-          int end = causal_rows > 0 ? seq_len - (causal_rows - 1 - row)
-                                    : seq_len;
+          int end = causal_rows > 0
+              ? seq_len - (causal_rows - 1 - row / group)
+              : seq_len;
           bool masked = col >= end;
           if constexpr (LocalMask) {
             masked = masked || col < end - 1 - params.window_size_left;

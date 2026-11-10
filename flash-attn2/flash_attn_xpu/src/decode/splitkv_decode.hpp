@@ -31,13 +31,11 @@ struct decode_args_t {
   // cu_seqlens_q[b] + j : b * q_per_batch + j). With cu_seqlens_q, batches
   // with more than q_per_batch queries are skipped (left to the generic
   // kernel), as are positions past the batch's query count.
+  // A work-group handles kQTile consecutive rows of the (query, Q head of
+  // the GQA group) rows of one (batch, KV head), head fastest, like
+  // PackGQA of FlashAttention 3: KV is read once per kQTile rows.
   const int* cu_seqlens_q = nullptr;
   int q_per_batch = 1;
-  // Q tile rows of a work-group: false = the GQA group of one query,
-  // true = up to kQTile queries of one Q head. Packing queries reads the KV
-  // of a batch once per Q head instead of once per query, which wins for
-  // MHA and small GQA groups.
-  bool pack_queries = false;
   // Bottom-right causal: query j of a batch with n queries sees the first
   // seq_len - (n - 1 - j) keys. Without it every query sees all keys.
   bool causal = false;

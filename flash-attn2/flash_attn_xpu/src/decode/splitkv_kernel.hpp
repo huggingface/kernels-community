@@ -2,10 +2,12 @@
  * Copyright (C) 2025 - 2026 Intel Corporation, All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  **************************************************************************************************/
-// Split-KV decode kernels: one work-group per (V tile, Q tile of the GQA
-// group, batch x KV head x split) plus a combine kernel that merges the
-// per-split partial outputs. The work decomposition follows vllm-xpu-kernels
-// csrc/xpu/attn/xe_2/kernel/paged_decode_kernel.hpp.
+// Split-KV decode kernels: one work-group per (V tile, kQTile rows of the
+// (query, GQA head) rows, batch x KV head x split) plus a combine kernel that
+// merges the per-split partial outputs. The work decomposition follows
+// vllm-xpu-kernels csrc/xpu/attn/xe_2/kernel/paged_decode_kernel.hpp; the
+// rows of several queries are packed like PackGQA of FlashAttention 3
+// (hopper/pack_gqa.h), which always packs when splitting KV.
 
 #pragma once
 
@@ -28,18 +30,18 @@ struct BatchSplit {
   int row;        // query row
   int q_len;      // # queries of the batch
   int seq_len;    // KV length visible to the query
-  int kv_len;     // KV length visible to the work-group (last query)
+  int kv_len;     // KV length visible to the batch (last query)
   int k_block0;   // first KV tile inside the window
   int windowed;   // # KV tiles inside the window
   int splits;     // # non-empty splits (>= 1)
   int nbps;       // KV tiles per split
-  bool valid;     // the work-group has KV to process
+  bool valid;     // the batch has KV to process
 };
 
-// Query j of batch b. With pack_queries the KV range and its splits cover
-// all queries of the batch, so every query of a work-group (and the combine
-// kernel) agrees on them; a query may then see no key of a split, or none at
-// all (seq_len <= 0).
+// Query j of batch b. The KV range and its splits cover all queries of the
+// batch, so the work-groups of a batch and the combine kernel agree on
+// them; a query may then see no key of a split, or none at all
+// (seq_len <= 0).
 CUTLASS_DEVICE BatchSplit get_batch_split(decode_args_t const& a, int b, int j) {
   BatchSplit s{};
   s.valid = false;
@@ -65,8 +67,8 @@ CUTLASS_DEVICE BatchSplit get_batch_split(decode_args_t const& a, int b, int j) 
   }
   s.seq_len = a.causal ? full - (q_len - 1 - j) : full;
   // [lo_len - 1 - window, kv_len): keys of the shortest / longest query.
-  s.kv_len = a.pack_queries ? full : s.seq_len;
-  int lo_len = a.pack_queries && a.causal ? full - (q_len - 1) : s.kv_len;
+  s.kv_len = full;
+  int lo_len = a.causal ? full - (q_len - 1) : full;
   if (s.kv_len <= 0) return s;
 
   int k_blocks = (s.kv_len + kKVTile - 1) / kKVTile;
@@ -131,13 +133,10 @@ struct SplitKVDecodeKernel {
     int group = a.num_heads_q / a.num_heads_kv;
     int tile_q = get<0>(TileShapeO{});
     int tile_v = get<1>(TileShapeO{});
-    int rows = a.pack_queries ? a.q_per_batch : group;
-    int units = a.pack_queries ? a.batch * a.num_heads_q
-                               : a.batch * a.q_per_batch * a.num_heads_kv;
     return dim3(
         (a.head_size_v + tile_v - 1) / tile_v,
-        (rows + tile_q - 1) / tile_q,
-        units * a.num_splits);
+        (a.q_per_batch * group + tile_q - 1) / tile_q,
+        a.batch * a.num_heads_kv * a.num_splits);
   }
 
   static dim3 get_block_shape() {
@@ -153,43 +152,54 @@ struct SplitKVDecodeKernel {
     int blk_v = int(BlockIdxX());
     int blk_q = int(BlockIdxY());
     int flat = int(BlockIdxZ());
-    const bool pack = a.pack_queries;
     int group = a.num_heads_q / a.num_heads_kv;
-    // Work-group units: (batch, Q head) when packing queries, else
-    // (batch, query, KV head).
-    int heads = pack ? a.num_heads_q : a.num_heads_kv;
-    int bh = (pack ? a.batch : a.batch * a.q_per_batch) * heads;
+    int bh = a.batch * a.num_heads_kv;
     int idx_split = flat / bh;
     int rem = flat - idx_split * bh;
-    int idx_u = rem / heads;
-    int h = rem - idx_u * heads;
+    int idx_b = rem / a.num_heads_kv;
+    int head = rem - idx_b * a.num_heads_kv;  // KV head
 
-    BatchSplit s = pack
-        ? get_batch_split(a, idx_u, 0)
-        : get_batch_split(a, idx_u / a.q_per_batch, idx_u % a.q_per_batch);
+    BatchSplit s = get_batch_split(a, idx_b, 0);
     if (!s.valid || idx_split >= s.splits) return;
-    if (pack && blk_q * get<0>(TileShapeO{}) >= s.q_len) return;
-    int idx_b = s.b;
+    // Tile rows p = query * group + head of the GQA group (PackGQA).
+    constexpr int tile_q = get<0>(TileShapeO{});
+    int row0 = blk_q * tile_q;
+    if (row0 >= s.q_len * group) return;
 
-    int head = pack ? h / group : h;      // KV head
-    int head_q0 = pack ? h : h * group;   // Q head of tile row 0
-    int rows = pack ? s.q_len : group;
-    // Pack + causal: query j sees kv_len - (q_len - 1 - j) keys.
-    int causal_rows = pack && a.causal ? s.q_len : 0;
-    // Leading queries that see no key at all keep their LSE untouched.
-    int first_row = causal_rows > s.kv_len ? causal_rows - s.kv_len : 0;
+    // Causal: query j sees kv_len - (q_len - 1 - j) keys. Leading queries
+    // that see no key at all keep their LSE untouched.
+    int causal_rows = a.causal ? s.q_len : 0;
+    int first_query = causal_rows > s.kv_len ? causal_rows - s.kv_len : 0;
     int blk_k0 = s.k_block0 + idx_split * s.nbps;
     int blk_k1 = blk_k0 + s.nbps;
     int blk_end = s.k_block0 + s.windowed;
     blk_k1 = blk_k1 < blk_end ? blk_k1 : blk_end;
 
+    // Surfaces of the tile rows of a [query, Q head, cols] tensor whose
+    // (query 0, head 0 of the group) starts at base: with one Q head per KV
+    // head a single surface of the queries, else one surface of the GQA
+    // heads per query [m_lo, m_hi] of the tile.
+    int head_q0 = head * group;
+    int m_lo = row0 / group;
+    int m_hi = (row0 + tile_q - 1) / group;
+    m_hi = m_hi < s.q_len - 1 ? m_hi : s.q_len - 1;
+    auto row_surfaces = [&](auto* base, int64_t query_stride,
+                            int64_t head_stride, int cols) {
+      using T = cute::remove_cvref_t<decltype(*base)>;
+      if (group == 1) {
+        // A single row only needs a valid pitch.
+        int64_t pitch = s.q_len > 1 ? query_stride : head_stride;
+        return RowSurfaces<T>{base, 0, pitch, s.q_len, cols, 1, 0, 0};
+      }
+      return RowSurfaces<T>{
+          base + m_lo * query_stride, query_stride, head_stride, group, cols,
+          m_hi - m_lo + 1, -m_lo * group, -group};
+    };
+
     auto q_ptr = const_cast<ElementQ*>(static_cast<ElementQ const*>(a.q)) +
         int64_t(s.row) * a.q_row_stride + int64_t(head_q0) * a.q_head_stride;
-    Tensor Q_2D = make_tensor(
-        make_gmem_ptr(q_ptr),
-        make_layout(
-            make_shape(rows, a.head_size),
-            make_stride(pack ? a.q_row_stride : a.q_head_stride, _1{})));
+    RowSurfaces<ElementQ> Q =
+        row_surfaces(q_ptr, a.q_row_stride, a.q_head_stride, a.head_size);
 
     int64_t k_off, v_off;
     int kv_rows;
@@ -233,13 +243,13 @@ struct SplitKVDecodeKernel {
     if (has_large_surface) {
       if constexpr (PagedKV) {
         mainloop.template operator()<true>(
-            Q_2D, K_2D, V_2D, tArA, tA_max, tA_sum, blk_qv, idx_b, blk_k0,
-            blk_k1, thr_id, s.kv_len, causal_rows);
+            Q, K_2D, V_2D, tArA, tA_max, tA_sum, blk_qv, idx_b, blk_k0,
+            blk_k1, thr_id, s.kv_len, causal_rows, group);
       }
     } else {
       mainloop.template operator()<false>(
-          Q_2D, K_2D, V_2D, tArA, tA_max, tA_sum, blk_qv, idx_b, blk_k0,
-          blk_k1, thr_id, s.kv_len, causal_rows);
+          Q, K_2D, V_2D, tArA, tA_max, tA_sum, blk_qv, idx_b, blk_k0,
+          blk_k1, thr_id, s.kv_len, causal_rows, group);
     }
 
     if constexpr (
@@ -250,38 +260,28 @@ struct SplitKVDecodeKernel {
     }
 
     Epilogue epilogue{{}, shared.epilogue};
-    int Hq = a.num_heads_q;
+    int64_t Hq = a.num_heads_q;
     int Dv = a.head_size_v;
-    // Tile rows are Q heads (stride 1 head) or queries (stride 1 row).
     if (s.splits == 1) {
       // Single split: write the final output and LSE directly.
       auto o_ptr = static_cast<ElementO*>(a.out) +
           (int64_t(s.row) * Hq + head_q0) * Dv;
-      Tensor O_2D = make_tensor(
-          make_gmem_ptr(o_ptr),
-          make_layout(
-              make_shape(rows, Dv),
-              make_stride(int64_t(pack ? Hq : 1) * Dv, _1{})));
       float* lse_ptr = a.softmax_lse + int64_t(idx_b) * a.lse_batch_stride +
           int64_t(head_q0) * a.lse_head_stride +
           int64_t(s.row) * a.lse_row_stride;
       epilogue(
-          O_2D, tArA, tA_max, tA_sum, blk_qv, thr_id, rows, first_row,
-          lse_ptr, pack ? a.lse_row_stride : a.lse_head_stride);
+          row_surfaces(o_ptr, Hq * Dv, Dv, Dv), tArA, tA_max, tA_sum, blk_qv,
+          thr_id, group, s.q_len, first_query, lse_ptr, a.lse_row_stride,
+          a.lse_head_stride);
     } else {
       int S = a.num_splits;
       float* o_ptr = a.oaccum +
           ((int64_t(s.row) * S + idx_split) * Hq + head_q0) * Dv;
-      Tensor O_2D = make_tensor(
-          make_gmem_ptr(o_ptr),
-          make_layout(
-              make_shape(rows, Dv),
-              make_stride(int64_t(pack ? S * Hq : 1) * Dv, _1{})));
       float* lse_acc =
           a.lse_accum + (int64_t(s.row) * Hq + head_q0) * S + idx_split;
       epilogue(
-          O_2D, tArA, tA_max, tA_sum, blk_qv, thr_id, rows, first_row,
-          lse_acc, int64_t(pack ? Hq : 1) * S);
+          row_surfaces(o_ptr, S * Hq * Dv, Dv, Dv), tArA, tA_max, tA_sum,
+          blk_qv, thr_id, group, s.q_len, first_query, lse_acc, Hq * S, S);
     }
   }
 };

@@ -211,35 +211,31 @@ inline bool stride_ok(int64_t s) {
 // Longest per-batch query the split-KV path takes (speculative decoding).
 constexpr int kMaxQueries = 16;
 
-// Work-group rows for `q` queries per batch: the GQA group of one query, or
-// (pack) up to kQTile queries of one Q head. Each work-group reads the KV
-// once, so pick the layout with fewer work-groups per (batch, KV head):
-// ceil(G / kQTile) * q vs. G * ceil(q / kQTile). Ties keep the GQA layout.
-// Returns the KV split count (0: generic kernel) for that layout; `forced`
-// > 0 overrides the plan.
+// The kernel packs the (query, GQA head) rows of a (batch, KV head) into
+// kQTile-row work-groups like FlashAttention 3's PackGQA, which it always
+// uses when splitting KV (hopper/flash_api.cpp). The split plan is keyed by
+// single-query decode, so map `q` queries per batch to the decode batch
+// with as many work-groups, and a GQA group as large as the rows a
+// work-group fills. Returns the KV split count (0: generic kernel);
+// `forced` > 0 overrides the plan.
 inline int plan_layout(sycl::queue& queue, int batch, int q, int num_heads_q,
                        int num_heads_kv, int head_size, int max_seqlen_k,
-                       bool paged, int64_t q_row_stride, bool& pack,
-                       int forced = 0) {
+                       bool paged, int64_t q_row_stride, int forced = 0) {
     constexpr int t = flash_xpu_splitkv::kQTile;
     const int g = num_heads_q / num_heads_kv;
-    const int q_tiles = (q + t - 1) / t;
-    pack = q > 1 && g * q_tiles < ((g + t - 1) / t) * q &&
-           stride_ok(q_row_stride);
-    if (forced > 0) {
-        forced = std::min(forced, flash_xpu_splitkv::kMaxSplits);
-    } else if (!pack) {
-        return plan_num_splits(queue, batch * q, num_heads_q, num_heads_kv,
-                               head_size, max_seqlen_k, paged);
-    }
-    // Packed: same work as a decode of batch * q_tiles with a group of
-    // min(q, t) rows per Q head.
-    int splits = forced > 0 ? forced
-        : plan_num_splits(queue, batch * q_tiles, num_heads_q * std::min(q, t),
-                          num_heads_q, head_size, max_seqlen_k, paged);
-    // Packed fp32 partial rows are splits * Hq * D floats apart; keep the
-    // pitch inside the 2D block limit.
-    while (pack && splits > 1 &&
+    // One head per KV head: the queries of a batch form one Q surface.
+    if (g == 1 && q > 1 && !stride_ok(q_row_stride)) return 0;
+    const int tiles = (q * g + t - 1) / t;
+    const int tiles_1 = (g + t - 1) / t;
+    const int eff_batch = (batch * tiles + tiles_1 - 1) / tiles_1;
+    int splits = forced > 0
+        ? std::min(forced, flash_xpu_splitkv::kMaxSplits)
+        : plan_num_splits(queue, eff_batch,
+                          num_heads_kv * std::min(q * g, std::max(g, t)),
+                          num_heads_kv, head_size, max_seqlen_k, paged);
+    // With one head per KV head the fp32 partial rows of a work-group are
+    // splits * Hq * D floats apart; keep the pitch inside the 2D block limit.
+    while (g == 1 && q > 1 && splits > 1 &&
            int64_t(splits) * num_heads_q * head_size * 4 >= (int64_t(1) << 24))
         splits >>= 1;
     return splits;
@@ -384,10 +380,9 @@ mha_fwd(
         seqlen_k > 0 && seqlen_k < (1 << 24) &&
         splitkv::supported(q, k, v, /*paged=*/false)) {
         auto queue = c10::xpu::getCurrentXPUStream(device_idx).queue();
-        bool skv_pack = false;
         int num_splits = splitkv::plan_layout(
             queue, batch_size, seqlen_q, num_heads, num_heads_k, q.size(-1),
-            seqlen_k, /*paged=*/false, q.stride(1), skv_pack);
+            seqlen_k, /*paged=*/false, q.stride(1));
         if (num_splits > 0) {
             at::Tensor out;
             if (out_.has_value() && out_->is_contiguous() &&
@@ -406,7 +401,6 @@ mha_fwd(
             a.out = out.data_ptr();
             a.softmax_lse = softmax_lse.data_ptr<float>();
             a.q_per_batch = seqlen_q;
-            a.pack_queries = skv_pack;
             a.causal = skv_causal;
             a.seqlen_k = seqlen_k;
             a.batch = batch_size;
@@ -789,7 +783,6 @@ mha_varlen_fwd(
     int skv_q_per_batch = 0;  // 0: split-KV kernel not used
     bool skv_mixed = false;
     bool skv_causal = false;
-    bool skv_pack = false;
     int skv_splits = 0;
     {
         auto int_dev = [&](const at::Tensor& t) {
@@ -825,7 +818,7 @@ mha_varlen_fwd(
             // k is [total_k, Hkv, D] or, paged, [num_blocks, page, Hkv, D].
             skv_splits = splitkv::plan_layout(
                 queue, batch_size, skv_q_per_batch, num_heads, k.size(-2),
-                q.size(-1), max_seqlen_k, skv_paged, q.stride(0), skv_pack);
+                q.size(-1), max_seqlen_k, skv_paged, q.stride(0));
             // The generic kernel runs the one-query batches of a mixed batch
             // with its prefill tiles; the split-KV kernel is always cheaper.
             if (skv_mixed) skv_splits = std::max(skv_splits, 1);
@@ -849,7 +842,6 @@ mha_varlen_fwd(
         a.softmax_lse = softmax_lse.data_ptr<float>();
         a.cu_seqlens_q = cu_q.data_ptr<int>();
         a.q_per_batch = skv_q_per_batch;
-        a.pack_queries = skv_pack;
         a.causal = skv_causal;
         a.cu_seqlens_k = cu_k.data_ptr<int>();
         a.seqlen_k = max_seqlen_k;
@@ -1311,10 +1303,9 @@ mha_fwd_kvcache(
         const int64_t q_row_stride =
             q.stride(0) == seqlen_q * q.stride(1) ? q.stride(1)
                                                   : int64_t(num_heads) * q.size(3);
-        bool skv_pack = false;
         int splits = splitkv::plan_layout(
             queue, batch_size, seqlen_q, num_heads, num_heads_k, head_size_og,
-            seqlen_k, paged_KV, q_row_stride, skv_pack,
+            seqlen_k, paged_KV, q_row_stride,
             num_splits > 1 ? num_splits : 0);
         if (knew_ok && splits > 0) {
             // Several queries: rows of q must be evenly spaced and out
@@ -1371,7 +1362,6 @@ mha_fwd_kvcache(
             a.out = out.data_ptr();
             a.softmax_lse = softmax_lse.data_ptr<float>();
             a.q_per_batch = seqlen_q;
-            a.pack_queries = skv_pack;
             a.causal = skv_causal;
             if (seqlens_k.defined()) {
                 a.seqused_k = seqlens_k.data_ptr<int>();
