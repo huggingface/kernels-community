@@ -533,7 +533,10 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None, block_within_k: bool 
         # A gate|up tile overhanging N (the 2D kernel's non-aligned N: N=320 at BN=128) returns a
         # wrong GLU / requant on every M, warp, stage, memory-mode and WS variant (all 157 such
         # admitted configs, W4A4 gate requant N=K=320, B200 2026-10-20); a BN dividing N is correct.
-        if args.get("GATE") and args["N"] % config_dim(c, args, "BLOCK_SIZE_N"):
+        # Scaled-activation kernels only: the weight-only kernels wrap the N tail and mask it in the
+        # epilogue, and their overhanging gate tiles are bit-identical (GPT-OSS N=2880 at BN=128,
+        # grouped, B200) and the fastest batch tiles there (gate|up T=64: 292 -> 274us).
+        if args.get("GATE") and acts_are_scaled(args) and args["N"] % config_dim(c, args, "BLOCK_SIZE_N"):
             return False
         # no-swap width cap: Triton miscompiles a scaled MMA wider than 256 into a sticky
         # illegal-address device trap; the stacked 2*BN extent under GATE counts in full
