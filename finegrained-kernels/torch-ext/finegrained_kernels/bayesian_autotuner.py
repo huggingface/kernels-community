@@ -390,6 +390,8 @@ class BayesianAutotuner(Autotuner):
             )
 
     def run(self, *args, **kwargs):
+        # FP fusion on, also for kernels launched directly (see ``compat._FusedLaunch``)
+        kwargs.setdefault("enable_fp_fusion", True)
         if _CALL_COUNTS is not None:
             _CALL_COUNTS[self.fn_name] = _CALL_COUNTS.get(self.fn_name, 0) + 1
         self._failures = []

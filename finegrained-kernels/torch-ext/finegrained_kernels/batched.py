@@ -61,7 +61,7 @@ def expert_setup(
     C,
     Bs,
     ExpertIds,
-    GatherIdx,
+    top_k,
     ScatterIdx,
     stride_a_m,
     stride_b_e,
@@ -78,8 +78,8 @@ def expert_setup(
     ``ADVANCE_BS=False`` leaves ``Bs`` at the buffer base (the mx scale leaf applies the expert
     offset itself — its swizzled path indexes by 128-row block, not the row-major expert stride).
 
-    ``A``'s source row is ``GatherIdx[batch_id]`` when ``GatherIdx`` is not None (the gate_up reading
-    unexpanded activations, many-to-one for top_k > 1) else ``batch_id``; ``C``'s destination
+    ``A``'s source row is ``batch_id // top_k`` (the gate_up reading unexpanded activations, one
+    row per token for its ``top_k`` routed rows; ``top_k=1`` is row ``batch_id``); ``C``'s destination
     row is ``ScatterIdx[batch_id]`` when ``ScatterIdx`` is not None else ``batch_id`` — the same virtual
     gather/scatter ``matmul_grouped`` does, so the routed rows need no materialized copy.
 
@@ -90,7 +90,7 @@ def expert_setup(
     pid_n = tl.program_id(axis=1)
     # Cast to int64 to prevent overflow on expert_id * stride_b_e.
     expert_id = tl.load(ExpertIds + batch_id * stride_eid).to(tl.int64)
-    in_row = tl.load(GatherIdx + batch_id).to(tl.int64) if GatherIdx is not None else batch_id
+    in_row = batch_id // top_k
     out_row = tl.load(ScatterIdx + batch_id).to(tl.int64) if ScatterIdx is not None else batch_id
     A = A + in_row * stride_a_m
     B = B + expert_id * stride_b_e
@@ -128,7 +128,6 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     Cs,  # (S, N // BLOCK_SIZE_N) per-(row, block) output scale; written iff OUTPUT_FORMAT
     Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     ExpertIds,  # (S,) — which expert each batch element routes to
-    GatherIdx,  # (S,) int — batch_id -> source row of A; read only when not None
     ScatterIdx,  # (S,) int — batch_id -> destination row of C; read only when not None
     # Shape
     S,
@@ -151,6 +150,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     stride_bias_e,
     stride_bias_n,
     stride_eid,
+    top_k,  # routed rows per source row of A: program batch_id reads row batch_id // top_k
     num_experts,
     # Meta-parameters. BLOCK_N/BLOCK_K are the QUANT block (one scale per (BLOCK_N, BLOCK_K) tile of
     # the weight); BLOCK_SIZE_* are the tuned COMPUTE tile. The N tile may subdivide the quant block
@@ -195,7 +195,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
         C,
         Bs,
         ExpertIds,
-        GatherIdx,
+        top_k,
         ScatterIdx,
         stride_a_m,
         stride_b_e,
@@ -273,7 +273,6 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
     Cs,  # (S, N // BLOCK_SIZE_N) per-(row, block) output scale; written iff OUTPUT_FORMAT
     Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     ExpertIds,  # (S,) — which expert each batch element routes to
-    GatherIdx,  # (S,) int — batch_id -> source row of A; read only when not None
     ScatterIdx,  # (S,) int — batch_id -> destination row of C; read only when not None
     # Shape
     S,
@@ -296,6 +295,7 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
     stride_bias_e,
     stride_bias_n,
     stride_eid,
+    top_k,  # routed rows per source row of A: program batch_id reads row batch_id // top_k
     num_experts,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
@@ -328,7 +328,7 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
         C,
         Bs,
         ExpertIds,
-        GatherIdx,
+        top_k,
         ScatterIdx,
         stride_a_m,
         stride_b_e,
@@ -410,7 +410,6 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     C,  # (S, N) output; under GATE the bf16 GLU intermediate
     Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     ExpertIds,  # (S,) — which expert each batch element routes to
-    GatherIdx,  # (S,) int — batch_id -> source row of A; read only when not None
     ScatterIdx,  # (S,) int — batch_id -> destination row of C; read only when not None
     # Shape
     S,
@@ -430,6 +429,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     stride_bias_e,
     stride_bias_n,
     stride_eid,
+    top_k,  # routed rows per source row of A: program batch_id reads row batch_id // top_k
     num_experts,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
@@ -464,7 +464,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
         C,
         Bs,
         ExpertIds,
-        GatherIdx,
+        top_k,
         ScatterIdx,
         stride_a_m,
         stride_b_e,
@@ -566,7 +566,6 @@ def mx_dynamic_matmul_batched_kernel(
     AsBsGlobal,  # (num_experts,) fp32 NVFP4 WEIGHT global g_b — recovers on the accumulator together with AsGlobal (in-register product); read iff not None
     CsGlobal,  # (1,) fp32 NVFP4 output global (next proj's provided input_scale); normalizes the requant; read iff not None
     ExpertIds,  # (S,) — which expert each routed row uses
-    GatherIdx,  # (S,) int — batch_id -> source row of A; read only when not None
     ScatterIdx,  # (S,) int — batch_id -> destination row of C; read only when not None
     # Shape
     S,
@@ -592,6 +591,7 @@ def mx_dynamic_matmul_batched_kernel(
     stride_bs_global,  # expert stride of AsBsGlobal (``global_scale_stride``)
     stride_cs_global,  # expert stride of CsGlobal (0 broadcasts a shared scalar)
     stride_eid,
+    top_k,  # routed rows per source row of A: program batch_id reads row batch_id // top_k
     num_experts,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
@@ -637,7 +637,7 @@ def mx_dynamic_matmul_batched_kernel(
         C,
         Bs,
         ExpertIds,
-        GatherIdx,
+        top_k,
         ScatterIdx,
         stride_a_m,
         stride_b_e,
@@ -759,7 +759,6 @@ def mx_weight_only_matmul_batched_kernel(
     C,
     Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     ExpertIds,
-    GatherIdx,
     ScatterIdx,
     S,
     N,
@@ -778,6 +777,7 @@ def mx_weight_only_matmul_batched_kernel(
     stride_bias_n,
     stride_bs_global,  # expert stride of BsGlobal (``global_scale_stride``)
     stride_eid,
+    top_k,  # routed rows per source row of A: program batch_id reads row batch_id // top_k
     num_experts,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -801,7 +801,7 @@ def mx_weight_only_matmul_batched_kernel(
     if PDL:
         gdc_wait()
     batch_id, pid_n, expert_id, A, B, C, Bs, in_row, out_row = expert_setup(
-        A, B, C, Bs, ExpertIds, GatherIdx, ScatterIdx,
+        A, B, C, Bs, ExpertIds, top_k, ScatterIdx,
         stride_a_m, stride_b_e, stride_c_m, stride_bs_e, stride_eid, ADVANCE_BS=False,
     )
     if is_off_rank(expert_id, num_experts):  # EP sentinel: non-local expert, output left uninit
@@ -895,7 +895,6 @@ def full_precision_matmul_batched_kernel(
     C,  # (S, N) output; under GATE the GLU intermediate
     Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     ExpertIds,  # (S,) — which expert each batch element routes to
-    GatherIdx,  # (S,) int — batch_id -> source row of A; read only when not None
     ScatterIdx,  # (S,) int — batch_id -> destination row of C; read only when not None
     # Shape
     S,
@@ -912,6 +911,7 @@ def full_precision_matmul_batched_kernel(
     stride_bias_e,
     stride_bias_n,
     stride_eid,
+    top_k,  # routed rows per source row of A: program batch_id reads row batch_id // top_k
     num_experts,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
@@ -939,9 +939,9 @@ def full_precision_matmul_batched_kernel(
         A,
         B,
         C,
-        None,  # no scales on the full-precision path
+        B,  # no scales on the full-precision path: a placeholder, returned untouched (Triton 3.6 cannot return None)
         ExpertIds,
-        GatherIdx,
+        top_k,
         ScatterIdx,
         stride_a_m,
         stride_b_e,
@@ -1004,6 +1004,14 @@ def unstacked_gate(gemm, output_dtype, simulate_unfused, act_fn, swiglu_alpha, s
     return list(out) if quant_group is not None else [out]
 
 
+def routed_rows_per_row(A: torch.Tensor, expert_ids: torch.Tensor) -> int:
+    """Routed rows per row of ``A``: 1 when ``A`` holds every routed row, ``top_k`` when it holds one
+    row per token (the gate_up reading the unexpanded hidden). Program ``s`` reads row ``s // top_k``."""
+    S, rows = expert_ids.shape[0], A.shape[0]
+    assert rows == 0 or S % rows == 0, f"{S} routed rows do not split evenly over A's {rows} rows"
+    return S // rows if rows else 1
+
+
 @compile_time_only_triton_op(
     add_op_namespace_prefix("w8a8_block_dynamic_fp8_matmul_batched"),
     mutates_args=(),
@@ -1024,28 +1032,28 @@ def w8a8_block_dynamic_fp8_matmul_batched(
     activation_format: str | None = None,
     quantize_output: bool = False,
     output_dtype: torch.dtype | None = None,
-    gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
 ) -> List[torch.Tensor]:
     """Block-scale batched FP8 matmul: C[s] = A[s] @ B[expert_ids[s]].T; activations
     quantized offline in one pass. The ``gate``/``act_fn``/``swiglu_*``/``requant``/``output_dtype``
     flags are the dispatcher's gate|up fusion kwargs (torch custom ops take only primitives —
-    ``matmul_batched`` unpacks the bundle). ``gather_idx``/``scatter_idx`` map the source row of A
-    / destination row of C per program (None = row s). Returns ``[C]``, or ``[C, Cs]`` under
+    ``matmul_batched`` unpacks the bundle). Program ``s`` reads row ``s // top_k`` of A and writes
+    row ``scatter_idx[s]`` of C (None = row s). Returns ``[C]``, or ``[C, Cs]`` under
     ``requant``.
 
-    A:  (rows, K) raw bf16/fp16 activations — rows addressed via ``gather_idx``
+    A:  (rows, K) raw bf16/fp16 activations — row ``s // top_k`` per program
     B:  (num_experts, N, K) FP8 weights; under ``gate`` the (num_experts, 2N, K) gate|up stack
     Bs: (num_experts, N // block_n, K // block_k) per-block weight scales (2N under gate)
     """
     validate_dense_operands(A, B)
 
     output_dtype = resolve_output_dtype(output_dtype, A, As)
-    # S is the routed-row count (one program per expert_id); A may hold fewer rows when
-    # gather_idx maps many programs to one source row (gate_up reading unexpanded hidden).
+    # S is the routed-row count (one program per expert_id); A holds S // top_k rows when the
+    # gate_up reads the unexpanded hidden.
     K = A.shape[1]
     S = expert_ids.shape[0]
+    top_k = routed_rows_per_row(A, expert_ids)
     num_experts, n_rows, N = expert_weight_shape(B, gate)
 
     assert len(block_size) == 2, (
@@ -1084,7 +1092,7 @@ def w8a8_block_dynamic_fp8_matmul_batched(
             lambda intermediate_dtype: w8a8_block_dynamic_fp8_matmul_batched(
                 A, B, As, Bs, expert_ids, block_size, gate=True, act_fn=None,
                 activation_format=activation_format, output_dtype=intermediate_dtype,
-                gather_idx=gather_idx, scatter_idx=scatter_idx, bias=bias,
+                scatter_idx=scatter_idx, bias=bias,
             ),
             output_dtype, simulate_unfused, act_fn, swiglu_alpha, swiglu_limit,
             quant_group=block_n if requant else None, use_ue8m0=bs_u8.dtype == torch.uint8,
@@ -1123,7 +1131,6 @@ def w8a8_block_dynamic_fp8_matmul_batched(
             Cs,
             bias,
             expert_ids,
-            gather_idx,  # None = A is expert-sorted; read only when not None (folds at trace time)
             scatter_idx,  # None = C is expert-sorted; read only when not None (folds at trace time)
             S,
             N,
@@ -1144,6 +1151,7 @@ def w8a8_block_dynamic_fp8_matmul_batched(
             bias_stride_e,
             bias_stride_n,
             expert_ids.stride(0),
+            top_k,
             BLOCK_SIZE_K=block_k,
             BLOCK_N=block_n,
             BLOCK_K=block_k,
@@ -1181,7 +1189,6 @@ def w8a8_block_static_fp8_matmul_batched(
     activation_format: str | None = None,
     quantize_output: bool = False,
     output_dtype: torch.dtype | None = None,
-    gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
 ) -> List[torch.Tensor]:
@@ -1191,7 +1198,7 @@ def w8a8_block_static_fp8_matmul_batched(
     in the K-loop and the scalar once post-loop. Returns ``[C]``, or ``[C, Cs]`` under
     ``output_format="fp8"`` (the per-row output scale is independent of the per-tensor input scale).
 
-    A:  (rows, K) raw bf16/fp16 activations — rows addressed via ``gather_idx``
+    A:  (rows, K) raw bf16/fp16 activations — row ``s // top_k`` per program
     B:  (num_experts, N, K) FP8 weights; under ``gate`` the (num_experts, 2N, K) gate|up stack
     As: scalar / (1,) for one calibrated scale, or (num_experts,) for a MoE that
         calibrates each expert separately
@@ -1202,6 +1209,7 @@ def w8a8_block_static_fp8_matmul_batched(
     output_dtype = resolve_output_dtype(output_dtype, A, None)
     K = A.shape[1]
     S = expert_ids.shape[0]
+    top_k = routed_rows_per_row(A, expert_ids)
     num_experts, n_rows, N = expert_weight_shape(B, gate)
 
     assert len(block_size) == 2, (
@@ -1246,7 +1254,6 @@ def w8a8_block_static_fp8_matmul_batched(
             Cs,
             bias,
             expert_ids,
-            gather_idx,  # None = A is expert-sorted; read only when not None (folds at trace time)
             scatter_idx,  # None = C is expert-sorted; read only when not None (folds at trace time)
             S,
             N,
@@ -1267,6 +1274,7 @@ def w8a8_block_static_fp8_matmul_batched(
             bias_stride_e,
             bias_stride_n,
             expert_ids.stride(0),
+            top_k,
             num_experts,
             BLOCK_SIZE_K=block_k,
             BLOCK_N=block_n,
@@ -1301,16 +1309,14 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
     output_dtype: torch.dtype | None = None,
-    gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Tensor-scale batched FP8 matmul: C[s] = A[s] @ B[expert_ids[s]].T. ``A`` raw
     (``As`` None) -> quantized here (offline, per-token); else pre-quantized (``As`` given).
-    ``gather_idx``/``scatter_idx`` map the source row of A / destination row of C per program
-    (None = row s).
+    Program ``s`` reads row ``s // top_k`` of A and writes row ``scatter_idx[s]`` of C (None = row s).
 
-    A:  (rows, K) raw or pre-quantized FP8 activations — rows addressed via ``gather_idx``
+    A:  (rows, K) raw or pre-quantized FP8 activations — row ``s // top_k`` per program
     B:  (num_experts, N, K) FP8 expert weights; under ``gate`` the (num_experts, 2N, K) stack
     As: (rows,) per-token scales alongside a pre-quantized A, or — on a raw A — the calibrated
         (static) activation scale: one value, or one per expert
@@ -1321,6 +1327,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
     output_dtype = resolve_output_dtype(output_dtype, A, As)
     K = A.shape[1]
     S = expert_ids.shape[0]
+    top_k = routed_rows_per_row(A, expert_ids)
     num_experts, rows, _ = B.shape
     # under gate|up fusion B is the (E, 2N, K) stack; N is the per-projection output width
     N = rows // 2 if gate else rows
@@ -1347,7 +1354,6 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
             C,
             bias,
             expert_ids,
-            gather_idx,  # None = A is expert-sorted; read only when not None (folds at trace time)
             scatter_idx,  # None = C is expert-sorted; read only when not None (folds at trace time)
             S,
             N,
@@ -1365,6 +1371,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
             bias_stride_e,
             bias_stride_n,
             expert_ids.stride(0),
+            top_k,
             num_experts=num_experts,
             GATE=gate,
             ACT_FN=act_fn,
@@ -1394,7 +1401,6 @@ def mx_dynamic_matmul_batched(
     activation_format: str | None = None,
     quantize_output: bool = False,
     output_dtype: torch.dtype | None = None,
-    gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     a_global_scale: torch.Tensor | None = None,
     b_global_scale: torch.Tensor | None = None,
@@ -1404,8 +1410,8 @@ def mx_dynamic_matmul_batched(
     """Batched MX matmul ``C[s] = A[s] @ B[expert_ids[s]].T``; activations quantized
     inline in the kernel (decode: one act row per program, inline is free). The
     ``gate``/``act_fn``/``swiglu_*``/``requant``/``output_dtype`` flags are ``matmul_batched``'s
-    gate|up fusion kwargs. ``gather_idx``/``scatter_idx`` map the
-    source row of A / destination row of C per program (None = row s). Returns ``[C]``, or
+    gate|up fusion kwargs. Program ``s`` reads row ``s // top_k`` of A and writes row
+    ``scatter_idx[s]`` of C (None = row s). Returns ``[C]``, or
     ``[C, Cs]`` under ``requant``. Weight format is detected from ``B.dtype``: ``int8`` → packed
     E2M1 (MXFP4, ``B`` is ``(num_experts, N, K//2)``); ``float8_e4m3fn`` → unpacked E4M3 (MXFP8);
     both use UE8M0 group-32 scales; under ``gate`` the (num_experts, 2N, K[/2]) gate|up stack.
@@ -1445,14 +1451,18 @@ def mx_dynamic_matmul_batched(
         # a per-expert g_a quantizes each routed row against ITS expert's global, the row -> expert
         # map being this op's own `expert_ids`; a gathered A holds one row per token, routed to
         # top_k experts at once, so it quantizes per routed row, through the gather
-        quantize_per_routed_row = is_per_expert_global(a_global_scale) and gather_idx is not None
+        top_k = routed_rows_per_row(A, expert_ids)
+        quantize_per_routed_row = is_per_expert_global(a_global_scale) and top_k > 1
+        routed_rows = (
+            torch.arange(expert_ids.shape[0], device=A.device, dtype=torch.int32) // top_k
+            if quantize_per_routed_row else None
+        )
         A, As = MX_ACT_QUANT["nvfp4"](
             A,
             global_scale=normalize_global_scale(a_global_scale, B.shape[0]),
             expert_index=expert_ids,
-            gather_idx=gather_idx if quantize_per_routed_row else None,
+            gather_idx=routed_rows,
         )
-        gather_idx = None if quantize_per_routed_row else gather_idx
         pre_quantized = True
     # int8 A = caller-provided packed-E2M1 activations (W4A4, native mxf4 MMA): K is two
     # values per stored byte and the scales are mandatory (nothing left to quantize).
@@ -1463,6 +1473,7 @@ def mx_dynamic_matmul_batched(
     output_dtype = resolve_output_dtype(output_dtype, A, As)
     K = A.shape[1] * ACT_VALUES_PER_BYTE
     S = expert_ids.shape[0]
+    top_k = routed_rows_per_row(A, expert_ids)
     num_experts, n_rows, N = expert_weight_shape(B, gate)
     K_b = B.shape[2]
     assert K == WEIGHT_VALUES_PER_BYTE * K_b, (
@@ -1548,7 +1559,6 @@ def mx_dynamic_matmul_batched(
             input_global_scale,  # AsBsGlobal = g_b per expert (acc; g_a folds in-kernel via AsGlobal)
             out_global_scale,  # CsGlobal: requant output normalization (next proj's provided input_scale); None folds out
             expert_ids,
-            gather_idx,  # None = A is expert-sorted; read only when not None (folds at trace time)
             scatter_idx,  # None = C is expert-sorted; read only when not None (folds at trace time)
             S,
             N,
@@ -1572,6 +1582,7 @@ def mx_dynamic_matmul_batched(
             global_scale_stride(input_global_scale),
             global_scale_stride(out_global_scale),
             expert_ids.stride(0),
+            top_k,
             SCALE_GROUP_K=scale_group,
             num_experts=num_experts,
             SWIZZLED_SCALES=swizzled_scales,
@@ -1605,17 +1616,16 @@ def full_precision_matmul_batched(
     activation_format: str | None = None,
     quantize_output: bool = False,
     output_dtype: torch.dtype | None = None,
-    gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
 ) -> List[torch.Tensor]:
     """Full-precision (BF16/FP16) batched matmul: C[s] = A[s] @ B[expert_ids[s]].T — no
     quantization anywhere, fp32 accumulation. ``gate``/``act_fn``/``swiglu_*``/
     ``simulate_unfused`` are the dispatcher's gate|up fusion kwargs (GLU only; ``requant`` is
-    meaningless without a quantized format). ``gather_idx``/``scatter_idx`` map the source
-    row of A / destination row of C per program (None = row s).
+    meaningless without a quantized format). Program ``s`` reads row ``s // top_k`` of A and
+    writes row ``scatter_idx[s]`` of C (None = row s).
 
-    A:  (rows, K) BF16/FP16 activations — rows addressed via ``gather_idx``
+    A:  (rows, K) BF16/FP16 activations — row ``s // top_k`` per program
     B:  (num_experts, N, K) expert weights in A's dtype; under ``gate`` the (num_experts, 2N, K) stack
     """
     validate_dense_operands(A, B)
@@ -1629,6 +1639,7 @@ def full_precision_matmul_batched(
     output_dtype = resolve_output_dtype(output_dtype, A, None)
     K = A.shape[1]
     S = expert_ids.shape[0]
+    top_k = routed_rows_per_row(A, expert_ids)
     num_experts, _, N = expert_weight_shape(B, gate)
     C = A.new_empty(S, gate_out_cols(N, gate, act_fn), dtype=output_dtype)
 
@@ -1643,7 +1654,6 @@ def full_precision_matmul_batched(
             C,
             bias,
             expert_ids,
-            gather_idx,  # None = A is expert-sorted; read only when not None (folds at trace time)
             scatter_idx,  # None = C is expert-sorted; read only when not None (folds at trace time)
             S,
             N,
@@ -1658,6 +1668,7 @@ def full_precision_matmul_batched(
             bias_stride_e,
             bias_stride_n,
             expert_ids.stride(0),
+            top_k,
             num_experts=num_experts,
             GATE=gate,
             ACT_FN=act_fn,
@@ -1687,7 +1698,6 @@ def mx_weight_only_matmul_batched(
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
     output_dtype: torch.dtype | None = None,
-    gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     b_global_scale: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
@@ -1711,12 +1721,13 @@ def mx_weight_only_matmul_batched(
         return unstacked_gate(
             lambda intermediate_dtype: mx_weight_only_matmul_batched(
                 A, B, Bs, expert_ids, output_dtype=intermediate_dtype,
-                gather_idx=gather_idx, scatter_idx=scatter_idx, b_global_scale=b_global_scale, bias=bias,
+                scatter_idx=scatter_idx, b_global_scale=b_global_scale, bias=bias,
             ),
             output_dtype, simulate_unfused, act_fn, swiglu_alpha, swiglu_limit,
         )
     K = A.shape[1]
     S = expert_ids.shape[0]
+    top_k = routed_rows_per_row(A, expert_ids)
     WEIGHT_VALUES_PER_BYTE = 2 if B.dtype == torch.int8 else 1
     num_experts, rows, K_b = B.shape
     assert K == WEIGHT_VALUES_PER_BYTE * K_b, (
@@ -1742,7 +1753,6 @@ def mx_weight_only_matmul_batched(
             C,
             bias,
             expert_ids,
-            gather_idx,
             scatter_idx,
             S,
             N,
@@ -1761,6 +1771,7 @@ def mx_weight_only_matmul_batched(
             bias_stride_n,
             global_scale_stride(b_global_scale),
             expert_ids.stride(0),
+            top_k,
             num_experts=num_experts,
             SCALE_GROUP_K=scale_group,
             WEIGHT_VALUES_PER_BYTE=WEIGHT_VALUES_PER_BYTE,
@@ -1792,7 +1803,6 @@ def matmul_batched(
     quantize_output: bool = False,
     simulate_unfused: bool = False,
     output_dtype: torch.dtype | None = None,
-    gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     a_global_scale: torch.Tensor | None = None,
     b_global_scale: torch.Tensor | None = None,
@@ -1821,10 +1831,10 @@ def matmul_batched(
     block, and rides a pre-quantized ``As`` the same way. Under an NVFP4 requant the
     fused requant normalizes the GLU intermediate by the PROVIDED ``output_global_scale`` (the next
     proj's calibrated ``input_scale``) before the block quant and returns ``[C, Cs]``; the down
-    consumes it as ``As=Cs, a_global_scale=output_global_scale``. ``gather_idx``/``scatter_idx`` (each None or a ``(S,)`` map)
-    address the source row of ``A`` / destination row of ``C`` per program — None means row
-    ``s``; the gather lets the gate_up read unexpanded activations (source row
-    ``s // num_top_k``) with no copy.
+    consumes it as ``As=Cs, a_global_scale=output_global_scale``. ``A`` holds either one row per routed row
+    or one row per token (the gate_up reading the unexpanded activations with no copy): program ``s``
+    reads row ``s // top_k``, ``top_k = len(expert_ids) // len(A)``, and writes row ``scatter_idx[s]``
+    of ``C`` (None = row ``s``).
 
     Routes by what the weight tensors themselves say (there is no ``block_size``
     parameter — the quantization block is derived from the scale shape,
@@ -1879,7 +1889,6 @@ def matmul_batched(
             activation_format,
             quantize_output,
             output_dtype,
-            gather_idx,
             scatter_idx,
             bias=bias,
         )
@@ -1901,7 +1910,6 @@ def matmul_batched(
             activation_format,
             quantize_output,
             output_dtype,
-            gather_idx,
             scatter_idx,
             bias=bias,
         )
@@ -1923,7 +1931,6 @@ def matmul_batched(
             swiglu_limit,
             simulate_unfused,
             output_dtype,
-            gather_idx,
             scatter_idx,
             b_global_scale=b_global_scale,
             bias=bias,
@@ -1943,7 +1950,6 @@ def matmul_batched(
             activation_format,
             quantize_output,
             output_dtype,
-            gather_idx,
             scatter_idx,
             a_global_scale,
             b_global_scale,
@@ -1956,7 +1962,7 @@ def matmul_batched(
         )
         out = w8a8_tensor_dynamic_fp8_matmul_batched(
             A, B, As, Bs, expert_ids, gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused,
-            output_dtype, gather_idx, scatter_idx, bias=bias,
+            output_dtype, scatter_idx, bias=bias,
         )
     else:
         out = w8a8_block_dynamic_fp8_matmul_batched(
@@ -1974,7 +1980,6 @@ def matmul_batched(
             activation_format,
             quantize_output,
             output_dtype,
-            gather_idx,
             scatter_idx,
             bias=bias,
         )
