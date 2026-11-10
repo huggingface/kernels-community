@@ -101,6 +101,7 @@ class BayesianAutotuner(Autotuner):
         runoff: bool = True,
         basin_probes: bool = True,
         max_refine_iters: int = 5,
+        max_pair_trials: int = 24,
         log_path: str | None = None,
         path_anchor_axes: tuple[str, ...] = (),
         coupled_axes: tuple[tuple[str, ...], ...] = (),
@@ -133,6 +134,7 @@ class BayesianAutotuner(Autotuner):
         self.runoff = overrides.get("runoff", runoff)
         self.basin_probes = overrides.get("basin_probes", basin_probes)
         self.max_refine_iters = overrides.get("max_refine_iters", max_refine_iters)
+        self.max_pair_trials = overrides.get("max_pair_trials", max_pair_trials)
         # Branch axes (by kwarg name) that relocate the TILE optimum — the caller's
         # declaration, since it is configuration knowledge (the tuner never hardcodes
         # axis names). Each distinct value combination of these axes gets one guaranteed
@@ -765,21 +767,51 @@ class BayesianAutotuner(Autotuner):
 
         # Coordinate-descent refinement: try single-dim perturbations around
         # the current best until no neighbor improves.
-        for _ in range(self.max_refine_iters):
+        def refine():
+            for _ in range(self.max_refine_iters):
+                best_idx = min(timings, key=timings.get)
+                best_sig = sigs[best_idx]
+                best_ms = timings[best_idx]
+                improved = False
+                for i, s in enumerate(sigs):
+                    if i in timings:
+                        continue
+                    diff = sum(1 for (_, a), (_, b) in zip(best_sig, s) if a != b)
+                    if diff != 1:
+                        continue
+                    if bench_idx(i) < best_ms:
+                        improved = True
+                if not improved:
+                    break
+
+        refine()
+        # Pair step: coordinate descent stops where the winner is two coupled flips away — a narrower tile wants
+        # fewer warps (Qwen3 INT4 gate|up T=64 crowned BN=256/8 warps at 83us over BN=128/4 warps at 67us), a
+        # deeper K tile a different memory mode (GPT-OSS MXFP4 T=2048: BK=128 + pointer A at 837us vs the crowned
+        # BK=64 + descriptor A at 922us) — and each single flip measures worse. Bench the two-axis neighbors whose
+        # BOTH new values already won somewhere (ranked by the worse of their best measured times), then descend
+        # again from any winner.
+        if self.max_pair_trials:
+            best_by_value: Dict = defaultdict(lambda: float("inf"))
+            for i, t in timings.items():
+                for dv in sigs[i]:
+                    best_by_value[dv] = min(best_by_value[dv], t)
             best_idx = min(timings, key=timings.get)
-            best_sig = sigs[best_idx]
-            best_ms = timings[best_idx]
-            improved = False
+            best_sig, best_ms = sigs[best_idx], timings[best_idx]
+            pairs = []
             for i, s in enumerate(sigs):
                 if i in timings:
                     continue
-                diff = sum(1 for (_, a), (_, b) in zip(best_sig, s) if a != b)
-                if diff != 1:
-                    continue
+                changed = [b for a, b in zip(best_sig, s) if a != b]
+                if len(changed) == 2:
+                    pairs.append((max(best_by_value[dv] for dv in changed), i))
+            pairs.sort()
+            improved = False
+            for _, i in pairs[: self.max_pair_trials]:
                 if bench_idx(i) < best_ms:
                     improved = True
-            if not improved:
-                break
+            if improved:
+                refine()
 
         # Crown RUNOFF: the search's single-shot timings carry enough noise to flip crowns
         # between same-code tune rolls (gpt-oss prefill grouped rolled 1727-2150us on identical
@@ -955,7 +987,7 @@ class BayesianAutotuner(Autotuner):
             # without n_trials a 3-trial exploratory winner gets replayed at 100 trials.
             str(self.keys),
             f"n_trials={self.n_trials},n_startup_trials={self.n_startup_trials},gamma={self.gamma},"
-            f"runoff={self.runoff},basin_probes={self.basin_probes},max_refine_iters={self.max_refine_iters},"
+            f"runoff={self.runoff},basin_probes={self.basin_probes},max_refine_iters={self.max_refine_iters},max_pair_trials={self.max_pair_trials},"
             f"coupled_axes={self.coupled_axes},cold_banks={self.cold_banks is not None}",
             str(tuning_key),
         ] + [str(c) for c in configs]  # str(Config) is pre_hook-free and process-stable
@@ -1095,6 +1127,7 @@ def bayesian_autotune(
     runoff: bool = True,
     basin_probes: bool = True,
     max_refine_iters: int = 5,
+    max_pair_trials: int = 24,
     log_path: str | None = None,
     path_anchor_axes: tuple[str, ...] = (),
     coupled_axes: tuple[tuple[str, ...], ...] = (),
@@ -1117,6 +1150,8 @@ def bayesian_autotune(
                               (runtime override: ``basin_probes``)
     max_refine_iters:         coordinate-descent iterations after the TPE (0 disables)
                               (runtime override: ``max_refine_iters``)
+    max_pair_trials:          two-axis neighbors of the converged winner benched after the
+                              coordinate descent (0 disables) (runtime override: ``max_pair_trials``)
     path_anchor_axes:         branch axes (kwarg names) whose values relocate the tile
                               optimum — one guaranteed max-tile anchor per value combo
                               (see _basin_anchor_indices); the kernel declares them, the
@@ -1151,6 +1186,7 @@ def bayesian_autotune(
             runoff=runoff,
             basin_probes=basin_probes,
             max_refine_iters=max_refine_iters,
+            max_pair_trials=max_pair_trials,
             log_path=log_path,
             path_anchor_axes=path_anchor_axes,
             coupled_axes=coupled_axes,
