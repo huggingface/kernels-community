@@ -534,10 +534,10 @@ def upload_report(dataset: str, results: Path):
     from huggingface_hub import HfApi, hf_hub_download
     from huggingface_hub.errors import EntryNotFoundError
 
-  results = [
-      r for r in json.loads(results.read_text())
-      if r["status"] in {"changed", "no_changes"} and r["url"]
-  ]
+    results = [
+        r for r in json.loads(results.read_text())
+        if r["status"] in {"changed", "no_changes"} and r["url"]
+    ]
     if not results:
         return
     api = HfApi()
