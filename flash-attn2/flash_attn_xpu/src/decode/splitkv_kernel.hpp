@@ -127,7 +127,15 @@ using Tensor2DT = decltype(make_tensor(
     make_gmem_ptr(static_cast<T*>(nullptr)),
     make_layout(make_shape(int{}, int{}), make_stride(_1{}, int64_t{}))));
 
-template <class Mainloop_, class Epilogue_, class ElementO_>
+// LargeSurface: the paged cache has more rows than a 2D block surface.
+// MultiQ: a tile may hold GQA heads of more than one query (Q.n > 1).
+// Both are chosen on the host so that each kernel holds a single mainloop.
+template <
+    class Mainloop_,
+    class Epilogue_,
+    class ElementO_,
+    bool LargeSurface,
+    bool MultiQ>
 struct SplitKVDecodeKernel {
   using Mainloop = Mainloop_;
   using Epilogue = Epilogue_;
@@ -279,27 +287,9 @@ struct SplitKVDecodeKernel {
     auto blk_qv = make_coord(blk_q, blk_v);
 
     Mainloop mainloop(params.mainloop, shared.mainloop);
-    bool has_large_surface = false;
-    if constexpr (PagedKV) {
-      has_large_surface = a.total_rows_kv > (int64_t(1) << 24);
-    }
-    // Q spans several surfaces only when a tile holds GQA heads of more
-    // than one query. Huge paged caches are rare and take the general path.
-    if (has_large_surface) {
-      if constexpr (PagedKV) {
-        mainloop.template operator()<true, true>(
-            Q, K_2D, V_2D, tArA, tA_max, tA_sum, blk_qv, idx_b, blk_k0,
-            blk_k1, thr_id, s.kv_len, causal_rows, group);
-      }
-    } else if (Q.n > 1) {
-      mainloop.template operator()<false, true>(
-          Q, K_2D, V_2D, tArA, tA_max, tA_sum, blk_qv, idx_b, blk_k0,
-          blk_k1, thr_id, s.kv_len, causal_rows, group);
-    } else {
-      mainloop.template operator()<false, false>(
-          Q, K_2D, V_2D, tArA, tA_max, tA_sum, blk_qv, idx_b, blk_k0,
-          blk_k1, thr_id, s.kv_len, causal_rows, group);
-    }
+    mainloop.template operator()<LargeSurface, MultiQ>(
+        Q, K_2D, V_2D, tArA, tA_max, tA_sum, blk_qv, idx_b, blk_k0, blk_k1,
+        thr_id, s.kv_len, causal_rows, group);
 
     if constexpr (
         !is_empty_v<MainloopSharedStorage> &&

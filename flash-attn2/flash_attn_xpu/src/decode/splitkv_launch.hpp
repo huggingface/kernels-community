@@ -65,7 +65,7 @@ struct SplitKVConfig {
       Layout<ShapePV>,
       SubgroupLayoutPV>::TiledMMA;
 
-  template <bool Paged, bool Local>
+  template <bool Paged, bool Local, bool LargeSurface, bool MultiQ>
   static void run(sycl::queue& queue, decode_args_t const& args) {
     using Mainloop = DecodeMainloop<
         Paged,
@@ -77,7 +77,8 @@ struct SplitKVConfig {
         Tensor2D<Element>,
         Tensor2DT<Element>>;
     using Epilogue = DecodeEpilogue<Mainloop, ShapeOut>;
-    using Kernel = SplitKVDecodeKernel<Mainloop, Epilogue, Element>;
+    using Kernel = SplitKVDecodeKernel<
+        Mainloop, Epilogue, Element, LargeSurface, MultiQ>;
 
     typename Kernel::Params params{
         args,
@@ -101,15 +102,31 @@ struct SplitKVConfig {
     }
   }
 
+  template <bool Paged, bool Local>
+  static void run_mode(sycl::queue& queue, decode_args_t const& args) {
+    // A tile of tile_q (query, GQA head) rows spans several queries only
+    // with several queries per batch and a group size tile_q doesn't divide.
+    constexpr int tile_q = get<0>(ShapeOut{});
+    int group = args.num_heads_q / args.num_heads_kv;
+    bool multi_q = args.q_per_batch > 1 && group > 1 && group % tile_q != 0;
+    if (Paged && args.total_rows_kv > (int64_t(1) << 24)) {
+      if constexpr (Paged) run<Paged, Local, true, true>(queue, args);
+    } else if (multi_q) {
+      run<Paged, Local, false, true>(queue, args);
+    } else {
+      run<Paged, Local, false, false>(queue, args);
+    }
+  }
+
   static void dispatch(sycl::queue& queue, decode_args_t const& args) {
     bool paged = args.block_table != nullptr;
     bool local = args.window_size_left >= 0;
     if (paged) {
-      if (local) run<true, true>(queue, args);
-      else       run<true, false>(queue, args);
+      if (local) run_mode<true, true>(queue, args);
+      else       run_mode<true, false>(queue, args);
     } else {
-      if (local) run<false, true>(queue, args);
-      else       run<false, false>(queue, args);
+      if (local) run_mode<false, true>(queue, args);
+      else       run_mode<false, false>(queue, args);
     }
   }
 };
