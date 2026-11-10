@@ -162,10 +162,13 @@ struct DecodeMainloop {
   CUTLASS_DEVICE
   DecodeMainloop(Params const& params_, SharedStorage&) : params(params_) {}
 
-  // Q_2D:   (q, d)  packed GQA rows of one KV head
+  // Q_2D:   (q, d)  tile rows: GQA heads of one query or queries of one head
   // K_2D:   (k, d)  one KV head; whole cache when paged, one sequence else
   // V_2D:   (v, k)
   // [blk_k0, blk_k1): logical KV tiles handled by this work-group.
+  // seq_len: keys visible to the last row. causal_rows > 0: row r is query
+  // r of causal_rows bottom-right aligned ones and sees
+  // seq_len - (causal_rows - 1 - r) keys; otherwise every row sees seq_len.
   template <bool has_large_surface, typename QVCoord>
   CUTLASS_DEVICE void operator()(
       TensorQ2D const& Q_2D,
@@ -179,7 +182,8 @@ struct DecodeMainloop {
       int blk_k0,
       int blk_k1,
       int thr_id,
-      int seq_len) {
+      int seq_len,
+      int causal_rows) {
     using namespace sycl::ext::oneapi::this_work_item;
 
     auto tile_shape_v =
@@ -408,16 +412,26 @@ struct DecodeMainloop {
       /* V prefetch for GEMM 2 */
       prefetch(prefetch_v, pVgV(_, _, _, tile_idx));
 
-      /* Sliding window: the query sits at KV position seq_len - 1. */
-      if constexpr (LocalMask) {
-        int first_col = seq_len - 1 - params.window_size_left;
+      /* Per-row key range: causal end (packed queries) and sliding window
+         start. The window is relative to the row's last visible key. */
+      bool row_causal =
+          causal_rows > 1 && (K + 1) * tile_k > seq_len - (causal_rows - 1);
+      if (LocalMask || row_causal) {
         Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
         Tensor gP = local_tile(
             cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
         auto cS_thread = thr_mma_qk.partition_C(gP);
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < tSrS.size(); ++i) {
-          if (get<1>(cS_thread(i)) < first_col) {
+          int row = get<0>(cS_thread(i));
+          int col = get<1>(cS_thread(i));
+          int end = causal_rows > 0 ? seq_len - (causal_rows - 1 - row)
+                                    : seq_len;
+          bool masked = col >= end;
+          if constexpr (LocalMask) {
+            masked = masked || col < end - 1 - params.window_size_left;
+          }
+          if (masked) {
             tSrS(i) = ElementS(-INFINITY);
           }
         }

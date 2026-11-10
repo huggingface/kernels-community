@@ -26,45 +26,53 @@ using namespace cute;
 struct BatchSplit {
   int b;          // batch
   int row;        // query row
+  int q_len;      // # queries of the batch
   int seq_len;    // KV length visible to the query
+  int kv_len;     // KV length visible to the work-group (last query)
   int k_block0;   // first KV tile inside the window
   int windowed;   // # KV tiles inside the window
   int splits;     // # non-empty splits (>= 1)
   int nbps;       // KV tiles per split
-  bool valid;
+  bool valid;     // the work-group has KV to process
 };
 
-// pb indexes (batch, query) pairs: b = pb / q_per_batch.
-CUTLASS_DEVICE BatchSplit get_batch_split(decode_args_t const& a, int pb) {
+// Query j of batch b. With pack_queries the KV range and its splits cover
+// all queries of the batch, so every query of a work-group (and the combine
+// kernel) agrees on them; a query may then see no key of a split, or none at
+// all (seq_len <= 0).
+CUTLASS_DEVICE BatchSplit get_batch_split(decode_args_t const& a, int b, int j) {
   BatchSplit s{};
   s.valid = false;
-  int b = pb / a.q_per_batch;
-  int j = pb - b * a.q_per_batch;
   s.b = b;
   int q_len;
   if (a.cu_seqlens_q != nullptr) {
     s.row = a.cu_seqlens_q[b] + j;
     q_len = a.cu_seqlens_q[b + 1] - a.cu_seqlens_q[b];
   } else {
-    s.row = pb;
+    s.row = b * a.q_per_batch + j;
     q_len = a.q_per_batch;
   }
+  s.q_len = q_len;
   if (j >= q_len || q_len > a.q_per_batch) return s;
+  int full;
   if (a.seqused_k != nullptr) {
-    s.seq_len = a.seqused_k[b] + a.seqlen_k_add;
-    s.seq_len = s.seq_len < a.seqlen_k ? s.seq_len : a.seqlen_k;
+    full = a.seqused_k[b] + a.seqlen_k_add;
+    full = full < a.seqlen_k ? full : a.seqlen_k;
   } else if (a.cu_seqlens_k != nullptr) {
-    s.seq_len = a.cu_seqlens_k[b + 1] - a.cu_seqlens_k[b];
+    full = a.cu_seqlens_k[b + 1] - a.cu_seqlens_k[b];
   } else {
-    s.seq_len = a.seqlen_k;
+    full = a.seqlen_k;
   }
-  if (a.causal) s.seq_len -= q_len - 1 - j;
-  if (s.seq_len <= 0) return s;
+  s.seq_len = a.causal ? full - (q_len - 1 - j) : full;
+  // [lo_len - 1 - window, kv_len): keys of the shortest / longest query.
+  s.kv_len = a.pack_queries ? full : s.seq_len;
+  int lo_len = a.pack_queries && a.causal ? full - (q_len - 1) : s.kv_len;
+  if (s.kv_len <= 0) return s;
 
-  int k_blocks = (s.seq_len + kKVTile - 1) / kKVTile;
+  int k_blocks = (s.kv_len + kKVTile - 1) / kKVTile;
   s.k_block0 = 0;
   if (a.window_size_left >= 0) {
-    int first_col = s.seq_len - 1 - a.window_size_left;
+    int first_col = lo_len - 1 - a.window_size_left;
     s.k_block0 = (first_col > 0 ? first_col : 0) / kKVTile;
   }
   s.windowed = k_blocks - s.k_block0;
@@ -123,10 +131,13 @@ struct SplitKVDecodeKernel {
     int group = a.num_heads_q / a.num_heads_kv;
     int tile_q = get<0>(TileShapeO{});
     int tile_v = get<1>(TileShapeO{});
+    int rows = a.pack_queries ? a.q_per_batch : group;
+    int units = a.pack_queries ? a.batch * a.num_heads_q
+                               : a.batch * a.q_per_batch * a.num_heads_kv;
     return dim3(
         (a.head_size_v + tile_v - 1) / tile_v,
-        (group + tile_q - 1) / tile_q,
-        a.batch * a.q_per_batch * a.num_heads_kv * a.num_splits);
+        (rows + tile_q - 1) / tile_q,
+        units * a.num_splits);
   }
 
   static dim3 get_block_shape() {
@@ -142,18 +153,31 @@ struct SplitKVDecodeKernel {
     int blk_v = int(BlockIdxX());
     int blk_q = int(BlockIdxY());
     int flat = int(BlockIdxZ());
-    int bh = a.batch * a.q_per_batch * a.num_heads_kv;
+    const bool pack = a.pack_queries;
+    int group = a.num_heads_q / a.num_heads_kv;
+    // Work-group units: (batch, Q head) when packing queries, else
+    // (batch, query, KV head).
+    int heads = pack ? a.num_heads_q : a.num_heads_kv;
+    int bh = (pack ? a.batch : a.batch * a.q_per_batch) * heads;
     int idx_split = flat / bh;
     int rem = flat - idx_split * bh;
-    int idx_pb = rem / a.num_heads_kv;
-    int head = rem - idx_pb * a.num_heads_kv;
+    int idx_u = rem / heads;
+    int h = rem - idx_u * heads;
 
-    BatchSplit s = get_batch_split(a, idx_pb);
+    BatchSplit s = pack
+        ? get_batch_split(a, idx_u, 0)
+        : get_batch_split(a, idx_u / a.q_per_batch, idx_u % a.q_per_batch);
     if (!s.valid || idx_split >= s.splits) return;
+    if (pack && blk_q * get<0>(TileShapeO{}) >= s.q_len) return;
     int idx_b = s.b;
 
-    int group = a.num_heads_q / a.num_heads_kv;
-    int head_q0 = head * group;
+    int head = pack ? h / group : h;      // KV head
+    int head_q0 = pack ? h : h * group;   // Q head of tile row 0
+    int rows = pack ? s.q_len : group;
+    // Pack + causal: query j sees kv_len - (q_len - 1 - j) keys.
+    int causal_rows = pack && a.causal ? s.q_len : 0;
+    // Leading queries that see no key at all keep their LSE untouched.
+    int first_row = causal_rows > s.kv_len ? causal_rows - s.kv_len : 0;
     int blk_k0 = s.k_block0 + idx_split * s.nbps;
     int blk_k1 = blk_k0 + s.nbps;
     int blk_end = s.k_block0 + s.windowed;
@@ -164,7 +188,8 @@ struct SplitKVDecodeKernel {
     Tensor Q_2D = make_tensor(
         make_gmem_ptr(q_ptr),
         make_layout(
-            make_shape(group, a.head_size), make_stride(a.q_head_stride, _1{})));
+            make_shape(rows, a.head_size),
+            make_stride(pack ? a.q_row_stride : a.q_head_stride, _1{})));
 
     int64_t k_off, v_off;
     int kv_rows;
@@ -180,7 +205,7 @@ struct SplitKVDecodeKernel {
         k_off = int64_t(idx_b) * a.k_batch_stride;
         v_off = int64_t(idx_b) * a.v_batch_stride;
       }
-      kv_rows = s.seq_len;
+      kv_rows = s.kv_len;
     }
     auto k_ptr = const_cast<ElementK*>(static_cast<ElementK const*>(a.k)) +
         k_off + int64_t(head) * a.k_head_stride;
@@ -209,12 +234,12 @@ struct SplitKVDecodeKernel {
       if constexpr (PagedKV) {
         mainloop.template operator()<true>(
             Q_2D, K_2D, V_2D, tArA, tA_max, tA_sum, blk_qv, idx_b, blk_k0,
-            blk_k1, thr_id, s.seq_len);
+            blk_k1, thr_id, s.kv_len, causal_rows);
       }
     } else {
       mainloop.template operator()<false>(
           Q_2D, K_2D, V_2D, tArA, tA_max, tA_sum, blk_qv, idx_b, blk_k0,
-          blk_k1, thr_id, s.seq_len);
+          blk_k1, thr_id, s.kv_len, causal_rows);
     }
 
     if constexpr (
@@ -227,31 +252,36 @@ struct SplitKVDecodeKernel {
     Epilogue epilogue{{}, shared.epilogue};
     int Hq = a.num_heads_q;
     int Dv = a.head_size_v;
+    // Tile rows are Q heads (stride 1 head) or queries (stride 1 row).
     if (s.splits == 1) {
       // Single split: write the final output and LSE directly.
       auto o_ptr = static_cast<ElementO*>(a.out) +
           (int64_t(s.row) * Hq + head_q0) * Dv;
       Tensor O_2D = make_tensor(
           make_gmem_ptr(o_ptr),
-          make_layout(make_shape(group, Dv), make_stride(int64_t(Dv), _1{})));
+          make_layout(
+              make_shape(rows, Dv),
+              make_stride(int64_t(pack ? Hq : 1) * Dv, _1{})));
       float* lse_ptr = a.softmax_lse + int64_t(idx_b) * a.lse_batch_stride +
           int64_t(head_q0) * a.lse_head_stride +
           int64_t(s.row) * a.lse_row_stride;
       epilogue(
-          O_2D, tArA, tA_max, tA_sum, blk_qv, thr_id, group, 1, nullptr,
-          lse_ptr, a.lse_head_stride);
+          O_2D, tArA, tA_max, tA_sum, blk_qv, thr_id, rows, first_row,
+          lse_ptr, pack ? a.lse_row_stride : a.lse_head_stride);
     } else {
       int S = a.num_splits;
       float* o_ptr = a.oaccum +
           ((int64_t(s.row) * S + idx_split) * Hq + head_q0) * Dv;
       Tensor O_2D = make_tensor(
           make_gmem_ptr(o_ptr),
-          make_layout(make_shape(group, Dv), make_stride(int64_t(Dv), _1{})));
+          make_layout(
+              make_shape(rows, Dv),
+              make_stride(int64_t(pack ? S * Hq : 1) * Dv, _1{})));
       float* lse_acc =
           a.lse_accum + (int64_t(s.row) * Hq + head_q0) * S + idx_split;
       epilogue(
-          O_2D, tArA, tA_max, tA_sum, blk_qv, thr_id, group, S, lse_acc,
-          nullptr, 0);
+          O_2D, tArA, tA_max, tA_sum, blk_qv, thr_id, rows, first_row,
+          lse_acc, int64_t(pack ? Hq : 1) * S);
     }
   }
 };
@@ -284,10 +314,10 @@ struct SplitKVCombineKernel {
     decode_args_t const& a = params.args;
     int t = int(ThreadIdxX());
     int hq = int(BlockIdxY());
-    int b = int(BlockIdxZ());
+    int pb = int(BlockIdxZ());
 
-    BatchSplit s = get_batch_split(a, b);
-    if (!s.valid || s.splits <= 1) return;
+    BatchSplit s = get_batch_split(a, pb / a.q_per_batch, pb % a.q_per_batch);
+    if (!s.valid || s.splits <= 1 || s.seq_len <= 0) return;
 
     int S = a.num_splits;
     int Hq = a.num_heads_q;

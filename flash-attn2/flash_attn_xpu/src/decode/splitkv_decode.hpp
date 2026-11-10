@@ -15,6 +15,7 @@ namespace flash_xpu_splitkv {
 
 // Work-group shape of the decode kernel (kv_tile 64, 4 subgroups of 16).
 constexpr int kKVTile = 64;
+constexpr int kQTile = 8;  // Q rows per work-group
 constexpr int kMaxSplits = 64;
 
 struct decode_args_t {
@@ -26,13 +27,17 @@ struct decode_args_t {
   float* oaccum = nullptr;        // [rows, splits, Hq, Dv] (num_splits > 1)
   float* lse_accum = nullptr;     // [rows, Hq, splits]     (num_splits > 1)
 
-  // Every batch b has up to q_per_batch queries; each query j is handled as
-  // its own decode row (row = cu_seqlens_q ? cu_seqlens_q[b] + j
-  // : b * q_per_batch + j). With cu_seqlens_q, batches with more than
-  // q_per_batch queries are skipped (left to the generic kernel), as are
-  // positions past the batch's query count.
+  // Every batch b has up to q_per_batch queries (row = cu_seqlens_q ?
+  // cu_seqlens_q[b] + j : b * q_per_batch + j). With cu_seqlens_q, batches
+  // with more than q_per_batch queries are skipped (left to the generic
+  // kernel), as are positions past the batch's query count.
   const int* cu_seqlens_q = nullptr;
   int q_per_batch = 1;
+  // Q tile rows of a work-group: false = the GQA group of one query,
+  // true = up to kQTile queries of one Q head. Packing queries reads the KV
+  // of a batch once per Q head instead of once per query, which wins for
+  // MHA and small GQA groups.
+  bool pack_queries = false;
   // Bottom-right causal: query j of a batch with n queries sees the first
   // seq_len - (n - 1 - j) keys. Without it every query sees all keys.
   bool causal = false;

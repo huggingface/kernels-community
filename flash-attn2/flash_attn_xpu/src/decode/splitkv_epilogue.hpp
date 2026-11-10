@@ -125,12 +125,12 @@ class DecodeEpilogue {
   CUTLASS_HOST_DEVICE
   DecodeEpilogue(Params const&, SharedStorage& shared_) : shared(shared_) {}
 
-  // O:           (q, v) output surface of this KV head, final (q dtype) when
-  //              not splitting, fp32 partial output of this split otherwise.
-  // lse_accum:   per-split natural-log LSE, row q_row at
-  //              lse_accum[q_row * num_kv_splits] (only when splitting).
-  // ptr_lse:     final LSE of row 0 of this KV head's group, rows lse_stride
-  //              apart (only when not splitting).
+  // O:           (q, v) output surface of the tile rows, final (q dtype)
+  //              when not splitting, fp32 partial output of this split
+  //              otherwise.
+  // ptr_lse:     LSE of tile row 0 (natural log; the per-split LSE when
+  //              splitting), rows lse_stride apart. Rows below first_row
+  //              see no key and leave it untouched.
   template <class TensorO2D, typename QVCoord>
   CUTLASS_DEVICE void operator()(
       TensorO2D const& O,
@@ -139,19 +139,19 @@ class DecodeEpilogue {
       FragARow& tA_sum,
       QVCoord blk_qv,
       int thr_id,
-      int head_group_q,
-      int num_kv_splits,
-      float* lse_accum,
+      int num_rows,
+      int first_row,
       float* ptr_lse,
       int64_t lse_stride) {
     using namespace cute;
     constexpr float kLn2 = 0.6931471805599453f;
 
-    // Decode tiles head_group_q across the grid's Q dimension (blk_qv[0]).
-    // This work-item reports statistics for packed row q_row.
+    // The grid's Q dimension (blk_qv[0]) tiles the num_rows rows.
+    // This work-item reports statistics for row q_row.
     constexpr int q_tile_rows = cute::size<0>(TileShapeO{});
     int q_row = get<0>(blk_qv) * q_tile_rows + thr_id;
-    bool row_valid = (thr_id < q_tile_rows) && (q_row < head_group_q);
+    bool row_valid = (thr_id < q_tile_rows) && (q_row < num_rows) &&
+                     (q_row >= first_row);
 
     auto [rA, rA_max, rA_sum, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
 
@@ -160,20 +160,18 @@ class DecodeEpilogue {
     if (row_valid && get<1>(blk_qv) == 0) {
       float row_lse = static_cast<float>(rA_max(0)) * kLn2 +
                       sycl::log(static_cast<float>(rA_sum(0)));
-      if (num_kv_splits > 1) {
-        lse_accum[q_row * num_kv_splits] = row_lse;
-      } else {
-        ptr_lse[q_row * lse_stride] = row_lse;
-      }
+      ptr_lse[q_row * lse_stride] = row_lse;
     }
 
     if (!active) return;
 
     // Normalize every split independently; the combine kernel weights the
-    // normalized partial outputs with exp(LSE_i - LSE).
+    // normalized partial outputs with exp(LSE_i - LSE). A row that sees no
+    // key of this split (packed queries) has sum 0 and LSE -inf: output 0.
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < rA_sum.size(); i++) {
-      rA_sum(i) = ElementA(1) / rA_sum(i);
+      rA_sum(i) = rA_sum(i) > ElementA(0) ? ElementA(1) / rA_sum(i)
+                                          : ElementA(0);
     }
 
     CUTLASS_PRAGMA_UNROLL
