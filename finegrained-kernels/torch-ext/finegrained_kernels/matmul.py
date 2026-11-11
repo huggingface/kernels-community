@@ -317,7 +317,9 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
                 GATE, False, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, block_k,
             )
             accumulator = block_dynamic_dot(
-                accumulator, a, a_s, b, b_s, block_k, SWAP_AB, USE_DOT_SCALED, False
+                accumulator, a, a_s, b, b_s, block_k, SWAP_AB, USE_DOT_SCALED, False,
+                B_SCALE_UNIFORM=not GATE and block_n % BLOCK_SIZE_N == 0,
+                B_SCALE_GROUPS=BLOCK_SIZE_N // block_n if not GATE and BLOCK_SIZE_N % block_n == 0 else 1,
             )
             a_ptrs, as_ptrs, b_ptrs, bs_ptrs, _, _ = advance_ptrs(
                 a_ptrs, as_ptrs, b_ptrs, bs_ptrs, b_ptrs, bs_ptrs,

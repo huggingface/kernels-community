@@ -1000,7 +1000,8 @@ def fp8_dot(a, b, SWAP_AB: tl.constexpr, BLOCK_SIZE_K: tl.constexpr):
 def block_dynamic_dot(
     acc, a, a_s, b, b_s,
     block_k: tl.constexpr, SWAP_AB: tl.constexpr, USE_DOT_SCALED: tl.constexpr,
-    FAKE_BATCH: tl.constexpr = False,
+    FAKE_BATCH: tl.constexpr = False, B_SCALE_UNIFORM: tl.constexpr = False,
+    B_SCALE_GROUPS: tl.constexpr = 1,
 ):
     """Accumulate one block-dynamic (1x128/128x128) fp8 K-tile into ``acc``, oriented by
     ``SWAP_AB``. ``USE_DOT_SCALED`` (UE8M0 scales on a native-M tile): fold the group scales
@@ -1011,7 +1012,12 @@ def block_dynamic_dot(
     UE8M0). ``FAKE_BATCH`` (single-token decode): ``fp8_dot`` pads the lone token to the MMA N
     atom and both scales broadcast down the weight-row (M) dim. Single-exit if/else so only the
     taken arm type-checks (a trailing fall-through arm would be checked even when an earlier
-    branch is taken)."""
+    branch is taken). ``B_SCALE_UNIFORM`` (the weight tile inside one scale block, every ``b_s`` equal):
+    the software rescale folds the weight scale into the per-row activation scale, one FMA per
+    partial value instead of two multiplies — the rescale, not the fp8 MMA, bounds the K loop on
+    tcgen05. ``B_SCALE_GROUPS`` > 1: the tile spans that many contiguous scale blocks, folded the
+    same way per block (DeepSeek-V3 qkv N=21504 K=7168 M=8192 on B200: 2025 -> 1247 us at BN=256;
+    folding the gate|up stack's column-interleaved scales measured no gain)."""
     if USE_DOT_SCALED:
         reps: tl.constexpr = block_k // 32
         a_sg = a_s[:, None].broadcast_to(a_s.shape[0], reps)
@@ -1031,6 +1037,18 @@ def block_dynamic_dot(
                 acc = acc + d * a_sd[:, None] * b_sd[:, None]
             else:  # no-swap [BM, BN] GEVM: act scale down M, weight-N scale across N (upstream form)
                 acc = acc + d * a_sd[:, None] * b_sd[None, :]
+        elif B_SCALE_UNIFORM and SWAP_AB:
+            acc = acc + tl.dot(b, a) * (a_sd * tl.max(b_sd, 0))[None, :]
+        elif B_SCALE_UNIFORM:
+            acc = acc + tl.dot(a, b) * (a_sd * tl.max(b_sd, 0))[:, None]
+        elif B_SCALE_GROUPS > 1 and not SWAP_AB:
+            # the tile spans B_SCALE_GROUPS contiguous scale blocks -> [BM, G, BN / G] with one per-row factor each
+            BM: tl.constexpr = a.shape[0]
+            BN: tl.constexpr = b.shape[1]
+            G: tl.constexpr = B_SCALE_GROUPS
+            bg = tl.max(b_sd.reshape(G, BN // G), 1)
+            s = a_sd[:, None] * bg[None, :]
+            acc = acc + (tl.dot(a, b).reshape(BM, G, BN // G) * s[:, :, None]).reshape(BM, BN)
         elif SWAP_AB:
             acc = acc + tl.dot(b, a) * b_sd[:, None] * a_sd[None, :]
         else:

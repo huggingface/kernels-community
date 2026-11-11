@@ -331,7 +331,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
                 b_ptrs, BDescriptor, gate_s_ptr, None, up_s_ptr, row0, n_off, k * BLOCK_SIZE_K, k,
                 stride_bs_k, GATE, True, B_MEMORY_MODE, False, BLOCK_SIZE_N, BLOCK_SIZE_K,
             )
-            acc = block_dynamic_dot(acc, a, a_s, w, w_s, BLOCK_SIZE_K, False, USE_DOT_SCALED, False)
+            acc = block_dynamic_dot(acc, a, a_s, w, w_s, BLOCK_SIZE_K, False, USE_DOT_SCALED, False, B_SCALE_UNIFORM=not GATE)
             a_ptrs += BLOCK_SIZE_K * stride_a_k
             b_ptrs += BLOCK_SIZE_K * stride_b_k
 
