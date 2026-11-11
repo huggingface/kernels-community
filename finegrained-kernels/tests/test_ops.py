@@ -30,6 +30,7 @@ weight scales pre-swizzled into the 5D SWIZZLE_32_4_4 tcgen05 layout — a pure 
 checked against the affine reference).
 Nothing in this file uses a kernel under test as the oracle."""
 
+import os
 from dataclasses import dataclass, field, replace
 
 import pytest
@@ -80,6 +81,7 @@ repack_ggml_int = finegrained_kernels.repack_ggml_int
 dequantize_int_weight = finegrained_kernels.dequantize_int_weight
 repack_awq_int4 = finegrained_kernels.repack_awq_int4
 repack_gptq_int4 = finegrained_kernels.repack_gptq_int4
+block_fp8_weight_only_matmul_batched_kernel = internals.batched.block_fp8_weight_only_matmul_batched_kernel
 int_weight_only_matmul_batched_kernel = internals.batched.int_weight_only_matmul_batched_kernel
 mx_dynamic_matmul_batched_kernel = internals.batched.mx_dynamic_matmul_batched_kernel
 w8a8_tensor_dynamic_fp8_matmul_batched_kernel = internals.batched.w8a8_tensor_dynamic_fp8_matmul_batched_kernel
@@ -87,11 +89,14 @@ block_fp8_weight_only_matmul_grouped_kernel = internals.grouped.block_fp8_weight
 full_precision_matmul_grouped_kernel = internals.grouped.full_precision_matmul_grouped_kernel
 int_weight_only_matmul_grouped_kernel = internals.grouped.int_weight_only_matmul_grouped_kernel
 mx_dynamic_matmul_grouped_kernel = internals.grouped.mx_dynamic_matmul_grouped_kernel
+mx_weight_only_matmul_grouped_kernel = internals.grouped.mx_weight_only_matmul_grouped_kernel
 w8a8_block_dynamic_fp8_matmul_grouped_kernel = internals.grouped.w8a8_block_dynamic_fp8_matmul_grouped_kernel
 w8a8_block_static_fp8_matmul_grouped_kernel = internals.grouped.w8a8_block_static_fp8_matmul_grouped_kernel
 w8a8_tensor_dynamic_fp8_matmul_grouped_kernel = internals.grouped.w8a8_tensor_dynamic_fp8_matmul_grouped_kernel
+block_fp8_weight_only_matmul_2d_kernel = internals.matmul.block_fp8_weight_only_matmul_2d_kernel
 int_weight_only_matmul_2d_kernel = internals.matmul.int_weight_only_matmul_2d_kernel
 mx_dynamic_matmul_kernel = internals.matmul.mx_dynamic_matmul_kernel
+w8a8_block_dynamic_fp8_matmul_kernel = internals.matmul.w8a8_block_dynamic_fp8_matmul_kernel
 w8a8_tensor_dynamic_fp8_matmul_kernel = internals.matmul.w8a8_tensor_dynamic_fp8_matmul_kernel
 
 
@@ -611,9 +616,11 @@ def _fp32_intermediate(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As
         W = dequant_gate_up(row, B, Bs, Bs_global)
     else:
         W = row["dequant"](B, Bs, Bs_global)
-    if problem.activation_format == "bf16" and problem.weights != "nvfp4":
+    if problem.activation_format == "bf16" and problem.weights != "nvfp4" and B.dtype != torch.float8_e4m3fn:
         # the dequantized weight in the activation dtype, as the GEMM does; NVFP4 applies its
-        # second-level global after the dot, so its W * global never rounds
+        # second-level global after the dot, so its W * global never rounds. FP8 weight-only
+        # is exact: FP8 * scale in fp32 (its scale lands on the partial, the activation or the
+        # output — SCALE_MODE — so the scaled weight is never rounded where it can avoid it)
         W = W.to(A.dtype).float()
     bias = _bias(problem, op)
     if op == "matmul":
@@ -804,6 +811,12 @@ def _check(problem: Problem, dq_out, ref_cmp, expert_ids, op):
         atol, rtol = DTYPE_TO_TOL[problem.dtype]
         if IS_SM89:
             atol = max(atol, 1e-2 * ref_cmp[keep].abs().max().item())
+        if problem.weights.startswith("fp8_") and problem.activation_format == "bf16":
+            # FP8 weight-only against the exact FP8 * scale reference: the SCALE_MODE placements that feed the
+            # MMA a bf16-rounded operand (the scaled weight under "tile", the scaled activation under "act") sit
+            # one bf16 rounding from it at the output's scale (2D/batched/grouped on B200: 2.6e-3..3.4e-3 of
+            # max|ref|, under 2^-8 = 3.9e-3); "acc" / "post" stay exact up to accumulation order
+            atol = max(atol, 2.0 ** -8 * ref_cmp[keep].abs().max().item())
         torch.testing.assert_close(
             dq_out[keep], ref_cmp[keep].to(problem.dtype).float(), atol=atol, rtol=rtol
         )
@@ -1015,12 +1028,23 @@ _SWEEP_CELLS = [
     # non-128 N on the 2D gate|up tile (gpt-oss-style N=320): the BN=128 tile overhangs N
     (Problem(weights="mxfp4", gate=True, activation_format="mxfp4", quantize_output=True, N=320, K=320), "matmul", mx_dynamic_matmul_kernel),
     (Problem(weights="nvfp4", gate=True, activation_format="nvfp4", quantize_output=True, swizzled=True, S=8), "batched", mx_dynamic_matmul_batched_kernel),
+    # the MX weight-only scalar decode arm: one-row tiles, admitted below half a routed row per expert
+    (Problem(weights="mxfp4", activation_format="bf16", S=4, E=16), "grouped", mx_weight_only_matmul_grouped_kernel),
     (Problem(weights="fp8_128x128", activation_format="bf16"), "grouped", block_fp8_weight_only_matmul_grouped_kernel),
+    # FP8 weight-only scale placements: the decode tiles' acc / act modes on the batched and 2D kernels, and the
+    # one-block-spans-K "post" placement (SCALE_POST) on per-tensor weights
+    (Problem(weights="fp8_128x128", activation_format="bf16", S=8), "batched", block_fp8_weight_only_matmul_batched_kernel),
+    (Problem(weights="fp8_128x128", activation_format="bf16", S=16), "matmul", block_fp8_weight_only_matmul_2d_kernel),
+    (Problem(weights="fp8_tensor", activation_format="bf16"), "grouped", block_fp8_weight_only_matmul_grouped_kernel),
     # gathered gate|up rows on the raw-activation dot arms: a TMA-gathered descriptor A under WS
     # is the lowering failure warp_spec_memory_mode_pruner(gather_only=True) fences
     (Problem(weights="bf16", gate=True), "grouped", full_precision_matmul_grouped_kernel),
     # the static block-scale kernel: its own three-stream K-loop under the block-dynamic fences
     (Problem(weights="fp8_128x128", gate=True), "grouped", w8a8_block_dynamic_fp8_matmul_grouped_kernel),
+    # the ungated block-dynamic tiles: the swapped token tiles and the weight-scale fold into the activation scale,
+    # per tile (grouped) and per scale block across a BN=256 tile (2D)
+    (Problem(weights="fp8_128x128", S=32), "grouped", w8a8_block_dynamic_fp8_matmul_grouped_kernel),
+    (Problem(weights="fp8_128x128", N=256), "matmul", w8a8_block_dynamic_fp8_matmul_kernel),
     (Problem(weights="fp8_128x128", gate=True, static=True), "grouped", w8a8_block_static_fp8_matmul_grouped_kernel),
     # the calibrated (static) arm on per-tensor weights: it hands the kernel a RAW A to quantize
     # per tile, the one activation form that cannot ride the TMA gather, so its admitted set is
@@ -1039,6 +1063,8 @@ _SWEEP_CELLS = [
     # the 2D kernel's single-token scalar reduce: its narrow tiles and the gate|up rows
     (Problem(weights="int4", zero_points=True, gate=True, S=1), "matmul", int_weight_only_matmul_2d_kernel),
     (Problem(weights="int4", zero_points=True, gate=True), "grouped", int_weight_only_matmul_grouped_kernel),
+    # the grouped scalar decode arm: one- to four-row tiles, admitted below half a routed row per expert
+    (Problem(weights="int4", zero_points=True, gate=True, S=4, E=16), "grouped", int_weight_only_matmul_grouped_kernel),
     (Problem(weights="int8", zero_points=True, S=4), "matmul", int_weight_only_matmul_2d_kernel),
     (Problem(weights="int2", zero_points=True, S=4), "matmul", int_weight_only_matmul_2d_kernel),
     # Sweeps include BK < group, so a tuned winner cannot hide wide-group addressing.
@@ -1089,7 +1115,11 @@ def test_every_admitted_config_is_correct(problem: Problem, op, tuner):
         for nargs in admitted["launches"]:  # every config runs below, in each launch's specialization
             tuner.precompile(admitted["configs"], nargs, workers=16)
         forgiven, overflowed = [], []
-        for cfg in admitted["configs"]:
+        configs = admitted["configs"]
+        if shard := os.environ.get("FINEGRAINED_SWEEP_SHARD"):  # "i/n": run every n-th admitted config, from the i-th
+            index, count = map(int, shard.split("/"))
+            configs = configs[index::count]
+        for cfg in configs:
             known = [tuner.known_failure(cfg, nargs) for nargs in admitted["launches"]]
             if any(k and _is_memory_overflow(k) for k in known):
                 overflowed.append(cfg)

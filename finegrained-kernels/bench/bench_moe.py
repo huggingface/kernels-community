@@ -2203,7 +2203,9 @@ def bench_problem_row(row, pname, cfg, arms, weights, rows_out):
             gu, gus, dn, dns, _, _, guz, dnz = banks[0]
             reference = _integer_moe_reference(cfg, hidden, idx, w, gu, gus, dn, dns, guz, dnz)
         # without our arm as the parity anchor, a decode dequant reference checks the others
+        # (unquantized weights carry no scales to dequantize: the plain reference already checks them)
         dequant_check = (None if "finegrained-kernels" in arms or grouped or cfg["weights"] in INT_BITS
+                         or banks[0][1] is None
                          else _dequant_moe_reference(cfg, hidden, idx, w, *banks[0][:6]))
         anchor_res, anchor_out = None, None
         for name in arms:
@@ -2641,6 +2643,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
             reference = (reference_input @ dequant.t()).to(x.dtype)
             del dequant
         anchor_res, anchor_out = None, None
+        runs = None  # an --arms filter can leave a row's bank with no arm to run
         for name in bank_arms[0]:
             runs = [arms[name] for arms in bank_arms]
             res, out = bench_modes(runs, name, reference)
