@@ -573,8 +573,12 @@ def pipeline_autotuning_configs(configs, pipelines, *, num_warps=None):
 
 
 def block_fp8_scale_mode_configs(configs):
-    """Cross the FP8 weight-only ``SCALE_MODE`` axis into a kernel's configs: where the coarse block scale lands
-    (``block_fp8_scale_mode_pruner`` admits each mode only where its scale is constant over its operand)."""
+    """Cross the FP8 weight-only ``SCALE_MODE`` axis into a kernel's configs: every tile keeps ``"tile"``; ``"acc"`` and
+    ``"act"`` go only onto the decode tiles where they measured a win (B200, 2D N=8192 K=6144 block-128: acc M=1 13.0 ->
+    11.2 us and grouped gate|up T=64 1857 -> 1477 us at BM <= 32, BK 128 — wider BK never sits in a 128 scale block;
+    act M=16 15.2 -> 11.4 us at BM=16; at M >= 64 tile matched or beat both).
+    ``"post"`` is no axis: it is the only placement where one scale block spans K, set at launch (``SCALE_POST``).
+    ``block_fp8_scale_mode_pruner`` admits each mode only where its scale is constant over its operand."""
     return [
         triton.Config(
             dict(config.kwargs, SCALE_MODE=mode),
@@ -585,7 +589,10 @@ def block_fp8_scale_mode_configs(configs):
             pre_hook=config.pre_hook,
         )
         for config in configs
-        for mode in ("tile", "acc", "post", "act")
+        for mode in ("tile", "acc", "act")
+        if mode == "tile"
+        or (mode == "acc" and config.kwargs["BLOCK_SIZE_M"] <= 32 and config.kwargs["BLOCK_SIZE_K"] <= 128)
+        or (mode == "act" and config.kwargs["BLOCK_SIZE_M"] <= 16)
     ]
 
 

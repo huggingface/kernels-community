@@ -282,22 +282,20 @@ def grouped_scalar_decode_pruner():
 def block_fp8_scale_mode_pruner():
     """``early_config_prune`` admitting each FP8 weight-only ``SCALE_MODE`` only where its scale is
     constant over what it multiplies: ``"acc"`` needs every K step inside one scale block
-    (``BLOCK_K % BLOCK_SIZE_K == 0``), ``"post"`` needs one block spanning all of K (per-expert
-    or per-channel scales), ``"act"`` needs the N tile inside one scale block."""
+    (``BLOCK_K % BLOCK_SIZE_K == 0``), ``"act"`` needs the N tile inside one scale block; where one block spans K
+    (per-tensor, per-expert or per-channel scales) the launch's ``SCALE_POST`` decides, so only ``"tile"`` runs."""
 
     def ok(c, args):
         mode = c.kwargs.get("SCALE_MODE", "tile")
         if args["BLOCK_K"] >= args["K"]:
-            # one scale over all of K: a single multiply after the loop does strictly less work than
-            # every in-loop placement, so it is the only mode — nothing to tune
-            return mode == "post"
+            # one scale over all of K: the kernel applies it once after the loop (SCALE_POST) whatever the tuned mode,
+            # so the other modes would only re-run the same kernel
+            return mode == "tile"
         if mode == "acc":
             # each step's partial is a separate dot read back out of the accumulator: a win on
             # decode tiles (2D N=8192 K=6144 on B200: M=1 13.0 -> 11.2 us; grouped gate|up T=64
             # 1857 -> 1477 us at BM=16), a loss once BM reaches tcgen05 sizes (M=256: 73 vs 47 us)
             return args["BLOCK_K"] % c.kwargs["BLOCK_SIZE_K"] == 0 and c.kwargs["BLOCK_SIZE_M"] <= 32
-        if mode == "post":
-            return False
         if mode == "act":
             # the N tile (2*BN interleaved rows under GATE) inside one scale block; separately
             # scaled gate/up rows alternate scale blocks within the tile

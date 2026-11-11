@@ -1274,8 +1274,10 @@ def block_fp8_weight_only_matmul_batched_kernel(
     B_MEMORY_MODE: tl.constexpr = "pointer",
     PDL: tl.constexpr = False,
     SCALE_MODE: tl.constexpr = "tile",  # where the coarse block scale lands (block_fp8_weight_only_dot)
+    SCALE_POST: tl.constexpr = False,  # one scale block spans K (set at launch): "post", the output scale
 ):
     """Batched FP8 W8A16 expert GEMM with optional fused gate/up activation."""
+    MODE: tl.constexpr = "post" if SCALE_POST else SCALE_MODE
     if PDL:
         gdc_wait()
     batch_id, pid_n, expert_id, A, B, C, unused_scale_base, in_row, out_row = expert_setup(
@@ -1313,7 +1315,7 @@ def block_fp8_weight_only_matmul_batched_kernel(
             k * BLOCK_SIZE_K, expert_id, offs_bn, k * BLOCK_SIZE_K + offs_k,
             stride_bs_e, stride_bs_n, stride_bs_k,
             GATE, False, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
-            BLOCK_N, BLOCK_K, GATE_SCALES, SCALE_MODE,
+            BLOCK_N, BLOCK_K, GATE_SCALES, MODE,
         )
         a_ptrs += BLOCK_SIZE_K * stride_a_k
         b_ptrs += BLOCK_SIZE_K * stride_b_k
@@ -1328,7 +1330,7 @@ def block_fp8_weight_only_matmul_batched_kernel(
         Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
         global_row=expert_id,
         # "post": one scale block spans K, so the weight scale is a per-column output scale
-        GlobalScale=Bs + weight_scale_rows(offs_bn, BLOCK_N, GATE_SCALES) * stride_bs_n if SCALE_MODE == "post" else None,
+        GlobalScale=Bs + weight_scale_rows(offs_bn, BLOCK_N, GATE_SCALES) * stride_bs_n if MODE == "post" else None,
         stride_global_e=stride_bs_e,
     )
 
@@ -2117,6 +2119,7 @@ def block_fp8_weight_only_matmul_batched(
             BLOCK_K=scale_block_k,
             GATE=gate,
             GATE_SCALES=gate and Bs.shape[1] > 1,
+            SCALE_POST=scale_block_k >= K,
             ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha,
             SWIGLU_LIMIT=swiglu_limit,

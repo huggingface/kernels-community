@@ -1487,8 +1487,10 @@ def block_fp8_weight_only_matmul_2d_kernel(
     PDL: tl.constexpr = False,
     GROUP_SIZE_M: tl.constexpr = None,
     SCALE_MODE: tl.constexpr = "tile",  # where the coarse block scale lands (block_fp8_weight_only_dot)
+    SCALE_POST: tl.constexpr = False,  # one scale block spans K (set at launch): "post", the output scale
 ):
     """Dense FP8 W8A16 GEMM with in-tile weight rescaling."""
+    MODE: tl.constexpr = "post" if SCALE_POST else SCALE_MODE
     if PDL:
         gdc_wait()
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
@@ -1508,7 +1510,7 @@ def block_fp8_weight_only_matmul_2d_kernel(
             0, offs_bn, k * BLOCK_SIZE_K + offs_k,
             0, stride_bs_n, stride_bs_k,
             GATE, False, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
-            BLOCK_N, BLOCK_K, GATE_SCALES, SCALE_MODE, K_SLICES=K_SLICES,
+            BLOCK_N, BLOCK_K, GATE_SCALES, MODE, K_SLICES=K_SLICES,
         )
         a_ptrs += BLOCK_SIZE_K * stride_a_k
         b_ptrs += BLOCK_SIZE_K * stride_b_k
@@ -1524,7 +1526,7 @@ def block_fp8_weight_only_matmul_2d_kernel(
         COMPUTE_MODE="dot", N_COLS=N,
         Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
         # "post": one scale block spans K, so the weight scale is a per-column output scale
-        GlobalScale=Bs + weight_scale_rows(offs_bn, BLOCK_N, GATE_SCALES) * stride_bs_n if SCALE_MODE == "post" else None,
+        GlobalScale=Bs + weight_scale_rows(offs_bn, BLOCK_N, GATE_SCALES) * stride_bs_n if MODE == "post" else None,
     )
 
 
@@ -2553,6 +2555,7 @@ def block_fp8_weight_only_matmul_2d(
             SWIGLU_LIMIT=swiglu_limit, SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(dtype),
             GATE_SCALES=gate and Bs.shape[0] > 1,
+            SCALE_POST=scale_block_k >= K,
             **pdl_launch_kwargs(),
         )
     return [C]

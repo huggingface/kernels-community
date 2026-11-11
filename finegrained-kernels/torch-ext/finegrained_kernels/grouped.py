@@ -1922,12 +1922,13 @@ def block_fp8_weight_only_matmul_grouped_kernel(
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
     GROUP_SIZE_M: tl.constexpr = 8,
-    # Where the coarse block scale lands: "tile" rescales every weight value before the dot,
-    # "acc" scales each K step's [M, N] partial (one block spans the step), "post" scales the
-    # accumulator once (one block spans K). The latter two leave the decode a plain FP8 cast.
+    # Where the coarse block scale lands (block_fp8_weight_only_dot): the tuned "tile" / "acc" / "act", or
+    # "post" — the epilogue's output scale — whenever one scale block spans K (SCALE_POST, set at launch).
     SCALE_MODE: tl.constexpr = "tile",
+    SCALE_POST: tl.constexpr = False,
 ):
     """Persistent FP8 W8A16 GEMM with optional fused gate/up activation."""
+    MODE: tl.constexpr = "post" if SCALE_POST else SCALE_MODE  # one scale block spans K: the output scale
     NUM_PROGRAMS = tl.num_programs(axis=0)
     start_pid = tl.program_id(axis=0)
     num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
@@ -2007,7 +2008,7 @@ def block_fp8_weight_only_matmul_grouped_kernel(
                 expert_id64, offs_bn, k * BLOCK_SIZE_K + offs_k,
                 stride_bs_e, stride_bs_n, stride_bs_k,
                 GATE, True, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
-                BLOCK_N, BLOCK_K, GATE_SCALES, SCALE_MODE,
+                BLOCK_N, BLOCK_K, GATE_SCALES, MODE,
                 B_DESCRIPTOR_IS_2D=B_DESCRIPTOR_IS_2D,
             )
             if A_MEMORY_MODE == "pointer":
@@ -2042,7 +2043,7 @@ def block_fp8_weight_only_matmul_grouped_kernel(
             stride_bias_n=stride_bias_n,
             global_row=expert_id64,
             # "post": one scale block spans K, so the weight scale is a per-column output scale
-            GlobalScale=Bs + weight_scale_rows(offs_bn, BLOCK_N, GATE_SCALES) * stride_bs_n if SCALE_MODE == "post" else None,
+            GlobalScale=Bs + weight_scale_rows(offs_bn, BLOCK_N, GATE_SCALES) * stride_bs_n if MODE == "post" else None,
             stride_global_e=stride_bs_e,
         )
 
@@ -2973,6 +2974,7 @@ def block_fp8_weight_only_matmul_grouped(
             BLOCK_K=scale_block_k,
             GATE=gate,
             GATE_SCALES=gate and Bs.shape[1] > 1,
+            SCALE_POST=scale_block_k >= K,
             ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha,
             SWIGLU_LIMIT=swiglu_limit,
