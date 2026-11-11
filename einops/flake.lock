@@ -41,11 +41,11 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1794415240,
-        "narHash": "sha256-/lzZlUAmFY4pWG139YJmdFNbRM/p4M9LtTlZzghdfDw=",
+        "lastModified": 1794417977,
+        "narHash": "sha256-gZFesIqOgAOvDPI67ERC3Rmue+IHNyfRN6F+rTQ1SFQ=",
         "owner": "huggingface",
         "repo": "kernels",
-        "rev": "7e6475f1b5891d95c3e190a3dff53c08f7538883",
+        "rev": "606ca529f3ca893a54886048594166c3201a04cd",
         "type": "github"
       },
       "original": {
@@ -70,22 +70,6 @@
         "type": "github"
       }
     },
-    "nixpkgs_2": {
-      "locked": {
-        "lastModified": 1793977579,
-        "narHash": "sha256-WrSODdZFVIs/Hh2NzC0bY+ROByi0bATg8WfePX8dPj8=",
-        "owner": "NixOS",
-        "repo": "nixpkgs",
-        "rev": "4fe25e12eb9f4c744966dd3de5a05246cf098601",
-        "type": "github"
-      },
-      "original": {
-        "owner": "NixOS",
-        "ref": "nixpkgs-unstable",
-        "repo": "nixpkgs",
-        "type": "github"
-      }
-    },
     "root": {
       "inputs": {
         "kernel-builder": "kernel-builder",
@@ -94,7 +78,10 @@
     },
     "rust-overlay": {
       "inputs": {
-        "nixpkgs": "nixpkgs_2"
+        "nixpkgs": [
+          "kernel-builder",
+          "nixpkgs"
+        ]
       },
       "locked": {
         "lastModified": 1792048409,
