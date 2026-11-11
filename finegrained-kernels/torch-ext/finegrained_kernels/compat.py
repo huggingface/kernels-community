@@ -260,11 +260,13 @@ def persistent_program_count(device_index: int, block_m: int | None = None) -> i
 
 
 def persistent_programs_per_sm(block_m: int) -> int:
-    """Overlap small persistent tiles' load latency with four programs per SM.
+    """Overlap small persistent tiles' load latency with four programs per SM, sixteen for the one-row tiles of
+    the CUDA-core decode reduce (a few registers each, no shared memory: they need the occupancy a non-persistent
+    grid of every tile would get).
 
     Tiles of 128 rows already occupy an SM's shared memory, so extra programs only add scheduling overhead.
     """
-    return 1 if block_m >= 128 else 4
+    return 1 if block_m >= 128 else 16 if block_m == 1 else 4
 
 
 

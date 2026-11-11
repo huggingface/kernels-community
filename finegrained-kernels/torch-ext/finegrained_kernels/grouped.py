@@ -1140,7 +1140,15 @@ def _mx_weight_only_grouped_configs():
                 num_stages=config.num_stages, pre_hook=config.pre_hook,
             )
             configs.extend(pipeline_autotuning_configs([seed], ("tile_loop", "flattened")))
-    return configs
+    # one-row tiles on the CUDA-core reduce (the batched kernel's decode arm), below half a routed row per expert
+    # (grouped_scalar_decode_pruner): a fine decode grid instead of a mostly empty MMA tile
+    scalar = narrow_scalar_autotuning_configs(
+        block_ms=(1,), block_ns=(8, 16, 32), WARP_SPEC=False, PACKED_SCHEDULE=False, SWAP_AB=True,
+        PIPELINE="k_loop", GROUP_SIZE_M=1, A_MEMORY_MODE="pointer", B_MEMORY_MODE="pointer",
+    )
+    for config in scalar:
+        config.pre_hook = grouped_pre_hook
+    return configs + scalar
 
 
 @bayesian_autotune(
@@ -1173,6 +1181,7 @@ def _mx_weight_only_grouped_configs():
             warp_spec_compile_guard_pruner(),
             gated_pointer_weight_warp_spec_pruner(),
             weight_only_dot_scaled_warps_pruner(),
+            grouped_scalar_decode_pruner(),
         )
     },
 )
@@ -1280,7 +1289,7 @@ def mx_weight_only_matmul_grouped_kernel(
             B + expert_id64 * stride_b_e, offs_bn, offs_kb,
             stride_b_n, stride_b_k, SWAP_AB,
         )
-        acc = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
+        acc = acc_init(COMPUTE_MODE, BLOCK_SIZE_M, n_width, SWAP_AB)
         kb_off = 0
         # The tail K-tile slides back to end at K instead of running past the row, so BK need
         # only FIT K (see the batched sibling): the overlapped lanes are re-read and cancelled
@@ -1310,7 +1319,7 @@ def mx_weight_only_matmul_grouped_kernel(
             b_ptrs += (step // WEIGHT_VALUES_PER_BYTE) * stride_b_k
             kb_off = tl.minimum((k + 1) * BLOCK_SIZE_K, K - BLOCK_SIZE_K) // WEIGHT_VALUES_PER_BYTE
 
-        if SWAP_AB:
+        if SWAP_AB and COMPUTE_MODE != "scalar":  # the scalar reduce already returns [1, N]
             acc = tl.trans(acc)
         gemm_epilogue(
             C, C, acc, out_row, pid_n, tile_id // num_n_tiles, row_mask,
