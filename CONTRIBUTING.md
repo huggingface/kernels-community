@@ -58,7 +58,9 @@ A recipe that needs files with no upstream equivalent keeps them in
 `port/overlay/`.
 
 - Change the kernel by changing the recipe or overlay, then inspect the result
-  with `nix build .#portedSrc`.
+  with `nix build .#portedSrc`. See
+  [generating the source at build time](https://github.com/huggingface/kernels/tree/main/kernel-port#generating-the-source-at-build-time)
+  for the `port` argument.
 - `flake.nix` and the recipe both pin upstream, and must agree. A `vendor`
   operation takes the flake input of the same `name`.
 - The build and `scripts/check_ports.py` fail when `build.toml` or
