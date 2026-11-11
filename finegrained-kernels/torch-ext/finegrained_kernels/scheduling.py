@@ -148,6 +148,28 @@ def _scatter_kernel(
 
 
 @triton.jit
+def _route_one_block_kernel(
+    ExpertIds, Perm, PermToken, ExpertStart, S,
+    NUM_TOP_K: tl.constexpr, NUM_EXPERTS: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+):
+    """The whole decode-sized routing in one program: count, exclusive offsets and the expert sort that
+    ``_count_kernel`` + ``_exclusive_offsets_kernel`` + ``_scatter_kernel`` (and the counters' memset) build
+    over four launches. One ``tl.sort`` on ``(expert << 32) | position`` orders the slots by expert; EP
+    sentinels take key ``NUM_EXPERTS`` and so fill the tail past ``expert_start[E]``, as the scatter places
+    them, and the padding sorts after them."""
+    offs = tl.arange(0, BLOCK_SIZE)
+    in_range = offs < S
+    expert_id = tl.load(ExpertIds + offs, mask=in_range, other=0)
+    key = tl.where(in_range, tl.where(is_off_rank(expert_id, NUM_EXPERTS), NUM_EXPERTS, expert_id), NUM_EXPERTS + 1)
+    counts = tl.histogram(key, NUM_EXPERTS, mask=key < NUM_EXPERTS)
+    tl.store(ExpertStart, 0)
+    tl.store(ExpertStart + 1 + tl.arange(0, NUM_EXPERTS), tl.cumsum(counts, 0))
+    src = tl.sort((key.to(tl.uint64) << 32) | offs.to(tl.uint64)).to(tl.uint32).to(tl.int32)
+    tl.store(Perm + offs, src, mask=in_range)
+    tl.store(PermToken + offs, src // NUM_TOP_K, mask=in_range)
+
+
+@triton.jit
 def _count_kernel(
     ExpertIds, ExpertFreq, S, NUM_EXPERTS: tl.constexpr, BLOCK_SIZE: tl.constexpr, AGGREGATE: tl.constexpr = False,
 ):
@@ -207,6 +229,10 @@ def routed_expert_start(expert_ids: torch.Tensor, num_experts: int) -> torch.Ten
     return _compute_expert_start(expert_ids, num_experts)
 
 
+# Routes up to this many slots are sorted by one program (``_route_one_block_kernel``).
+_ONE_BLOCK_ROUTING_MAX_ROWS = 1024
+
+
 def _aggregate_routing(num_routed_tokens: int, num_experts: int) -> bool:
     return num_routed_tokens >= 4096 and num_experts <= 2 * _ROUTING_BLOCK_SIZE
 
@@ -259,6 +285,18 @@ def _compute_grouped_scheduling(
     device = expert_ids.device
     expert_ids = expert_ids.int().contiguous()  # routing kernels index with unit stride
     num_routed_tokens = expert_ids.numel()  # S = num_tokens * num_top_k
+    if num_routed_tokens <= _ONE_BLOCK_ROUTING_MAX_ROWS:
+        # decode: one launch instead of a memset and three (Qwen3-30B-A3B T=1 on B200: 5.5 -> ~1.5 us of routing)
+        expert_start = torch.empty(num_experts + 1, dtype=torch.int32, device=device)
+        perm = torch.empty(num_routed_tokens, dtype=torch.int32, device=device)
+        perm_token = torch.empty(num_routed_tokens, dtype=torch.int32, device=device)
+        with device_context(device):
+            compile_time_only_triton_wrap(_route_one_block_kernel)[(1,)](
+                expert_ids, perm, perm_token, expert_start, num_routed_tokens,
+                NUM_TOP_K=num_top_k, NUM_EXPERTS=num_experts,
+                BLOCK_SIZE=max(triton.next_power_of_2(num_routed_tokens), 16),
+            )
+        return perm_token, perm, expert_start
     counters = torch.empty(num_experts + 1, dtype=torch.int32, device=device)
     expert_start = _launch_expert_start(expert_ids, num_experts, counters)
     perm = torch.empty(num_routed_tokens, dtype=torch.int32, device=device)
