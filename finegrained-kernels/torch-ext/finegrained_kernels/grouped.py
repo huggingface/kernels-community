@@ -144,12 +144,28 @@ def _block_fp8_grouped_configs():
     return configs
 
 
+def _block_dynamic_fp8_grouped_configs():
+    """The block-FP8 grouped grid plus swapped token tiles (weight rows on the tcgen05 M side) for experts holding
+    16-64 rows, where an unswapped BM <= 32 tile runs on mma.sync."""
+    configs = _block_fp8_grouped_configs()
+    for config in configs:
+        config.kwargs["SWAP_AB"] = False
+    if is_sm10x():
+        configs.extend(
+            triton.Config(dict(c.kwargs, SWAP_AB=True), num_warps=c.num_warps, num_stages=c.num_stages,
+                          num_ctas=c.num_ctas, maxnreg=c.maxnreg, pre_hook=c.pre_hook)
+            for c in list(configs)
+            if c.kwargs["BLOCK_SIZE_M"] in (16, 32, 64) and not c.kwargs["WARP_SPEC"] and c.num_warps == 4
+            and c.kwargs["PIPELINE"] == "k_loop"
+        )
+    return configs
+
+
 @bayesian_autotune(
-    # No SWAP_AB axis: the descriptor loads the natural-orientation ((2|1), BN, BK) gate|up box
-    # and transposes once to the same K-major tile the pointer arm builds. Both memory axes are
-    # emitted; the tuner routes per key. Swap-coupling verdicts are B200 (sm_100) — re-chart on
-    # H100 or the target device before reusing SWAP_AB here.
-    _block_fp8_grouped_configs(),
+    # SWAP_AB (sm_100): swapped token tiles, the weight box loaded rows-major as the MMA lhs; unswapped, the
+    # descriptor loads the natural-orientation ((2|1), BN, BK) gate|up box and transposes once to the same
+    # K-major tile the pointer arm builds. Both memory axes are emitted; the tuner routes per key.
+    _block_dynamic_fp8_grouped_configs(),
     # GATE keys the gate|up arm separately: its dot is 2*BN wide, a different tile optimum.
     # BLOCK_SIZE_N/BLOCK_SIZE_K here are the launch-pinned quant block (not tuned) — they gate
     # descriptor-box legality, so checkpoints with different blocks must not share a winner.
@@ -233,6 +249,9 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
     GROUP_SIZE_M: tl.constexpr = 8,
+    # weight rows on the MMA's M side, a 16-64 token tile on N: below tcgen05's 128-row M the
+    # unswapped tile falls back to mma.sync with most of its rows empty
+    SWAP_AB: tl.constexpr = False,
 ):
     """Block-scale grouped FP8 expert matmul kernel — persistent grid-stride over tiles.
 
@@ -255,7 +274,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     tile, keep the plain ``tl.dot`` + software rescale."""
     USE_DOT_SCALED: tl.constexpr = (As.dtype.element_ty == tl.uint8) and (
         BLOCK_SIZE_M >= 128
-    )
+    ) and not SWAP_AB
     NUM_PROGRAMS = tl.num_programs(axis=0)
     start_pid = tl.program_id(axis=0)
     num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
@@ -314,14 +333,14 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
             offs_k,
             stride_b_n,
             stride_b_k,
-            False,
+            SWAP_AB,
         )
         # under GATE the tile's two scale blocks are the adjacent (gate, up) pair at 2*pid_n; non-GATE
         # reads the single block (up_s_ptr dead).
         gate_s_ptr = Bs + expert_id64 * stride_bs_e + ((2 if GATE else 1) * pid_n) * stride_bs_n
         up_s_ptr = gate_s_ptr + stride_bs_n
 
-        acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
+        acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, SWAP_AB)
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC and PIPELINE == "k_loop"):
             a, a_s = load_act_block_dynamic(
                 a_ptrs, as_ptrs, row_mask, row_mask, ADescriptor, m_start, k * BLOCK_SIZE_K,
@@ -329,12 +348,17 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
             )
             w, w_s = load_weight_block_dynamic(
                 b_ptrs, BDescriptor, gate_s_ptr, None, up_s_ptr, row0, n_off, k * BLOCK_SIZE_K, k,
-                stride_bs_k, GATE, True, B_MEMORY_MODE, False, BLOCK_SIZE_N, BLOCK_SIZE_K,
+                stride_bs_k, GATE, True, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
             )
-            acc = block_dynamic_dot(acc, a, a_s, w, w_s, BLOCK_SIZE_K, False, USE_DOT_SCALED, False, B_SCALE_UNIFORM=not GATE)
+            acc = block_dynamic_dot(
+                acc, tl.trans(a) if SWAP_AB else a, a_s, w, w_s, BLOCK_SIZE_K, SWAP_AB, USE_DOT_SCALED, False,
+                B_SCALE_UNIFORM=not GATE,
+            )
             a_ptrs += BLOCK_SIZE_K * stride_a_k
             b_ptrs += BLOCK_SIZE_K * stride_b_k
 
+        if SWAP_AB:
+            acc = tl.trans(acc)
         gemm_epilogue(
             C,
             Cs,
