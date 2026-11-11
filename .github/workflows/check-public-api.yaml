@@ -39,6 +39,6 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           # Keep in sync with check-ports.yaml.
-          KERNEL_PORT: "nix run --refresh github:huggingface/kernels/kernel-port-no-importlib#kernel-port --"
+          KERNEL_PORT: "nix run --refresh github:huggingface/kernels/kernel-port-srcless#kernel-port --"
         run: |
           uv run --script scripts/check_public_api.py --base-ref "$BASE_SHA"
