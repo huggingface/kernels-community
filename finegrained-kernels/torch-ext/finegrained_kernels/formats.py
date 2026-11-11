@@ -252,9 +252,14 @@ def routed_rows(A, gather_idx, scatter_idx, expert_start, num_experts) -> int:
     return S
 
 def tokens_per_expert_bucket(S: int, num_experts: int) -> int:
-    """log2 bucket of the average routed rows per expert — the grouped kernels' autotune
-    key (raw S would retune per unique token count)."""
-    return int((S + num_experts - 1) // num_experts).bit_length()
+    """log2 bucket of the average routed rows per expert — the grouped kernels' autotune key (raw S
+    would retune per unique token count). From one row per expert up, the bucket of ``ceil(S / E)``
+    (``tile_order_pruner``'s regime boundary falls on these); below it, sixteenths of a row: the
+    ceiling alone put every decode batch in one bucket (Qwen3-30B-A3B, E=128 top-8: T=1, 8 and 16),
+    and T=16 ran T=1's crown (81 vs 46 us)."""
+    if S < num_experts:
+        return (16 * S // num_experts).bit_length()  # 0..4
+    return (-(-S // num_experts)).bit_length() + 4
 
 def normalize_global_scale(
     g: torch.Tensor | None, num_experts: int
