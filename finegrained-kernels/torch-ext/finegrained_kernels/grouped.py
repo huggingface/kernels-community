@@ -1778,6 +1778,16 @@ def _block_fp8_weight_only_grouped_configs():
     configs = _grouped_dot_configs()
     for config in configs:
         config.kwargs.update(SWAP_AB=False, PIPELINE="k_loop")
+    # Decode tiles with the weight rows on the MMA's M side: an expert holding a row or two leaves most of a
+    # 16-row token tile empty (B200, E128 H=I=6144 top-4 gate|up T=64: 1477 -> 1360 us; Qwen3-30B-A3B T=8
+    # 37.1 -> 34.9 us). The INT grouped kernel measured slower swapped (its rows-major decode costs more).
+    configs.extend(
+        triton.Config(dict(c.kwargs, SWAP_AB=True), num_warps=c.num_warps, num_stages=c.num_stages,
+                      num_ctas=c.num_ctas, maxnreg=c.maxnreg, pre_hook=c.pre_hook)
+        for c in list(configs)
+        if c.kwargs["BLOCK_SIZE_M"] <= 32 and not c.kwargs["WARP_SPEC"] and c.num_warps == 4
+        and c.kwargs["BLOCK_SIZE_N"] in (64, 128) and c.kwargs["BLOCK_SIZE_K"] in (128, 256)
+    )
     # Stage decoded weights on the MMA lhs and overlap consecutive output tiles.
     if is_sm10x():
         for packed in (False, True):
