@@ -1431,12 +1431,11 @@ def w8a8_block_dynamic_fp8_matmul_batched(
         f"the fused 'fp8' requant needs square quant blocks, got {block_size}"
     )
     # The decode band runs the ``gate`` contract UNSTACKED (``unstacked_gate``): this same op
-    # with ``act_fn=None`` (the raw gate|up output), then the one-kernel ``fused_glu``. Holding the gate AND up tiles per CTA
-    # doubles the smem footprint and halves occupancy precisely where the launch is
-    # weight-bandwidth-bound, and the fp8 ``tl.dot`` — unlike the MX/NVFP4 scaled MMA, whose
-    # wide M operand earns the native instruction — gains nothing back: DSV3 shape, same 235MB
-    # weight read, stacked 69.8µs vs unstacked 49.8µs at S=8, a wash by S=32. A requant is the
-    # same offline quant the raw activation gets below, applied to the GLU output.
+    # with ``act_fn=None`` (the raw gate|up output), then the one-kernel ``fused_glu``. Both forms
+    # read the same interleaved 2*BN-row tile; the fused epilogue's requant pins the output tile to
+    # the quant block, which takes the narrower N grids the raw output tunes to at a few rows.
+    # DeepSeek-V3 MoE decode (T=1, cold weights, graph): 73.2us unstacked vs 73.6 fused, bit-identical.
+    # A requant is the same offline quant the raw activation gets below, applied to the GLU output.
     if gate and act_fn is not None and S <= GATE_UNSTACK_MAX_S:
         return unstacked_gate(
             lambda intermediate_dtype: w8a8_block_dynamic_fp8_matmul_batched(
