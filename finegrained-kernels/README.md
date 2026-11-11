@@ -325,7 +325,7 @@ How much of the MMA each tile uses. *Scale off weight tile*: a coarse weight sca
 
 | Family | Kernel | native scaled MMA | swap-AB decode | scalar GEMV | split-K | tile pipeline | weight on MMA lhs | cuBLAS route | scale off weight tile |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 2D | block FP8 (dynamic act) | 🟠 | 🔴 | 🔴 | 🟢 | 🟠 | ⚪ | 🟠 | 🟢* |
+| 2D | block FP8 (dynamic act) | 🟠 | ⚪† | 🔴 | 🟢 | 🟠 | ⚪ | 🟠 | 🟢* |
 | 2D | block FP8 (static act) | ⚪ | 🔴 | 🔴 | ⚪† | ⚪ | ⚪ | 🔴 | 🟢* |
 | 2D | tensor / row-wise FP8 | ⚪ | 🟠 | 🔴 | ⚪† | ⚪ | ⚪ | 🟠 | 🟢* |
 | 2D | MXFP8 / MXFP4 / NVFP4 | 🟠 | 🟠 | 🟠 | 🟢 | 🟢 | ⚪ | 🟠 | ⚪ |
