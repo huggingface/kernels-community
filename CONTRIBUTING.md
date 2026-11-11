@@ -37,6 +37,9 @@ When you are done, you can open a PR to the `kernels-community` repository. Plea
 
 ## How do ported kernels work?
 
+> [!WARNING]
+> `kernel-port` is experimental, so this layout may still change.
+
 A kernel can be generated from an upstream repository by a
 [`kernel-port`](https://github.com/huggingface/kernels/tree/main/kernel-port)
 recipe in `<kernel>/port/port.kdl`, in place of committing a copy of upstream.
@@ -56,8 +59,8 @@ A recipe that needs files with no upstream equivalent keeps them in
 
 - Change the kernel by changing the recipe or overlay, then inspect the result
   with `nix build .#portedSrc`.
-- `flake.nix` and the recipe both pin upstream, and must agree. An input for a
-  `vendor` operation has the same name as that operation.
+- `flake.nix` and the recipe both pin upstream, and must agree. A `vendor`
+  operation takes the flake input of the same `name`.
 - The build and `scripts/check_ports.py` fail when `build.toml` or
   `port-provenance.json` differ from what the recipe generates. Review the
   change, then update them:
@@ -71,8 +74,6 @@ A recipe that needs files with no upstream equivalent keeps them in
   If `port-provenance.json` changes without a change to the recipe, a new
   `kernel-port` changed the generated code. Compare `.#portedSrc` before and
   after to see how.
-
-Older ports commit the generated tree in `<kernel>/src` instead.
 
 ## How to benchmark a kernel?
 
