@@ -845,6 +845,9 @@ def mx_weight_only_matmul_batched_kernel(
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
     B_MEMORY_MODE: tl.constexpr = "pointer",
     PDL: tl.constexpr = False,
+    # gate|up as an ungated GEMM over the interleaved 2N rows (no stacked tile: same footprint as ungated), its
+    # SwiGLU in the epilogue over each tile's (gate, up) row pairs — the separate fused_glu launch folded in
+    PAIRED_GLU: tl.constexpr = False,
 ):
     """weight-only batched (decode) expert matmul: raw bf16 activations against MXFP4/MXFP8 weights upcast
     to bf16 in-loop (unpack + per-group group-scale), plain ``tl.dot``. One routed row + one N-tile
@@ -911,11 +914,13 @@ def mx_weight_only_matmul_batched_kernel(
 
     if PDL:
         gdc_launch_dependents()
+    # PAIRED_GLU: the tile's BLOCK_SIZE_N interleaved rows are BLOCK_SIZE_N // 2 (gate, up) pairs, the gated
+    # epilogue's [BM, 2 * BN] form with BN halved; it writes N // 2 columns
     gemm_epilogue(
         C, None, accumulator, out_row, pid_n, 0, out_row, 1, stride_c_n, 1, 1,
-        BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, BLOCK_SIZE_K,
+        BLOCK_SIZE_M, BLOCK_SIZE_N // 2 if PAIRED_GLU else BLOCK_SIZE_N, GATE or PAIRED_GLU, None, BLOCK_SIZE_K,
         ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
-        COMPUTE_MODE=COMPUTE_MODE, SWAP_AB=SWAP_AB, FAKE_BATCH=True, N_COLS=N,
+        COMPUTE_MODE=COMPUTE_MODE, SWAP_AB=SWAP_AB, FAKE_BATCH=True, N_COLS=N // 2 if PAIRED_GLU else N,
         GlobalScale=BsGlobal,
         stride_global_e=stride_bs_global,
         global_row=expert_id,
@@ -2167,7 +2172,10 @@ def mx_weight_only_matmul_batched(
     # loop; unlike the block-FP8 band this never inverts (GPT-OSS shape: 48.0->39.7µs at S=4,
     # still ahead at S=512; 2026-08-06).
     output_dtype = resolve_output_dtype(output_dtype, A, None)
-    if gate and act_fn is not None:
+    # the SwiGLU runs in the GEMM's epilogue over the interleaved rows' pairs (PAIRED_GLU); the unfused-reference
+    # rounding (simulate_unfused) keeps the separate fused_glu launch
+    paired = gate and act_fn is not None and not simulate_unfused
+    if gate and act_fn is not None and not paired:
         return unstacked_gate(
             lambda intermediate_dtype: mx_weight_only_matmul_batched(
                 A, B, Bs, expert_ids, output_dtype=intermediate_dtype,
@@ -2182,11 +2190,11 @@ def mx_weight_only_matmul_batched(
     assert K == WEIGHT_VALUES_PER_BYTE * K_b, (
         f"K ({K}) must equal {WEIGHT_VALUES_PER_BYTE} * B.shape[2] ({K_b})"
     )
-    N = rows // 2 if gate else rows
+    N = rows if paired else rows // 2 if gate else rows
     scale_group = mx_scale_family(Bs, K)
     assert Bs.dtype != torch.float8_e4m3fn or scale_group == NVFP4_SCALE_GROUP_K, "group-32 E4M3 FP4 weights require calibrated FP8 activations"
     b_global_scale = normalize_global_scale(b_global_scale, num_experts)
-    C = A.new_empty(S, gate_out_cols(N, gate, act_fn), dtype=output_dtype)
+    C = A.new_empty(S, rows // 2 if paired else gate_out_cols(N, gate, act_fn), dtype=output_dtype)
     b_u8 = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)
 
@@ -2226,7 +2234,8 @@ def mx_weight_only_matmul_batched(
             num_experts=num_experts,
             SCALE_GROUP_K=scale_group,
             WEIGHT_VALUES_PER_BYTE=WEIGHT_VALUES_PER_BYTE,
-            GATE=gate,
+            GATE=gate and not paired,
+            PAIRED_GLU=paired,
             ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha,
             SWIGLU_LIMIT=swiglu_limit,
