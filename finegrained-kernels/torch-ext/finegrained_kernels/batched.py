@@ -27,14 +27,14 @@ from .bayesian_autotuner import bayesian_autotune
 from .bench import gemm_cold_banks
 
 from ._ops import add_op_namespace_prefix
-from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, narrow_scalar_autotuning_configs, tl_dtype, pdl_launch_kwargs
+from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, narrow_scalar_autotuning_configs, tl_dtype, pdl_launch_kwargs, block_fp8_scale_mode_configs
 from .descriptors import batched_weight_descriptor, rebind_batched_mx_bs_descriptor, rebind_batched_weight_descriptor
 from .formats import block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, is_per_expert_global, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_operands, weight_block_size, validate_int_operands, INT_WEIGHT_DTYPES
 from .epilogue import fused_glu
 from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, prepare_fp8_mx_inputs, permute_routed_rows, static_expert_act_operands, tensor_wide_act_operands
 from .swizzle import swizzled_scale_descriptor
 from .scheduling import is_off_rank, routed_expert_start
-from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, plain_dot, static_dot, MMA_N_ATOM, int_weight_only_compute
+from .mma import block_dynamic_dot, block_fp8_weight_only_dot, fp8_dot, mx_compute, mx_weight_only_compute, plain_dot, static_dot, MMA_N_ATOM, int_weight_only_compute
 from .loading.scales import apply_row_scale, weight_scale_rows, csf_weight_scales
 from .loading.tiles import (
     advance_ptrs,
@@ -45,7 +45,6 @@ from .loading.tiles import (
     load_act_plain,
     load_act_static,
     load_weight_block_dynamic,
-    load_weight_block_fp8,
     load_weight_int,
     load_weight_int_group,
     load_weight_mx,
@@ -56,7 +55,7 @@ from .loading.tiles import (
     weight_tile_ptrs,
 )
 from .epilogue import acc_init, bias_strides, gemm_epilogue
-from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, dot_scaled_staging_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gate_tile_cap_pruner, mx_config_pruner, require_moe_dims_aligned, scale_subblock_pruner, single_row_tile_pruner, smem_pruner, swizzled_scale_config_pruner, weight_only_swap_scope_pruner, int_scale_group_tile_pruner
+from .pruners import PATH_ANCHOR_AXES, block_fp8_scale_mode_pruner, fp8_dot_warp_pruner, dot_scaled_staging_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gate_tile_cap_pruner, mx_config_pruner, require_moe_dims_aligned, scale_subblock_pruner, single_row_tile_pruner, smem_pruner, swizzled_scale_config_pruner, weight_only_swap_scope_pruner, int_scale_group_tile_pruner
 
 
 @triton.jit
@@ -1207,7 +1206,9 @@ def full_precision_matmul_batched_kernel(
 
 
 @bayesian_autotune(
-    with_weight_stream(get_accelerator_autotuning_configs(tune_block_nk=True, swap_ab=True, swap_block_sizes_m=(1, 2))),
+    block_fp8_scale_mode_configs(
+        with_weight_stream(get_accelerator_autotuning_configs(tune_block_nk=True, swap_ab=True, swap_block_sizes_m=(1, 2)))
+    ),
     # S (routed rows) keyed like the fp8/mx batched siblings — decode re-tunes per batch;
     # GATE keys the gate|up arm separately (its stacked dot is 2*BN wide).
     ["N", "K", "S", "GATE", "BLOCK_N", "BLOCK_K", "GATE_SCALES"],
@@ -1222,6 +1223,7 @@ def full_precision_matmul_batched_kernel(
             block_within_dim_pruner("N", "BLOCK_SIZE_N"),
             descriptor_box_pruner(),
             smem_pruner(),
+            block_fp8_scale_mode_pruner(),
         )
     },
 )
@@ -1271,6 +1273,7 @@ def block_fp8_weight_only_matmul_batched_kernel(
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
     B_MEMORY_MODE: tl.constexpr = "pointer",
     PDL: tl.constexpr = False,
+    SCALE_MODE: tl.constexpr = "tile",  # where the coarse block scale lands (block_fp8_weight_only_dot)
 ):
     """Batched FP8 W8A16 expert GEMM with optional fused gate/up activation."""
     if PDL:
@@ -1305,14 +1308,13 @@ def block_fp8_weight_only_matmul_batched_kernel(
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a, unused_activation = load_act_plain(a_ptrs, 0, 0, 0, None, 0, "pointer", False)
-        w = load_weight_block_fp8(
-            b_ptrs, BDescriptor, Bs, 0, batched_weight_row(expert_id, pid_n, N, n_width, GATE), k * BLOCK_SIZE_K,
-            expert_id, offs_bn, k * BLOCK_SIZE_K + offs_k,
+        accumulator = block_fp8_weight_only_dot(
+            accumulator, a, b_ptrs, BDescriptor, Bs, 0, batched_weight_row(expert_id, pid_n, N, n_width, GATE),
+            k * BLOCK_SIZE_K, expert_id, offs_bn, k * BLOCK_SIZE_K + offs_k,
             stride_bs_e, stride_bs_n, stride_bs_k,
             GATE, False, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
-            BLOCK_N, BLOCK_K, GATE_SCALES, a.dtype,
+            BLOCK_N, BLOCK_K, GATE_SCALES, SCALE_MODE,
         )
-        accumulator = plain_dot(accumulator, a, w, SWAP_AB)
         a_ptrs += BLOCK_SIZE_K * stride_a_k
         b_ptrs += BLOCK_SIZE_K * stride_b_k
 
@@ -1325,6 +1327,9 @@ def block_fp8_weight_only_matmul_batched_kernel(
         COMPUTE_MODE="dot", FAKE_BATCH=True,
         Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
         global_row=expert_id,
+        # "post": one scale block spans K, so the weight scale is a per-column output scale
+        GlobalScale=Bs + weight_scale_rows(offs_bn, BLOCK_N, GATE_SCALES) * stride_bs_n if SCALE_MODE == "post" else None,
+        stride_global_e=stride_bs_e,
     )
 
 

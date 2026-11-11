@@ -16,7 +16,8 @@ import triton
 import triton.language as tl
 
 from .quant import e2m1_cols_to_bf16, e2m1_cols_to_e4m3, e2m1_cols_to_f32, e2m1_to_bf16, e2m1_to_e4m3, e2m1_to_f32
-from .loading.scales import decode_group_scale
+from .loading.scales import block_fp8_scaled_act, block_fp8_weight_scale_cols, decode_group_scale
+from .loading.tiles import load_weight_block_fp8, load_weight_plain
 from .compat import is_nvidia, is_sm10x
 from .ptx import (
     add_mul_x2, add_x2, dp4a, e2m1x8_to_f16x2, e4m3x4_to_f16x2, f16x2_dot4_f32, int4_nibbles_to_16bit_lanes, int8_bytes_to_f16_lanes, int_words_fma_rows,
@@ -930,6 +931,47 @@ def plain_dot(acc, a, b, SWAP_AB: tl.constexpr = False, K_SLICES: tl.constexpr =
         out = tl.dot(a, b, acc, out_dtype=OUT_DTYPE)
     return out
 
+
+
+@triton.jit
+def block_fp8_weight_only_dot(
+    acc, a, b_ptrs, b_descriptor, bs_ptr, row0, n_off, k_off,
+    expert_id, offs_n, offs_k, stride_bs_e, stride_bs_n, stride_bs_k,
+    GATE: tl.constexpr, GROUPED: tl.constexpr, B_MEMORY_MODE: tl.constexpr, SWAP_AB: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GATE_SCALES: tl.constexpr,
+    SCALE_MODE: tl.constexpr, B_DESCRIPTOR_IS_2D: tl.constexpr = False, K_SLICES: tl.constexpr = 1,
+):
+    """One K step of an FP8 W8A16 GEMM. ``SCALE_MODE`` places the coarse block scale: ``"tile"`` rescales every
+    weight value before the dot; ``"acc"`` scales the step's ``[M, N]`` partial (one block spans the step);
+    ``"post"`` leaves it to the caller, applied once to the accumulator (one block spans K). The latter two keep
+    the in-loop decode a plain FP8 cast and multiply ``M x N`` values instead of ``K x N``. ``"act"`` scales the
+    ``[M, BK]`` activation tile per K group instead, at any BK, where the N tile sits in one scale block."""
+    if SCALE_MODE == "tile":
+        w = load_weight_block_fp8(
+            b_ptrs, b_descriptor, bs_ptr, row0, n_off, k_off,
+            expert_id, offs_n, offs_k, stride_bs_e, stride_bs_n, stride_bs_k,
+            GATE, GROUPED, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
+            BLOCK_N, BLOCK_K, GATE_SCALES, a.dtype,
+            B_DESCRIPTOR_IS_2D=B_DESCRIPTOR_IS_2D,
+        )
+        return plain_dot(acc, a, w, SWAP_AB, K_SLICES)
+    w, _w = load_weight_plain(
+        b_ptrs, b_descriptor, row0, n_off, k_off,
+        GATE, GROUPED, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
+        B_DESCRIPTOR_IS_2D=B_DESCRIPTOR_IS_2D,
+    )
+    w = w.to(a.dtype)
+    if SCALE_MODE == "act":
+        a = block_fp8_scaled_act(
+            a, bs_ptr, expert_id, offs_n, k_off, stride_bs_e, stride_bs_n, stride_bs_k, BLOCK_N, BLOCK_K,
+        )
+    if SCALE_MODE == "acc":
+        w_s = block_fp8_weight_scale_cols(
+            bs_ptr, expert_id, offs_n, k_off, stride_bs_e, stride_bs_n, stride_bs_k, BLOCK_N, BLOCK_K, GATE_SCALES,
+        )
+        return acc + plain_dot(tl.zeros_like(acc), a, w, SWAP_AB, K_SLICES) * w_s
+    return plain_dot(acc, a, w, SWAP_AB, K_SLICES)
 
 @triton.jit
 def k_slices_sum(acc, K_SLICES: tl.constexpr = 1):

@@ -317,9 +317,9 @@ def apply_global_scale(acc, GlobalScale, stride_gs_e, GlobalScaleA, stride_gsa_e
     """Apply output scales before bias/GLU: a weight global or a tile of per-channel weight
     scale pointers, then the activation global. Expert strides select each expert's scales;
     stride 0 broadcasts a shared scale. INT32 accumulators convert here, after the full K sum.
-    ``None`` folds the arm out."""
+    Scales decode by dtype (``decode_group_scale``: UE8M0 bytes, E4M3, or float). ``None`` folds the arm out."""
     if GlobalScale is not None:
-        acc = acc.to(tl.float32) * tl.load(GlobalScale + expert_id * stride_gs_e).to(tl.float32)
+        acc = acc.to(tl.float32) * decode_group_scale(tl.load(GlobalScale + expert_id * stride_gs_e)).to(tl.float32)
     if GlobalScaleA is not None:
         acc = acc * tl.load(GlobalScaleA + expert_id * stride_gsa_e).to(tl.float32)
     return acc
@@ -420,6 +420,42 @@ def dequant_block_fp8_weight_tile(
             scales = tl.trans(scales)
         w = w.to(tl.float32) * scales
     return w.to(DTYPE)
+
+
+@triton.jit
+def block_fp8_weight_scale_cols(
+    Scales, expert, offs_n, k_off,
+    stride_scale_e, stride_scale_n, stride_scale_k,
+    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GATE_SCALES: tl.constexpr = False,
+):
+    """The coarse FP8 block scale of each weight row at K offset ``k_off``, as a vector over the
+    output columns. Scaling a K step's ``[M, N]`` partial (or the whole accumulator when one block
+    spans K) instead of every weight value leaves the in-loop decode a plain FP8 cast."""
+    scale_n = weight_scale_rows(offs_n, BLOCK_N, GATE_SCALES)
+    return decode_group_scale(tl.load(
+        Scales + expert * stride_scale_e + scale_n * stride_scale_n + (k_off // BLOCK_K) * stride_scale_k
+    ))
+
+
+@triton.jit
+def block_fp8_scaled_act(
+    a, Scales, expert, offs_n, k_off,
+    stride_scale_e, stride_scale_n, stride_scale_k,
+    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """An ``[M, BK]`` activation tile times its weight tile's coarse block scale per K group, for a weight tile
+    whose rows all sit in one scale block: ``M x BK`` multiplies in place of the ``BK x N`` weight rescale."""
+    BM: tl.constexpr = a.shape[0]
+    BK: tl.constexpr = a.shape[1]
+    groups: tl.constexpr = max(BK // BLOCK_K, 1)
+    scale_row = tl.min(offs_n, 0) // BLOCK_N
+    s = decode_group_scale(tl.load(
+        Scales + expert * stride_scale_e + scale_row * stride_scale_n
+        + (k_off // BLOCK_K + tl.arange(0, groups)) * stride_scale_k
+    ))
+    scaled = a.to(tl.float32).reshape(BM, groups, BK // groups) * s[None, :, None]
+    return scaled.reshape(BM, BK).to(a.dtype)
 
 
 @triton.jit

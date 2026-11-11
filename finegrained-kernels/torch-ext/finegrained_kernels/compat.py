@@ -570,6 +570,23 @@ def pipeline_autotuning_configs(configs, pipelines, *, num_warps=None):
     ]
 
 
+def block_fp8_scale_mode_configs(configs):
+    """Cross the FP8 weight-only ``SCALE_MODE`` axis into a kernel's configs: where the coarse block scale lands
+    (``block_fp8_scale_mode_pruner`` admits each mode only where its scale is constant over its operand)."""
+    return [
+        triton.Config(
+            dict(config.kwargs, SCALE_MODE=mode),
+            num_warps=config.num_warps,
+            num_stages=config.num_stages,
+            num_ctas=config.num_ctas,
+            maxnreg=config.maxnreg,
+            pre_hook=config.pre_hook,
+        )
+        for config in configs
+        for mode in ("tile", "acc", "post", "act")
+    ]
+
+
 def narrow_scalar_autotuning_configs(block_ms=(1,), block_ns=(8, 16, 32), **fixed):
     """The tiles of a ``scalar`` arm that unpacks a weight tile once for ``BLOCK_SIZE_M`` token rows and reduces it on
     the CUDA cores (a weight-rows-major GEVM): 8-32 weight rows per program, so a decode grid fills the SMs where the

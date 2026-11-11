@@ -26,14 +26,14 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .bayesian_autotuner import bayesian_autotune
 from ._ops import add_op_namespace_prefix
-from .compat import FP8_DTYPE, is_sm10x, launches_skipped, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, pdl_launch_kwargs, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, narrow_dot_autotuning_configs, narrow_scalar_autotuning_configs, split_k_autotuning_configs, persistent_program_count, pipeline_autotuning_configs
+from .compat import FP8_DTYPE, is_sm10x, launches_skipped, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, pdl_launch_kwargs, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, narrow_dot_autotuning_configs, narrow_scalar_autotuning_configs, split_k_autotuning_configs, persistent_program_count, pipeline_autotuning_configs, block_fp8_scale_mode_configs
 from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_tiled_descriptors, rebind_weight_only_descriptors, weight_descriptor
 from .formats import FP8_WEIGHT_ONLY_DEQUANT_MIN_M, INT_WEIGHT_ONLY_DEQUANT_MIN_DIM, INT_WEIGHT_ONLY_DEQUANT_MIN_M, block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, normalize_global_scale, e2m1_as_uint8, is_mx, is_rowwise, mx_scale_family, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_2d_operands, weight_format, validate_int_operands, validate_svdquant_operands, INT_WEIGHT_DTYPES
 from .bench import gemm_cold_banks
 from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, maybe_act_quant, mxfp8_act_quant, nvfp4_act_quant, quantize_calibrated_act, quantize_rows_static, tensor_wide_act_operands, prepare_fp8_mx_inputs, dequantize_int_weight, permute_act_cols, svdquant_act_quant
 from .loading.scales import apply_row_scale, dequant_block_fp8_weight, mx_2d_scale_ptrs, weight_scale_rows, csf_weight_scales
-from .mma import SM10X, block_dynamic_dot, fp8_dot, k_slices_sum, mx_compute, mx_weight_only_compute, plain_dot, static_dot, int_weight_only_compute
+from .mma import SM10X, block_dynamic_dot, block_fp8_weight_only_dot, fp8_dot, k_slices_sum, mx_compute, mx_weight_only_compute, plain_dot, static_dot, int_weight_only_compute
 from .loading.tiles import (
     advance_ptrs,
     output_tile_range,
@@ -42,7 +42,6 @@ from .loading.tiles import (
     load_act_plain,
     load_act_static,
     load_weight_block_dynamic,
-    load_weight_block_fp8,
     load_weight_int,
     load_weight_int_group,
     int_group_ptrs,
@@ -55,7 +54,7 @@ from .loading.tiles import (
     swizzle_offsets,
 )
 from .epilogue import acc_finalize, acc_init, add_bias, bias_strides, gemm_epilogue, store_masked, store_masked_oriented
-from .pruners import PATH_ANCHOR_AXES, group_size_m_pruner, fp8_dot_warp_pruner, fp4_act_gate_warp_spec_pruner, gate_stacked_tmem_trap_pruner, block_dynamic_2d_warp_spec_pruner, block_dynamic_mma_width_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, descriptor_needs_prequant_pruner, matched_memory_modes_pruner, mx_2d_swap_scope_pruner, native_mma_m_pruner, mx_config_pruner, scalar_max_m_pruner, smem_pruner, swap_decode_scope_pruner, swap_max_m_pruner, k_slices_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, warp_spec_compile_guard_pruner, warp_spec_memory_mode_pruner, mx_auxiliary_pruner, block_m_cap_pruner, int_2d_warp_spec_pruner, int_split_k_pruner, scalar_block_m_pruner, int_scale_group_tile_pruner
+from .pruners import PATH_ANCHOR_AXES, block_fp8_scale_mode_pruner, group_size_m_pruner, fp8_dot_warp_pruner, fp4_act_gate_warp_spec_pruner, gate_stacked_tmem_trap_pruner, block_dynamic_2d_warp_spec_pruner, block_dynamic_mma_width_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, descriptor_needs_prequant_pruner, matched_memory_modes_pruner, mx_2d_swap_scope_pruner, native_mma_m_pruner, mx_config_pruner, scalar_max_m_pruner, smem_pruner, swap_decode_scope_pruner, swap_max_m_pruner, k_slices_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, warp_spec_compile_guard_pruner, warp_spec_memory_mode_pruner, mx_auxiliary_pruner, block_m_cap_pruner, int_2d_warp_spec_pruner, int_split_k_pruner, scalar_block_m_pruner, int_scale_group_tile_pruner
 
 # The 2D-grid kernels' L2-locality swizzle depth is derived per-tile inside
 # ``swizzle_offsets`` (see SWIZZLE_GROUP_A_BYTES there) — no per-kernel constant here.
@@ -1431,14 +1430,14 @@ assert all(
 
 
 @bayesian_autotune(
-    get_accelerator_autotuning_configs(
+    block_fp8_scale_mode_configs(get_accelerator_autotuning_configs(
         group_sizes_m=DENSE_GROUP_SIZES_M,
         tune_block_nk=True, tune_block_m=True, warp_spec=True,
         swap_ab=True, swap_block_sizes_m=(1, 2, 4, 8), k_slices=(1, 2, 4),
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
         pre_hook=rebind_weight_only_descriptors,
-    ),
+    )),
     ["N", "K", "m_bit_length", "GATE", "BLOCK_N", "BLOCK_K", "GATE_SCALES"],
     n_trials=100,
     cold_banks=gemm_cold_banks,
@@ -1455,6 +1454,7 @@ assert all(
             descriptor_box_pruner(),
             smem_pruner(),
             k_slices_pruner(),
+            block_fp8_scale_mode_pruner(),
         )
     },
 )
@@ -1484,6 +1484,7 @@ def block_fp8_weight_only_matmul_2d_kernel(
     K_SLICES: tl.constexpr = 1,
     PDL: tl.constexpr = False,
     GROUP_SIZE_M: tl.constexpr = None,
+    SCALE_MODE: tl.constexpr = "tile",  # where the coarse block scale lands (block_fp8_weight_only_dot)
 ):
     """Dense FP8 W8A16 GEMM with in-tile weight rescaling."""
     if PDL:
@@ -1500,14 +1501,13 @@ def block_fp8_weight_only_matmul_2d_kernel(
             a_ptrs, ADescriptor, pid_m * BLOCK_SIZE_M, k * BLOCK_SIZE_K, None, 0,
             A_MEMORY_MODE, False,
         )
-        w = load_weight_block_fp8(
-            b_ptrs, BDescriptor, Bs, 0, pid_n * n_width, k * BLOCK_SIZE_K,
+        accumulator = block_fp8_weight_only_dot(
+            accumulator, a, b_ptrs, BDescriptor, Bs, 0, pid_n * n_width, k * BLOCK_SIZE_K,
             0, offs_bn, k * BLOCK_SIZE_K + offs_k,
             0, stride_bs_n, stride_bs_k,
             GATE, False, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
-            BLOCK_N, BLOCK_K, GATE_SCALES, a.dtype,
+            BLOCK_N, BLOCK_K, GATE_SCALES, SCALE_MODE, K_SLICES=K_SLICES,
         )
-        accumulator = plain_dot(accumulator, a, w, SWAP_AB, K_SLICES)
         a_ptrs += BLOCK_SIZE_K * stride_a_k
         b_ptrs += BLOCK_SIZE_K * stride_b_k
     if PDL:
@@ -1521,6 +1521,8 @@ def block_fp8_weight_only_matmul_2d_kernel(
         ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
         COMPUTE_MODE="dot", N_COLS=N,
         Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
+        # "post": one scale block spans K, so the weight scale is a per-column output scale
+        GlobalScale=Bs + weight_scale_rows(offs_bn, BLOCK_N, GATE_SCALES) * stride_bs_n if SCALE_MODE == "post" else None,
     )
 
 
