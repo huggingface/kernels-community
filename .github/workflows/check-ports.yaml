@@ -1,7 +1,7 @@
 name: Check Ports
 
 # Verify ports match their recipes: the committed src tree, or for a port that
-# generates src at build time, the hash of that tree, build.toml and the pins.
+# generates src at build time, build.toml and the provenance with its hashes.
 # PRs check changed ports;
 # checker changes, pushes to main, scheduled runs and manual runs check all ports.
 on:
@@ -17,8 +17,6 @@ on:
       - "*/port/**"
       - "*/src/**"
       - "*/build.toml"
-      - "*/flake.lock"
-      - "*/flake.nix"
       - "*/port-provenance.json"
       - "scripts/check_ports.py"
       - ".github/workflows/check-ports.yaml"

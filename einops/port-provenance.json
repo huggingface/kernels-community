@@ -5,7 +5,8 @@
   "sources": {
     "upstream": {
       "repo": "https://github.com/arogozhnikov/einops.git",
-      "commit": "ad2c8d67d08cbebb45e1aff2be21dc88635fc695"
+      "commit": "ad2c8d67d08cbebb45e1aff2be21dc88635fc695",
+      "hash": "sha256-J9m5LMOleHf2UziUbOtwf+DFpu/wBDcAyHUor4kqrR8="
     }
   },
   "tree": "sha256:d454da2f3166645865ab52d87f70e0794623bf6bcb1ecb89451a5efd84429a0a"

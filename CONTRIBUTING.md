@@ -41,16 +41,16 @@ When you are done, you can open a PR to the `kernels-community` repository. Plea
 > `kernel-port` is experimental, so this layout may still change.
 
 A kernel can be generated from an upstream repository by a
-[`kernel-port`](https://github.com/huggingface/kernels/tree/main/kernel-port)
+[`kernel-port`](https://github.com/huggingface/kernels/tree/main/kernel-port#generating-the-source-at-build-time)
 recipe in `<kernel>/port/port.kdl`, in place of committing a copy of upstream.
 Such a kernel directory only has what cannot be derived:
 
 ```
 einops/
-  flake.nix             # Pins `upstream` and passes `port = { ... }`
+  flake.nix             # The usual flake, with `path = ./.`
   flake.lock
   build.toml            # Generated, committed because Nix reads it during evaluation
-  port-provenance.json  # Generated, has the hash of the generated tree
+  port-provenance.json  # Generated, pins and hashes the sources and the generated tree
   port/port.kdl
 ```
 
@@ -58,19 +58,15 @@ A recipe that needs files with no upstream equivalent keeps them in
 `port/overlay/`.
 
 - Change the kernel by changing the recipe or overlay, then inspect the result
-  with `nix build .#portedSrc`. See
-  [generating the source at build time](https://github.com/huggingface/kernels/tree/main/kernel-port#generating-the-source-at-build-time)
-  for the `port` argument.
-- `flake.nix` and the recipe both pin upstream, and must agree. A `vendor`
-  operation takes the flake input of the same `name`.
+  with `nix build .#portedSrc`.
 - The build and `scripts/check_ports.py` fail when `build.toml` or
   `port-provenance.json` differ from what the recipe generates. Review the
-  change, then update them:
+  change, then regenerate them from a checkout at the recipe's pins:
 
   ```bash
-  cd <kernel>
-  out=$(nix build --no-link --print-out-paths .#portedSrc)
-  install -m 644 $out/build.toml $out/port-provenance.json .
+  kernel-port <kernel>/port/port.kdl --dir <upstream-checkout> \
+      [--vendor name=<checkout>] --out <dir>
+  install -m 644 <dir>/build.toml <dir>/port-provenance.json <kernel>
   ```
 
   If `port-provenance.json` changes without a change to the recipe, a new

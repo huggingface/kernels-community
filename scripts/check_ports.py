@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import filecmp
-import json
 import os
 import re
 import shlex
@@ -31,9 +30,6 @@ CHECKER_FILES = {"scripts/check_ports.py", ".github/workflows/check-ports.yaml"}
 # hash of the generated tree, which stands in for comparing a committed tree.
 SRCLESS_GENERATED = ("build.toml", "port-provenance.json")
 
-# Files beside the recipe that a src-less port has to keep in sync with it.
-SRCLESS_FILES = {*SRCLESS_GENERATED, "flake.lock", "flake.nix"}
-
 
 def runner_cmd() -> list:
     return shlex.split(os.environ.get("KERNEL_PORT", DEFAULT_RUNNER))
@@ -58,7 +54,7 @@ def changed_ports(root: Path, ref: str) -> list:
         parts = line.split("/")
         if len(parts) >= 3 and parts[1] in ("port", "src"):
             touched.add(parts[0])
-        elif len(parts) == 2 and parts[1] in SRCLESS_FILES:
+        elif len(parts) == 2 and parts[1] in SRCLESS_GENERATED:
             touched.add(parts[0])
     return sorted(k for k in find_ports(root) if k in touched)
 
@@ -146,34 +142,14 @@ def generate(recipe: Path, out: Path, workdir: Path) -> list:
     return []
 
 
-def locked_revs(kernel_dir: Path) -> dict:
-    """Return the locked revision of each direct input of a kernel's flake."""
-    lock = kernel_dir / "flake.lock"
-    if not lock.is_file():
-        return {}
-    nodes = json.loads(lock.read_text())["nodes"]
-    return {
-        name: nodes[node]["locked"].get("rev")
-        for name, node in nodes["root"]["inputs"].items()
-        if isinstance(node, str)
-    }
-
-
-def check_srcless(kernel_dir: Path, generated: Path, pins: dict) -> list:
-    """Check what a src-less port commits, given its pins by flake input name."""
+def check_srcless(kernel_dir: Path, generated: Path) -> list:
+    """Check what a src-less port commits."""
     problems = []
     for name in SRCLESS_GENERATED:
         if not (kernel_dir / name).is_file():
             problems.append(f"no src/ and no committed {name}")
         elif not filecmp.cmp(generated / name, kernel_dir / name, shallow=False):
             problems.append(f"differs: {name}")
-
-    locked = locked_revs(kernel_dir)
-    for name, commit in pins.items():
-        if locked.get(name) != commit:
-            problems.append(
-                f"flake.lock pins {name} at {locked.get(name)}, the recipe at {commit}"
-            )
 
     # The generated tests are not in the repository, so the check that scans
     # committed tests never sees them.
@@ -205,9 +181,7 @@ def check(kernel: str, root: Path, workdir: Path) -> list:
     committed = root / kernel / "src"
     if committed.is_dir():
         return compare(out, committed)
-    pins = {"upstream": commit}
-    pins.update((name, commit) for name, _, commit in parse_vendors(recipe))
-    return check_srcless(root / kernel, out, pins)
+    return check_srcless(root / kernel, out)
 
 
 def main() -> int:
@@ -253,10 +227,9 @@ def main() -> int:
             "If an overlay file went stale, refresh it from <kernel>/src first.\n"
             "If only port-provenance.json differs, the recipe changed and the\n"
             "port was not rerun.\n"
-            "For a kernel without src/, review the change, then update with:\n"
-            "  cd <kernel> && out=$(nix build --no-link --print-out-paths .#portedSrc)\n"
-            "  install -m 644 $out/build.toml $out/port-provenance.json .\n"
-            "and keep the commits in flake.nix equal to the recipe's. A change in\n"
+            "For a kernel without src/, review the change, then run it with\n"
+            "--out <dir> and install <dir>/build.toml and\n"
+            "<dir>/port-provenance.json into <kernel>. A change in\n"
             "port-provenance.json alone means the generated tree changed: if the\n"
             "recipe did not, kernel-port did.",
             file=sys.stderr,

@@ -1,5 +1,4 @@
 import importlib.util
-import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,7 +6,6 @@ from types import SimpleNamespace
 import pytest
 
 COMMIT = "a" * 40
-PINS = {"upstream": COMMIT, "dep": COMMIT}
 PROVENANCE = '{"tree": "sha256:aa"}\n'
 BUILD_TOML = '[general]\nname = "k"\nversion = 1\n\n[general.hub]\nrepo-id = "org/k"\n'
 
@@ -23,25 +21,12 @@ def ports(monkeypatch):
     return module
 
 
-def lock(rev, vendor=COMMIT):
-    return json.dumps(
-        {
-            "nodes": {
-                "root": {"inputs": {"upstream": "upstream", "dep": "dep"}},
-                "upstream": {"locked": {"rev": rev}},
-                "dep": {"locked": {"rev": vendor}},
-            }
-        }
-    )
-
-
 @pytest.fixture
 def srcless(tmp_path):
     kernel = tmp_path / "repo" / "k"
     kernel.mkdir(parents=True)
     (kernel / "build.toml").write_text(BUILD_TOML)
     (kernel / "port-provenance.json").write_text(PROVENANCE)
-    (kernel / "flake.lock").write_text(lock(COMMIT))
 
     generated = tmp_path / "out" / "k"
     (generated / "tests").mkdir(parents=True)
@@ -54,19 +39,19 @@ def srcless(tmp_path):
 
 
 def test_srcless_port_in_sync(ports, srcless):
-    assert ports.check_srcless(*srcless, PINS) == []
+    assert ports.check_srcless(*srcless) == []
 
 
 def test_srcless_port_stale_build_toml(ports, srcless):
     kernel, generated = srcless
     (kernel / "build.toml").write_text(BUILD_TOML.replace("version = 1", "version = 2"))
-    assert ports.check_srcless(kernel, generated, PINS) == ["differs: build.toml"]
+    assert ports.check_srcless(kernel, generated) == ["differs: build.toml"]
 
 
 def test_srcless_port_output_changed(ports, srcless):
     kernel, generated = srcless
     (generated / "port-provenance.json").write_text('{"tree": "sha256:bb"}\n')
-    assert ports.check_srcless(kernel, generated, PINS) == [
+    assert ports.check_srcless(kernel, generated) == [
         "differs: port-provenance.json"
     ]
 
@@ -74,7 +59,7 @@ def test_srcless_port_output_changed(ports, srcless):
 def test_srcless_port_needs_provenance(ports, srcless):
     kernel, generated = srcless
     (kernel / "port-provenance.json").unlink()
-    assert ports.check_srcless(kernel, generated, PINS) == [
+    assert ports.check_srcless(kernel, generated) == [
         "no src/ and no committed port-provenance.json"
     ]
 
@@ -82,23 +67,9 @@ def test_srcless_port_needs_provenance(ports, srcless):
 def test_srcless_port_needs_build_toml(ports, srcless):
     kernel, generated = srcless
     (kernel / "build.toml").unlink()
-    assert ports.check_srcless(kernel, generated, PINS) == [
+    assert ports.check_srcless(kernel, generated) == [
         "no src/ and no committed build.toml"
     ]
-
-
-def test_srcless_port_lock_drifts_from_recipe(ports, srcless):
-    kernel, generated = srcless
-    (kernel / "flake.lock").write_text(lock("b" * 40))
-    (problem,) = ports.check_srcless(kernel, generated, PINS)
-    assert "flake.lock pins upstream" in problem
-
-
-def test_srcless_port_vendor_lock_drifts_from_recipe(ports, srcless):
-    kernel, generated = srcless
-    (kernel / "flake.lock").write_text(lock(COMMIT, vendor="b" * 40))
-    (problem,) = ports.check_srcless(kernel, generated, PINS)
-    assert "flake.lock pins dep" in problem
 
 
 def test_parse_vendors(ports, tmp_path):
@@ -133,7 +104,7 @@ def test_generate_passes_vendors(ports, tmp_path, monkeypatch):
 def test_srcless_port_checks_generated_test_versions(ports, srcless):
     kernel, generated = srcless
     (generated / "tests" / "test_k.py").write_text('get_kernel("org/k", version=2)\n')
-    (problem,) = ports.check_srcless(kernel, generated, PINS)
+    (problem,) = ports.check_srcless(kernel, generated)
     assert "expected get_kernel" in problem
 
 
@@ -143,7 +114,7 @@ def test_changed_ports_counts_srcless_files(ports, tmp_path, monkeypatch):
         (tmp_path / name / "port" / "port.kdl").touch()
 
     class Diff:
-        stdout = "a/flake.lock\nb/port/port.kdl\nc/README.md\nother/flake.lock\n"
+        stdout = "a/build.toml\nb/port/port.kdl\nc/README.md\nother/build.toml\n"
 
     monkeypatch.setattr(ports.subprocess, "run", lambda *a, **k: Diff)
     assert ports.changed_ports(tmp_path, "base") == ["a", "b"]
