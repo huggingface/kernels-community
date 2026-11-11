@@ -339,7 +339,7 @@ How much of the MMA each tile uses. *Scale off weight tile*: a coarse weight sca
 | batched | MXFP8 / MXFP4 / NVFP4 | 🟠 | 🟠 | 🟢 | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
 | batched | MX weight-only (W4A16 / W8A16) | 🟠 | 🟠 | 🟢 | 🔴 | ⚪ | ⚪ | ⚪ | ⚪ |
 | batched | FP8 weight-only | ⚪ | 🟢 | 🔴 | ⚪ | ⚪ | ⚪ | ⚪ | 🟠 |
-| batched | INT2/4/8 (GPTQ, AWQ, SmoothQuant) | ⚪ | 🟠 | 🟢 | 🔴 | ⚪ | ⚪ | ⚪ | ⚪ |
+| batched | INT2/4/8 (GPTQ, AWQ, SmoothQuant) | ⚪ | 🟠 | 🟢 | ⚪† | ⚪ | ⚪ | ⚪ | ⚪ |
 | batched | BF16 / FP16 | ⚪ | 🟢 | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
 | grouped | block FP8 (dynamic act) | 🟠 | 🟢 | ⚪ | ⚪ | 🟢 | ⚪ | ⚪ | 🟢* |
 | grouped | block FP8 (static act) | ⚪ | ⚪ | ⚪ | ⚪ | 🟢 | ⚪ | ⚪ | 🟢* |
