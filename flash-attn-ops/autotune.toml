@@ -1,0 +1,9 @@
+command = ["python", "autotune.py"]
+# Source directory packaged as configs/ in each build variant.
+configs = "torch-ext/flash_attn_ops/configs"
+
+[[targets]]
+name = "l4"
+gpu = "NVIDIA L4"
+runner = "aws-g6-12xlarge-plus"
+backend = "cuda"
