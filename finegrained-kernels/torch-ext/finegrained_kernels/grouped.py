@@ -2602,8 +2602,12 @@ def mx_dynamic_matmul_grouped(
     act_global_scale = normalize_global_scale(a_global_scale, num_experts)
     # A per-expert g_a quantizes each row against ITS expert's global. A gathered A holds one row
     # per token, routed to top_k experts at once, so it quantizes per routed row, into expert-sorted
-    # rows the GEMM then reads without a gather.
-    quantize_per_routed_row = is_per_expert_global(a_global_scale) and gather_idx is not None
+    # rows the GEMM then reads without a gather. The swizzled arm does the same in the expand regime,
+    # where reading the routed rows contiguously beats gathering them in the K loop.
+    quantize_per_routed_row = gather_idx is not None and (
+        is_per_expert_global(a_global_scale)
+        or (swizzled_scales and As is None and expand_regime(gather_idx.numel(), num_experts))
+    )
     if a_global_scale is not None:
         assert activation_format in ("nvfp4", "fp8"), "an activation global requires NVFP4 or calibrated tensor-FP8"
         assert not quantize_per_routed_row or As is None, (
@@ -2617,13 +2621,9 @@ def mx_dynamic_matmul_grouped(
         gather_idx = None
     elif swizzled_scales:
         if As is None and gather_idx is not None:
-            # Quantize ONCE at (num_tokens, K) and let the kernel gather the packed rows:
-            # the fused sorted-quant below re-reads and re-quantizes each row per routed
-            # copy (top_k times). A/B at GLM nvfp4 / dsv4 mxfp8 prefill shapes: 1697 ->
-            # 1531us / 1180 -> 1159us on the gate_up GEMM, bit-identical — the (T, K)
-            # packed buffer is L2-sized, so the descriptor gather4 reads hit cache while
-            # any materialized (S, K) layout streams DRAM (a fused quant+scatter form
-            # measured SLOWER everywhere — see OPTIMIZATION_LOG: fused-quant-scatter).
+            # Below the expand regime, quantize ONCE at (num_tokens, K) and let the kernel
+            # gather the packed rows: the routed-rows quant above re-quantizes each row per
+            # routed copy (top_k times), which only pays once the gather costs the GEMM more.
             # The scales take the same gather+swizzle pass a caller-provided row-major
             # As takes.
             A, As = (

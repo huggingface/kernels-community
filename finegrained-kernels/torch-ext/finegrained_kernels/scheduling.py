@@ -567,12 +567,11 @@ def expand_regime(S_rows: int, num_experts: int) -> bool:
     tokens/expert — gather4's 1-row box is MONOTONIC in tokens/expert; every other arch has
     no gather TMA at all, so any large-S gather expands).
 
-    Raw bf16 activations (the full-precision grouped path) were A/B'd against keeping the
-    in-kernel gather, 200-trial tunes each side, 2026-08-28: DeepSeek-V4 3455 -> 3344us (-3.2%),
-    DeepSeek-V3 7267 -> 7290 (wash), GLM-5.2 6039 -> 6439 (+6.6%). The copy (150-370us) is
-    offset by what the gather costs the GEMM, and which side wins is shape-specific within the
-    tune's roll variance — so the law is NOT split on ``act_itemsize``; it stays as measured.
-    ``FINEGRAINED_FORCE_GATHER=1`` is the A/B knob (never expand)."""
+    The copy wins on every arm (B200, T=8192, full fused MoE, one process, graphs interleaved,
+    bit-identical; Triton 3.9): DeepSeek-V3 FP8 block-dynamic 6533 -> 5713us, GLM-5.2 bf16
+    7474 -> 6170, DeepSeek-V4 bf16 3854 -> 3644. The swizzled MX arm takes the routed-rows quant
+    instead of a copy (``mx_dynamic_matmul_grouped``): DeepSeek-V4 W4A8 gate|up T=2048 605 -> 538us,
+    T=8192 1085 -> 967. ``FINEGRAINED_FORCE_GATHER=1`` is the A/B knob (never expand)."""
     if os.environ.get("FINEGRAINED_FORCE_GATHER"):
         return False
     return S_rows >= 4096 and (not is_sm10x() or S_rows < 1024 * num_experts)

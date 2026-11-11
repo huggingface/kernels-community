@@ -62,7 +62,7 @@ from .formats import get_supported_act_fns, is_mx, is_per_expert_global, is_roww
 from .norm import norm_column_factor, rms_inv_rows, rms_norm_rows
 from .loading.scales import csf_weight_scales
 from .quant import _launch_act_quant, MX_ACT_QUANT, mx_act_quant_routed_scales
-from .scheduling import compute_grouped_scheduling, is_off_rank, off_rank, routed_expert_start
+from .scheduling import compute_grouped_scheduling, expand_regime, is_off_rank, off_rank, routed_expert_start
 from .epilogue import fused_glu
 
 
@@ -412,13 +412,15 @@ def _fused_post_expert_norm(down_out, post_expert_norm, weight, eps):
 def _gate_up_activations(hidden, fmt, gate_up_scale, global_scale, activation_scale, scatter_idx, expert_start, pre_quant_scale=None):
     """``(A, As)`` for the grouped gate_up. Under a shared global on swizzled MX weights, ``hidden``
     is quantized once with its scales stored straight into each routed row's expert tile, which
-    the op reads as is while gathering the values; anywhere else the op quantizes ``hidden``."""
+    the op reads as is while gathering the values; anywhere else, and in the expand regime (where
+    the op quantizes the routed rows in expert order instead), the op quantizes ``hidden``."""
     if (
         pre_quant_scale is not None
         or fmt not in MX_ACT_QUANT
         or gate_up_scale.ndim != 5
         or activation_scale is not None
         or is_per_expert_global(global_scale)
+        or expand_regime(scatter_idx.numel(), expert_start.numel() - 1)
     ):
         return hidden, activation_scale
     K = hidden.shape[1]
