@@ -1006,6 +1006,9 @@ def int_weight_only_matmul_batched_kernel(
     B_MEMORY_MODE: tl.constexpr = "pointer",
     PDL: tl.constexpr = False,
     INT_BITS: tl.constexpr = 4,
+    # gate|up as an ungated GEMM over the interleaved 2N rows, its SwiGLU in the epilogue over each tile's
+    # (gate, up) row pairs (see mx_weight_only_matmul_batched_kernel)
+    PAIRED_GLU: tl.constexpr = False,
 ):
     """Integer batched expert matmul: bf16/fp16 weight-only, calibrated INT4/FP8, or INT8 SmoothQuant.
     One routed row + one N-tile per
@@ -1078,9 +1081,10 @@ def int_weight_only_matmul_batched_kernel(
         output_scale_stride = stride_bs_e
     gemm_epilogue(
         C, None, accumulator, out_row, pid_n, 0, out_row, 1, stride_c_n, 1, 1,
-        BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, BLOCK_SIZE_K,
+        BLOCK_SIZE_M, BLOCK_SIZE_N // 2 if PAIRED_GLU else BLOCK_SIZE_N, GATE or PAIRED_GLU, None, BLOCK_SIZE_K,
         ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
-        COMPUTE_MODE=COMPUTE_MODE, SWAP_AB=SWAP_AB, FAKE_BATCH=True, N_COLS=N, global_row=expert_id,
+        COMPUTE_MODE=COMPUTE_MODE, SWAP_AB=SWAP_AB, FAKE_BATCH=True, N_COLS=N // 2 if PAIRED_GLU else N,
+        global_row=expert_id,
         Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
         GlobalScale=output_scale, stride_global_e=output_scale_stride,
         GlobalScaleA=AsGlobal, stride_global_a=stride_asglobal_e,
@@ -2289,7 +2293,10 @@ def int_weight_only_matmul_batched(
     output_dtype = resolve_output_dtype(output_dtype, A, None)
     if gate and act_fn is None:
         gate = False
-    if gate:
+    # the SwiGLU runs in the GEMM's epilogue over the interleaved rows' pairs (PAIRED_GLU); the unfused-reference
+    # rounding (simulate_unfused) keeps the separate fused_glu launch
+    paired = gate and not simulate_unfused
+    if gate and not paired:
         return unstacked_gate(
             lambda intermediate_dtype: int_weight_only_matmul_batched(
                 A, B, Bs, expert_ids, output_dtype=intermediate_dtype,
@@ -2307,7 +2314,7 @@ def int_weight_only_matmul_batched(
             quant_dtype=torch.int8 if smoothquant else FP8_DTYPE,
         )
         gather_idx = b_perm = None
-    C = A.new_empty(S, gate_out_cols(N, gate, act_fn), dtype=output_dtype)
+    C = A.new_empty(S, N // 2 if paired else N, dtype=output_dtype)
 
     def grid(META):
         return (S, triton.cdiv(N, META["BLOCK_SIZE_N"]))
@@ -2351,7 +2358,8 @@ def int_weight_only_matmul_batched(
             num_experts=num_experts,
             SCALE_GROUP_K=K // Bs.shape[2],
             INT_BITS=bits,
-            GATE=gate,
+            GATE=False,
+            PAIRED_GLU=paired,
             ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha,
             SWIGLU_LIMIT=swiglu_limit,
