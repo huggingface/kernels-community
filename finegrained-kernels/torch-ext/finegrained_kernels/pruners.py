@@ -266,6 +266,19 @@ def require_moe_dims_aligned(N: int, K: int, block_n: int, block_k: int) -> None
         )
 
 
+def grouped_scalar_decode_pruner():
+    """``early_config_prune`` admitting the grouped kernels' ``"scalar"`` CUDA-core arm only below half a routed
+    row per expert (``2 * S < num_experts``): there the one-row tiles give single-token decode a fine grid (B200,
+    Qwen3-30B-A3B INT4 gate|up T=1: 11.1 -> 7.0 us); from half a row up the MMA tile measured faster (T=8: 34.5 vs
+    37.1 us), and at four rows the extra path anchor spent the down projection's trials on the wrong tiles (T=64:
+    35.3 -> 60.6 us)."""
+
+    def ok(c, args):
+        return c.kwargs.get("COMPUTE_MODE") != "scalar" or 2 * args["S"] < args["num_experts"]
+
+    return config_filter(ok)
+
+
 def block_fp8_scale_mode_pruner():
     """``early_config_prune`` admitting each FP8 weight-only ``SCALE_MODE`` only where its scale is
     constant over what it multiplies: ``"acc"`` needs every K step inside one scale block
