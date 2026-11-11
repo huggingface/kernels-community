@@ -1,24 +1,51 @@
 recipe version=1
 
+// Pin the exact clean upstream tree this recipe transforms.
 source \
     repo="https://github.com/arogozhnikov/einops.git" \
     commit="ad2c8d67d08cbebb45e1aff2be21dc88635fc695"
 
-// Carry over the package and its tests, minus upstream's test launcher.
+// Retain only the Python package and its upstream tests.
 prune keep="einops/**"
+
+// Drop upstream's test launcher, pytest does not use it.
 delete in="einops/tests/run_tests.py"
-move from="einops/tests" to="tests"
-move from="einops" to="torch-ext/einops"
+
+// Lift upstream tests out of the package into the kernel test root.
+move \
+    from="einops/tests" \
+    to="tests"
+
+// Place the distributable package in the torch extension tree.
+move \
+    from="einops" \
+    to="torch-ext/einops"
 
 // Make package-internal imports work under the Hub-generated module name.
-relativize_imports in="torch-ext/einops/**" package_root="torch-ext/einops" changes=7
+relativize_imports \
+    in="torch-ext/einops/**" \
+    package_root="torch-ext/einops" \
+    changes=7
 
 // Expose array_api because Hub consumers cannot import it by package name.
-ensure_import in="torch-ext/einops/__init__.py" from="." name="array_api" changes=1
+ensure_import \
+    in="torch-ext/einops/__init__.py" \
+    from="." \
+    name="array_api" \
+    changes=1
 
 // Point imports of the former einops.tests package at the lifted tests.
-remap_module in="tests/*.py" from="einops.tests" to="tests" changes=7
-relativize_imports in="tests/*.py" package_root="tests" changes=7
+remap_module \
+    in="tests/*.py" \
+    from="einops.tests" \
+    to="tests" \
+    changes=7
+
+// Make imports between lifted test modules package-relative.
+relativize_imports \
+    in="tests/*.py" \
+    package_root="tests" \
+    changes=7
 
 // Resolve product imports through the locally built Hub kernel. The package
 // init binds it privately so `from . import *` cannot pick it up.
@@ -37,7 +64,7 @@ kernelize_imports \
     version=1 \
     changes=25
 
-// Default to the CI backends, while allowing local overrides.
+// Default to Torch and NumPy tests, with an EINOPS_TEST_BACKENDS override.
 replace in="tests/__init__.py" \
     find="ENVVAR_NAME = \"EINOPS_TEST_BACKENDS\"\n" \
     with="ENVVAR_NAME = \"EINOPS_TEST_BACKENDS\"\nos.environ.setdefault(ENVVAR_NAME, \"torch,numpy\")\n"
@@ -50,6 +77,7 @@ replace in="tests/test_layers.py" \
 // Select every upstream test for the kernel CI suite.
 mark_tests in="tests/test_*.py" marker="kernels_ci" changes=63
 
+// Emit the noarch kernel manifest and supported runtime backends.
 manifest \
     name="einops" \
     version=1 \
