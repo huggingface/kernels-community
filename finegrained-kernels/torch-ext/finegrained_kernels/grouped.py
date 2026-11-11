@@ -24,7 +24,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .bayesian_autotuner import bayesian_autotune
 from ._ops import add_op_namespace_prefix
-from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, persistent_program_count, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, pipeline_autotuning_configs, persistent_programs_per_sm, is_sm10x, block_fp8_scale_mode_configs
+from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, persistent_program_count, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, pipeline_autotuning_configs, persistent_programs_per_sm, is_sm10x, block_fp8_scale_mode_configs, narrow_scalar_autotuning_configs
 from .bench import gemm_cold_banks
 from .descriptors import build_grouped_operand_descriptors, rebind_grouped_descriptors, rebind_grouped_mx_descriptors
 from .formats import FP8_WEIGHT_ONLY_DEQUANT_MIN_M, MX_WEIGHT_ONLY_GATE_DEQUANT_MIN_M, block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, row_scale_stride, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, validate_int_operands, INT_WEIGHT_DTYPES
@@ -1369,7 +1369,15 @@ def _int_grouped_configs():
             elif config.kwargs["PACKED_SCHEDULE"]:
                 # More epilogue warps relieve FP32 register pressure when the down projection adds bias.
                 configs.extend(pipeline_autotuning_configs([config], ("flattened",), num_warps=8))
-    return configs
+    for config in configs:
+        config.kwargs["COMPUTE_MODE"] = "dot"
+    scalar = narrow_scalar_autotuning_configs(
+        block_ms=(1, 2, 4), block_ns=(8, 16, 32), WARP_SPEC=False, PACKED_SCHEDULE=False, SWAP_AB=False,
+        PIPELINE="k_loop", GROUP_SIZE_M=1, A_MEMORY_MODE="pointer", B_MEMORY_MODE="pointer", PROGRAMS_PER_SM=8,
+    )
+    for config in scalar:
+        config.pre_hook = grouped_pre_hook
+    return configs + scalar
 
 
 @bayesian_autotune(
@@ -1455,6 +1463,9 @@ def int_weight_only_matmul_grouped_kernel(
     SWAP_AB: tl.constexpr = False,
     PIPELINE: tl.constexpr = "k_loop",
     GROUP_SIZE_M: tl.constexpr = 1,
+    # "scalar": the CUDA-core reduce over 1-4 row tiles and 8-32 weight rows (the batched kernel's decode arm), for
+    # experts holding a row or two, where an MMA tile is mostly padding and the decode grid too coarse
+    COMPUTE_MODE: tl.constexpr = "dot",
 ):
     """Integer grouped expert matmul: bf16/fp16 weight-only, calibrated INT4/FP8, or INT8 SmoothQuant.
     Persistent grid-stride; pointer or host-TMA operands, affine scales.
@@ -1545,7 +1556,7 @@ def int_weight_only_matmul_grouped_kernel(
                     stride_bz_k, GATE, False, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, GROUPED=True,
                 )
             acc = int_weight_only_compute(
-                acc, a, w, w_s, w_z, BLOCK_SIZE_K, n_width, SCALE_GROUP_K, "dot", ROWS_MAJOR, INT_BITS, SWAP_AB,
+                acc, a, w, w_s, w_z, BLOCK_SIZE_K, n_width, SCALE_GROUP_K, COMPUTE_MODE, ROWS_MAJOR, INT_BITS, SWAP_AB,
                 weight_global=None if BsGlobal is None else tl.load(BsGlobal + expert_id64 * stride_bsglobal_e),
             )
             a_ptrs += BLOCK_SIZE_K * stride_a_k
