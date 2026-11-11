@@ -490,7 +490,13 @@ def moe_fused_grouped(
     ``activation_scale_ub`` caps dynamic row-wise FP8 activations at both projections.
     ``*_proj_scale_exceptions``/``*_proj_scale_exception_offsets`` mark that projection's
     ``*_proj_scale_inv`` as a CSF-compressed NVFP4 fixed stream (``prepare_nvfp4_csf_scales``);
-    the block decodes it, only the routed experts, before its GEMMs."""
+    the block decodes it, only the routed experts, before its GEMMs.
+
+    Below half a routed row per expert (single-token decode) the block runs ``moe_fused_batched``, the same
+    math: one program per (row, weight tile) and no routing sort beat the grouped tiles there (B200, T=1:
+    GPT-OSS-120B MXFP4 W4A16 31.9 vs 23.1 us, DeepSeek-V4 MXFP4 W4A8 38.0 vs 26.5 us, bit-identical)."""
+    if 2 * top_k_index.numel() < gate_up_proj.size(0):
+        return moe_fused_batched(**locals())  # locals() is exactly the parameters here
     num_top_k = top_k_index.size(-1)
     NUM_EXPERTS = gate_up_proj.size(0)
     expert_start, gather_idx, scatter_idx = compute_grouped_scheduling(
