@@ -1783,7 +1783,7 @@ def w8a8_block_dynamic_fp8_matmul(
     mutates_args=(),
     opaque=True,
 )
-@path_autotune(("inline", "offline"))
+@path_autotune(("inline_quant", "offline_quant"))
 def w8a8_block_static_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -1850,7 +1850,7 @@ def w8a8_block_static_fp8_matmul(
     A_q, _ = maybe_act_quant(
         A.view(M, K),
         lambda x: ((x.to(torch.float32) / As).to(FP8_DTYPE), As),
-        w8a8_block_static_fp8_matmul.paths.choose((N, K, M.bit_length(), gate, str(A.dtype))) == "offline",
+        w8a8_block_static_fp8_matmul.paths.choose((N, K, M.bit_length(), gate, str(A.dtype))) == "offline_quant",
     )
     # Host-TMA descriptors over (M, K)/(N, K); placeholder boxes re-bound per config by
     # rebind_bd_descriptors. Read only by the descriptor configs the tuner picks for wide-N
@@ -2023,7 +2023,7 @@ def w8a8_tensor_dynamic_fp8_matmul(
 @compile_time_only_triton_op(
     add_op_namespace_prefix("mx_dynamic_matmul"), mutates_args=(), opaque=True
 )
-@path_autotune(("triton", "cublas", "inline", "offline"))
+@path_autotune(("triton", "cublas", "inline_quant", "offline_quant"))
 def mx_dynamic_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -2172,8 +2172,8 @@ def mx_dynamic_matmul(
     else:
         offline = mx_dynamic_matmul.paths.choose(
             (N, K, M.bit_length(), activation_format, str(B.dtype), str(Bs.dtype), gate, str(A.dtype)),
-            offered=("inline", "offline"),
-        ) == "offline"
+            offered=("inline_quant", "offline_quant"),
+        ) == "offline_quant"
         a_vals, as_scales = maybe_act_quant(A.view(M, K), act_quant, offline)
     A_q = e2m1_as_uint8(a_vals)
     as_u8 = ue8m0_as_uint8(as_scales)
@@ -2503,7 +2503,7 @@ def mx_weight_only_matmul_2d(
 @compile_time_only_triton_op(
     add_op_namespace_prefix("block_fp8_weight_only_matmul_2d"), mutates_args=(), opaque=True,
 )
-@path_autotune(("inline", "dequant"))
+@path_autotune(("inline_dequant", "offline_dequant"))
 def block_fp8_weight_only_matmul_2d(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -2527,7 +2527,7 @@ def block_fp8_weight_only_matmul_2d(
     N = rows // 2 if gate else rows
     # Prefill can instead dequantize the weight once (into cuBLAS when there is no GLU to fuse); the path tuner
     # times both per M bucket.
-    if block_fp8_weight_only_matmul_2d.paths.choose((N, K, M.bit_length(), gate, str(A.dtype))) == "dequant":
+    if block_fp8_weight_only_matmul_2d.paths.choose((N, K, M.bit_length(), gate, str(A.dtype))) == "offline_dequant":
         weights = dequant_block_fp8_weight(B, Bs, A.dtype, gate=gate)
         # no GLU to fuse (ungated, or the raw gate|up output): cuBLAS over the dequantized rows
         if ((not gate or act_fn is None) and output_dtype in (None, A.dtype)
@@ -2572,7 +2572,7 @@ def block_fp8_weight_only_matmul_2d(
     mutates_args=(),
     opaque=True,
 )
-@path_autotune(("inline", "dequant", "quantize_first"))
+@path_autotune(("inline_dequant", "offline_dequant", "inline_quant", "offline_quant"))
 def int_weight_only_matmul_2d(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -2611,8 +2611,8 @@ def int_weight_only_matmul_2d(
     quantize_on_load = (
         a_scale is not None and b_perm is None and a_pre_quant_scale is None
         and int_weight_only_matmul_2d.paths.choose(
-            (N, K, M.bit_length(), bits, str(A.dtype), smoothquant), offered=("inline", "quantize_first")
-        ) == "inline"
+            (N, K, M.bit_length(), bits, str(A.dtype), smoothquant), offered=("inline_quant", "offline_quant")
+        ) == "inline_quant"
     )
     if (b_perm is not None or a_pre_quant_scale is not None or a_scale is not None) and not quantize_on_load:
         A = permute_act_cols(A, b_perm, a_pre_quant_scale, a_scale, torch.int8 if smoothquant else FP8_DTYPE)
@@ -2623,8 +2623,8 @@ def int_weight_only_matmul_2d(
     if (
         a_scale is None and A.ndim == 2 and not gate and bias is None and output_dtype in (None, A.dtype)
         and int_weight_only_matmul_2d.paths.choose(
-            (N, K, M.bit_length(), bits, str(A.dtype)), offered=("inline", "dequant")
-        ) == "dequant"
+            (N, K, M.bit_length(), bits, str(A.dtype)), offered=("inline_dequant", "offline_dequant")
+        ) == "offline_dequant"
     ):
         with torch.autocast(A.device.type, enabled=False):
             return [torch.nn.functional.linear(A, dequantize_int_weight(B, Bs, K, b_zero, dtype=A.dtype))]

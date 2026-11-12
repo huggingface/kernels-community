@@ -360,7 +360,7 @@ def test_act_quant_arms_are_bit_equal():
     # each arm pinned through the op's path tuner (affine scales: no cuBLAS route, so the Triton kernel runs)
     op = internals.matmul.mx_dynamic_matmul
     inline_out, offline_out = (
-        op.paths._run(arm, (A, B, None, Bs), {"output_dtype": torch.bfloat16})[0] for arm in ("inline", "offline")
+        op.paths._run(arm, (A, B, None, Bs), {"output_dtype": torch.bfloat16})[0] for arm in ("inline_quant", "offline_quant")
     )
     assert torch.equal(inline_out, offline_out)
 

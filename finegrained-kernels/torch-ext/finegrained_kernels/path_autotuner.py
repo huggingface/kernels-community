@@ -75,18 +75,16 @@ class PathAutotuner:
         own paths. A single one needs no decision; where nothing can be timed (CUDA-graph capture, the fake-tensor
         pass of a compiled caller, another decision's timing run) an undecided key takes the first offered."""
         offered = self.paths if offered is None else tuple(offered)
-        if torch.compiler.is_compiling():  # a traced caller (e.g. a MoE forward): the tuned decision or the default
-            if self.forced in offered:
-                return self.forced
-            return self.cache.get(key + offered, offered[0]) if len(offered) > 1 else offered[0]
-        pinned = self._pinned.get()
-        if pinned in offered:  # the decision being timed; another decision of the call resolves as usual
-            return pinned
         if len(offered) == 1:
             return offered[0]
         if self.forced in offered:
             return self.forced
         key = key + offered
+        if torch.compiler.is_compiling():  # a traced caller (e.g. a MoE forward): the tuned decision or the default
+            return self.cache.get(key, offered[0])
+        pinned = self._pinned.get()
+        if pinned in offered:  # the decision being timed; another decision of the call resolves as usual
+            return pinned
         path = self.cache.get(key)
         if path is None:
             if launches_skipped() or torch.cuda.is_current_stream_capturing() or self._tuning.get():
