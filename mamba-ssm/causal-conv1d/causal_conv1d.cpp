@@ -3,6 +3,16 @@
  ******************************************************************************/
 
 #include <torch/all.h>
+#ifdef USE_ROCM
+// kernel-builder only hipifies .cu files, so map the CUDA host APIs used here.
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
+using cudaStream_t = hipStream_t;
+namespace at::cuda {
+using CUDAGuard = at::hip::HIPGuardMasqueradingAsCUDA;
+inline auto getCurrentCUDAStream() { return at::hip::getCurrentHIPStreamMasqueradingAsCUDA(); }
+}  // namespace at::cuda
+#else
 #if TORCH_VERSION_MAJOR > 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 6)
 #include <c10/core/DeviceGuard.h>
 #else
@@ -10,6 +20,7 @@
 #endif
 
 #include <c10/cuda/CUDAStream.h>
+#endif
 #include <vector>
 
 #include "causal_conv1d.h"

@@ -100,6 +100,8 @@ struct WarpReverseScan {
     // While in cub, it's defined as a macro that takes a redundant unused argument.
     #ifndef USE_ROCM
         #define WARP_THREADS CUB_WARP_THREADS(0)
+    #elif defined(HIPCUB_DEVICE_WARP_THREADS)
+        #define WARP_THREADS HIPCUB_DEVICE_WARP_THREADS
     #else
         #define WARP_THREADS HIPCUB_WARP_THREADS
     #endif
@@ -129,7 +131,7 @@ struct WarpReverseScan {
     /// Constructor
     explicit __device__ __forceinline__
     WarpReverseScan()
-        : lane_id(threadIdx.x & 0x1f)
+        : lane_id(threadIdx.x & (WARP_THREADS - 1))
         , warp_id(IS_ARCH_WARP ? 0 : (lane_id / LOGICAL_WARP_THREADS))
         , member_mask(cub::WarpMask<LOGICAL_WARP_THREADS>(warp_id))
     {

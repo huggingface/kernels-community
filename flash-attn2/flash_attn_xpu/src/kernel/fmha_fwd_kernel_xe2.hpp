@@ -244,9 +244,15 @@ class XeFMHAFwdKernelXe2 {
         if (p.cache_leftpad) {
           leftpad_k = p.cache_leftpad[idx_b];
         }
+        const bool append_kv = p.Knew != nullptr && p.seqlen_knew > 0;
+        effective_seq_kv = orig_cache_seqlens
+            + (append_kv ? p.seqlen_knew : 0) - leftpad_k;
+        // Empty rows (e.g. batch padding with cache_seqlens = -1) must not
+        // touch the cache: skip them before the append, like CUDA does.
+        if (effective_seq_kv <= 0) continue;
 
         // Fused cache update: copy knew/vnew into kcache/vcache
-        if (p.Knew != nullptr && p.seqlen_knew > 0) {
+        if (append_kv) {
           constexpr int num_threads = SGPerWG::value * cute::intel::sg_size;
           auto* k_src = p.Knew
               + idx_b * p.knew_batch_stride + head * p.knew_head_stride;
@@ -346,9 +352,6 @@ class XeFMHAFwdKernelXe2 {
             }
           }
           sycl::group_barrier(get_work_group<3>());
-          effective_seq_kv = (orig_cache_seqlens + p.seqlen_knew) - leftpad_k;
-        } else {
-          effective_seq_kv = orig_cache_seqlens - leftpad_k;
         }
       }
       if (effective_seq_kv <= 0) continue;

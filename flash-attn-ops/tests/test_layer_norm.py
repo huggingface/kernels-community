@@ -8,6 +8,7 @@ import kernels
 import pytest
 import torch
 import torch.nn.functional as F
+from kernels import get_kernel
 
 flash_attn_ops = kernels.get_kernel("kernels-community/flash-attn-ops", version=1)
 

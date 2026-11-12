@@ -1148,6 +1148,7 @@ def main(*, dry_run: bool = False):
             )
     dispatches = []
     failed = []
+    autotune_builds = []
     security_dispatches = []
     security_failed = []
 
@@ -1175,6 +1176,9 @@ def main(*, dry_run: bool = False):
         )
         emit_dispatch_diagnostics(release_result, dry_run=dry_run)
         for wf, dk in release_result.dispatched:
+            autotune_builds.append(
+                {"kernel": kernel_name, "workflow": wf, "dispatch_key": dk}
+            )
             dispatches.append(
                 DispatchResult(kernel_name=f"{kernel_name} ({wf})", dispatch_key=dk)
             )
@@ -1222,6 +1226,12 @@ def main(*, dry_run: bool = False):
                 "Bot response could not be posted. Ensure workflow token has issues/pull-requests write permission.",
                 file=sys.stderr,
             )
+        # Hand the complete dispatch set to the build barrier. A partial dispatch
+        # must never start autotuning, even if its remaining builds succeed.
+        if command == "merge-and-upload" and not failed and autotune_builds:
+            with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+                request = {"pr_number": issue_number, "builds": autotune_builds}
+                print(f"autotune_request={json.dumps(request)}", file=output)
     return 1 if failed else 0
 
 

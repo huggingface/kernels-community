@@ -1076,7 +1076,7 @@ struct BwdKernelLauncher {
         compat::experimental::launch_policy policy0{dimGrid0, dimBlock0, launch_props0, kernel_props0};
         compat::experimental::launch<
             mha_dot_do_o<decltype(trait)>,
-            mhaodoDeviceNameBwd<decltype(trait)>>(policy0, trait, param);
+            mhaodoDeviceNameBwd<decltype(trait)>>(policy0, queue, trait, param);
         // No explicit sync needed: in-order SYCL queue guarantees Phase 1
         // completes before Phase 2 starts.
 
@@ -1103,7 +1103,7 @@ struct BwdKernelLauncher {
         compat::experimental::launch_policy policy1{dimGrid1, dimBlock1, launch_props1, kernel_props1};
         compat::experimental::launch<
             mha_backward_seq<decltype(trait)>,
-            mhabwdDeviceNameBwd<decltype(trait)>>(policy1, trait, param);
+            mhabwdDeviceNameBwd<decltype(trait)>>(policy1, queue, trait, param);
         // No explicit sync needed: in-order SYCL queue guarantees Phase 2
         // completes before Phase 3 starts.
 
@@ -1116,9 +1116,8 @@ struct BwdKernelLauncher {
         compat::experimental::launch_policy policy2{dimGrid2, dimBlock2, launch_props2, kernel_props2};
         compat::experimental::launch<
             mhd_convert_dq<decltype(trait)>,
-            mhacvtDeviceNameBwd<decltype(trait)>>(policy2, trait, param);
-        compat::wait_and_throw();
-        
+            mhacvtDeviceNameBwd<decltype(trait)>>(policy2, queue, trait, param);
+
         return cutlass::Status::kSuccess;
     }
 };

@@ -2,7 +2,7 @@
   description = "Flake for trimul_gpumode kernels";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/torch-2.15.0-final";
+    kernel-builder.url = "github:huggingface/kernels";
   };
 
   outputs =
