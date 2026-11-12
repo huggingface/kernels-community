@@ -1,9 +1,8 @@
 import argparse
 import torch
 import torch.multiprocessing as mp
-import kernels
 
-deep_gemm = kernels.get_kernel("kernels-community/deep-gemm", version=3)
+from generators import deep_gemm
 
 
 def main(local_rank: int):

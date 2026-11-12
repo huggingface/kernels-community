@@ -5,9 +5,8 @@ import os
 import subprocess
 import sys
 
-import kernels
 
-deep_gemm = kernels.get_kernel("kernels-community/deep-gemm", version=3)
+from generators import deep_gemm
 
 
 # Single test template

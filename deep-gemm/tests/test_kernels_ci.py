@@ -20,13 +20,10 @@
 #   - the operator/fake-tensor registration of the Hopper-only GEMMs, which is
 #     checked under `FakeTensorMode` and so needs no kernel launch.
 
-import kernels
 import pytest
 import torch
 
-# `kernels-community/deep-gemm` is `[general.hub] repo-id` and 3 is
-# `[general] version` in `build.toml`.
-deep_gemm = kernels.get_kernel("kernels-community/deep-gemm", version=3)
+from generators import deep_gemm
 
 pytestmark = [
     pytest.mark.kernels_ci,
