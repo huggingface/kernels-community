@@ -25,17 +25,20 @@ class apply_rotary_transformers(nn.Module):
         q_rotated = q.clone()
         k_rotated = k.clone()
 
-        # Get half dimension for rotation
-        half_dim = q.shape[-1] // 2
-        q1 = q_rotated[..., :half_dim]
-        q2 = q_rotated[..., half_dim:]
-        k1 = k_rotated[..., :half_dim]
-        k2 = k_rotated[..., half_dim:]
-        if cos.shape[-1] != half_dim:
-            # Trim cos/sin to match half_dim
-            cos = cos[..., :half_dim]
-            sin = sin[..., :half_dim]
+        # Support both full and partial RoPE:
+        # If cos.shape[-1] < q.shape[-1], only rotate the first rotary_dim dimensions.
+        rotary_dim = min(cos.shape[-1], q.shape[-1])
+        half_rotary_dim = rotary_dim // 2
 
-        ops.apply_rotary(q1, q2, cos, sin, q1, q2, False)
-        ops.apply_rotary(k1, k2, cos, sin, k1, k2, False)
+        q1 = q_rotated[..., :half_rotary_dim]
+        q2 = q_rotated[..., half_rotary_dim:rotary_dim]
+        k1 = k_rotated[..., :half_rotary_dim]
+        k2 = k_rotated[..., half_rotary_dim:rotary_dim]
+
+        cos_rot = cos[..., :half_rotary_dim]
+        sin_rot = sin[..., :half_rotary_dim]
+
+        ops.apply_rotary(q1, q2, cos_rot, sin_rot, q1, q2, False)
+        ops.apply_rotary(k1, k2, cos_rot, sin_rot, k1, k2, False)
         return q_rotated, k_rotated
+
