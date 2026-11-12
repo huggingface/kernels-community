@@ -1,8 +1,7 @@
 import torch
 import random
-import kernels
 
-deep_gemm = kernels.get_kernel("kernels-community/deep-gemm", version=2)
+from generators import deep_gemm
 
 bench_kineto = deep_gemm.testing.bench_kineto
 count_bytes = deep_gemm.testing.count_bytes

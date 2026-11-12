@@ -747,6 +747,10 @@ def tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits=None):
     ops.tf32_hc_prenorm_gemm(a, b, d, sqr_sum, ns, has_ns)
 
 
+# Fused per-token FP8 cast (local to the Kernel Hub build)
+from .fused_cast import fused_per_token_cast_to_fp8
+
+
 from .mega import (
     SymmBuffer,
     get_symm_buffer_for_mega_moe,
