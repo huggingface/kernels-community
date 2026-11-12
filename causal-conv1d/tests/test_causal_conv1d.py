@@ -46,6 +46,8 @@ DEVICE = torch.accelerator.current_accelerator().type if torch.accelerator.is_av
 @pytest.mark.parametrize('dim', [64, 4096 + 32])
 # @pytest.mark.parametrize('dim', [64])
 def test_causal_conv1d(dim, seqlen, width, has_bias, silu_activation, itype, channel_last, has_initial_states, return_final_states):
+    if itype == torch.float32 and width > 4:
+        pytest.skip("widths 5-8 need 16-bit input")
     if not channel_last and (has_initial_states or return_final_states):
         pytest.skip("Only channel_last support initial_states or return_final_states")
     device = DEVICE
@@ -129,6 +131,8 @@ def test_causal_conv1d(dim, seqlen, width, has_bias, silu_activation, itype, cha
 @pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
 # @pytest.mark.parametrize("dim", [2048])
 def test_causal_conv1d_update(dim, width, seqlen, has_cache_seqlens, has_bias, silu_activation, itype):
+    if itype == torch.float32 and width > 4:
+        pytest.skip("widths 5-8 need 16-bit input")
     device = DEVICE
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
@@ -174,6 +178,8 @@ def test_causal_conv1d_update(dim, width, seqlen, has_cache_seqlens, has_bias, s
 @pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
 # @pytest.mark.parametrize("dim", [2048])
 def test_causal_conv1d_update_with_batch_gather(dim, width, seqlen, has_cache_seqlens, has_bias, silu_activation, itype):
+    if itype == torch.float32 and width > 4:
+        pytest.skip("widths 5-8 need 16-bit input")
     device = DEVICE
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
@@ -303,6 +309,8 @@ def test_causal_conv1d_race_condition(seqlen, width, has_bias, silu_activation, 
 @pytest.mark.parametrize('dim', [64, 4096 + 32])
 # @pytest.mark.parametrize('dim', [64])
 def test_causal_conv1d_varlen(dim, seqlen, width, has_bias, silu_activation, itype):
+    if itype == torch.float32 and width > 4:
+        pytest.skip("widths 5-8 need 16-bit input")
     device = DEVICE
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
