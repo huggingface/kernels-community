@@ -113,7 +113,7 @@ def weighted_reduce_kernel(
     before the routing weight, so the normalized rows are never written or re-read."""
     if PDL:
         gdc_wait()
-    g = tl.program_id(0)
+    g = tl.program_id(0).to(tl.int64)  # g * NUM_TOP_K * stride_rows_m passes 2**31 at 300k routed rows of H=7168
     offs_h = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
     mask = offs_h < H
     acc = tl.zeros((BLOCK_H,), tl.float32)

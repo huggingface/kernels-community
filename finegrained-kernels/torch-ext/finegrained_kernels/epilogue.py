@@ -288,7 +288,7 @@ def _glu_kernel(
     materializes), so the two are bit-identical."""
     if PDL:
         gdc_wait()
-    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)  # flat offsets past 2**31 elements
     mask = offs < n_out
     # gate|up columns alternate (gate 2j, up 2j+1) — the interleaved row order the GEMM emits
     base = (offs // INTER) * 2 * INTER + 2 * (offs % INTER)
