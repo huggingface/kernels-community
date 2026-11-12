@@ -299,11 +299,3 @@ void deep_gemm_fp8_einsum(
 void deep_gemm_tf32_hc_prenorm_gemm(
     const Tensor& a, const Tensor& b, const Tensor& d,
     const Tensor& sqr_sum, int64_t num_splits, bool has_num_splits);
-
-// ============================================================================
-// Fused per-token FP8 cast (local to the Kernel Hub build)
-// ============================================================================
-
-void deep_gemm_per_token_cast_to_fp8_into(
-    const at::Tensor& x, at::Tensor& out, at::Tensor& out_sf,
-    int64_t gran_k, bool use_ue8m0, bool use_packed_ue8m0);

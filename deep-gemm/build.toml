@@ -147,16 +147,3 @@ src = [
     "deep_gemm/include/deep_gemm/scheduler/mega_moe.cuh",
     "deep_gemm/include/deep_gemm/scheduler/paged_mqa_logits.cuh",
 ]
-
-# Fused per-token FP8 cast (local to the Kernel Hub build): plain CUDA, so it is also built for the pre-Hopper archs the
-# CI runner has, unlike DeepGEMM's SM90/SM100 kernels.
-[kernel.per_token_cast]
-language = "cpp-cuda"
-cuda-capabilities = [
-    "8.0",
-    "8.9",
-    "9.0",
-    "10.0",
-]
-depends = ["torch"]
-src = ["csrc/local/per_token_cast.cu"]

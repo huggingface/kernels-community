@@ -210,13 +210,10 @@ def test_gemm_ops_registered() -> None:
         layout = torch.zeros((num_groups * M,), device='cuda', dtype=torch.int32)
         deep_gemm.m_grouped_bf16_gemm_nt_contiguous(grouped_a, grouped_b, grouped_d, layout)
 
-        x = torch.randn((M, K), device='cuda', dtype=torch.bfloat16)
-        deep_gemm.fused_per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
-
 
 # ── fused per-token FP8 cast ────────────────────────────────────────────────
-# A local addition (csrc/local/per_token_cast.cu), built for every arch the CI
-# runner might have, and checked bit for bit against upstream's PyTorch reference.
+# A local addition (`deep_gemm/fused_cast.py`, a Triton kernel), checked bit for
+# bit against upstream's PyTorch reference.
 
 def _cast_input(m: int, n: int, dtype: torch.dtype) -> torch.Tensor:
     torch.manual_seed(m * n)
