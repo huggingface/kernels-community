@@ -2315,6 +2315,7 @@ def mx_dynamic_matmul(
 @compile_time_only_triton_op(
     add_op_namespace_prefix("full_precision_matmul_2d"), mutates_args=(), opaque=True
 )
+@path_autotune(("triton", "cublas"))
 def full_precision_matmul_2d(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -2339,6 +2340,15 @@ def full_precision_matmul_2d(
     M = A.numel() // A.shape[-1]
     # a row-strided A, e.g. the last position of each sequence in `generate`, flattens to a view
     A_2d = A.view(M, K)
+    # A plain GEMM can run on cuBLAS instead (B200, N=K=4096, M=8192: 1398 vs 1232 TFLOPS); the path tuner times both
+    if (
+        not gate and not simulate_unfused and output_dtype in (None, A.dtype)
+        and (bias is None or bias.dtype == A.dtype)
+        and full_precision_matmul_2d.paths.choose((N, K, M.bit_length(), bias is None, str(A.dtype))) == "cublas"
+    ):
+        native_bias = bias[0] if bias is not None and bias.ndim == 2 else bias
+        with torch.autocast(A.device.type, enabled=False):
+            return [torch.nn.functional.linear(A, B, native_bias)]
     C = A.new_empty(A.shape[:-1] + (gate_out_cols(N, gate, act_fn),), dtype=output_dtype)
 
     a_descriptor = maybe_descriptor(A.view(M, K), [16, 32])
