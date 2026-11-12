@@ -348,6 +348,11 @@ struct FMHAFwdMainloopXe2<
         cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), _));
 
     for (int K = blk_k0; K < blk_k1; K++) {
+      // Split barrier to keep the sub-groups of a work-group together, as in
+      // sycl-tla's xe_fmha_fwd_mainloop and vllm's chunk_prefill mainloop.
+      // Without it, two work-groups sharing one BMG Xe-core produce wrong
+      // results or hang the GPU.
+      barrier_arrive(ScopeWorkgroup);
       int physical_page = 0;
       if constexpr (PagedKV) {
         physical_page = params.paged.ptr_page_table[
@@ -602,6 +607,7 @@ struct FMHAFwdMainloopXe2<
           }
         }
       }
+      barrier_wait(ScopeWorkgroup);
     }
 
     // Use shared get_LSE_metadata from fmha_fwd_common.hpp

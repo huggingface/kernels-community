@@ -112,6 +112,8 @@ class XeFMHAFwdKernelXe2 {
     int64_t vnew_head_stride = 0;
     int64_t vnew_row_stride = 0;
     int seqlen_knew = 0;
+    // Varlen: skip batches with fewer queries (0 = none).
+    int min_seqlen_q = 0;
   };
   using KernelParams = KernelArguments;
 
@@ -224,6 +226,11 @@ class XeFMHAFwdKernelXe2 {
       auto [seq_len_qo, seq_len_kv] = sequence_length_shape;
       if (blk_q * get<0>(TileShapeQK{}) >= seq_len_qo)
         continue;
+      // Varlen: batches with fewer queries are left to another kernel.
+      if constexpr (is_var_len) {
+        if (seq_len_qo < p.min_seqlen_q)
+          continue;
+      }
 
       // KV Cache: override seq_len_kv with per-batch effective length
       int effective_seq_kv = seq_len_kv;
@@ -357,10 +364,8 @@ class XeFMHAFwdKernelXe2 {
 
       // Causal-only early-exit: skip SGs that are fully masked. With
       // LocalMask we can't easily do this here, so let the loop body mask.
-      if (CausalMask && !LocalMask &&
-          first_non_masked_sequence > last_seq_coord) {
-        continue;
-      }
+      const bool sg_skip = CausalMask && !LocalMask &&
+          first_non_masked_sequence > last_seq_coord;
 
       // Per-SG effective KV length.
       int seq_len;
@@ -388,6 +393,27 @@ class XeFMHAFwdKernelXe2 {
       }
       const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
       const int total_blk = k_blocks - k_block0;
+
+      // The mainloop runs a work-group split barrier per K block, so every
+      // sub-group must arrive the same number of times. With causal/local
+      // masks the K range is per sub-group: pad the shorter (and skipped)
+      // sub-groups with empty barrier rounds up to the work-group maximum.
+      const int sg_iters = sg_skip ? 0 : cute::max(0, total_blk);
+      int wg_iters = sg_iters;
+      if constexpr (CausalMask || LocalMask) {
+        wg_iters = sycl::reduce_over_group(
+            get_work_group<3>(), sg_iters, sycl::maximum<int>());
+      }
+      auto pad_barriers = [&] {
+        for (int i = sg_iters; i < wg_iters; i++) {
+          barrier_arrive(ScopeWorkgroup);
+          barrier_wait(ScopeWorkgroup);
+        }
+      };
+      if (sg_skip) {
+        pad_barriers();
+        continue;
+      }
 
       int offset_q = 0, offset_k = 0, offset_v = 0, offset_o = 0;
       if constexpr (is_var_len) {
@@ -503,6 +529,7 @@ class XeFMHAFwdKernelXe2 {
           s.num_heads_q,
           q_offset_sg,
           p.cache_seqlens ? p.cache_seqlens[idx_b] : 0);
+      pad_barriers();
 
       if constexpr (
           !is_empty_v<MainloopSharedStorage> &&
