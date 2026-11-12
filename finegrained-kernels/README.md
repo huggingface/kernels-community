@@ -257,6 +257,8 @@ Which optimizations each kernel can use, grouped by what they improve. Rows are 
 
 🟢 available (a tuner axis or config; 🟢* always on) · 🟠 fenced or partial: pruned in some regime · 🔴 not implemented where it would plausibly apply · ⚪ not applicable (⚪† deliberately absent, measured not to win)
 
+Where a kernel has alternative launch paths (prefill dequantization or staging against the in-loop conversion, a cuBLAS route against the Triton kernel), the path tuner (`path_autotune`) times the valid ones per shape bucket and keeps the fastest, cached like a kernel config; there are no fixed size thresholds. A 🟠 there means the path is only valid for some recipes (e.g. no fused GLU or bias). The INT 2D cuBLAS route is the prefill dequantization into cuBLAS; its static activation scale is quantized inline (on load) or offline (one pass first), also as timed. The 2D MX activation quantization still switches from inline to offline at a fixed `MX_MATMUL_ACT_PREQUANT_MIN_M`.
+
 #### Scheduling and launch
 
 How work is spread over the GPU and how launches overlap.
@@ -316,7 +318,7 @@ How operands and scales are read.
 | grouped | MXFP8 / MXFP4 / NVFP4 | 🟢 | 🟢 | 🟠 | ⚪ | 🟠 | ⚪ |
 | grouped | MX weight-only (W4A16 / W8A16) | 🟢 | 🟢 | 🟠 | ⚪ | ⚪ | 🟠 |
 | grouped | FP8 weight-only | 🟢 | 🟢 | 🟠 | ⚪ | ⚪ | 🟢 |
-| grouped | INT2/4/8 (GPTQ, AWQ, SmoothQuant) | 🟢 | 🟢 | 🟠 | ⚪ | ⚪ | ⚪† |
+| grouped | INT2/4/8 (GPTQ, AWQ, SmoothQuant) | 🟢 | 🟢 | 🟠 | ⚪ | ⚪ | 🟢 |
 | grouped | BF16 / FP16 | 🟢 | 🟢 | 🟠 | ⚪ | ⚪ | ⚪ |
 
 #### Compute
@@ -331,7 +333,7 @@ How much of the MMA each tile uses. *Scale off weight tile*: a coarse weight sca
 | 2D | MXFP8 / MXFP4 / NVFP4 | 🟠 | 🟠 | 🟠 | 🟢 | 🟢 | ⚪ | 🟠 | ⚪ |
 | 2D | MX weight-only (W4A16 / W8A16) | 🟠 | 🔴 | 🔴 | 🔴 | ⚪ | 🟢 | 🔴 | ⚪ |
 | 2D | FP8 weight-only | ⚪ | 🟠 | 🔴 | ⚪† | ⚪ | 🔴 | 🟠 | 🟠 |
-| 2D | INT2/4/8 (GPTQ, AWQ, SmoothQuant) | ⚪ | 🟠 | 🟠 | 🟠 | ⚪ | 🔴 | 🔴 | ⚪ |
+| 2D | INT2/4/8 (GPTQ, AWQ, SmoothQuant) | ⚪ | 🟠 | 🟠 | 🟠 | ⚪ | 🔴 | 🟠 | ⚪ |
 | 2D | BF16 / FP16 | ⚪ | 🟠 | ⚪ | ⚪ | ⚪ | ⚪ | 🔴 | ⚪ |
 | batched | block FP8 (dynamic act) | 🔴 | 🟠 | 🔴 | ⚪† | ⚪ | ⚪ | ⚪ | 🟢* |
 | batched | block FP8 (static act) | ⚪ | 🟠 | 🔴 | ⚪† | ⚪ | ⚪ | ⚪ | 🟢* |
@@ -362,7 +364,7 @@ Work done without an extra pass or launch.
 | 2D | MXFP8 / MXFP4 / NVFP4 | 🟢 | 🟢 | ⚪ | 🟢 | 🟠 |
 | 2D | MX weight-only (W4A16 / W8A16) | ⚪ | 🟢 | ⚪ | 🟢 | ⚪ |
 | 2D | FP8 weight-only | ⚪ | 🟢 | ⚪ | 🟢 | ⚪ |
-| 2D | INT2/4/8 (GPTQ, AWQ, SmoothQuant) | 🟢* | 🟢 | ⚪ | 🟢 | ⚪ |
+| 2D | INT2/4/8 (GPTQ, AWQ, SmoothQuant) | 🟢 | 🟢 | ⚪ | 🟢 | ⚪ |
 | 2D | BF16 / FP16 | ⚪ | 🟢 | ⚪ | 🟢 | ⚪ |
 | batched | block FP8 (dynamic act) | 🟢* | 🟢 | 🟢 | 🟢 | 🟢 |
 | batched | block FP8 (static act) | 🟢 | 🟢 | 🔴 | 🟢 | 🟢 |

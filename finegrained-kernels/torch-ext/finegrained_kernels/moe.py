@@ -47,6 +47,7 @@ from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 from .grouped import matmul_grouped
 from .batched import GATE_UNSTACK_MAX_S, matmul_batched
 from .bayesian_autotuner import bayesian_autotune
+from .path_autotuner import path_autotune
 from ._ops import add_op_namespace_prefix
 from .compat import (
     MX_SCALE_GROUP_K,
@@ -433,6 +434,7 @@ def _gate_up_activations(hidden, fmt, gate_up_scale, global_scale, activation_sc
     )
 
 
+@path_autotune(("grouped", "batched"))
 def moe_fused_grouped(
     hidden_states: torch.Tensor,  # (T, H)
     top_k_index: torch.Tensor,  # (T, K) int
@@ -494,11 +496,21 @@ def moe_fused_grouped(
     ``*_proj_scale_inv`` as a CSF-compressed NVFP4 fixed stream (``prepare_nvfp4_csf_scales``);
     the block decodes it, only the routed experts, before its GEMMs.
 
-    Below half a routed row per expert (single-token decode) the block runs ``moe_fused_batched``, the same
-    math: one program per (row, weight tile) and no routing sort beat the grouped tiles there (B200, T=1:
-    GPT-OSS-120B MXFP4 W4A16 31.9 vs 23.1 us, DeepSeek-V4 MXFP4 W4A8 38.0 vs 26.5 us, bit-identical)."""
-    if 2 * top_k_index.numel() < gate_up_proj.size(0):
-        return moe_fused_batched(**locals())  # locals() is exactly the parameters here
+    At a few routed rows per expert the block can instead run ``moe_fused_batched``, the same math: one program per
+    (row, weight tile) and no routing sort (B200, T=1: GPT-OSS-120B MXFP4 W4A16 23.1 vs 31.9 us, DeepSeek-V4 MXFP4
+    W4A8 26.5 vs 38.0 us; T=16 GPT-OSS a near tie, T=64 the grouped tiles 400 vs 644 us). The path tuner times both
+    per routed-rows bucket; where nothing can be timed, decode (below half a routed row per expert) runs batched."""
+    params = dict(locals())  # exactly the parameters here
+    rows, num_experts = top_k_index.numel(), gate_up_proj.size(0)
+    offered = ("batched", "grouped") if 2 * rows < num_experts else ("grouped", "batched")
+    if simulate_unfused:  # the two chains round in different orders: a test of one keeps its rounding untimed
+        offered = offered[:1]
+    key = (
+        num_experts, rows.bit_length(), tuple(gate_up_proj.shape[1:]), str(gate_up_proj.dtype),
+        str(getattr(gate_up_proj_scale_inv, "dtype", None)), activation_format, str(hidden_states.dtype),
+    )
+    if moe_fused_grouped.paths.choose(key, offered) == "batched":
+        return moe_fused_batched(**params)
     num_top_k = top_k_index.size(-1)
     NUM_EXPERTS = gate_up_proj.size(0)
     expert_start, gather_idx, scatter_idx = compute_grouped_scheduling(

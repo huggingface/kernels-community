@@ -19,13 +19,11 @@ import triton
 
 from .compat import MX_SCALE_GROUP_K, NIBBLES_PER_BYTE, NVFP4_SCALE_GROUP_K, UE8M0_DTYPE
 
-# Amortize weight conversion across this many activation rows per GEMM.
-FP8_WEIGHT_ONLY_DEQUANT_MIN_M = 1024
-# MX weight-only grouped gate|up stages BF16 weights from this many routed rows per expert (the down arm never gains).
-MX_WEIGHT_ONLY_GATE_DEQUANT_MIN_M = 256
-# The integer 2D prefill dequantizes once only at this many rows and above this weight size.
-INT_WEIGHT_ONLY_DEQUANT_MIN_M = 4096
-INT_WEIGHT_ONLY_DEQUANT_MIN_DIM = 2048
+# The weight-only grouped GEMMs (FP8, MX gate|up, integer) offer staged BF16 weights, dequantized once for the BF16
+# grouped GEMM, from this many routed rows per expert, and their path tuners time staging against the in-loop
+# conversion. Below it staging cannot amortize, and it would write a BF16 copy of every expert (29 GB for a
+# 6144-wide 256-expert MoE) just to lose a timing.
+WEIGHT_ONLY_STAGE_MIN_ROWS = 256
 
 
 def ue8m0_as_uint8(scale: torch.Tensor | None) -> torch.Tensor | None:

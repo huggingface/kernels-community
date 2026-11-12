@@ -23,12 +23,13 @@ import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .bayesian_autotuner import bayesian_autotune
+from .path_autotuner import path_autotune
 from ._ops import add_op_namespace_prefix
 from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, persistent_program_count, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, pipeline_autotuning_configs, persistent_programs_per_sm, is_sm10x, block_fp8_scale_mode_configs, narrow_scalar_autotuning_configs
 from .bench import gemm_cold_banks
 from .descriptors import build_grouped_operand_descriptors, rebind_grouped_descriptors, rebind_grouped_mx_descriptors
-from .formats import FP8_WEIGHT_ONLY_DEQUANT_MIN_M, MX_WEIGHT_ONLY_GATE_DEQUANT_MIN_M, block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, row_scale_stride, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, validate_int_operands, INT_WEIGHT_DTYPES
-from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, mx_act_quant_grouped, mx_act_quant_routed_rows, quantize_routed_rows_per_expert, static_expert_act_operands, swizzle_grouped_mx_scales, tensor_wide_act_operands, prepare_fp8_mx_inputs, permute_routed_rows
+from .formats import WEIGHT_ONLY_STAGE_MIN_ROWS, block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, row_scale_stride, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, validate_int_operands, INT_WEIGHT_DTYPES
+from .quant import dequantize_int_weight, fp8_act_quant_block_dynamic, MX_ACT_QUANT, mx_act_quant_grouped, mx_act_quant_routed_rows, quantize_routed_rows_per_expert, static_expert_act_operands, swizzle_grouped_mx_scales, tensor_wide_act_operands, prepare_fp8_mx_inputs, permute_routed_rows
 from .swizzle import swizzled_scale_descriptor
 from .loading.scales import apply_row_scale, weight_scale_rows, dequant_block_fp8_weight, dequant_mx_weight, csf_weight_scales, load_swizzled_rows_scale
 from .mma import block_dynamic_dot, block_fp8_weight_only_dot, fp8_dot, mx_compute, mx_dot_scaled_tokens, mx_weight_only_compute, static_dot, int_weight_only_compute
@@ -2889,6 +2890,7 @@ def full_precision_matmul_grouped(
     mutates_args=(),
     opaque=True,
 )
+@path_autotune(("inline", "staged"))
 def block_fp8_weight_only_matmul_grouped(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -2917,7 +2919,11 @@ def block_fp8_weight_only_matmul_grouped(
 
     num_experts, _, N = expert_weight_shape(B, gate)
     S = routed_rows(A, gather_idx, scatter_idx, expert_start, num_experts)
-    if S >= FP8_WEIGHT_ONLY_DEQUANT_MIN_M * num_experts:
+    # Prefill can instead stage BF16 weights once and run the BF16 grouped GEMM (DeepSeek-V3 experts, B200, graph:
+    # in-loop wins at 256-1024 rows per expert, staging at 2048), so the path tuner times both.
+    if S >= WEIGHT_ONLY_STAGE_MIN_ROWS * num_experts and block_fp8_weight_only_matmul_grouped.paths.choose(
+        (N, K, num_experts, tokens_per_expert_bucket(S, num_experts), gate, str(A.dtype))
+    ) == "staged":
         weights = dequant_block_fp8_weight(
             B, Bs, A.dtype, gate=gate, expert_start=expert_start,
         )
@@ -2990,6 +2996,7 @@ def block_fp8_weight_only_matmul_grouped(
     mutates_args=(),
     opaque=True,
 )
+@path_autotune(("in_loop", "staged"))
 def mx_weight_only_matmul_grouped(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -3031,12 +3038,17 @@ def mx_weight_only_matmul_grouped(
     b_global_scale = normalize_global_scale(b_global_scale, num_experts)
     a_global_scale = normalize_global_scale(a_global_scale, num_experts)
     S = routed_rows(A, gather_idx, scatter_idx, expert_start, num_experts)
-    # Large gate|up prefill stages exact BF16 weights (an E2M1/E4M3 value times a UE8M0 scale) once and runs the
-    # BF16 grouped GEMM: GPT-OSS-120B, B200, 256 / 512 rows per expert 0.83x / 0.64x; at 64 it is 2x slower, and
-    # the down arm loses at every size (1.2-1.5x), so it keeps the in-loop upcast.
+    # The GEMM can instead stage exact BF16 weights (an E2M1/E4M3 value times a UE8M0 scale) once and run the BF16
+    # grouped GEMM, bit-identical. Neither wins outright (GPT-OSS-120B gate|up, B200, graph: 128 rows per expert a
+    # tie, 256 in-loop 3077 vs 3688us, 512 a tie, 1024 staged 10307 vs 12249us), so the path tuner times both, per
+    # projection. Below WEIGHT_ONLY_STAGE_MIN_ROWS rows per expert staging cannot amortize: those keep the in-loop
+    # upcast untimed.
     if (
-        gate and mx_scale_family(Bs, K) == MX_SCALE_GROUP_K and b_global_scale is None and a_global_scale is None
-        and A.dtype != torch.float32 and S >= MX_WEIGHT_ONLY_GATE_DEQUANT_MIN_M * num_experts
+        mx_scale_family(Bs, K) == MX_SCALE_GROUP_K and b_global_scale is None and a_global_scale is None
+        and A.dtype != torch.float32 and S >= WEIGHT_ONLY_STAGE_MIN_ROWS * num_experts
+        and mx_weight_only_matmul_grouped.paths.choose(
+            (N, K, num_experts, tokens_per_expert_bucket(S, num_experts), gate, str(A.dtype), str(B.dtype))
+        ) == "staged"
     ):
         weights = dequant_mx_weight(B, Bs, A.dtype, expert_start=expert_start)
         return full_precision_matmul_grouped(
@@ -3111,6 +3123,7 @@ def mx_weight_only_matmul_grouped(
     mutates_args=(),
     opaque=True,
 )
+@path_autotune(("inline", "staged"))
 def int_weight_only_matmul_grouped(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -3148,6 +3161,19 @@ def int_weight_only_matmul_grouped(
     N = rows // 2 if gate else rows
     S = routed_rows(A, gather_idx, scatter_idx, expert_start, num_experts)
     output_dtype = resolve_output_dtype(output_dtype, A, None)
+    # Plain weight-only prefill can instead dequantize every expert once and run the BF16 grouped GEMM, as the dense
+    # op does into cuBLAS; the path tuner times both.
+    if (
+        b_perm is None and a_pre_quant_scale is None and a_scale is None and b_scale2 is None
+        and S >= WEIGHT_ONLY_STAGE_MIN_ROWS * num_experts
+        and int_weight_only_matmul_grouped.paths.choose(
+            (N, K, num_experts, tokens_per_expert_bucket(S, num_experts), bits, gate, str(A.dtype))
+        ) == "staged"
+    ):
+        return full_precision_matmul_grouped(
+            A, dequantize_int_weight(B, Bs, K, b_zero, dtype=A.dtype), expert_start, gate, act_fn, swiglu_alpha,
+            swiglu_limit, simulate_unfused, None, False, output_dtype, gather_idx, scatter_idx, bias=bias,
+        )
     if b_perm is not None or a_pre_quant_scale is not None or a_scale is not None:
         A = permute_routed_rows(
             A, b_perm, S, gather_idx, expert_start=expert_start,

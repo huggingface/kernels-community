@@ -24,6 +24,7 @@ import triton.language as tl
 from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
 from .bayesian_autotuner import bayesian_autotune
+from .path_autotuner import path_autotune
 from .bench import gemm_cold_banks
 
 from ._ops import add_op_namespace_prefix
@@ -1345,9 +1346,6 @@ def block_fp8_weight_only_matmul_batched_kernel(
 
 
 GATE_UNSTACK_MAX_S = 16  # the unstacked-gate decode band (see the dispatch in the wrapper)
-# act-order routed rows the integer kernel gathers in-kernel; above, permute_routed_rows first (B200, Qwen3-30B-A3B
-# gate|up: S=8 8.8 vs 9.8us, S=32 21.3 vs 21.6us, S=128 70.6 vs 68.0us, S=512 236.6 vs 224.4us)
-ACT_ORDER_GATHER_MAX_S = 8
 
 
 def unstacked_gate(gemm, output_dtype, simulate_unfused, act_fn, swiglu_alpha, swiglu_limit,
@@ -2255,6 +2253,7 @@ def mx_weight_only_matmul_batched(
     mutates_args=(),
     opaque=True,
 )
+@path_autotune(("gather", "permute"))
 def int_weight_only_matmul_batched(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -2279,8 +2278,9 @@ def int_weight_only_matmul_batched(
     activations against 2/4/8-bit integer weights, ``B`` ``(E, N, K // VPW)`` interleaved uint32 words
     (``int_weight_only_matmul_2d``), ``Bs`` ``(E, N, K // group)`` float
     group scales, ``b_zero`` the matching integer zero points (``None``: symmetric) and ``b_perm`` ``(E, K)`` int32
-    the act-order K orders (``None``: natural): up to ``ACT_ORDER_GATHER_MAX_S`` routed rows the kernel gathers each
-    row's columns itself, above it one ``permute_routed_rows`` launch lays the rows out first. Returns ``[C]``. The weight
+    the act-order K orders (``None``: natural): the kernel gathers each row's columns itself, or one
+    ``permute_routed_rows`` launch lays the rows out first, as the path tuner timed it (B200, Qwen3-30B-A3B gate|up:
+    S=8 8.8 vs 9.8us for the gather, S=32 a tie, S=128 70.6 vs 68.0us and S=512 236.6 vs 224.4us for the permute). Returns ``[C]``. The weight
     is dequantized to the activation dtype (``((q - zero) * scale)`` rounded in the scale dtype, then cast), as the torch
     "dequantize, then matmul" reference does, so results match it up to fp32 summation order."""
     bits = validate_int_operands(A, B, Bs, b_zero, b_perm, a_scale, b_scale2)
@@ -2306,7 +2306,12 @@ def int_weight_only_matmul_batched(
     K = A.shape[1]
     S = expert_ids.shape[0]
     num_experts, N, K_b = B.shape
-    if a_scale is not None or a_pre_quant_scale is not None or (b_perm is not None and S > ACT_ORDER_GATHER_MAX_S):
+    if a_scale is not None or a_pre_quant_scale is not None or (
+        b_perm is not None
+        and int_weight_only_matmul_batched.paths.choose(
+            (N, K, num_experts, S.bit_length(), gate, str(A.dtype)), offered=("gather", "permute")
+        ) == "permute"
+    ):
         A = permute_routed_rows(
             A, b_perm, S, gather_idx, expert_ids=expert_ids,
             pre_quant_scale=a_pre_quant_scale, num_experts=num_experts, quant_scale=a_scale,

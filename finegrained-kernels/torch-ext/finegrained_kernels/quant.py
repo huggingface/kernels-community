@@ -836,20 +836,14 @@ def row_padded_empty(rows: int, cols: int, row_multiple: int, dtype: torch.dtype
     return torch.empty(padded * cols, device=device, dtype=dtype)[: rows * cols].view(rows, cols)
 
 
-def maybe_act_quant(x, act_quant, min_m):
-    """Row-count-gated offline activation pre-quant. Apply ``act_quant`` (a one-pass
-    quant kernel, e.g. ``mxfp8_act_quant``) when the GEMM consuming ``x`` is
-    compute-bound (``rows >= min_m``) — the inline form re-quantizes per N-tile there.
-    ``min_m`` is the consumer kernel's crossover, defined next to its wrapper with its
-    provenance (measured sweep or inherited estimate). Below the threshold return ``x``
-    raw: the weight-bandwidth-bound GEMM quantizes its
-    one thin tile inline for free (the UE8M0 inline quant is exponent-only), and a
-    separate quant kernel is pure added latency (M=1 graph attn decode measured
-    0.66-0.85x offline). Bit-exact either way. Returns ``(a, a_scale)``; the consumer
-    kernel picks its arm off ``a``'s dtype at compile time (fp8 = pre-quantized, raw
-    bf16/fp16 = quantize inline), so in the inline arm ``a_scale`` is a constexpr-dead
-    placeholder."""
-    if x.shape[0] >= min_m:
+def maybe_act_quant(x, act_quant, offline):
+    """Offline activation pre-quant: apply ``act_quant`` (a one-pass quant kernel, e.g. ``mxfp8_act_quant``) when
+    ``offline``, else return ``x`` raw for the consuming GEMM to quantize inline. Inline saves a launch where the GEMM
+    is weight-bandwidth-bound (M=1 attention decode: 0.66-0.85x offline), offline saves re-quantizing per N tile
+    where it is compute-bound; the consumer's path tuner times both. Bit-exact either way. Returns ``(a, a_scale)``;
+    the consumer kernel picks its arm off ``a``'s dtype at compile time (fp8 = pre-quantized, raw bf16/fp16 =
+    quantize inline), so in the inline arm ``a_scale`` is a constexpr-dead placeholder."""
+    if offline:
         return act_quant(x)
     return x, x
 

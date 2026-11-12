@@ -25,10 +25,11 @@ from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .bayesian_autotuner import bayesian_autotune
+from .path_autotuner import path_autotune
 from ._ops import add_op_namespace_prefix
 from .compat import FP8_DTYPE, is_sm10x, launches_skipped, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, pdl_launch_kwargs, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, narrow_dot_autotuning_configs, narrow_scalar_autotuning_configs, split_k_autotuning_configs, persistent_program_count, pipeline_autotuning_configs, block_fp8_scale_mode_configs
 from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_tiled_descriptors, rebind_weight_only_descriptors, weight_descriptor
-from .formats import FP8_WEIGHT_ONLY_DEQUANT_MIN_M, INT_WEIGHT_ONLY_DEQUANT_MIN_DIM, INT_WEIGHT_ONLY_DEQUANT_MIN_M, block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, normalize_global_scale, e2m1_as_uint8, is_mx, is_rowwise, mx_scale_family, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_2d_operands, weight_format, validate_int_operands, validate_svdquant_operands, INT_WEIGHT_DTYPES
+from .formats import block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, normalize_global_scale, e2m1_as_uint8, is_mx, is_rowwise, mx_scale_family, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_2d_operands, weight_format, validate_int_operands, validate_svdquant_operands, INT_WEIGHT_DTYPES
 from .bench import gemm_cold_banks
 from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, maybe_act_quant, mxfp8_act_quant, nvfp4_act_quant, quantize_calibrated_act, quantize_rows_static, tensor_wide_act_operands, prepare_fp8_mx_inputs, dequantize_int_weight, permute_act_cols, svdquant_act_quant
@@ -59,16 +60,6 @@ from .pruners import PATH_ANCHOR_AXES, block_fp8_scale_mode_pruner, group_size_m
 # The 2D-grid kernels' L2-locality swizzle depth is derived per-tile inside
 # ``swizzle_offsets`` (see SWIZZLE_GROUP_A_BYTES there) — no per-kernel constant here.
 
-# maybe_act_quant crossovers (min rows for offline pre-quant). MX: MEASURED — B200
-# 2D-matmul sweep, graph-timed, H=6144 MXFP8 / H=4096 MXFP4: inline wins only at M=1
-# (33 vs 44us / 20 vs 30us), offline from M=16 for MXFP8 (22 vs 33us), 2-3x by M>=64
-# (MXFP4's M=16 cell marginally favors inline — outweighed); NVFP4 inherits the
-# family gate (not swept — same pack/amax structure as MXFP4). STATIC: inherited
-# estimate, not swept — its inline arm is cheaper elementwise work, so the true
-# crossover is at or above the MX one; the M=1 decode case (the one that matters) is
-# inline either way.
-MX_MATMUL_ACT_PREQUANT_MIN_M = 16
-STATIC_MATMUL_ACT_PREQUANT_MIN_M = 16
 # the largest M tile of the quantized 2D kernels; the activations they derive are padded to it
 MATMUL_A_ROW_MULTIPLE = 128
 
@@ -1654,6 +1645,7 @@ def full_precision_matmul_2d_kernel(
     mutates_args=(),
     opaque=True,
 )
+@path_autotune(("triton", "cublas"))
 def w8a8_block_dynamic_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -1699,7 +1691,9 @@ def w8a8_block_dynamic_fp8_matmul(
     )
     # cuBLAS MXFP8 fast path for power-of-two block scales, inside the op as the MX route
     if not gate and bias is None and not simulate_unfused:
-        _smm = _torch_scaled_mm_2d_block_ue8m0(A, B, Bs, block_size, resolve_output_dtype(output_dtype, A, None))
+        _smm = _torch_scaled_mm_2d_block_ue8m0(
+            A, B, Bs, block_size, resolve_output_dtype(output_dtype, A, None), w8a8_block_dynamic_fp8_matmul.paths
+        )
         if _smm is not None:
             return [_smm]
 
@@ -1789,6 +1783,7 @@ def w8a8_block_dynamic_fp8_matmul(
     mutates_args=(),
     opaque=True,
 )
+@path_autotune(("inline", "offline"))
 def w8a8_block_static_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -1850,13 +1845,12 @@ def w8a8_block_static_fp8_matmul(
     bs_u8 = ue8m0_as_uint8(Bs)
     C = A.new_empty(A.shape[:-1] + (gate_out_cols(N, gate, act_fn),), dtype=output_dtype)
     As = As.reshape(1).to(torch.float32)
-    # M-gated static pre-quant (bit-exact with the inline arm: same scalar, same cast);
-    # like MX, the inline form is cheap elementwise work — at M=1 a separate kernel is
-    # pure added latency. The kernel picks its arm off A's dtype.
+    # Static pre-quant, bit-exact with the inline arm (same scalar, same cast): the kernel picks its arm off A's dtype,
+    # and the path tuner times inline against offline per M bucket.
     A_q, _ = maybe_act_quant(
         A.view(M, K),
         lambda x: ((x.to(torch.float32) / As).to(FP8_DTYPE), As),
-        STATIC_MATMUL_ACT_PREQUANT_MIN_M,
+        w8a8_block_static_fp8_matmul.paths.choose((N, K, M.bit_length(), gate, str(A.dtype))) == "offline",
     )
     # Host-TMA descriptors over (M, K)/(N, K); placeholder boxes re-bound per config by
     # rebind_bd_descriptors. Read only by the descriptor configs the tuner picks for wide-N
@@ -1910,6 +1904,7 @@ def w8a8_block_static_fp8_matmul(
     mutates_args=(),
     opaque=True,
 )
+@path_autotune(("triton", "cublas"))
 def w8a8_tensor_dynamic_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -1946,7 +1941,7 @@ def w8a8_tensor_dynamic_fp8_matmul(
     # every caller gets it, and a None falls through to the Triton launch unchanged.
     if not gate and not simulate_unfused and bias is None:
         _smm = _torch_scaled_mm_2d_tensor_wise(
-            A, B, As, Bs, None, output_dtype, activation_scale_ub
+            A, B, As, Bs, None, output_dtype, w8a8_tensor_dynamic_fp8_matmul.paths, activation_scale_ub
         )
         if _smm is not None:
             return [_smm]
@@ -2028,6 +2023,7 @@ def w8a8_tensor_dynamic_fp8_matmul(
 @compile_time_only_triton_op(
     add_op_namespace_prefix("mx_dynamic_matmul"), mutates_args=(), opaque=True
 )
+@path_autotune(("triton", "cublas", "inline", "offline"))
 def mx_dynamic_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -2049,8 +2045,7 @@ def mx_dynamic_matmul(
     svdquant_lora_a: torch.Tensor | None = None,
     svdquant_lora_b: torch.Tensor | None = None,
 ) -> List[torch.Tensor]:
-    """MX/NVFP4 matmul ``C = A @ B.T``; activations quantized offline above the
-    ``maybe_act_quant`` M threshold, inline below it. ``activation_format`` sets the
+    """MX/NVFP4 matmul ``C = A @ B.T``; activations quantized offline or inline, as the path tuner timed it. ``activation_format`` sets the
     activation grid — E4M3 (``"mxfp8"``, the default) or packed E2M1 (``"mxfp4"``,
     W4A4); NVFP4 weights (E4M3 scales) pin ``"nvfp4"``. Weight format detected from
     ``B.dtype``: ``int8`` → packed E2M1 (``B`` is ``(N, K//2)``); ``float8_e4m3fn`` →
@@ -2098,7 +2093,7 @@ def mx_dynamic_matmul(
     if not gate and not quantize_output and bias is None and not simulate_unfused and svdquant_lora_a is None:
         _smm = _torch_scaled_mm_2d(
             A, B, As, Bs, activation_format, a_global_scale, b_global_scale,
-            resolve_output_dtype(output_dtype, A, None),
+            resolve_output_dtype(output_dtype, A, None), mx_dynamic_matmul.paths,
         )
         if _smm is not None:
             return [_smm]
@@ -2137,8 +2132,8 @@ def mx_dynamic_matmul(
     # resolve BEFORE the C alloc: with a pre-quantized A (As given) the default output is
     # bf16, not A's storage dtype (fp8 / packed int8 are not valid output element types)
     output_dtype = resolve_output_dtype(output_dtype, A, As)
-    # Activation quant is always maybe_act_quant — offline above the M threshold, inline in the
-    # kernel below it (fp4 packs in-register). The offline arm writes swizzled scales directly when
+    # Activation quant is always maybe_act_quant — offline, or inline in the kernel (fp4 packs in-register), as the
+    # path tuner timed it. The offline arm writes swizzled scales directly when
     # the weight is swizzled (fused, no post-quant pass), else affine. Inline acts (small M) stay
     # affine in-register even under a swizzled weight — the dot_scaled reads the mixed layout fine.
     # NVFP4 two-level: a_global_scale (the calibrated activation global) normalizes the quant on both
@@ -2175,7 +2170,11 @@ def mx_dynamic_matmul(
         if swizzled_scales and As.ndim == 2:
             as_scales = swizzle_mx_scales(As)
     else:
-        a_vals, as_scales = maybe_act_quant(A.view(M, K), act_quant, MX_MATMUL_ACT_PREQUANT_MIN_M)
+        offline = mx_dynamic_matmul.paths.choose(
+            (N, K, M.bit_length(), activation_format, str(B.dtype), str(Bs.dtype), gate, str(A.dtype)),
+            offered=("inline", "offline"),
+        ) == "offline"
+        a_vals, as_scales = maybe_act_quant(A.view(M, K), act_quant, offline)
     A_q = e2m1_as_uint8(a_vals)
     as_u8 = ue8m0_as_uint8(as_scales)
     # the act-scale layout is carried by the buffer itself: 5D = swizzled (the offline arm under
@@ -2494,6 +2493,7 @@ def mx_weight_only_matmul_2d(
 @compile_time_only_triton_op(
     add_op_namespace_prefix("block_fp8_weight_only_matmul_2d"), mutates_args=(), opaque=True,
 )
+@path_autotune(("inline", "dequant"))
 def block_fp8_weight_only_matmul_2d(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -2515,7 +2515,9 @@ def block_fp8_weight_only_matmul_2d(
     assert A.shape[-1] == K
     M = A.numel() // K
     N = rows // 2 if gate else rows
-    if M >= FP8_WEIGHT_ONLY_DEQUANT_MIN_M:
+    # Prefill can instead dequantize the weight once (into cuBLAS when there is no GLU to fuse); the path tuner
+    # times both per M bucket.
+    if block_fp8_weight_only_matmul_2d.paths.choose((N, K, M.bit_length(), gate, str(A.dtype))) == "dequant":
         weights = dequant_block_fp8_weight(B, Bs, A.dtype, gate=gate)
         # no GLU to fuse (ungated, or the raw gate|up output): cuBLAS over the dequantized rows
         if ((not gate or act_fn is None) and output_dtype in (None, A.dtype)
@@ -2560,6 +2562,7 @@ def block_fp8_weight_only_matmul_2d(
     mutates_args=(),
     opaque=True,
 )
+@path_autotune(("inline", "dequant", "quantize_first"))
 def int_weight_only_matmul_2d(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -2593,22 +2596,25 @@ def int_weight_only_matmul_2d(
     K = A.shape[-1]
     M = A.numel() // K
     N = rows // 2 if gate else rows
-    # Decode quantizes a calibrated activation on load, saving the separate pass's launch (1.6us of the ModelOpt
-    # W4A8 6144x4096 M=1 call); larger M quantizes once rather than once per N tile.
+    # A calibrated activation can be quantized on load, saving the separate pass's launch (1.6us of the ModelOpt
+    # W4A8 6144x4096 M=1 call), or once up front rather than once per N tile: the path tuner times both.
     quantize_on_load = (
-        a_scale is not None and b_perm is None and a_pre_quant_scale is None and M < STATIC_MATMUL_ACT_PREQUANT_MIN_M
+        a_scale is not None and b_perm is None and a_pre_quant_scale is None
+        and int_weight_only_matmul_2d.paths.choose(
+            (N, K, M.bit_length(), bits, str(A.dtype), smoothquant), offered=("inline", "quantize_first")
+        ) == "inline"
     )
     if (b_perm is not None or a_pre_quant_scale is not None or a_scale is not None) and not quantize_on_load:
         A = permute_act_cols(A, b_perm, a_pre_quant_scale, a_scale, torch.int8 if smoothquant else FP8_DTYPE)
     assert A.is_contiguous(), "A must be contiguous (the host-TMA descriptor arm reads its box)"
-    # Large prefill amortizes a per-call dequantization into cuBLAS, as the FP8 weight-only route does
-    # (Qwen2.5-7B qkv GPTQ M=8192, B200: INT4 216.6 -> 201.1 us, INT8 249.6 -> 206.3 us, bitwise; the Triton BF16
-    # GEMM it replaces ran 233 us against cuBLAS's 194). Smaller projections keep conversion inline to avoid the
-    # extra dispatch cost in eager mode.
+    # Prefill can instead dequantize the weight once into cuBLAS, bitwise the same. Where that pays depends on M
+    # and the weight shape (B200, graph: from M=512 at 4096x4096, yet only from M=8192 on smaller projections), so
+    # the path tuner times both per M bucket.
     if (
-        a_scale is None and A.ndim == 2 and M >= INT_WEIGHT_ONLY_DEQUANT_MIN_M
-        and min(N, K) >= INT_WEIGHT_ONLY_DEQUANT_MIN_DIM
-        and not gate and bias is None and output_dtype in (None, A.dtype)
+        a_scale is None and A.ndim == 2 and not gate and bias is None and output_dtype in (None, A.dtype)
+        and int_weight_only_matmul_2d.paths.choose(
+            (N, K, M.bit_length(), bits, str(A.dtype)), offered=("inline", "dequant")
+        ) == "dequant"
     ):
         with torch.autocast(A.device.type, enabled=False):
             return [torch.nn.functional.linear(A, dequantize_int_weight(B, Bs, K, b_zero, dtype=A.dtype))]
@@ -2696,13 +2702,9 @@ def int_weight_only_matmul_2d(
 # carry registered dgrads, so differentiating callers fall through to the Triton ops. CUDA-graph
 # capture is fine (measured under do_bench_cudagraph).
 
-_SCALED_MM_MIN_M = int(os.environ.get("FINEGRAINED_SCALED_MM_MIN_M", "2"))
-# Row-wise FP8 keeps Triton decode; the public path wins through the measured M=8192.
-_SCALED_MM_ROWWISE_MIN_M = 65
-_SCALED_MM_ROWWISE_MAX_M = 8193
-# UE8M0 block FP8 keeps Triton through M=256 (B200, N=12288 K=4096, cudagraph): M=128 16.0 vs 19.1us,
-# M=256 23.3 vs 23.6, then M=320 40.8 vs 27.2, M=2048 138.5 vs 91.2, M=8192 510.2 vs 330.0.
-_SCALED_MM_BLOCK_MIN_M = 257
+# Where a route is valid, the op's path tuner times it against the Triton kernel per M bucket: neither wins everywhere
+# (UE8M0 block FP8, B200, N=12288 K=4096, graph: Triton through M=256, cuBLAS from 320; row-wise FP8: Triton at
+# decode, cuBLAS from about M=256).
 
 
 def _scaled_mm_2d(
@@ -2756,14 +2758,15 @@ def _smm_reject(reason):
     return None
 
 
-def _torch_scaled_mm_2d_tensor_wise(A, B, As, Bs, activation_format, out_dtype, activation_scale_ub=None):
+def _torch_scaled_mm_2d_tensor_wise(A, B, As, Bs, activation_format, out_dtype, paths, activation_scale_ub=None):
     """The scaled_mm route for the K-constant FP8 scales, or ``None`` to take the Triton ops.
 
     One fp32 value per operand IS scaled_mm's ``TensorWise`` and one per row of each its
     ``RowWise``, so this arm needs neither swizzled scales nor a block-aligned K:
     - per-tensor weights with a STATIC activation scale (``TensorWise``);
     - row-wise weights with per-token activations, derived here by the same quant the Triton
-      arm runs, or handed in pre-quantized (``RowWise``), in the measured M window.
+      arm runs, or handed in pre-quantized (``RowWise``).
+    Where it is valid, ``paths`` (the op's path tuner) decides between it and the Triton kernel.
     """
     if os.environ.get("FINEGRAINED_DISABLE_SCALED_MM"):
         return _smm_reject("env-disabled")
@@ -2781,8 +2784,6 @@ def _torch_scaled_mm_2d_tensor_wise(A, B, As, Bs, activation_format, out_dtype, 
     if rowwise:
         if As is not None and As.numel() != M:
             return _smm_reject("static activation scale on row-wise weights")
-        if not _SCALED_MM_ROWWISE_MIN_M <= M < _SCALED_MM_ROWWISE_MAX_M:
-            return _smm_reject("M")
     elif As is None or As.numel() != 1:
         return _smm_reject("not-static-per-tensor")
     if (As is not None and As.dtype is not torch.float32) or Bs.dtype is not torch.float32:
@@ -2792,6 +2793,8 @@ def _torch_scaled_mm_2d_tensor_wise(A, B, As, Bs, activation_format, out_dtype, 
         return _smm_reject("shape")
     if B.stride(-1) != 1 or (B.storage_offset() * B.element_size()) % 16:
         return _smm_reject("weight-layout")
+    if paths.choose((B.shape[0], K, M.bit_length(), rowwise, str(A.dtype))) != "cublas":
+        return _smm_reject("tuned to Triton")
     if rowwise:
         Aq, As, _, _ = tensor_wide_act_operands(
             A.reshape(M, K), As, activation_scale_ub=activation_scale_ub
@@ -2805,7 +2808,7 @@ def _torch_scaled_mm_2d_tensor_wise(A, B, As, Bs, activation_format, out_dtype, 
     return out.reshape(*A.shape[:-1], B.shape[0])
 
 
-def _torch_scaled_mm_2d_block_ue8m0(A, B, Bs, block_size, out_dtype):
+def _torch_scaled_mm_2d_block_ue8m0(A, B, Bs, block_size, out_dtype, paths):
     """The scaled_mm route for 128x128 UE8M0 block FP8 (the DeepGEMM-Blackwell checkpoints), or
     ``None`` to take the Triton kernel. A power-of-two block scale is an MX group-32 scale repeated
     over its block, so the same operands run as cuBLAS's MXFP8 GEMM: the activation quant writes each
@@ -2827,10 +2830,12 @@ def _torch_scaled_mm_2d_block_ue8m0(A, B, Bs, block_size, out_dtype):
         return _smm_reject("out-dtype")
     N, K = B.shape
     M = A.numel() // K
-    if M < _SCALED_MM_BLOCK_MIN_M or K % 128 or N % 128:
-        return _smm_reject("shape/minM")
+    if K % 128 or N % 128:
+        return _smm_reject("shape")
     if B.stride(-1) != 1:
         return _smm_reject("weight-layout")
+    if paths.choose((N, K, M.bit_length(), str(A.dtype))) != "cublas":
+        return _smm_reject("tuned to Triton")
     Aq, As = fp8_act_quant_block_dynamic(A.reshape(M, K), 128, use_ue8m0=True, swizzled=True)
     weight_rows = torch.arange(N, device=B.device, dtype=torch.int32) // 128
     Bs_mx = swizzle_mx_scales(bs_u8.repeat_interleave(4, dim=1), gather_idx=weight_rows)
@@ -2838,9 +2843,9 @@ def _torch_scaled_mm_2d_block_ue8m0(A, B, Bs, block_size, out_dtype):
     return out.reshape(*A.shape[:-1], N)
 
 
-def _torch_scaled_mm_2d(A, B, As, Bs, activation_format, a_global_scale, b_global_scale, out_dtype):
-    """The scaled_mm route, or ``None`` to take the Triton ops. Fires only where measured to
-    win AND where the semantics are identical: plain ungated GEMM, quantized activations in
+def _torch_scaled_mm_2d(A, B, As, Bs, activation_format, a_global_scale, b_global_scale, out_dtype, paths):
+    """The scaled_mm route, or ``None`` to take the Triton ops. Offered where the semantics are identical, and taken
+    where ``paths`` (the op's path tuner) measured it faster: plain ungated GEMM, quantized activations in
     the WEIGHT's fmt, SWIZZLE_32_4_4 weight scales (Blackwell scaled_mm rejects row-major
     outright), bf16 out, eager, no grad."""
     if os.environ.get("FINEGRAINED_DISABLE_SCALED_MM"):
@@ -2868,10 +2873,12 @@ def _torch_scaled_mm_2d(A, B, As, Bs, activation_format, a_global_scale, b_globa
     M = A.numel() // A.shape[-1]
     group = 32 if fmt == "mxfp8" else 16
     K = A.shape[-1] if As is None else (A.shape[-1] * (2 if fmt == "nvfp4" else 1))
-    if M < _SCALED_MM_MIN_M or K % group or B.shape[0] % 16:
-        return _smm_reject("shape/minM")
+    if K % group or B.shape[0] % 16:
+        return _smm_reject("shape")
     if As is not None and As.ndim != 5:
         return _smm_reject("affine-As")  # pre-quantized activations must arrive with swizzled scales too
+    if paths.choose((B.shape[0], K, M.bit_length(), fmt, As is None, str(A.dtype)), offered=("triton", "cublas")) != "cublas":
+        return _smm_reject("tuned to Triton")
     if fmt == "mxfp8":
         Aq = A.reshape(M, K) if As is not None else None
         if Aq is None:
