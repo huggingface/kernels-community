@@ -35,7 +35,8 @@ DEVICES = _devices()
 
 
 def gelu_fast(x: torch.Tensor) -> torch.Tensor:
-    return 0.5 * x * (1.0 + torch.tanh(x * 0.7978845608 * (1.0 + 0.044715 * x * x)))
+    f = x.float()
+    return (0.5 * f * (1.0 + torch.tanh(f * 0.7978845608 * (1.0 + 0.044715 * f * f)))).to(x.dtype)
 
 
 def gelu_new(x: torch.Tensor) -> torch.Tensor:
@@ -299,3 +300,20 @@ def test_empty_input(dtype: torch.dtype, device: str) -> None:
 
     assert activation.silu_and_mul(torch.empty(0, 64, dtype=dtype), x).shape == (0, 64)
     assert activation.silu(torch.empty(0, 128, dtype=dtype), x).shape == (0, 128)
+    assert activation.fatrelu_and_mul(torch.empty(0, 64, dtype=dtype), x, 0.0).shape == (0, 64)
+    # An invalid (empty grid) launch is only reported by the next kernel launch.
+    torch.ones(1).add_(1).cpu()
+
+
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+@pytest.mark.parametrize("device", DEVICES)
+@torch.inference_mode()
+def test_gelu_fast_rounding(dtype: torch.dtype, device: str) -> None:
+    # Regression test: gelu_fast rounded its intermediates to the input dtype, so half/bf16
+    # results were several ulps off at small |x| and differed between CUDA and ROCm.
+    # It should now be within 1 ulp of the fp32 result everywhere.
+    torch.manual_seed(0)
+    x = torch.randn(2048, 13824, dtype=dtype, device=device)
+    out = activation.gelu_fast(torch.empty_like(x), x)
+    rtol = {torch.half: 2**-10, torch.bfloat16: 2**-7}[dtype]
+    torch.testing.assert_close(out, gelu_fast(x), atol=1e-5, rtol=rtol)
