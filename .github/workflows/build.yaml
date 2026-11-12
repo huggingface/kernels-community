@@ -585,7 +585,11 @@ jobs:
           apt-get install -y --no-install-recommends ca-certificates curl xz-utils sudo
 
       # Containers have no systemd, so install Nix without an init system.
+      # The action's cached nix-installer is saved by non-root runners (uid
+      # 1001); restore it as root-owned so the action can run it as root here.
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        env:
+          TAR_OPTIONS: --no-same-owner
         with:
           planner: linux
           init: none
