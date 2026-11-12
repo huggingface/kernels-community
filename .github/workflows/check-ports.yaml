@@ -1,6 +1,8 @@
 name: Check Ports
 
-# Verify committed src trees match their port recipes. PRs check changed ports;
+# Verify ports match their recipes: the committed src tree, or for a port that
+# generates src at build time, build.toml and the provenance with its hashes.
+# PRs check changed ports;
 # checker changes, pushes to main, scheduled runs and manual runs check all ports.
 on:
   push:
@@ -14,6 +16,8 @@ on:
     paths:
       - "*/port/**"
       - "*/src/**"
+      - "*/build.toml"
+      - "*/port-provenance.json"
       - "scripts/check_ports.py"
       - ".github/workflows/check-ports.yaml"
   workflow_dispatch:
@@ -40,7 +44,7 @@ jobs:
         env:
           # Refresh the runner to catch upstream changes.
           # TODO: switch back to main once huggingface/kernels#877 is merged.
-          KERNEL_PORT: "nix run --refresh github:huggingface/kernels/kernel-port-no-importlib#kernel-port --"
+          KERNEL_PORT: "nix run --refresh github:huggingface/kernels/kernel-port-srcless#kernel-port --"
           BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || '' }}
         run: |
           if [ -n "$BASE_REF" ]; then

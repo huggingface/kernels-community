@@ -32,8 +32,13 @@ jobs:
       - name: Install uv
         run: pip install uv
 
+      # Ports without a committed src tree are generated to read their API.
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
       - name: Check public API
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          # Keep in sync with check-ports.yaml.
+          KERNEL_PORT: "nix run --refresh github:huggingface/kernels/kernel-port-srcless#kernel-port --"
         run: |
           uv run --script scripts/check_public_api.py --base-ref "$BASE_SHA"

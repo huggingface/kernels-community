@@ -8,6 +8,9 @@ source \
 // Retain only the Python package and its upstream tests.
 prune keep="einops/**"
 
+// Drop upstream's test launcher, pytest does not use it.
+delete in="einops/tests/run_tests.py"
+
 // Lift upstream tests out of the package into the kernel test root.
 move \
     from="einops/tests" \
@@ -21,24 +24,28 @@ move \
 // Make package-internal imports work under the Hub-generated module name.
 relativize_imports \
     in="torch-ext/einops/**" \
-    package_root="torch-ext/einops"
+    package_root="torch-ext/einops" \
+    changes=7
 
 // Expose array_api because Hub consumers cannot import it by package name.
 ensure_import \
     in="torch-ext/einops/__init__.py" \
     from="." \
-    name="array_api"
+    name="array_api" \
+    changes=1
 
 // Point imports of the former einops.tests package at the lifted tests.
 remap_module \
-    in="tests/{__init__,test_*}.py" \
+    in="tests/*.py" \
     from="einops.tests" \
-    to="tests"
+    to="tests" \
+    changes=7
 
 // Make imports between lifted test modules package-relative.
 relativize_imports \
-    in="tests/{__init__,test_*}.py" \
-    package_root="tests"
+    in="tests/*.py" \
+    package_root="tests" \
+    changes=7
 
 // Resolve product imports through the locally built Hub kernel. The package
 // init binds it privately so `from . import *` cannot pick it up.
@@ -47,16 +54,20 @@ kernelize_imports \
     package="einops" \
     binding="_einops" \
     kernel="kernels-community/einops" \
-    version=1
+    version=1 \
+    changes=1
 
 kernelize_imports \
     in="tests/test_*.py" \
     package="einops" \
     kernel="kernels-community/einops" \
-    version=1
+    version=1 \
+    changes=25
 
 // Default to Torch and NumPy tests, with an EINOPS_TEST_BACKENDS override.
-overlay from="overlay"
+replace in="tests/__init__.py" \
+    find="ENVVAR_NAME = \"EINOPS_TEST_BACKENDS\"\n" \
+    with="ENVVAR_NAME = \"EINOPS_TEST_BACKENDS\"\nos.environ.setdefault(ENVVAR_NAME, \"torch,numpy\")\n"
 
 // Use the supported replacement for NumPy 2's removed in1d API.
 replace in="tests/test_layers.py" \
@@ -70,7 +81,7 @@ mark_tests in="tests/test_*.py" marker="kernels_ci" changes=63
 manifest \
     name="einops" \
     version=1 \
-    edition=5 \
+    edition=6 \
     license="MIT" \
     upstream="https://github.com/arogozhnikov/einops.git" \
     backends="cpu,cuda,metal,rocm,xpu" \

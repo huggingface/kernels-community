@@ -177,6 +177,12 @@ jobs:
           # Ported kernels keep build.toml in <kernel>/src; the flake stays at
           # <kernel> and points nix at it.
           $CONFIG = if (Test-Path "$KERNEL/src/build.toml") { "$KERNEL/src" } else { "$KERNEL" }
+          # This workflow builds without Nix, so it cannot generate a tree that is
+          # not committed. No ported kernel is in WINDOWS_KERNELS yet.
+          if ((Test-Path "$KERNEL/port/port.kdl") -and -not (Test-Path "$KERNEL/src")) {
+            Write-Error "Kernel '$KERNEL' generates its source with Nix, which Windows builds do not support"
+            exit 1
+          }
           if ((Test-Path "$KERNEL") -and (Test-Path "$KERNEL/flake.nix") -and (Test-Path "$CONFIG/build.toml")) {
             echo "kernel=$KERNEL" >> $env:GITHUB_OUTPUT
             echo "config=$CONFIG" >> $env:GITHUB_OUTPUT

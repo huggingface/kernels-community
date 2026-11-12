@@ -16,6 +16,8 @@ on:
     paths:
       - ".github/scripts/**"
       - ".github/pr-labels.json"
+      - "scripts/check_ports.py"
+      - "scripts/test_check_ports.py"
       - "scripts/check_public_api.py"
       - "scripts/test_check_public_api.py"
       - "scripts/kernel_status_snapshot.py"
@@ -38,6 +40,8 @@ on:
     paths:
       - ".github/scripts/**"
       - ".github/pr-labels.json"
+      - "scripts/check_ports.py"
+      - "scripts/test_check_ports.py"
       - "scripts/check_public_api.py"
       - "scripts/test_check_public_api.py"
       - "scripts/kernel_status_snapshot.py"
@@ -77,7 +81,7 @@ jobs:
       - name: Run tests
         run: |
           uv run --no-project --python 3.11 --with 'pytest>=8,<9' \
-            pytest .github/scripts scripts/test_check_public_api.py scripts/test_kernel_status_snapshot.py -v
+            pytest .github/scripts scripts/test_check_ports.py scripts/test_check_public_api.py scripts/test_kernel_status_snapshot.py -v
 
       - name: Test kernel-status CLI
         working-directory: scripts/kernel-status
