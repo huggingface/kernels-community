@@ -1,4 +1,4 @@
-# Fused per-token FP8 cast (local to the Kernel Hub build, no upstream counterpart).
+# `utils.per_token_cast_to_fp8` as one Triton kernel (local to the Kernel Hub build).
 
 import torch
 import triton
@@ -15,7 +15,7 @@ def _per_token_cast_to_fp8_kernel(
     GRAN_K: tl.constexpr, GROUPS: tl.constexpr, USE_UE8M0: tl.constexpr, PACKED: tl.constexpr,
     INV_E4M3_MAX: tl.constexpr,
 ):
-    """`GROUPS` scale groups of `GRAN_K` values of row `program_id(0)`."""
+    """`GROUPS` scale groups of row `program_id(0)`."""
     row = tl.program_id(0).to(tl.int64)
     groups = tl.program_id(1) * GROUPS + tl.arange(0, GROUPS)
     columns = groups[:, None] * GRAN_K + tl.arange(0, GRAN_K)[None, :]
@@ -47,11 +47,8 @@ def _per_token_cast_to_fp8_kernel(
 
 
 def fused_per_token_cast_to_fp8(x, use_ue8m0, gran_k=128, use_packed_ue8m0=False, out=None, out_sf=None):
-    """`utils.per_token_cast_to_fp8` in one kernel launch, bit for bit: `x` (`(m, n)`, bfloat16 or float32) as
-    float8_e4m3fn with one scale per `gran_k` values of a row, rounded up to a power of two with `use_ue8m0` and packed
-    four per int32 with `use_packed_ue8m0`. The kernel writes `out` (`(m, n)` float8_e4m3fn) and `out_sf` (`(m, ceil(n /
-    gran_k))` float32, or `(m, ceil(n / gran_k) / 4)` int32 when packed) in place, so they can be views of a larger
-    buffer; they are allocated when not given. Returns `(out, out_sf)`."""
+    """`utils.per_token_cast_to_fp8` in one kernel, bit for bit, with the same arguments. It writes into `out` and
+    `out_sf` when given (e.g. views of a larger buffer) instead of allocating them."""
     assert x.dim() == 2 and x.stride(1) == 1, "x must be 2D with contiguous rows"
     assert not use_packed_ue8m0 or use_ue8m0, "packed scales are UE8M0"
     m, n = x.shape
