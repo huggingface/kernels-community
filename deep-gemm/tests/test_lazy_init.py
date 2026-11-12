@@ -2,7 +2,7 @@ import argparse
 import torch
 import torch.multiprocessing as mp
 
-from generators import deep_gemm
+from generators import deep_gemm  # noqa: F401 (loading it before the processes start is the test)
 
 
 def main(local_rank: int):
