@@ -8,8 +8,7 @@ gpu = "NVIDIA L4"
 runner = "aws-g6-12xlarge-plus"
 backend = "cuda"
 
-# Keep the matrix bounded for the workflow's 60-minute GPU job. The row count
-# is fixed because it is not part of the Triton autotuning keys.
+# Keep the matrix bounded for the workflow's 60-minute GPU job.
 [workloads]
 rows = 512
 dtypes = ["bfloat16"]

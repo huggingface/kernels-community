@@ -4,29 +4,54 @@ import argparse
 import json
 import math
 import os
-import shutil
 import tempfile
 import tomllib
+from collections import defaultdict
 from pathlib import Path
 
 
-def collect(cache_dir: Path, output: Path):
+def collect(cache_dir: Path, output: Path, gpu: str, kernel):
+    tuning = kernel._autotune
+    tuners = {
+        "_layer_norm_fwd_1pass_kernel": ("layer_norm_fwd", tuning.FORWARD_KEY),
+        "_layer_norm_bwd_kernel": ("layer_norm_bwd", tuning.BACKWARD_KEY),
+    }
     paths = sorted(cache_dir.glob("*/*.autotune.json"))
     if not paths:
         raise ValueError("Autotuning produced no configs")
-    if output.exists():
-        shutil.rmtree(output)
+    files = defaultdict(lambda: defaultdict(list))
     for path in paths:
+        op, keys = tuners[path.name.removesuffix(".autotune.json")]
         data = json.loads(path.read_text())
         config, timing = min(data["configs_timings"], key=lambda item: item[1])
         if not all(math.isfinite(value) for value in timing):
             raise ValueError(f"No successful config in {path}")
-        # Keep only the winner and omit timing noise, so an unchanged selection
-        # produces no diff. Triton still reads this as its native cache format.
-        data["configs_timings"] = [[config, [0.0, 0.0, 0.0]]]
-        target = output / path.parent.name / path.name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+        key = dict(zip(keys, data["key"][: len(keys)], strict=True))
+        dtypes = data["key"][len(keys) :]
+        if not dtypes or config["kwargs"] or config.get("pre_hook"):
+            raise ValueError(f"Unexpected normalization tuning config in {path}")
+        filename = tuning.config_file_name(op, key.pop("N"), dtypes[0], gpu)
+        rows = str(key.pop("M"))
+        files[filename][rows].append(
+            {
+                "key": key,
+                "tensor_dtypes": dtypes,
+                "config": {
+                    name: config[name]
+                    for name in ("num_warps", "num_stages", "num_ctas")
+                },
+            }
+        )
+    output.mkdir(parents=True, exist_ok=True)
+    for filename, rows in sorted(files.items()):
+        for cases in rows.values():
+            cases.sort(
+                key=lambda case: json.dumps(case["key"], sort_keys=True)
+                + str(case["tensor_dtypes"])
+            )
+        (output / filename).write_text(
+            json.dumps(rows, indent=2, sort_keys=True) + "\n"
+        )
 
 
 def tune_workloads(kernel, workloads):
@@ -87,7 +112,7 @@ def tune(gpu: str):
         output = Path(
             os.environ.get("AUTOTUNE_CONFIGS", "torch-ext/flash_attn_ops/configs")
         )
-        collect(Path(tmp), output / gpu)
+        collect(Path(tmp), output, gpu, kernel)
 
 
 if __name__ == "__main__":
