@@ -7,3 +7,11 @@ name = "l4"
 gpu = "NVIDIA L4"
 runner = "aws-g6-12xlarge-plus"
 backend = "cuda"
+
+# Keep the matrix bounded for the workflow's 60-minute GPU job.
+[workloads]
+rows = 512
+dtypes = ["bfloat16"]
+hidden_sizes = [1024, 2048, 4096, 8192]
+# Fused prenorm cases use residuals with the same dtype as the inputs.
+residual_hidden_sizes = [1024, 2048, 4096, 8192]
