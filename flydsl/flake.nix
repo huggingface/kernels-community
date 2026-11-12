@@ -2,7 +2,7 @@
   description = "Flake for the FlyDSL SDK (repackaged upstream wheel)";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/sdk-variants";
+    kernel-builder.url = "github:huggingface/kernels/finegrained-abi3";
   };
 
   outputs =
@@ -25,7 +25,7 @@
       version = "0.5.0";
 
       variantOf =
-        buildSet: "sdk-rocm-${buildSet.buildConfig.rocmVersion}-abi3-${buildSet.buildConfig.system}";
+        buildSet: "sdk-rocm-${buildSet.buildConfig.rocmVersion}-cpython-3.12-abi3-${buildSet.buildConfig.system}";
 
       # NOTE: replace once the builder provides some nice interfaces for SDKs.
       builderLib = kernel-builder + "/nix-builder/lib";

@@ -22,7 +22,7 @@
   llvm,
   version,
 
-  # The build variant to produce, e.g. `sdk-rocm-7.0-abi3-x86_64-linux`.
+  # The build variant to produce, e.g. `sdk-rocm-7.0-cpython-3.12-abi3-x86_64-linux`.
   variant,
 
   # The (short) Git revision of the kernel, with dashes replaced by underscores
