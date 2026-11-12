@@ -612,13 +612,29 @@ def narrow_scalar_autotuning_configs(block_ms=(1,), block_ns=(8, 16, 32), **fixe
 
 
 
+def zero_split_k_counters(pre_hook=None):
+    """``pre_hook`` for a split-K config: zero the launch's ``TileCounters`` first when ``split_k_workspace`` handed out
+    counters it left unzeroed (graph capture), then run ``pre_hook``. Only a split config needs them zero, so a graph
+    whose crowned config does not split records no memset for scratch it never reads."""
+
+    def hook(nargs):
+        counters = nargs.get("TileCounters")
+        if getattr(counters, "_unzeroed", False):
+            counters.zero_()
+            counters._unzeroed = False
+        if pre_hook is not None:
+            pre_hook(nargs)
+
+    return hook
+
+
 def split_k_autotuning_configs(splits, memory_modes=("descriptor", "pointer"), pre_hook=None, configs=None, **fixed):
     """The decode ``dot`` tiles (BM=16, BN {16, 32, 64}, BK {128, 256, 512}) crossed with a ``SPLIT_K`` axis: K split
     across ``splits`` programs per output tile, reduced in-kernel. Matched memory modes, warps {2, 4}, stages 3-5.
     ``configs`` instead expands caller-selected tiles, e.g. native scaled MMA at decode."""
     if configs is not None:
         return [triton.Config(dict(c.kwargs, SPLIT_K=split), num_warps=c.num_warps, num_stages=c.num_stages,
-                              num_ctas=c.num_ctas, maxnreg=c.maxnreg, pre_hook=c.pre_hook)
+                              num_ctas=c.num_ctas, maxnreg=c.maxnreg, pre_hook=zero_split_k_counters(c.pre_hook))
                 for c in configs for split in splits]
     modes = resolve_memory_modes(memory_modes)
     blocks = [
@@ -630,7 +646,7 @@ def split_k_autotuning_configs(splits, memory_modes=("descriptor", "pointer"), p
         for sk in splits
     ]
     return [
-        triton.Config(b, num_warps=w, num_stages=s, pre_hook=pre_hook)
+        triton.Config(b, num_warps=w, num_stages=s, pre_hook=zero_split_k_counters(pre_hook))
         for b in blocks
         for w in (2, 4)
         for s in (3, 4, 5)

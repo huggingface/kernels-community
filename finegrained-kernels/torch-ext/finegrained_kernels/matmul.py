@@ -706,15 +706,16 @@ def split_k_workspace(device: torch.device, partials_numel: int, counters_numel:
     eager launches reuse one pair per (device, stream), zeroed once at creation and grown when a launch needs more: the
     stream orders the launches sharing it (the caching allocator also reuses a replaced pair in stream order), and a
     concurrent stream has its own pair. Graph capture gets private scratch whose counters are zeroed on every replay, so
-    a graph never shares counters with eager launches or other graphs, whatever stream it is replayed on: by a memset,
-    or, with ``zero_counters=False``, by a kernel the caller launches before the GEMM (a memset node between two PDL
-    launches costs its own time and the overlap). The cached pairs come from their own pool, out of a cudagraph-trees
-    warmup's graph pool."""
+    a graph never shares counters with eager launches or other graphs, whatever stream it is replayed on: by the crowned
+    split config's ``pre_hook`` (``zero_split_k_counters``: a memset node only when the graph's config splits), or, with
+    ``zero_counters=False``, by a kernel the caller launches before the GEMM (a memset node between two PDL launches
+    costs its own time and the overlap). The cached pairs come from their own pool, out of a cudagraph-trees warmup's
+    graph pool."""
     cuda = device.type == "cuda"
     if launches_skipped() or (cuda and torch.cuda.is_current_stream_capturing()):
-        counters = torch.zeros if zero_counters else torch.empty
-        return (torch.empty(partials_numel, device=device, dtype=torch.float32),
-                counters(counters_numel, device=device, dtype=torch.int32))
+        counters = torch.empty(counters_numel, device=device, dtype=torch.int32)
+        counters._unzeroed = zero_counters
+        return torch.empty(partials_numel, device=device, dtype=torch.float32), counters
     key = torch.accelerator.current_stream(device)
     pair = _SPLIT_K_WORKSPACES.get(key)
     if pair is None or pair[0].numel() < partials_numel or pair[1].numel() < counters_numel:
@@ -1217,7 +1218,6 @@ def split_k_reduce(acc, Partials, TileCounters, tile, num_tiles, BM: tl.constexp
     + narrow_dot_autotuning_configs(
         block_ms=(1, 2, 4, 8), block_ns=(32, 64), pre_hook=rebind_weight_only_descriptors, WARP_SPEC=False, SWAP_AB=True,
     )
-    + split_k_autotuning_configs(SPLIT_K_VALUES, pre_hook=rebind_weight_only_descriptors, WARP_SPEC=False)
     + narrow_scalar_autotuning_configs(block_ms=(1, 2, 4)),
     # the width and the scale group decide which tiles fit and compile: part of the key
     ["N", "K", "m_bit_length", "GATE", "INT_BITS", "SCALE_GROUP_K", "ACT_QUANT"],
@@ -1424,12 +1424,6 @@ def int_weight_only_matmul_2d_kernel(
             GlobalScale=output_scale, GlobalScaleA=AsGlobal,
             Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
         )
-
-assert all(
-    c.kwargs["BLOCK_SIZE_N"] <= SPLIT_K_MAX_BLOCK_N and c.kwargs.get("BLOCK_SIZE_M") == 16
-    for c in int_weight_only_matmul_2d_kernel.configs if c.kwargs.get("SPLIT_K", 1) > 1
-), "a split-K config outgrows the partials buffer int_weight_only_matmul_2d allocates"
-
 
 @bayesian_autotune(
     block_fp8_scale_mode_configs(get_accelerator_autotuning_configs(
@@ -2626,16 +2620,10 @@ def int_weight_only_matmul_2d(
     def grid(META):
         return (triton.cdiv(M, META["BLOCK_SIZE_M"]), triton.cdiv(N, META["BLOCK_SIZE_N"]), META.get("SPLIT_K", 1))
 
-    # split-K scratch (decode band only, int_split_k_pruner): fp32 partials sized for the widest split over the split
-    # tiles' padded grid (BM=16 rows, up to SPLIT_K_MAX_BLOCK_N columns per tile), counters for the narrowest tile's grid
+    # no split-K: its arrival counters need zeroing, a memset node per CUDA-graph replay with no producer kernel to fold
+    # it into, which costs more than the split saves (Qwen2.5-7B GPTQ INT4 qkv decode, cold weights, graph: 12.2 split
+    # vs 8.2us unsplit; eager the split was 0.45us ahead)
     partials = counters = None
-    if M <= SPLIT_K_MAX_M:
-        partials, counters = split_k_workspace(
-            A.device,
-            SPLIT_K_VALUES[-1] * triton.cdiv(M, 16) * 16
-            * triton.cdiv(N, SPLIT_K_MAX_BLOCK_N) * SPLIT_K_MAX_BLOCK_N * (2 if gate else 1),
-            triton.cdiv(M, 16) * triton.cdiv(N, 16),
-        )
 
     with device_context(A.device):
         bias_stride_e, bias_stride_n = bias_strides(bias)
