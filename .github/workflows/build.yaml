@@ -584,9 +584,19 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates curl xz-utils sudo
 
+      # Fetch the installer ourselves: the action's cached copy is saved by
+      # non-root runners (uid 1001) and restored with that owner and mode
+      # 0110, which the action then refuses to run as root in this container.
+      - name: Fetch nix-installer
+        run: |
+          curl -fsSL --retry 3 -o /usr/local/bin/nix-installer \
+            https://install.determinate.systems/nix-installer/stable/x86_64-linux
+          chmod 755 /usr/local/bin/nix-installer
+
       # Containers have no systemd, so install Nix without an init system.
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
         with:
+          source-binary: /usr/local/bin/nix-installer
           planner: linux
           init: none
           extra-conf: |
