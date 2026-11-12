@@ -7,7 +7,7 @@ import sys
 
 import kernels
 
-deep_gemm = kernels.get_kernel("kernels-community/deep-gemm", version=2)
+deep_gemm = kernels.get_kernel("kernels-community/deep-gemm", version=3)
 
 
 # Single test template

@@ -3,7 +3,7 @@ import torch
 
 import kernels
 
-deep_gemm = kernels.get_kernel("kernels-community/deep-gemm", version=2)
+deep_gemm = kernels.get_kernel("kernels-community/deep-gemm", version=3)
 
 bench_kineto = deep_gemm.testing.bench_kineto
 calc_diff = deep_gemm.testing.calc_diff

@@ -3,7 +3,7 @@ import torch
 import torch.multiprocessing as mp
 import kernels
 
-deep_gemm = kernels.get_kernel("kernels-community/deep-gemm", version=2)
+deep_gemm = kernels.get_kernel("kernels-community/deep-gemm", version=3)
 
 
 def main(local_rank: int):

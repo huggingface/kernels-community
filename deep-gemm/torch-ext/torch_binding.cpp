@@ -384,6 +384,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     );
     ops.impl("tf32_hc_prenorm_gemm", torch::kCUDA,
              &deep_gemm_tf32_hc_prenorm_gemm);
+
+    // Fused per-token FP8 cast (local to the Kernel Hub build, see csrc/local/per_token_cast.cu)
+    ops.def(
+        "per_token_cast_to_fp8_into("
+        "Tensor x, Tensor! out, Tensor! out_sf, "
+        "int gran_k, bool use_ue8m0, bool use_packed_ue8m0) -> ()"
+    );
+    ops.impl("per_token_cast_to_fp8_into", torch::kCUDA,
+             &deep_gemm_per_token_cast_to_fp8_into);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

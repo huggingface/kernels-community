@@ -40,6 +40,7 @@ for _op in [
     "m_grouped_bf16_gemm_nt_masked",
     "fp8_gemm_nt_skip_head_mid",
     "fp8_fp4_mega_moe",
+    "per_token_cast_to_fp8_into",
 ]:
 
     @torch.library.register_fake(add_op_namespace_prefix(_op))
@@ -745,6 +746,30 @@ def tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits=None):
     has_ns = num_splits is not None
     ns = num_splits if has_ns else 0
     ops.tf32_hc_prenorm_gemm(a, b, d, sqr_sum, ns, has_ns)
+
+
+# Fused per-token FP8 cast (local to the Kernel Hub build)
+
+
+def fused_per_token_cast_to_fp8(x, use_ue8m0, gran_k=128, use_packed_ue8m0=False, out=None, out_sf=None):
+    """`utils.per_token_cast_to_fp8` in one kernel launch, bit for bit: `x` (bfloat16 or float32, `(m, n)`) as
+    float8_e4m3fn with one scale per `gran_k` (32 or 128) values of a row, rounded up to a power of two with `use_ue8m0`
+    and packed four per int32 with `use_packed_ue8m0`. `out` (`(m, n)` float8_e4m3fn) and `out_sf` (`(m, ceil(n /
+    gran_k))` float32, or `(m, ceil(n / gran_k) / 4)` int32 when packed) may be given, e.g. as views of a buffer, and are
+    allocated otherwise. Returns `(out, out_sf)`."""
+    m, n = x.shape
+    num_groups = -(-n // gran_k)
+    if out is None:
+        out = torch.empty((m, n), dtype=torch.float8_e4m3fn, device=x.device)
+    if out_sf is None:
+        out_sf = (
+            torch.empty((m, num_groups // 4), dtype=torch.int32, device=x.device)
+            if use_packed_ue8m0
+            else torch.empty((m, num_groups), dtype=torch.float32, device=x.device)
+        )
+    # compiled ahead of time: no JIT runtime (or CUDA toolkit) needed, unlike the GEMMs behind `ops`
+    _ops.per_token_cast_to_fp8_into(x, out, out_sf, gran_k, use_ue8m0, use_packed_ue8m0)
+    return out, out_sf
 
 
 from .mega import (

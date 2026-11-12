@@ -5,7 +5,7 @@ from typing import Generator, List, Optional, Tuple
 
 import kernels
 
-deep_gemm = kernels.get_kernel("kernels-community/deep-gemm", version=2)
+deep_gemm = kernels.get_kernel("kernels-community/deep-gemm", version=3)
 
 get_arch_major = deep_gemm.testing.get_arch_major
 

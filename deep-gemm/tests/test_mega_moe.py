@@ -8,7 +8,7 @@ from typing import Tuple
 
 import kernels
 
-deep_gemm = kernels.get_kernel("kernels-community/deep-gemm", version=2)
+deep_gemm = kernels.get_kernel("kernels-community/deep-gemm", version=3)
 
 per_token_cast_to_fp4 = deep_gemm.utils.per_token_cast_to_fp4
 per_token_cast_to_fp8 = deep_gemm.utils.per_token_cast_to_fp8
