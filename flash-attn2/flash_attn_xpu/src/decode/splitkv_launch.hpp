@@ -17,6 +17,7 @@
 #include "splitkv_kernel.hpp"
 
 namespace flash_xpu_splitkv {
+inline namespace FLASH_XPU_SPLITKV_TARGET_NS {
 
 using namespace cute;
 
@@ -104,11 +105,9 @@ struct SplitKVConfig {
 
   template <bool Paged, bool Local>
   static void run_mode(sycl::queue& queue, decode_args_t const& args) {
-    // A tile of tile_q (query, GQA head) rows spans several queries only
-    // with several queries per batch and a group size tile_q doesn't divide.
-    constexpr int tile_q = get<0>(ShapeOut{});
-    int group = args.num_heads_q / args.num_heads_kv;
-    bool multi_q = args.q_per_batch > 1 && group > 1 && group % tile_q != 0;
+    // Single-query decode gets the vllm mainloop: one Q surface and no
+    // per-row causal mask.
+    bool multi_q = args.q_per_batch > 1;
     if (Paged && args.total_rows_kv > (int64_t(1) << 24)) {
       if constexpr (Paged) run<Paged, Local, true, true>(queue, args);
     } else if (multi_q) {
@@ -131,13 +130,15 @@ struct SplitKVConfig {
   }
 };
 
+}  // namespace FLASH_XPU_SPLITKV_TARGET_NS
 }  // namespace flash_xpu_splitkv
 
 // One dtype per translation unit keeps per-TU compile memory bounded.
 #define FLASH_XPU_SPLITKV_INSTANTIATE(HD, NAME, ELEMENT)                      \
   namespace flash_xpu_splitkv {                                               \
   template <>                                                                 \
-  void splitkv_decode_##NAME<HD>(sycl::queue & q, const decode_args_t& a) {   \
+  void splitkv_decode_##NAME<FLASH_XPU_SPLITKV_TARGET_ARCH, HD>(              \
+      sycl::queue & q, const decode_args_t& a) {                              \
     SplitKVConfig<ELEMENT, HD>::dispatch(q, a);                               \
   }                                                                           \
   }

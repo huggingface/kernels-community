@@ -45,6 +45,7 @@
 #include "splitkv_mainloop.hpp"
 
 namespace flash_xpu_splitkv {
+inline namespace FLASH_XPU_SPLITKV_TARGET_NS {
 
 using namespace cute;
 
@@ -333,4 +334,5 @@ class DecodeEpilogue {
   }
 };
 
+}  // namespace FLASH_XPU_SPLITKV_TARGET_NS
 }  // namespace flash_xpu_splitkv

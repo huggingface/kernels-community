@@ -20,6 +20,7 @@
 #include "splitkv_epilogue.hpp"
 
 namespace flash_xpu_splitkv {
+inline namespace FLASH_XPU_SPLITKV_TARGET_NS {
 
 using namespace cute;
 
@@ -128,7 +129,8 @@ using Tensor2DT = decltype(make_tensor(
     make_layout(make_shape(int{}, int{}), make_stride(_1{}, int64_t{}))));
 
 // LargeSurface: the paged cache has more rows than a 2D block surface.
-// MultiQ: a tile may hold GQA heads of more than one query (Q.n > 1).
+// MultiQ: more than one query per batch; a tile may then hold GQA heads of
+// more than one query (Q.n > 1) and causal rows see different keys.
 // Both are chosen on the host so that each kernel holds a single mainloop.
 template <
     class Mainloop_,
@@ -390,14 +392,35 @@ struct SplitKVCombineKernel {
     if (active) shared.weight[t] = w * (1.f / sum);
     sycl::group_barrier(wg);
 
+    // Each thread owns 4 contiguous columns (Dv % 8 == 0) and issues the
+    // loads of kUnroll splits back to back: a serial per-split loop is bound
+    // by one memory latency per split.
+    using Vec = sycl::vec<float, 4>;
+    constexpr int kUnroll = 8;
     const float* oacc = a.oaccum + (int64_t(s.row) * S * Hq + hq) * Dv;
     int64_t split_stride = int64_t(Hq) * Dv;
-    for (int d = t; d < Dv; d += kThreads) {
-      float acc = 0.f;
-      for (int i = 0; i < s.splits; i++) {
-        acc += shared.weight[i] * oacc[i * split_stride + d];
+    int n = s.splits;
+    for (int d = t * 4; d < Dv; d += kThreads * 4) {
+      const float* src = oacc + d;
+      Vec acc(0.f);
+      int i = 0;
+      for (; i + kUnroll <= n; i += kUnroll) {
+        Vec v[kUnroll];
+        CUTLASS_PRAGMA_UNROLL
+        for (int u = 0; u < kUnroll; u++) {
+          v[u] = *reinterpret_cast<const Vec*>(src + (i + u) * split_stride);
+        }
+        CUTLASS_PRAGMA_UNROLL
+        for (int u = 0; u < kUnroll; u++) {
+          acc += shared.weight[i + u] * v[u];
+        }
       }
-      o[d] = ElementO(acc);
+      for (; i < n; i++) {
+        acc += shared.weight[i] *
+            *reinterpret_cast<const Vec*>(src + i * split_stride);
+      }
+      CUTLASS_PRAGMA_UNROLL
+      for (int k = 0; k < 4; k++) o[d + k] = ElementO(acc[k]);
     }
     if (t == 0) {
       *lse_out = lse_max + sycl::log(sum);
@@ -405,4 +428,5 @@ struct SplitKVCombineKernel {
   }
 };
 
+}  // namespace FLASH_XPU_SPLITKV_TARGET_NS
 }  // namespace flash_xpu_splitkv

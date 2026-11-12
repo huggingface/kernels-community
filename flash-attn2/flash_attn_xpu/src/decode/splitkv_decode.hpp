@@ -11,6 +11,26 @@
 
 #include <sycl/sycl.hpp>
 
+// The device headers are compiled once per architecture (see
+// splitkv_decode_fp16) and sycl-tla expands them differently each time;
+// separate inline namespaces keep the linker from merging symbols that share
+// a name but not a body.
+// Test the value, not defined(): <sycl/sycl.hpp> defines every
+// __SYCL_TARGET_* macro it does not see as 0 (as sycl-tla's cutlass.h does).
+#if __SYCL_TARGET_INTEL_GPU_CRI__
+#define FLASH_XPU_SPLITKV_TARGET_NS xe35
+#define FLASH_XPU_SPLITKV_TARGET_ARCH 35
+#define FLASH_XPU_VLLM_NS vllm_xe35
+// vllm-xpu-kernels builds its XE3 kernels with 512 GRF (add_xe3_kernel_library).
+#ifndef VLLM_GRF_SIZE
+#define VLLM_GRF_SIZE 512
+#endif
+#else
+#define FLASH_XPU_SPLITKV_TARGET_NS xe20
+#define FLASH_XPU_SPLITKV_TARGET_ARCH 20
+#define FLASH_XPU_VLLM_NS vllm_xe20
+#endif
+
 namespace flash_xpu_splitkv {
 
 // Work-group shape of the decode kernel (kv_tile 64, 4 subgroups of 16).
@@ -86,22 +106,29 @@ struct decode_args_t {
 
 // Head-dim buckets with a compiled kernel. The runtime head size may be any
 // multiple of 8 up to the bucket.
-template <int HeadDim>
+// The kernels are built twice: Arch 20 for pvc/bmg, and Arch 35 from the
+// CRI-only translation units (-D__SYCL_TARGET_INTEL_GPU_CRI__), where
+// sycl-tla emits the Xe35 block loads (cache hints, wider transposed loads).
+template <int Arch, int HeadDim>
 void splitkv_decode_fp16(sycl::queue& queue, const decode_args_t& args);
-template <int HeadDim>
+template <int Arch, int HeadDim>
 void splitkv_decode_bf16(sycl::queue& queue, const decode_args_t& args);
 
-#define FLASH_XPU_SPLITKV_DECLARE(HD)                                        \
+#define FLASH_XPU_SPLITKV_DECLARE(ARCH, HD)                                  \
   template <>                                                                \
-  void splitkv_decode_fp16<HD>(sycl::queue&, const decode_args_t&);          \
+  void splitkv_decode_fp16<ARCH, HD>(sycl::queue&, const decode_args_t&);    \
   template <>                                                                \
-  void splitkv_decode_bf16<HD>(sycl::queue&, const decode_args_t&);
-FLASH_XPU_SPLITKV_DECLARE(64)
-FLASH_XPU_SPLITKV_DECLARE(96)
-FLASH_XPU_SPLITKV_DECLARE(128)
-FLASH_XPU_SPLITKV_DECLARE(192)
-FLASH_XPU_SPLITKV_DECLARE(256)
-FLASH_XPU_SPLITKV_DECLARE(512)
+  void splitkv_decode_bf16<ARCH, HD>(sycl::queue&, const decode_args_t&);
+#define FLASH_XPU_SPLITKV_DECLARE_ARCH(ARCH)                                 \
+  FLASH_XPU_SPLITKV_DECLARE(ARCH, 64)                                        \
+  FLASH_XPU_SPLITKV_DECLARE(ARCH, 96)                                        \
+  FLASH_XPU_SPLITKV_DECLARE(ARCH, 128)                                       \
+  FLASH_XPU_SPLITKV_DECLARE(ARCH, 192)                                       \
+  FLASH_XPU_SPLITKV_DECLARE(ARCH, 256)                                       \
+  FLASH_XPU_SPLITKV_DECLARE(ARCH, 512)
+FLASH_XPU_SPLITKV_DECLARE_ARCH(20)
+FLASH_XPU_SPLITKV_DECLARE_ARCH(35)
+#undef FLASH_XPU_SPLITKV_DECLARE_ARCH
 #undef FLASH_XPU_SPLITKV_DECLARE
 
 // Scatter k_new/v_new [b, s_new, Hkv, D] into the cache at positions
@@ -127,5 +154,83 @@ struct append_args_t {
 };
 
 void splitkv_append_kv(sycl::queue& queue, const append_args_t& args);
+
+// Paged single-query decode of vllm-xpu-kernels (csrc/xpu/attn/xe_3,
+// src/decode/vllm), fp16/bf16, page size a multiple of 64. Same fields as
+// vllm's paged_decode_args_t, plus lse_row_stride. Built for Xe35 (CRI) only.
+struct vllm_decode_args_t {
+  void* query;
+  void* key;
+  void* value;
+  void* out;
+  void* tem_out;
+  void* softmax_lse_accum;
+  void* block_table;
+  void* cu_seqlens_q;
+  void* cu_seqlens_k;  // per-batch KV lengths (seqused_k), or cumulative
+  bool kv_cumulative = false;  // cu_seqlens_k is cumulative (b + 1 entries)
+  int max_queries;
+  int max_keys;
+  int total_seqlen_q;
+  int total_seqlen_k;
+  void* q_scale = nullptr;
+  void* k_scale = nullptr;
+  void* v_scale = nullptr;
+  float sm_scale;
+  void* sm_sink = nullptr;
+  int batch_size;
+  int num_heads_q;
+  int num_heads_k;
+  int head_size;
+  int v_head_size;
+  int max_blocks_per_seq;
+  int block_size;
+  int window_size_left = -1;
+  int window_size_right = -1;
+  bool is_varlen = true;
+  bool is_paged = true;
+  bool is_causal = false;
+  bool is_local = false;
+  bool is_sink = false;
+  int num_kv_splits = 1;
+  const int* splits_per_seq = nullptr;
+  const void* work_list = nullptr;
+  int total_wgs = 0;
+  int64_t k_stride_page = 0;
+  int64_t k_stride_seq = 0;
+  int64_t k_stride_heads = 0;
+  int64_t v_stride_page = 0;
+  int64_t v_stride_seq = 0;
+  int64_t v_stride_heads = 0;
+  void* is_prefill = nullptr;
+  int64_t q_stride_seq = 0;
+  int64_t q_stride_heads = 0;
+  int64_t q_stride_batch = 0;
+  int page_stride_elements = 0;
+  float* softmax_lse = nullptr;
+  int lse_stride = 0;      // between heads
+  int lse_row_stride = 1;  // between query tokens
+  // Packed speculative decode: num_heads_q holds spec_q_len query positions
+  // per KV head group, position-major (vllm's spec_q_len).
+  int spec_q_len = 1;
+};
+
+template <int Arch, int HeadDim>
+void vllm_paged_decode_fp16(sycl::queue& queue, const vllm_decode_args_t& args);
+template <int Arch, int HeadDim>
+void vllm_paged_decode_bf16(sycl::queue& queue, const vllm_decode_args_t& args);
+
+#define FLASH_XPU_VLLM_DECLARE(HD)                                            \
+  template <>                                                                \
+  void vllm_paged_decode_fp16<35, HD>(sycl::queue&, const vllm_decode_args_t&); \
+  template <>                                                                \
+  void vllm_paged_decode_bf16<35, HD>(sycl::queue&, const vllm_decode_args_t&);
+FLASH_XPU_VLLM_DECLARE(64)
+FLASH_XPU_VLLM_DECLARE(96)
+FLASH_XPU_VLLM_DECLARE(128)
+FLASH_XPU_VLLM_DECLARE(192)
+FLASH_XPU_VLLM_DECLARE(256)
+FLASH_XPU_VLLM_DECLARE(512)
+#undef FLASH_XPU_VLLM_DECLARE
 
 }  // namespace flash_xpu_splitkv

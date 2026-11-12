@@ -47,8 +47,10 @@
 
 #include "../xe_barrier_compat.hpp"
 #include "../collective/copy_block_slm.hpp"
+#include "splitkv_decode.hpp"
 
 namespace flash_xpu_splitkv {
+inline namespace FLASH_XPU_SPLITKV_TARGET_NS {
 
 using namespace cute;
 
@@ -204,9 +206,9 @@ struct DecodeMainloop {
   // seq_len: keys visible to the last query. causal_rows > 0: query m is
   // one of causal_rows bottom-right aligned ones and sees
   // seq_len - (causal_rows - 1 - m) keys; otherwise every query sees seq_len.
-  // MultiQ: Q.n may be > 1. With a single Q surface the Q block load feeds
-  // the MMA directly (no merge), which keeps the Q and K loads in flight
-  // together.
+  // MultiQ: more than one query per batch, so Q.n may be > 1 and causal
+  // rows may see different keys. Without it the Q block load feeds the MMA
+  // directly and the per-row mask is compiled out, as in vllm-xpu-kernels.
   template <bool has_large_surface, bool MultiQ, typename QVCoord>
   CUTLASS_DEVICE void operator()(
       RowSurfaces<ElementQ> const& Q,
@@ -440,11 +442,11 @@ struct DecodeMainloop {
       /* GEMM 1: S = K * Q */
       clear(tSrS);
       for (int D = 0; D < size<4>(tKgK); D++) {
-        copy(copy_k, tKgK_cache(_, _, _, D), tKrK);
-        copy(copy_q, tQgQ(_, _, _, D), tQrQ);
-        // Rows of the other Q surfaces; each load leaves the rows outside
-        // its surface zero, so OR-ing the bits merges them.
         if constexpr (MultiQ) {
+          copy(copy_k, tKgK_cache(_, _, _, D), tKrK);
+          copy(copy_q, tQgQ(_, _, _, D), tQrQ);
+          // Rows of the other Q surfaces; each load leaves the rows outside
+          // its surface zero, so OR-ing the bits merges them.
           for (int i = 1; i < Q.n; i++) {
             auto Q_i = Q.tensor(i);
             int x_shift_i;
@@ -468,6 +470,9 @@ struct DecodeMainloop {
                   sycl::bit_cast<QBits>(QElem(tQrQ_i(j)))));
             }
           }
+        } else {
+          copy(copy_q, tQgQ(_, _, _, D), tQrQ);
+          copy(copy_k, tKgK_cache(_, _, _, D), tKrK);
         }
 
         reorder(tQrQ, tSrQ);
@@ -482,8 +487,8 @@ struct DecodeMainloop {
       /* Per-row key range: causal end of the row's query and sliding
          window start. The window is relative to the row's last visible
          key. */
-      bool row_causal =
-          causal_rows > 1 && (K + 1) * tile_k > seq_len - (causal_rows - 1);
+      bool row_causal = MultiQ && causal_rows > 1 &&
+          (K + 1) * tile_k > seq_len - (causal_rows - 1);
       if (LocalMask || row_causal) {
         Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
         Tensor gP = local_tile(
@@ -493,7 +498,7 @@ struct DecodeMainloop {
         for (int i = 0; i < tSrS.size(); ++i) {
           int row = get<0>(cS_thread(i));
           int col = get<1>(cS_thread(i));
-          int end = causal_rows > 0
+          int end = MultiQ && causal_rows > 0
               ? seq_len - (causal_rows - 1 - row / group)
               : seq_len;
           bool masked = col >= end;
@@ -591,4 +596,5 @@ struct DecodeMainloop {
   }
 };
 
+}  // namespace FLASH_XPU_SPLITKV_TARGET_NS
 }  // namespace flash_xpu_splitkv
