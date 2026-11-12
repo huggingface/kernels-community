@@ -3102,3 +3102,85 @@ fig.tight_layout(rect=(0, 0, 1, 0.985))
 out_png = os.path.join(_HERE, f"bench_moe{suffix}.png")
 fig.savefig(out_png, dpi=120)
 print(f"wrote {out_png}" + ("" if REPLOT else f" + bench_moe{suffix}.csv"))
+
+
+def _plot_summary(csv_path, out_path):
+    """One heatmap of the whole run: per problem (rows) and regime x timing mode (columns), finegrained-kernels'
+    speedup over the fastest rival, best rival time / ours (> 1: ours is faster), colored on a log scale that
+    saturates at 2x either way and labeled with the ratio and the rival. Eager is left out: decode is measured
+    the way it runs, in a CUDA graph."""
+    import csv
+    import math
+    from matplotlib.colors import LinearSegmentedColormap
+
+    ours = "finegrained-kernels"
+    cells, order = {}, []
+    with open(csv_path) as f:
+        for r in csv.DictReader(f):
+            if r["mode"] == "eager" or not r["latency_us"] or r["impl"].endswith("unfused"):
+                continue
+            if r["problem"] not in order:
+                order.append((r["category"], r["problem"]))
+            cells.setdefault((r["problem"], r["regime"], r["mode"]), {})[r["impl"]] = float(r["latency_us"])
+    columns = [(regime, mode) for mode in ("cudagraph", "compile") for regime in ("decode", "batch", "prefill")]
+    rival_names = {
+        "trtllm": "TRT-LLM", "vllm": "vLLM fused_moe", "vllm_mm": "vLLM CUTLASS", "vllm_marlin": "vLLM Marlin",
+        "vllm_exllama": "vLLM ExLlama", "marlin": "Marlin W8A16", "torch_mm": "torch scaled_mm",
+        "torch": "torch scaled_grouped_mm", "torch_rowwise": "torch scaled_mm/expert",
+        "torch_weight_only": "torch dequant+GEMM", "transformers": "torch grouped_mm",
+        "transformers@main": "transformers@main", "flashinfer_mxint4": "FlashInfer mxint4",
+        "flashinfer_cutlass_moe": "FlashInfer CUTLASS",
+    }
+    def has_cells(problem):
+        return any(ours in times and len(times) > 1 for (p, _, _), times in cells.items() if p == problem)
+    problems = [(c, p) for c, p in sorted(dict.fromkeys(order)) if has_cells(p)]
+    category_of = {p: c for c, p in problems}
+    problems = [p for _, p in problems]
+    ratio = [[math.nan] * len(columns) for _ in problems]
+    label = [[""] * len(columns) for _ in problems]
+    for i, problem in enumerate(problems):
+        for j, (regime, mode) in enumerate(columns):
+            times = cells.get((problem, regime, mode), {})
+            rivals = {k: v for k, v in times.items() if k != ours}
+            if ours not in times or not rivals:
+                continue
+            rival, best = min(rivals.items(), key=lambda kv: kv[1])
+            ratio[i][j] = best / times[ours]
+            label[i][j] = f"{ratio[i][j]:.2f}x\n{rival_names.get(rival, rival)}"
+
+    # diverging: red (ours slower) through a neutral gray at parity to blue (ours faster)
+    cmap = LinearSegmentedColormap.from_list("parity", ["#e34948", "#f0efec", "#2a78d6"])
+    values = [[math.log2(v) if v == v else math.nan for v in row] for row in ratio]
+    fig_s, ax_s = plt.subplots(figsize=(15, 0.42 * len(problems) + 1.6))
+    image = ax_s.imshow(values, cmap=cmap, vmin=-1, vmax=1, aspect="auto")
+    for i, row in enumerate(values):
+        for j, v in enumerate(row):
+            if v == v:
+                ax_s.text(j, i, label[i][j], ha="center", va="center", fontsize=6.5,
+                          color="#ffffff" if abs(v) > 0.75 else "#0b0b0b")
+    ax_s.set_xticks(range(len(columns)), [f"{regime}\n{mode}" for regime, mode in columns], fontsize=8)
+    ax_s.xaxis.tick_top()
+    def short(problem):  # the model without its org, the rest of the row name as is
+        name = problem.split("/", 1)[-1] if "/" in problem.split(" ", 1)[0] else problem
+        return name if len(name) <= 64 else name[:63] + "…"
+    ax_s.set_yticks(range(len(problems)), [short(p) for p in problems], fontsize=7.5)
+    ax_s.axvline(2.5, color="#fcfcfb", linewidth=6)
+    for i in range(1, len(problems)):  # a gap between categories
+        if category_of[problems[i]] != category_of[problems[i - 1]]:
+            ax_s.axhline(i - 0.5, color="#fcfcfb", linewidth=6)
+    for spine in ax_s.spines.values():
+        spine.set_visible(False)
+    bar = fig_s.colorbar(image, ax=ax_s, fraction=0.02, pad=0.01, ticks=[-1, -0.5, 0, 0.5, 1])
+    bar.ax.set_yticklabels(["<=0.5x", "0.71x", "1x", "1.41x", ">=2x"], fontsize=7)
+    bar.set_label("speedup over the fastest rival (best rival time / ours)", fontsize=8)
+    wins = sum(v > 1 for row in ratio for v in row if v == v)
+    total = sum(v == v for row in ratio for v in row)
+    ax_s.set_title(f"finegrained-kernels vs the fastest rival per cell ({device_name}): faster in {wins} of {total} cells",
+                   fontsize=10, pad=28)
+    fig_s.tight_layout()
+    fig_s.savefig(out_path, dpi=130, bbox_inches="tight")
+    print(f"wrote {out_path}")
+
+
+_plot_summary(os.path.join(_HERE, f"bench_moe{suffix}.csv") if not REPLOT else _CSV,
+              os.path.join(_HERE, f"bench_moe{suffix}_summary.png"))
