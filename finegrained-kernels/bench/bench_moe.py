@@ -187,6 +187,12 @@ def _activation_format(cfg):
     return cfg["activation_format"]
 
 
+def _torch_arm_enlisted(cfg):
+    """Whether a MoE row runs the ``torch`` (``F.scaled_grouped_mm``) arm: same-family MX weights and
+    quantized activations, the only forms scaled_grouped_mm expresses (see the MoE row's arm list)."""
+    return _quantized_acts(cfg) and cfg["weights"] in _MX_WEIGHTS and cfg["activation_format"] is None
+
+
 def _quantized_acts(cfg):
     """Whether the activations are quantized at all (weight-only chains read affine scales and
     have no quantized-activation baselines)."""
@@ -2770,11 +2776,7 @@ def _run_task(kind, pname, cfg, rows_out):
         # (single-forward impls with no unfused form).
         # ... and same-family only: scaled_grouped_mm has no mixed-family form (the W4A8
         # mxfp4-weight x mxfp8-act row raises a contraction-dim mismatch on the packed rhs).
-        torch_arm_t = ("torch",) if (
-            _quantized_acts(cfg)
-            and cfg["weights"] in _MX_WEIGHTS
-            and cfg["activation_format"] is None
-        ) else ()
+        torch_arm_t = ("torch",) if _torch_arm_enlisted(cfg) else ()
         # the status quo an fgm integration replaces: transformers@main on this checkpoint, via its
         # finegrained_fp8 experts dispatch. It belongs on the UNFUSED row — it applies the GLU in
         # Python between two GEMMs (`self._apply_gate`), so it has no fused epilogue; comparing it
@@ -2851,7 +2853,8 @@ TASKS = ([("moe", p, c) for p, c in MOE_PROBLEMS.items()
          + [("attn", p, c) for p, c in ATTN_PROBLEMS.items() if wanted("linear quantized", p)])
 if ONLY_ARMS is not None:  # only the rows that enlist a requested arm
     TASKS = [t for t in TASKS if set(ONLY_ARMS) & ({"finegrained-kernels"} | set(t[2].get("baselines", ()))
-                                                   | set(t[2].get("fused_extra", ())))]
+                                                   | set(t[2].get("fused_extra", ()))
+                                                   | ({"torch"} if t[0] == "moe" and _torch_arm_enlisted(t[2]) else set()))]
 
 rows = []
 if REPLOT:
