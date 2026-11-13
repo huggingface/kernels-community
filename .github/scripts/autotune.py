@@ -52,6 +52,35 @@ def config_path(config):
     return Path(*parts[source + 2 :])
 
 
+def target_config_files(root, target):
+    """Select flat configs using the GPU suffix shared with the kernel loader."""
+    suffix = f",device_name={target['gpu'].replace(' ', '_')}.json"
+    return {
+        name: data
+        for name, data in config_files(root).items()
+        if Path(name).parent == Path(".") and name.endswith(suffix)
+    }
+
+
+def copy_configs(files, source, destination):
+    for name in files:
+        path = destination / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source / name, path)
+
+
+def replace_target_configs(source, destination, target):
+    """Replace only this target's files; preserve failed/untuned GPU results."""
+    files = target_config_files(source, target)
+    if not files or files != config_files(source):
+        raise ValueError(f"Missing or unexpected configs for {target['name']}")
+    previous = target_config_files(destination, target)
+    for name in previous:
+        (destination / name).unlink()
+    copy_configs(files, source, destination)
+    return [destination / name for name in sorted(previous.keys() | files.keys())]
+
+
 AUTOTUNE_MARKER = "<!-- kernels-community-autotune -->"
 
 
@@ -338,15 +367,15 @@ def tune(target_name: str, artifacts: Path, revision: str, source_sha: str):
         AUTOTUNE_CONFIGS=config["configs"],
         LOCAL_KERNELS=f"{info['repo_id']}={variant}",
     )
-    output = Path(config["configs"]) / target["gpu"]
-    previous = config_files(output)
-    if output.exists():
-        shutil.rmtree(output)
+    output = Path(config["configs"])
+    previous = target_config_files(output, target)
+    for name in previous:
+        (output / name).unlink()
     subprocess.run(config["command"], env=env, check=True)
-    current = config_files(output)
+    current = target_config_files(output, target)
     if not current:
         raise ValueError(f"Autotuning produced no configs in {output}")
-    shutil.copytree(output, artifacts / target["gpu"])
+    copy_configs(current, output, artifacts / target["gpu"])
     (artifacts / "source.json").write_text(
         json.dumps(
             {
@@ -419,7 +448,8 @@ def publish(
         directory = artifact / target["gpu"]
         if not config_files(directory):
             raise ValueError(f"Missing configs for {target['name']}")
-        directories.append((directory, kernel / config["configs"] / target["gpu"]))
+        destination = kernel / config["configs"]
+        directories.append((directory, destination, target))
     subprocess.run(["git", "fetch", "origin", "main"], check=True)
     # Never propose stale settings over newer kernel code or newer tuning results.
     subprocess.run(
@@ -448,11 +478,9 @@ def publish(
         print(f"Config PR already exists: {existing[0]['url']}")
         return
     subprocess.run(["git", "switch", "-c", branch, "origin/main"], check=True)
-    for directory, destination in directories:
-        if destination.exists():
-            shutil.rmtree(destination)
-        shutil.copytree(directory, destination)
-        subprocess.run(["git", "add", "--", str(destination)], check=True)
+    for directory, destination, target in directories:
+        paths = replace_target_configs(directory, destination, target)
+        subprocess.run(["git", "add", "--", *(str(path) for path in paths)], check=True)
     diff = subprocess.run(["git", "diff", "--cached", "--quiet"], check=False)
     if diff.returncode == 0:
         print(f"{kernel}: configs unchanged")

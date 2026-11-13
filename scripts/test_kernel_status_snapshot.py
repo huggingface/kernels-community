@@ -102,3 +102,10 @@ def test_history_picks_up_events_newer_than_history_jsonl(tmp_path):
 
     rows = snap.load_history(snap.Dataset(str(tmp_path)), NOW)
     assert [r["result"] for r in rows] == ["success", "failure"]
+
+
+def test_card_is_stamped_with_the_snapshot_time():
+    card = snap.render_card("2026-11-10T02:32:44+00:00")
+    assert card.startswith("---\npretty_name: Kernel status\n")
+    assert "Last updated: 2026-11-10T02:32:44+00:00" in card
+    assert "{generated_at}" not in card
