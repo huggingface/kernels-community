@@ -18,6 +18,7 @@ import triton.language as tl
 from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
 from .bayesian_autotuner import bayesian_autotune
+from .path_autotuner import path_autotune
 from .formats import global_scale_stride, int_weight_bits, is_per_expert_global, normalize_global_scale
 from ._ops import add_op_namespace_prefix
 from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, is_blackwell, is_sm10x, pdl_launch_kwargs, sm_count
@@ -913,7 +914,7 @@ def _svdquant_pruner(configs, named_args, **kwargs):
 
 @bayesian_autotune(
     [triton.Config({"BLOCK_M": bm, "BLOCK_K": bk, "SWAP_AB": swap}, num_warps=w, num_stages=s)
-     for bm in (1, 16, 32, 64) for bk in (64, 128, 256) for w in (4, 8) for s in (1, 3)
+     for bm in (1, 16, 32, 64, 128) for bk in (64, 128, 256, 512) for w in (4, 8) for s in (1, 3, 4)
      for swap in (False, True)],
     ["K", "RANK", "m_bucket", "SPLIT_K", "SWIZZLED"],
     n_trials=100,
@@ -980,14 +981,16 @@ def _svdquant_down_reduce_kernel(Partials, Down, M, RANK: tl.constexpr, SPLIT_K:
     tl.store(Down + offsets, tl.sum(parts, 0), mask=offsets < M * RANK)
 
 
+@path_autotune(("fused", "separate"))
 def svdquant_act_quant(x, lora_a, pre_quant_scale, global_scale, swizzled):
-    """Quantized residual input and BF16 down projection from the same pre-quantized input."""
+    """Quantized residual input and BF16 down projection from the same pre-quantized input: one pass that does both,
+    or (path tuner, per M bucket) the NVFP4 quant as its own launch, whose tiles need not also suit the down MMA."""
     K, rank = x.shape[-1], lora_a.shape[0]
     x = x.reshape(-1, K)
     M = x.shape[0]
-    separate_quant = is_sm10x() and rank == 32 and M >= 4096 and M * K >= 1 << 25
+    separate_quant = M > 1 and svdquant_act_quant.paths.choose(
+        (K, rank, M.bit_length(), swizzled, pre_quant_scale is None)) == "separate"
     if separate_quant:
-        # Independent quantization tiles avoid keeping the large input in both quant and MMA layouts.
         values, scales = _launch_act_quant(
             x, "nvfp4", NVFP4_SCALE_GROUP_K, torch.float8_e4m3fn,
             swizzled, global_scale, pre_quant_scale=pre_quant_scale)
@@ -1661,6 +1664,7 @@ def _dequantize_int_kernel(
     W,  # (rows, K // VPW) uint32 words, interleaved (interleave_int_words)
     Ws,  # (rows, K // SCALE_GROUP_K) float group scales
     Wz,  # (rows, K // SCALE_GROUP_K) integer zero points; None for the symmetric 2 ** (BITS - 1)
+    WsGlobal,  # fp32 W4A8 second-level weight scale (the E4M3 rounding of ``int_dequant``); None otherwise
     Out,  # (rows, K)
     rows,
     K_WORDS,
@@ -1690,19 +1694,22 @@ def _dequantize_int_kernel(
     scale = tl.load(Ws + g_ptrs, mask=mask)
     zero = (1 << (BITS - 1)) if Wz is None else tl.load(Wz + g_ptrs, mask=mask).to(tl.int32)
     v = (q - zero).to(scale.dtype) * scale
+    if WsGlobal is not None:
+        v = tl.clamp(v.to(tl.float32) / tl.load(WsGlobal), -448.0, 448.0)
     out_ptrs = Out + offs_r[:, None].to(tl.int64) * (K_WORDS * VPW) + offs_k[None, :]
     tl.store(out_ptrs, v.to(Out.dtype.element_ty), mask=mask)
 
 
 def dequantize_int_weight(
     words: torch.Tensor, scales: torch.Tensor, K: int, zeros: torch.Tensor | None = None,
-    dtype: torch.dtype | None = None,
+    dtype: torch.dtype | None = None, global_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """An integer weight in the GEMMs' interleaved layout (``(..., N, K // VPW)`` uint32, ``interleave_int_words``)
     back to ``(..., N, K)`` the way the GEMMs dequantize it: ``(q - zero)`` in the scale dtype times the per-group
     scale, rounded once, then cast to ``dtype`` (``None``: the scale dtype). The width follows from ``K`` and the
-    word count; ``zeros`` ``None`` is the symmetric zero point ``2 ** (bits - 1)``. One fused launch, used by the
-    large-prefill path that dequantizes once and runs the unquantized GEMM."""
+    word count; ``zeros`` ``None`` is the symmetric zero point ``2 ** (bits - 1)``. ``global_scale`` (W4A8) divides
+    that value as ModelOpt's second quantizer does before its E4M3 rounding (``dtype`` FP8). One fused launch, used by
+    the large-prefill paths that dequantize once and run the cuBLAS GEMM."""
     bits = int_weight_bits(K, words)
     k_words = words.shape[-1]
     group = K // scales.shape[-1]
@@ -1716,7 +1723,7 @@ def dequantize_int_weight(
     grid = (triton.cdiv(rows, 16), triton.cdiv(k_words, 32))
     with device_context(words.device):
         compile_time_only_triton_wrap(_dequantize_int_kernel)[grid](
-            words.contiguous(), scales.contiguous(), None if zeros is None else zeros.contiguous(), out,
+            words.contiguous(), scales.contiguous(), None if zeros is None else zeros.contiguous(), global_scale, out,
             rows, k_words, BITS=bits, SCALE_GROUP_K=group, BLOCK_SIZE_R=16, BLOCK_SIZE_W=32, num_warps=4,
         )
     return out

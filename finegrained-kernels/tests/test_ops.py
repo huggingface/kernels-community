@@ -94,6 +94,7 @@ w8a8_block_dynamic_fp8_matmul_grouped_kernel = internals.grouped.w8a8_block_dyna
 w8a8_block_static_fp8_matmul_grouped_kernel = internals.grouped.w8a8_block_static_fp8_matmul_grouped_kernel
 w8a8_tensor_dynamic_fp8_matmul_grouped_kernel = internals.grouped.w8a8_tensor_dynamic_fp8_matmul_grouped_kernel
 block_fp8_weight_only_matmul_2d_kernel = internals.matmul.block_fp8_weight_only_matmul_2d_kernel
+full_precision_matmul_2d_kernel = internals.matmul.full_precision_matmul_2d_kernel
 int_weight_only_matmul_2d_kernel = internals.matmul.int_weight_only_matmul_2d_kernel
 mx_dynamic_matmul_kernel = internals.matmul.mx_dynamic_matmul_kernel
 w8a8_block_dynamic_fp8_matmul_kernel = internals.matmul.w8a8_block_dynamic_fp8_matmul_kernel
@@ -409,6 +410,8 @@ def scenarios() -> list[Problem]:
         Problem(weights="int4", S=8, gate=True, bias=True, pre_quant_scale=True, compile=True),
         Problem(weights="int4", S=32, gate=True, bias=True, activation_format="fp8", static=True,
                 pre_quant_scale=True, compile=True),
+        # ungated W4A8 prefill: the path tuner may take the dequantize-to-E4M3 cuBLAS route
+        Problem(weights="int4", S=512, activation_format="fp8", static=True, pre_quant_scale=True),
         Problem(weights="int8", int_group=None, gate=True, bias=True, activation_format="int8", static=True,
                 pre_quant_scale=True, compile=True),
     ]
@@ -1029,6 +1032,8 @@ _SWEEP_CELLS = [
     (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "matmul", mx_dynamic_matmul_kernel),
     # non-128 N on the 2D gate|up tile (gpt-oss-style N=320): the BN=128 tile overhangs N
     (Problem(weights="mxfp4", gate=True, activation_format="mxfp4", quantize_output=True, N=320, K=320), "matmul", mx_dynamic_matmul_kernel),
+    # SVDQuant prefill: the persistent tiles and the low-rank epilogue only this recipe admits
+    (Problem(weights="nvfp4", S=256, svdquant_rank=32, pre_quant_scale=True), "matmul", mx_dynamic_matmul_kernel),
     (Problem(weights="nvfp4", gate=True, activation_format="nvfp4", quantize_output=True, swizzled=True, S=8), "batched", mx_dynamic_matmul_batched_kernel),
     # the MX weight-only scalar decode arm: one-row tiles, admitted below half a routed row per expert
     (Problem(weights="mxfp4", activation_format="bf16", S=4, E=16), "grouped", mx_weight_only_matmul_grouped_kernel),
@@ -1037,6 +1042,9 @@ _SWEEP_CELLS = [
     # one-block-spans-K "post" placement (SCALE_POST) on per-tensor weights
     (Problem(weights="fp8_128x128", activation_format="bf16", S=8), "batched", block_fp8_weight_only_matmul_batched_kernel),
     (Problem(weights="fp8_128x128", activation_format="bf16", S=16), "matmul", block_fp8_weight_only_matmul_2d_kernel),
+    # batch-sized M: the swapped tiles (weight rows on the MMA M axis) through BM=128, with a ragged row tail
+    (Problem(weights="fp8_128x128", activation_format="bf16", S=100), "matmul", block_fp8_weight_only_matmul_2d_kernel),
+    (Problem(weights="bf16", S=100), "matmul", full_precision_matmul_2d_kernel),
     (Problem(weights="fp8_tensor", activation_format="bf16"), "grouped", block_fp8_weight_only_matmul_grouped_kernel),
     # gathered gate|up rows on the raw-activation dot arms: a TMA-gathered descriptor A under WS
     # is the lowering failure warp_spec_memory_mode_pruner(gather_only=True) fences

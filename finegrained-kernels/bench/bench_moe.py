@@ -2203,6 +2203,9 @@ def bench_problem_row(row, pname, cfg, arms, weights, rows_out):
             inputs = [(hidden, idx, w, logits)] + [
                 _clone_tensors((hidden, idx, w, logits)) for _ in banks[1:]
             ]
+        # activations too: a model produces them inside its graph, so cudagraph trees would otherwise copy them in per call
+        for bank in inputs:
+            _mark_static(*bank)
         first_args = (cfg, grouped, hidden, idx, w, *banks[0][:6], logits, *banks[0][6:])
         reference = torch_weight_only_arm(*first_args)() if "torch_weight_only" in cfg["baselines"] else None
         if cfg["weights"] in INT_BITS:
@@ -2295,6 +2298,8 @@ def bench_svdquant_row(row, pname, cfg, rows_out):
         act_global = ((x * smooth).abs().amax().float() / (6 * 448)).reshape(1)
         banks = _weight_banks(weights)
         inputs = [x] + [x.clone() for _ in banks[1:]]
+        # activations too: a model produces them inside its graph, so cudagraph trees would otherwise copy them in per call
+        _mark_static(*inputs)
         bank_arms = [_svdquant_arms(hidden, bank, act_global) for bank, hidden in zip(banks, inputs)]
         # Sample rows to bound reference memory without omitting timed work.
         xs = x[:32] * smooth
@@ -2626,6 +2631,8 @@ def bench_attn_row(row, pname, cfg, rows_out):
         x = torch.randn(tokens, K, device=DEVICE, dtype=cfg.get("dtype", torch.bfloat16))
         banks = _weight_banks(weights)
         inputs = [x] + [x.clone() for _ in banks[1:]]
+        # activations too: a model produces them inside its graph, so cudagraph trees would otherwise copy them in per call
+        _mark_static(*inputs)
         bank_arms = [_attn_arms(cfg, hidden, bank) for bank, hidden in zip(banks, inputs)]
         reference = bank_arms[0]["torch_weight_only"]() if "torch_weight_only" in bank_arms[0] else None
         if ONLY_ARMS is not None:

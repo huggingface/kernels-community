@@ -1209,6 +1209,12 @@ def split_k_reduce(acc, Partials, TileCounters, tile, num_tiles, BM: tl.constexp
     + narrow_dot_autotuning_configs(
         block_ms=(1, 2, 4, 8), block_ns=(32, 64), pre_hook=rebind_weight_only_descriptors, WARP_SPEC=False, SWAP_AB=True,
     )
+    # wide swapped tiles for batch-sized M: the weight rows fill the tcgen05 M axis (INT8 4608x3584, B200: M=64 13.1 ->
+    # 11.2us)
+    + narrow_dot_autotuning_configs(
+        block_ms=(16, 32, 64, 128), block_ns=(64, 128), pre_hook=rebind_weight_only_descriptors, WARP_SPEC=False,
+        SWAP_AB=True,
+    )
     + narrow_scalar_autotuning_configs(block_ms=(1, 2, 4)),
     # the width and the scale group decide which tiles fit and compile: part of the key
     ["N", "K", "m_bit_length", "GATE", "INT_BITS", "SCALE_GROUP_K", "ACT_QUANT"],
@@ -1420,7 +1426,7 @@ def int_weight_only_matmul_2d_kernel(
     block_fp8_scale_mode_configs(get_accelerator_autotuning_configs(
         group_sizes_m=DENSE_GROUP_SIZES_M,
         tune_block_nk=True, tune_block_m=True, warp_spec=True,
-        swap_ab=True, swap_block_sizes_m=(1, 2, 4, 8), k_slices=(1, 2, 4),
+        swap_ab=True, swap_block_sizes_m=(1, 2, 4, 8, 16, 32, 64, 128), k_slices=(1, 2, 4),
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
         pre_hook=rebind_weight_only_descriptors,
@@ -1435,7 +1441,7 @@ def int_weight_only_matmul_2d_kernel(
         "early_config_prune": compose_pruners(
             group_size_m_pruner(),
             block_within_dim_pruner("K"),
-            swap_max_m_pruner("M", max_m=8),
+            swap_max_m_pruner("M", max_m=128),
             gate_stacked_tmem_trap_pruner(),
             warp_spec_compile_guard_pruner(),
             descriptor_box_pruner(),
@@ -1521,7 +1527,7 @@ def block_fp8_weight_only_matmul_2d_kernel(
     get_accelerator_autotuning_configs(
         group_sizes_m=DENSE_GROUP_SIZES_M,
         tune_block_nk=True, warp_spec=True, tune_block_m=True,
-        swap_ab=True, swap_block_sizes_m=(1, 2, 4, 8), k_slices=(1, 2, 4),
+        swap_ab=True, swap_block_sizes_m=(1, 2, 4, 8, 16, 32, 64, 128), k_slices=(1, 2, 4),
         a_memory_modes=("descriptor", "pointer"), b_memory_modes=("descriptor", "pointer"),
         pre_hook=rebind_weight_only_descriptors,
     ),
@@ -1536,7 +1542,7 @@ def block_fp8_weight_only_matmul_2d_kernel(
         "early_config_prune": compose_pruners(
             group_size_m_pruner(),
             block_within_dim_pruner("K"),
-            swap_max_m_pruner("M", max_m=8),
+            swap_max_m_pruner("M", max_m=128),
             matched_memory_modes_pruner(),
             descriptor_box_pruner(),
             gate_stacked_tmem_trap_pruner(),
@@ -2347,6 +2353,7 @@ def full_precision_matmul_2d(
         and full_precision_matmul_2d.paths.choose((N, K, M.bit_length(), bias is None, str(A.dtype))) == "cublas"
     ):
         native_bias = bias[0] if bias is not None and bias.ndim == 2 else bias
+        # a caller's autocast region would recast F.linear (not the Triton kernel), making the output dtype depend on the path
         with torch.autocast(A.device.type, enabled=False):
             return [torch.nn.functional.linear(A, B, native_bias)]
     C = A.new_empty(A.shape[:-1] + (gate_out_cols(N, gate, act_fn),), dtype=output_dtype)
@@ -2533,6 +2540,7 @@ def block_fp8_weight_only_matmul_2d(
         if ((not gate or act_fn is None) and output_dtype in (None, A.dtype)
                 and (bias is None or bias.dtype == A.dtype)):
             native_bias = bias[0] if bias is not None and bias.ndim == 2 else bias
+            # a caller's autocast region would recast F.linear (not the Triton kernel), making the output dtype depend on the path
             with torch.autocast(A.device.type, enabled=False):
                 return [torch.nn.functional.linear(A, weights, native_bias)]
         return full_precision_matmul_2d(
@@ -2614,20 +2622,33 @@ def int_weight_only_matmul_2d(
             (N, K, M.bit_length(), bits, str(A.dtype), smoothquant), offered=("inline_quant", "offline_quant")
         ) == "inline_quant"
     )
-    if (b_perm is not None or a_pre_quant_scale is not None or a_scale is not None) and not quantize_on_load:
+    # Prefill can instead dequantize the weight once into cuBLAS: weight-only to the activation dtype (bitwise the
+    # same), W4A8 to its E4M3 weight for the FP8 tensorwise GEMM (ModelOpt's two-level weight, the activation
+    # quantized as the Triton arm's offline pass does; nemotron qkv, B200: M=8192 621 -> 186us, M=64 24.1 -> 19.4us). Where that
+    # pays depends on M and the weight shape (B200, graph, weight-only: from M=512 at 4096x4096, yet only from M=8192
+    # on smaller projections), so the path tuner times both per M bucket.
+    fp8_cublas_eligible = b_scale2 is not None and is_sm10x() and hasattr(torch.nn.functional, "scaled_mm") and (
+        output_dtype == torch.bfloat16 and K % 16 == 0 and N % 16 == 0)
+    offline_dequant = (
+        (a_scale is None and A.ndim == 2 and output_dtype in (None, A.dtype) or fp8_cublas_eligible)
+        and not gate and bias is None
+        and int_weight_only_matmul_2d.paths.choose(
+            (N, K, M.bit_length(), bits, str(A.dtype), a_scale is None), offered=("inline_dequant", "offline_dequant")
+        ) == "offline_dequant"
+    )
+    if (b_perm is not None or a_pre_quant_scale is not None or a_scale is not None) and (
+        offline_dequant or not quantize_on_load
+    ):
         A = permute_act_cols(A, b_perm, a_pre_quant_scale, a_scale, torch.int8 if smoothquant else FP8_DTYPE)
     assert A.is_contiguous(), "A must be contiguous (the host-TMA descriptor arm reads its box)"
-    # Prefill can instead dequantize the weight once into cuBLAS, bitwise the same. Where that pays depends on M
-    # and the weight shape (B200, graph: from M=512 at 4096x4096, yet only from M=8192 on smaller projections), so
-    # the path tuner times both per M bucket.
-    if (
-        a_scale is None and A.ndim == 2 and not gate and bias is None and output_dtype in (None, A.dtype)
-        and int_weight_only_matmul_2d.paths.choose(
-            (N, K, M.bit_length(), bits, str(A.dtype)), offered=("inline_dequant", "offline_dequant")
-        ) == "offline_dequant"
-    ):
+    if offline_dequant and a_scale is None:
+        # a caller's autocast region would recast F.linear (not the Triton kernel), making the output dtype depend on the path
         with torch.autocast(A.device.type, enabled=False):
             return [torch.nn.functional.linear(A, dequantize_int_weight(B, Bs, K, b_zero, dtype=A.dtype))]
+    if offline_dequant:
+        weight = dequantize_int_weight(B, Bs, K, b_zero, dtype=FP8_DTYPE, global_scale=b_scale2)
+        out = _scaled_mm_2d(A.view(M, K), a_scale, weight, b_scale2, None, None, "fp8")
+        return [out.view(*A.shape[:-1], N)]
     C = A.new_empty(A.shape[:-1] + (gate_out_cols(N, gate, act_fn),), dtype=output_dtype)
     # placeholder boxes, rebound per tuned config by rebind_weight_only_descriptors
     a_descriptor = maybe_descriptor(A.view(M, K), [1, 32])

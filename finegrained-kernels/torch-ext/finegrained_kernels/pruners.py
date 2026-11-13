@@ -1514,7 +1514,9 @@ def mx_auxiliary_pruner():
         if not is_sm10x() or args["GATE"]:
             return False
         if persistent:
-            return args.get("LORA_RANK", 0) > 0 and args["M"] >= 128
+            # a warp-specialized persistent tile loop (flattened or tile_loop) fails Triton 3.9's partition verifier:
+            # "'scf.if' op partition ids in attr ttg.partition does not contain partition ids of all child ops"
+            return args.get("LORA_RANK", 0) > 0 and args["M"] >= 128 and not c.kwargs.get("WARP_SPEC")
         if c.kwargs["COMPUTE_MODE"] != "scalar" and args.get("LORA_RANK", 0) == 0:
             return False
         return (
