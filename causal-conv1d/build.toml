@@ -5,6 +5,7 @@ edition = 6
 license = "BSD-3-Clause"
 backends = [
     "cuda",
+    "rocm",
     "xpu",
 ]
 
@@ -19,6 +20,7 @@ src = [
 
 [torch.stable-abi]
 cuda = "2.10"
+rocm = "2.10"
 xpu = "2.13"
 
 [kernel.causal_conv1d_xpu]
@@ -36,6 +38,38 @@ src = [
 [kernel.causal_conv1d]
 language = "cpp-cuda"
 depends = ["torch"]
+include = ["causal-conv1d"]
+src = [
+    "causal-conv1d/causal_conv1d_bwd.cu",
+    "causal-conv1d/causal_conv1d_common.h",
+    "causal-conv1d/causal_conv1d.cpp",
+    "causal-conv1d/causal_conv1d_fwd.cu",
+    "causal-conv1d/causal_conv1d.h",
+    "causal-conv1d/causal_conv1d_update.cu",
+    "causal-conv1d/static_switch.h",
+]
+
+[kernel.causal_conv1d_rocm]
+language = "cpp-rocm"
+depends = ["torch"]
+rocm-archs = [
+    "gfx906",
+    "gfx908",
+    "gfx90a",
+    "gfx940",
+    "gfx941",
+    "gfx942",
+    "gfx950",
+    "gfx1030",
+    "gfx1100",
+    "gfx1101",
+    "gfx1102",
+    "gfx1103",
+    "gfx1150",
+    "gfx1151",
+    "gfx1200",
+    "gfx1201",
+]
 include = ["causal-conv1d"]
 src = [
     "causal-conv1d/causal_conv1d_bwd.cu",
