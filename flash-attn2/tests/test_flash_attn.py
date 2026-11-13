@@ -1973,6 +1973,64 @@ def test_flash_attn_splitkv(
 #       flash_attn2.layers.rotary (upstream baggage not shipped with this kernel).
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_flash_attn_kvcache_empty_rows(device, dtype):
+    """Rows with no KV at all must be skipped before knew/vnew are appended.
+
+    Continuous batching pads a decode batch with dummy rows that carry
+    ``cache_seqlens = -1``. With one new token the total KV length is
+    ``-1 + 1 = 0``, so such a row has to be skipped before the cache is
+    touched; otherwise the new token is scattered to row ``-1`` of the page the
+    dummy ``block_table`` entry points at, silently corrupting whatever lives
+    there.
+    """
+    if device == "cpu":
+        pytest.skip("flash_attn_with_kvcache is not supported on CPU")
+
+    torch.manual_seed(0)
+    nheads, d, page_size, num_blocks = 4, 64, 64, 8
+    batch_size, n_real = 4, 2
+    # Two pages per sequence, the last page is the one the padding rows point at.
+    trash_page = num_blocks - 1
+
+    k_cache = torch.randn(num_blocks, page_size, nheads, d, device=device, dtype=dtype)
+    v_cache = torch.randn(num_blocks, page_size, nheads, d, device=device, dtype=dtype)
+    k_cache_ref = k_cache.clone()
+    v_cache_ref = v_cache.clone()
+
+    block_table = torch.tensor(
+        [[0, 1], [2, 3], [trash_page, trash_page], [trash_page, trash_page]],
+        dtype=torch.int32,
+        device=device,
+    )
+    # Real rows already hold a full first page, so the new token lands at the
+    # start of their second page. Padding rows are empty.
+    cache_seqlens = torch.tensor([page_size] * n_real + [-1] * (batch_size - n_real),
+                                 dtype=torch.int32, device=device)
+
+    q = torch.randn(batch_size, 1, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(batch_size, 1, nheads, d, device=device, dtype=dtype)
+    v = torch.randn(batch_size, 1, nheads, d, device=device, dtype=dtype)
+
+    flash_attn_with_kvcache(
+        q, k_cache, v_cache, k, v,
+        cache_seqlens=cache_seqlens, block_table=block_table, causal=True,
+    )
+
+    # The real rows appended to the first slot of their second page.
+    for b in range(n_real):
+        page = block_table[b, 1].item()
+        assert torch.equal(k_cache[page, 0], k[b, 0])
+        assert torch.equal(v_cache[page, 0], v[b, 0])
+        k_cache_ref[page, 0] = k[b, 0]
+        v_cache_ref[page, 0] = v[b, 0]
+
+    # Nothing else moved. In particular row -1 of the trash page, which aliases
+    # the last row of the preceding page, is untouched.
+    assert torch.equal(k_cache, k_cache_ref)
+    assert torch.equal(v_cache, v_cache_ref)
+
+
 def _generate_block_kvcache(seqlen_k, paged_kv_block_size, batch_size, nheads_k, d, device, dtype):
     num_blocks = math.ceil(seqlen_k / paged_kv_block_size) * batch_size * 3
     k_cache_paged = torch.randn(

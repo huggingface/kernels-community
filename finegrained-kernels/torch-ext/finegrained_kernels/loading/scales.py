@@ -44,7 +44,7 @@ def load_block_fp8_act_tile(
     a_descriptor=0,
     m_off=0,
     k_off=0,
-    A_MEMORY_MODE: tl.constexpr = "pointer",
+    A_MEMORY_MODE: tl.constexpr = tl.constexpr("pointer"),
     as_mask=None,
     TRANSPOSED: tl.constexpr = False,
 ):
@@ -232,9 +232,9 @@ def load_mx_act_tile(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
-    A_MEMORY_MODE: tl.constexpr = "pointer",
+    A_MEMORY_MODE: tl.constexpr = tl.constexpr("pointer"),
     A_GATHER: tl.constexpr = False,
-    FORMAT: tl.constexpr = "mxfp8",
+    FORMAT: tl.constexpr = tl.constexpr("mxfp8"),
 ):
     """Load one MX activation K-tile as ``(a_vals, a_scale)`` — the arm is picked
     off the pointer dtype at compile time: fp8 pointers load pre-quantized E4M3 values +
@@ -357,27 +357,21 @@ def mx_2d_scale_ptrs(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     SCALE_COLS: tl.constexpr,
-    SWIZZLED_SCALES: tl.constexpr,
     GATE: tl.constexpr = False,
 ):
     """Prologue 2D MX scale-pointer tiles + bounds masks as ``(as_ptrs, bs_ptrs, as_mask,
-    bs_mask)``. Affine arm: per-(row, group) ``as``/``bs`` pointer tiles read off AFFINE
-    row/col offsets (the %-wrapped operand offsets would make the scale load a non-affine
-    gather) with row/col bounds masks. Swizzled arm: the scales are read via the SA/BS
-    descriptors in the loop, so these tiles are dead — return the base scalars + null masks.
-    Single return — the arms have divergent types (base scalars + null masks vs affine pointer
-    tiles + bounds masks), so an early return can't unify them; the constexpr selects one."""
-    if SWIZZLED_SCALES:
-        as_ptrs, bs_ptrs, as_mask, bs_mask = As, Bs, None, None
-    else:
-        offs_am_lin = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-        ROWS: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
-        offs_bn_lin = pid_n * ROWS + tl.arange(0, ROWS)
-        offs_sf = tl.arange(0, SCALE_COLS)
-        as_ptrs = As + offs_am_lin[:, None] * stride_as_m + offs_sf[None, :]
-        bs_ptrs = Bs + (offs_bn_lin[:, None] * stride_bs_n + offs_sf[None, :] * stride_bs_k)
-        as_mask = offs_am_lin < M
-        bs_mask = offs_bn_lin < (2 * N if GATE else N)
+    bs_mask)``: per-(row, group) ``as``/``bs`` pointer tiles read off AFFINE row/col offsets (the
+    %-wrapped operand offsets would make the scale load a non-affine gather) with row/col bounds
+    masks. Swizzled scales are read via the SA/BS descriptors in the loop instead, so the kernel
+    does not call this for them."""
+    offs_am_lin = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    ROWS: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
+    offs_bn_lin = pid_n * ROWS + tl.arange(0, ROWS)
+    offs_sf = tl.arange(0, SCALE_COLS)
+    as_ptrs = As + offs_am_lin[:, None] * stride_as_m + offs_sf[None, :]
+    bs_ptrs = Bs + (offs_bn_lin[:, None] * stride_bs_n + offs_sf[None, :] * stride_bs_k)
+    as_mask = offs_am_lin < M
+    bs_mask = offs_bn_lin < (2 * N if GATE else N)
     return as_ptrs, bs_ptrs, as_mask, bs_mask
 
 
@@ -661,7 +655,7 @@ def _decode_fixed_kernel(
     ALIGNED_OUTPUT: tl.constexpr,
 ):
     pairs: tl.constexpr = ROWS * (COLS // 2)
-    tiles: tl.constexpr = tl.cdiv(pairs, BLOCK)
+    tiles: tl.constexpr = (pairs + BLOCK - 1) // BLOCK  # plain ints: Triton 3.6 evaluates this outside the JIT
     offsets = tl.arange(0, BLOCK)
     # Contiguous pairs avoid padding each row to a power-of-two tile width.
     # Keep indices local to an expert; only the expert base needs 64-bit addressing.

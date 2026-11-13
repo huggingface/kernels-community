@@ -1,0 +1,201 @@
+name: Autotune
+
+on:
+  workflow_call:
+    inputs:
+      request:
+        description: "Completed merge-and-upload dispatch set, including the originating PR"
+        type: string
+        required: true
+
+# Serialize source PR creation and read/append/write updates to the Hub CSV.
+concurrency:
+  group: autotune
+  queue: max
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  plan:
+    if: >-
+      github.repository == 'huggingface/kernels-community' && github.ref == 'refs/heads/main'
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    runs-on: ubuntu-latest
+    outputs:
+      source_sha: ${{ steps.build.outputs.source_sha }}
+      kernels: ${{ steps.plan.outputs.kernels }}
+      gpu_jobs: ${{ steps.plan.outputs.gpu_jobs }}
+      skipped: ${{ steps.plan.outputs.skipped }}
+      has_work: ${{ steps.plan.outputs.has_work }}
+      has_kernels: ${{ steps.plan.outputs.has_kernels }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Validate all builds and check autotuner origin
+        id: build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AUTOTUNE_REQUEST: ${{ inputs.request }}
+        run: python .github/scripts/autotune.py build-run "$RUNNER_TEMP/hub-uploads"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.build.outputs.skip != 'true'
+        with:
+          ref: ${{ steps.build.outputs.source_sha }}
+      - run: pip install 'huggingface_hub>=2.3.0'
+        if: steps.build.outputs.skip != 'true'
+      - name: Select and print published kernels
+        if: steps.build.outputs.skip != 'true'
+        id: plan
+        run: python .github/scripts/autotune.py plan "$RUNNER_TEMP/hub-uploads"
+
+  tune:
+    name: Autotune (${{ matrix.kernel }}/${{ matrix.name }})
+    needs: plan
+    if: needs.plan.outputs.has_work == 'true'
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.gpu_jobs) }}
+    runs-on:
+      group: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.source_sha }}
+      - name: Check assigned GPU
+        id: gpu
+        env:
+          GPU: ${{ matrix.gpu }}
+        run: python3 .github/scripts/autotune.py probe "$GPU"
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: steps.gpu.outputs.supported == 'true'
+        with:
+          python-version: "3.12"
+      - name: Install tuning dependencies
+        if: steps.gpu.outputs.supported == 'true'
+        run: pip install torch kernels einops 'huggingface_hub>=2.3.0'
+      - name: Tune configs
+        id: tune
+        if: steps.gpu.outputs.supported == 'true'
+        working-directory: ${{ matrix.kernel }}
+        env:
+          CUDA_VISIBLE_DEVICES: "0"
+          TARGET: ${{ matrix.name }}
+          HUB_REVISION: ${{ matrix.revision }}
+          SOURCE_SHA: ${{ needs.plan.outputs.source_sha }}
+        run: >-
+          python ../.github/scripts/autotune.py tune "$TARGET" "$RUNNER_TEMP/autotune"
+          --revision "$HUB_REVISION" --source-sha "$SOURCE_SHA"
+      - name: Upload configs for collection
+        if: steps.tune.outputs.tuned == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: autotune-${{ matrix.kernel }}.${{ matrix.name }}
+          path: ${{ runner.temp }}/autotune/
+          if-no-files-found: error
+          overwrite: true
+
+  collect:
+    needs: [plan, tune]
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.has_kernels == 'true'
+    permissions:
+      actions: read
+      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      kernels: ${{ steps.results.outputs.kernels }}
+      has_changes: ${{ steps.results.outputs.has_changes }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.source_sha }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: autotune-*.*
+          path: ${{ runner.temp }}/autotune/
+      - name: Collect target outcomes and job URLs
+        id: results
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GPU_JOBS: ${{ needs.plan.outputs.gpu_jobs }}
+          SKIPPED_TARGETS: ${{ needs.plan.outputs.skipped }}
+        run: python .github/scripts/autotune.py collect "$RUNNER_TEMP/results.json" "$RUNNER_TEMP/autotune"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: autotune-results
+          path: ${{ runner.temp }}/results.json
+          overwrite: true
+
+  config-pr:
+    needs: [plan, collect]
+    if: always() && needs.collect.result == 'success' && needs.collect.outputs.has_changes == 'true'
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: ${{ fromJSON(needs.collect.outputs.kernels) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.source_sha }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: autotune-results
+          path: ${{ runner.temp }}/
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: autotune-${{ matrix.kernel }}.*
+          path: ${{ runner.temp }}/autotune/
+      - name: Open a source config PR for review and merge-and-upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KERNEL: ${{ matrix.kernel }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python .github/scripts/autotune.py publish "$KERNEL" "$RUNNER_TEMP/autotune" "$RUNNER_TEMP/results.json" "$RUN_URL"
+
+  report:
+    needs: [plan, collect]
+    if: always() && needs.collect.result == 'success'
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.source_sha }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: autotune-results
+          path: ${{ runner.temp }}/
+      - run: pip install 'huggingface_hub>=1.19.0'
+      - name: Append target job URLs to each kernel's report
+        env:
+          HF_OIDC_RESOURCE: datasets/kernels-community/autotune-runs
+        run: python .github/scripts/autotune.py report kernels-community/autotune-runs "$RUNNER_TEMP/results.json"

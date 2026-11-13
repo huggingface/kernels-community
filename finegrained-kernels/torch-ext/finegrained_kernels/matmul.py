@@ -27,7 +27,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from .bayesian_autotuner import bayesian_autotune
 from .path_autotuner import path_autotune
 from ._ops import add_op_namespace_prefix
-from .compat import FP8_DTYPE, is_sm10x, launches_skipped, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, pdl_launch_kwargs, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, narrow_dot_autotuning_configs, narrow_scalar_autotuning_configs, split_k_autotuning_configs, persistent_program_count, pipeline_autotuning_configs, block_fp8_scale_mode_configs
+from .compat import FP8_DTYPE, is_sm10x, launches_skipped, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, pdl_launch_kwargs, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, narrow_dot_autotuning_configs, narrow_scalar_autotuning_configs, split_k_autotuning_configs, persistent_program_count, pipeline_autotuning_configs, block_fp8_scale_mode_configs, FP8_MAX, is_triton_greater_or_equal
 from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_tiled_descriptors, rebind_weight_only_descriptors, weight_descriptor
 from .formats import block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, normalize_global_scale, e2m1_as_uint8, is_mx, is_rowwise, mx_scale_family, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_2d_operands, weight_format, validate_int_operands, validate_svdquant_operands, INT_WEIGHT_DTYPES
 from .bench import gemm_cold_banks
@@ -55,7 +55,7 @@ from .loading.tiles import (
     swizzle_offsets,
 )
 from .epilogue import acc_finalize, acc_init, add_bias, bias_strides, gemm_epilogue, store_masked, store_masked_oriented
-from .pruners import PATH_ANCHOR_AXES, block_fp8_scale_mode_pruner, group_size_m_pruner, fp8_dot_warp_pruner, fp4_act_gate_warp_spec_pruner, gate_stacked_tmem_trap_pruner, block_dynamic_2d_warp_spec_pruner, block_dynamic_mma_width_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, descriptor_needs_prequant_pruner, matched_memory_modes_pruner, mx_2d_swap_scope_pruner, native_mma_m_pruner, mx_config_pruner, scalar_max_m_pruner, smem_pruner, swap_decode_scope_pruner, swap_max_m_pruner, k_slices_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, warp_spec_compile_guard_pruner, warp_spec_memory_mode_pruner, mx_auxiliary_pruner, block_m_cap_pruner, int_2d_warp_spec_pruner, int_split_k_pruner, scalar_block_m_pruner, int_scale_group_tile_pruner
+from .pruners import PATH_ANCHOR_AXES, block_fp8_scale_mode_pruner, group_size_m_pruner, fp8_dot_warp_pruner, fp4_act_gate_warp_spec_pruner, gate_stacked_tmem_trap_pruner, block_dynamic_2d_warp_spec_pruner, block_dynamic_mma_width_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, descriptor_needs_prequant_pruner, matched_memory_modes_pruner, mx_2d_swap_scope_pruner, native_mma_m_pruner, mx_config_pruner, scalar_max_m_pruner, smem_pruner, swap_decode_scope_pruner, swap_max_m_pruner, k_slices_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, warp_spec_compile_guard_pruner, warp_spec_memory_mode_pruner, mx_auxiliary_pruner, block_m_cap_pruner, int_2d_warp_spec_pruner, int_split_k_pruner, scalar_block_m_pruner, int_scale_group_tile_pruner, nvfp4_requant_warps_pruner
 
 # The 2D-grid kernels' L2-locality swizzle depth is derived per-tile inside
 # ``swizzle_offsets`` (see SWIZZLE_GROUP_A_BYTES there) — no per-kernel constant here.
@@ -801,6 +801,7 @@ def _mx_matmul_configs():
             smem_pruner(),
             descriptor_box_pruner("BLOCK_SIZE_K"),
             swizzled_scale_config_pruner(),
+            nvfp4_requant_warps_pruner(),
             warp_spec_compile_guard_pruner(),
             fp4_act_gate_warp_spec_pruner(),
         )
@@ -922,10 +923,14 @@ def mx_dynamic_matmul_kernel(
         # Scales read affine off row/col offsets + bounds masks (the %-wrapped operand offsets would
         # make the scale load a non-affine gather); the SWIZZLED arm reads them via the SA/BS
         # descriptors in the loop instead, so its pointer tiles are dead (base scalars + null masks).
-        as_ptrs, bs_ptrs, as_mask, bs_mask = mx_2d_scale_ptrs(
-            As, Bs, pid_m, pid_n, M, N, stride_as_m, stride_bs_n, stride_bs_k,
-            BLOCK_SIZE_M, BLOCK_SIZE_N, SCALE_COLS, SWIZZLED_SCALES, GATE,
-        )
+        # (chosen here, not in the helper: Triton 3.6 cannot return None from a jit function)
+        if SWIZZLED_SCALES:
+            as_ptrs, bs_ptrs, as_mask, bs_mask = As, Bs, None, None
+        else:
+            as_ptrs, bs_ptrs, as_mask, bs_mask = mx_2d_scale_ptrs(
+                As, Bs, pid_m, pid_n, M, N, stride_as_m, stride_bs_n, stride_bs_k,
+                BLOCK_SIZE_M, BLOCK_SIZE_N, SCALE_COLS, GATE,
+            )
         # Operand tiles: activation + the (GATE-stacked-aware) weight, both single leaf calls (the
         # descriptor-vs-pointer and gate|up-stack branches fold inside the leaves). The swap arm
         # loads both naturally — mx_compute reorients at the dot under SWAP_AB, flattening the token tile.
@@ -1855,7 +1860,7 @@ def w8a8_block_static_fp8_matmul(
     # and the path tuner times inline against offline per M bucket.
     A_q, _ = maybe_act_quant(
         A.view(M, K),
-        lambda x: ((x.to(torch.float32) / As).to(FP8_DTYPE), As),
+        lambda x: ((x.to(torch.float32) / As).clamp(-FP8_MAX, FP8_MAX).to(FP8_DTYPE), As),
         w8a8_block_static_fp8_matmul.paths.choose((N, K, M.bit_length(), gate, str(A.dtype))) == "offline_quant",
     )
     # Host-TMA descriptors over (M, K)/(N, K); placeholder boxes re-bound per config by
@@ -2196,7 +2201,10 @@ def mx_dynamic_matmul(
     # SWIZZLE_32_4_4 layout (CSDescriptor), so the fused down reads it on the fast path. 2D dense
     # output rows are contiguous (no scatter), so it's always swizzle-able. Format-general — the
     # swizzle is a byte-tiling over the N // out_g scale grid (mxfp8/mxfp4 group-32, nvfp4 group-16).
-    swizzled_out = requant and swizzled_scales
+    # Triton 3.6 stores the swizzled requant scales wrong through CSDescriptor (all configs, B200, 2D NVFP4 gate|up:
+    # 130% mean error; correct on 3.7.1 and 3.9): there the kernel writes them row-major and they are swizzled after.
+    swizzled_out = requant and swizzled_scales and is_triton_greater_or_equal("3.7")
+    swizzle_after = requant and swizzled_scales and not swizzled_out
     if output_format in ("mxfp4", "nvfp4"):
         C = A.new_empty(A.shape[:-1] + (N // 2,), dtype=torch.int8)
     elif output_format == "mxfp8":
@@ -2315,6 +2323,8 @@ def mx_dynamic_matmul(
         )
     # NVFP4's block scales are already normalized by the provided output global (CsGlobal =
     # output_global_scale) at requant, so the caller pairs cs_ret with that global as the down's As.
+    if swizzle_after:
+        cs_ret = swizzle_mx_scales(cs_ret)
     return [C, cs_ret] if cs_ret is not None else [C]
 
 

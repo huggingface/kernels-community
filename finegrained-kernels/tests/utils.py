@@ -240,7 +240,7 @@ def quant_dequant_a(
     the MX format) else kept fp32; quantize to E4M3 and scale back.
     """
     if scale is not None:
-        A_fp8 = (A.float() / scale).to(FP8_DTYPE)
+        A_fp8 = (A.float() / scale).clamp(FP8_MIN, FP8_MAX).to(FP8_DTYPE)
         return A_fp8.float() * scale
     M, K = A.shape
     groups = A.float().reshape(M, K // block_k, block_k)

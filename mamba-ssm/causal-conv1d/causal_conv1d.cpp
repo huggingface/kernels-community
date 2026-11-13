@@ -3,6 +3,16 @@
  ******************************************************************************/
 
 #include <torch/all.h>
+#ifdef USE_ROCM
+// kernel-builder only hipifies .cu files, so map the CUDA host APIs used here.
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
+using cudaStream_t = hipStream_t;
+namespace at::cuda {
+using CUDAGuard = at::hip::HIPGuardMasqueradingAsCUDA;
+inline auto getCurrentCUDAStream() { return at::hip::getCurrentHIPStreamMasqueradingAsCUDA(); }
+}  // namespace at::cuda
+#else
 #if TORCH_VERSION_MAJOR > 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 6)
 #include <c10/core/DeviceGuard.h>
 #else
@@ -10,6 +20,7 @@
 #endif
 
 #include <c10/cuda/CUDAStream.h>
+#endif
 #include <vector>
 
 #include "causal_conv1d.h"
@@ -165,7 +176,8 @@ causal_conv1d_fwd(const at::Tensor &x,
         TORCH_CHECK(dim % 8 == 0, "causal_conv1d only supports channel dimension divisible by 8 for now");
         TORCH_CHECK(x.stride(2) % 8 == 0 and x.stride(0) % 8 == 0, "causal_conv1d with channel last layout requires strides (x.stride(0) and x.stride(2)) to be multiples of 8");
     }
-    TORCH_CHECK(width >= 2 && width <= 4, "causal_conv1d only supports width between 2 and 4");
+    TORCH_CHECK(width >= 2 && width <= (input_type == at::ScalarType::Float ? 4 : 8),
+                "causal_conv1d only supports width between 2 and 4 (2 and 8 for half/bfloat16 input)");
 
     if (bias_.has_value()) {
         auto bias = bias_.value();
@@ -272,7 +284,8 @@ causal_conv1d_bwd(const at::Tensor &x,
     const int seqlen = sizes[2];
     const int width = weight.size(-1);
 
-    TORCH_CHECK(width >= 2 && width <= 4, "causal_conv1d only supports width between 2 and 4");
+    TORCH_CHECK(width >= 2 && width <= (input_type == at::ScalarType::Float ? 4 : 8),
+                "causal_conv1d only supports width between 2 and 4 (2 and 8 for half/bfloat16 input)");
 
     CHECK_SHAPE(x, batch_size, dim, seqlen);
     CHECK_SHAPE(weight, dim, width);
@@ -414,7 +427,8 @@ causal_conv1d_update(const at::Tensor &x,
     CHECK_SHAPE(x, batch_size, dim, seqlen);
     CHECK_SHAPE(weight, dim, width);
 
-    TORCH_CHECK(width >= 2 && width <= 4, "causal_conv1d only supports width between 2 and 4");
+    TORCH_CHECK(width >= 2 && width <= (input_type == at::ScalarType::Float ? 4 : 8),
+                "causal_conv1d only supports width between 2 and 4 (2 and 8 for half/bfloat16 input)");
 
     if (bias_.has_value()) {
         auto bias = bias_.value();

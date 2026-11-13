@@ -2,8 +2,19 @@
  * Copyright (c) 2023, Tri Dao.
  ******************************************************************************/
 
+#ifndef USE_ROCM
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#else
+// kernel-builder only hipifies .cu files, so map the CUDA host APIs used here.
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
+using cudaStream_t = hipStream_t;
+namespace at::cuda {
+using CUDAGuard = at::hip::HIPGuardMasqueradingAsCUDA;
+inline auto getCurrentCUDAStream() { return at::hip::getCurrentHIPStreamMasqueradingAsCUDA(); }
+}  // namespace at::cuda
+#endif
 #include <torch/all.h>
 #include <vector>
 

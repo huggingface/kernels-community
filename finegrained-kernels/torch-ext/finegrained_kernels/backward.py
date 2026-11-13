@@ -81,6 +81,7 @@ from .pruners import (
     block_within_dim_pruner,
     config_filter,
     descriptor_box_pruner,
+    dgrad_grouped_warps_pruner,
     compose_pruners,
     smem_pruner,
     warp_spec_compile_guard_pruner,
@@ -365,6 +366,7 @@ def dgrad_matmul_2d(
     reset_to_zero=("C",),
     prune_configs_by={
         "early_config_prune": compose_pruners(
+            dgrad_grouped_warps_pruner(),
             block_within_dim_pruner("N"),  # exact N-loop: no tail mask, constant-stride advance
             config_filter(  # the scale row advances by BN // SCALE_ROW_DIV — must be whole
                 lambda c, a: c.kwargs["BLOCK_SIZE_N"] % max(a.get("SCALE_ROW_DIV", 1), 1) == 0

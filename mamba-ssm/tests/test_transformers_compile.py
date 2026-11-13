@@ -16,7 +16,7 @@ class LoadedLayer:
     layer_name: str
 
     def load(self):
-        kernel = kernels.get_kernel("kernels-community/mamba-ssm", version=4)
+        kernel = kernels.get_kernel("kernels-community/mamba-ssm", version=5)
         return getattr(kernel.layers, self.layer_name)
 
 
@@ -42,9 +42,10 @@ def model(request):
 
 
 def kernelize(model):
-    kernel = kernels.get_kernel("kernels-community/mamba-ssm", version=4)
+    kernel = kernels.get_kernel("kernels-community/mamba-ssm", version=5)
+    device = "rocm" if torch.version.hip else "cuda"
     mapping = {
-        name: {"cuda": LoadedLayer(name)}
+        name: {device: LoadedLayer(name)}
         for name in kernel.layers.__all__
     }
     # Deliberately do not pass TORCH_COMPILE: users compile after kernelization.

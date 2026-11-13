@@ -14,6 +14,8 @@ jobs:
   handle-comment:
     if: ${{ github.event.issue.pull_request }}
     runs-on: ubuntu-latest
+    outputs:
+      autotune_request: ${{ steps.command.outputs.autotune_request }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -23,6 +25,7 @@ jobs:
         # Make the PR commit available so the bot can read its build.toml (data only).
         run: git fetch --depth=1 origin "refs/pull/${{ github.event.issue.number }}/head"
       - name: Handle /kernel-bot command
+        id: command
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Read-only org token, used *solely* to look up team membership so
@@ -64,3 +67,35 @@ jobs:
             exit 1
           fi
           python3 .github/scripts/pr_comment_kernel_bot.py
+
+  wait-for-builds:
+    needs: handle-comment
+    if: needs.handle-comment.outputs.autotune_request != ''
+    permissions:
+      contents: read
+      actions: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    outputs:
+      request: ${{ steps.wait.outputs.request }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - name: Wait for every dispatched build and upload
+        id: wait
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AUTOTUNE_REQUEST: ${{ needs.handle-comment.outputs.autotune_request }}
+        run: python3 .github/scripts/wait_for_autotune_builds.py
+
+  autotune:
+    needs: wait-for-builds
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: write
+      id-token: write
+    uses: ./.github/workflows/autotune.yaml
+    with:
+      request: ${{ needs.wait-for-builds.outputs.request }}

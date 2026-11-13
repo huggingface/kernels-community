@@ -25,7 +25,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from .bayesian_autotuner import bayesian_autotune
 from .path_autotuner import path_autotune
 from ._ops import add_op_namespace_prefix
-from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, persistent_program_count, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, pipeline_autotuning_configs, persistent_programs_per_sm, is_sm10x, block_fp8_scale_mode_configs, narrow_scalar_autotuning_configs
+from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, persistent_program_count, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, pipeline_autotuning_configs, persistent_programs_per_sm, is_sm10x, block_fp8_scale_mode_configs, narrow_scalar_autotuning_configs, is_triton_greater_or_equal
 from .bench import gemm_cold_banks
 from .descriptors import build_grouped_operand_descriptors, rebind_grouped_descriptors, rebind_grouped_mx_descriptors
 from .formats import WEIGHT_ONLY_STAGE_MIN_ROWS, block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, row_scale_stride, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, validate_int_operands, INT_WEIGHT_DTYPES
@@ -50,7 +50,7 @@ from .loading.tiles import (
     weight_tile_ptrs,
 )
 from .epilogue import acc_init, bias_strides, gemm_epilogue
-from .pruners import PATH_ANCHOR_AXES, grouped_scalar_decode_pruner, block_fp8_scale_mode_pruner, int_scale_group_tile_pruner, fp8_dot_warp_pruner, raw_activation_pointer_pruner, warp_spec_memory_mode_pruner, packed_schedule_scope_pruner, tile_order_pruner, affine_scale_warp_spec_pruner, block_dynamic_grouped_matmul_pruner, block_static_grouped_matmul_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gate_stacked_tmem_trap_pruner, gated_pointer_weight_warp_spec_pruner, grouped_mx_swap_scope_pruner, mx_config_pruner, require_moe_dims_aligned, smem_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, swizzled_scales_bm_pruner, warp_spec_compile_guard_pruner, weight_only_dot_scaled_warps_pruner
+from .pruners import PATH_ANCHOR_AXES, grouped_scalar_decode_pruner, block_fp8_scale_mode_pruner, int_scale_group_tile_pruner, fp8_dot_warp_pruner, raw_activation_pointer_pruner, warp_spec_memory_mode_pruner, packed_schedule_scope_pruner, tile_order_pruner, affine_scale_warp_spec_pruner, block_dynamic_grouped_matmul_pruner, block_static_grouped_matmul_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gate_stacked_tmem_trap_pruner, gated_pointer_weight_warp_spec_pruner, grouped_mx_swap_scope_pruner, mx_config_pruner, require_moe_dims_aligned, smem_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, swizzled_scales_bm_pruner, warp_spec_compile_guard_pruner, weight_only_dot_scaled_warps_pruner, mxfp4_operand_warps_pruner
 
 
 def grouped_pre_hook(nargs):
@@ -833,6 +833,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     prune_configs_by={
         "early_config_prune": compose_pruners(
             tile_order_pruner(),
+            mxfp4_operand_warps_pruner(),
             swizzled_out_bm_pruner(),
             packed_schedule_scope_pruner(),
             mx_config_pruner("K", "N"),
@@ -2693,7 +2694,10 @@ def mx_dynamic_matmul_grouped(
     # group-32, E4M3 group-16 NVFP4); only the column count (cb_cs) and scale byte dtype differ. The
     # swizzle needs contiguous 128-row blocks, i.e. an expert-sorted output (scatter_idx None — the
     # fused gate_up convention); a scattered requant keeps row-major Cs.
-    swizzled_out = requant and scatter_idx is None and swizzled_scales
+    # Triton 3.6 stores the swizzled requant scales wrong through CSDescriptor (as in matmul_2d): there they are written
+    # row-major (expert-sorted) and swizzled after.
+    swizzled_out = requant and scatter_idx is None and swizzled_scales and is_triton_greater_or_equal("3.7")
+    swizzle_after = requant and scatter_idx is None and swizzled_scales and not swizzled_out
     if output_format in ("mxfp4", "nvfp4"):  # packed E2M1 intermediate, feeds a W4A4 down as-is
         assert N % (2 * scale_group) == 0, (
             f"N (={N}) must be a multiple of {2 * scale_group} to pack E2M1 pairs"
@@ -2788,6 +2792,8 @@ def mx_dynamic_matmul_grouped(
             SWIZZLED_SCALES=swizzled_scales,
             SWIZZLED_OUT=swizzled_out,
         )
+    if swizzle_after:
+        cs_ret = swizzle_grouped_mx_scales(cs_ret, expert_start)[0].view(scale_dtype)
     return [C, cs_ret] if requant else [C]
 
 

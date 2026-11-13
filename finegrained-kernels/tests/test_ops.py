@@ -1182,7 +1182,7 @@ def test_ue8m0_scale_bytes():
     values = [0, 1, 2, 126, 127, 128, 254, 255]
     scales = torch.tensor(values, dtype=torch.uint8, device=TEST_DEVICE)
     actual = torch.empty(8, dtype=torch.float32, device=TEST_DEVICE)
-    _decode_ue8m0_scales[(1,)](scales, actual)
+    _decode_ue8m0_scales[(1,)](scales, actual, enable_fp_fusion=True)
     expected = torch.tensor(
         [2.0 ** (byte - 127) for byte in values[:-1]] + [float("nan")],
         dtype=torch.float32, device=TEST_DEVICE,

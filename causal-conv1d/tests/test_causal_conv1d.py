@@ -11,7 +11,7 @@ import pytest
 from einops import rearrange
 
 
-causal_conv1d = kernels.get_kernel("kernels-community/causal-conv1d", version=2)
+causal_conv1d = kernels.get_kernel("kernels-community/causal-conv1d", version=3)
 
 causal_conv1d_fn = causal_conv1d.causal_conv1d_fn
 causal_conv1d_update = causal_conv1d.causal_conv1d_update
@@ -36,7 +36,7 @@ DEVICE = torch.accelerator.current_accelerator().type if torch.accelerator.is_av
 # @pytest.mark.parametrize('silu_activation', [True])
 @pytest.mark.parametrize("has_bias", [False, True])
 # @pytest.mark.parametrize('has_bias', [True])
-@pytest.mark.parametrize("width", [2, 3, 4])
+@pytest.mark.parametrize("width", [2, 3, 4, 5, 7, 8])
 # @pytest.mark.parametrize('width', [3])
 @pytest.mark.parametrize(
     "seqlen", [1, 2, 8, 16, 32, 64, 128, 129, 130, 151, 256, 372, 512, 784, 1024, 1134, 2048, 4096]
@@ -46,6 +46,8 @@ DEVICE = torch.accelerator.current_accelerator().type if torch.accelerator.is_av
 @pytest.mark.parametrize('dim', [64, 4096 + 32])
 # @pytest.mark.parametrize('dim', [64])
 def test_causal_conv1d(dim, seqlen, width, has_bias, silu_activation, itype, channel_last, has_initial_states, return_final_states):
+    if itype == torch.float32 and width > 4:
+        pytest.skip("widths 5-8 need 16-bit input")
     if not channel_last and (has_initial_states or return_final_states):
         pytest.skip("Only channel_last support initial_states or return_final_states")
     device = DEVICE
@@ -124,11 +126,13 @@ def test_causal_conv1d(dim, seqlen, width, has_bias, silu_activation, itype, cha
 # @pytest.mark.parametrize('has_cache_seqlens', [True])
 @pytest.mark.parametrize("seqlen", [1, 4, 5])
 # @pytest.mark.parametrize('seqlen', [4])
-@pytest.mark.parametrize("width", [2, 3, 4])
+@pytest.mark.parametrize("width", [2, 3, 4, 5, 7, 8])
 # @pytest.mark.parametrize('width', [4])
 @pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
 # @pytest.mark.parametrize("dim", [2048])
 def test_causal_conv1d_update(dim, width, seqlen, has_cache_seqlens, has_bias, silu_activation, itype):
+    if itype == torch.float32 and width > 4:
+        pytest.skip("widths 5-8 need 16-bit input")
     device = DEVICE
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
@@ -169,11 +173,13 @@ def test_causal_conv1d_update(dim, width, seqlen, has_cache_seqlens, has_bias, s
 # @pytest.mark.parametrize('has_cache_seqlens', [True])
 @pytest.mark.parametrize("seqlen", [1, 4, 5])
 # @pytest.mark.parametrize('seqlen', [4])
-@pytest.mark.parametrize("width", [2, 3, 4])
+@pytest.mark.parametrize("width", [2, 3, 4, 5, 7, 8])
 # @pytest.mark.parametrize('width', [4])
 @pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
 # @pytest.mark.parametrize("dim", [2048])
 def test_causal_conv1d_update_with_batch_gather(dim, width, seqlen, has_cache_seqlens, has_bias, silu_activation, itype):
+    if itype == torch.float32 and width > 4:
+        pytest.skip("widths 5-8 need 16-bit input")
     device = DEVICE
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
@@ -236,7 +242,7 @@ def test_causal_conv1d_get_states(dim, itype):
 @pytest.mark.parametrize('silu_activation', [True])
 # @pytest.mark.parametrize("has_bias", [False, True])
 @pytest.mark.parametrize('has_bias', [True])
-# @pytest.mark.parametrize("width", [2, 3, 4])
+# @pytest.mark.parametrize("width", [2, 3, 4, 5, 7, 8])
 @pytest.mark.parametrize('width', [4])
 @pytest.mark.parametrize(
     # "seqlen", [8, 16, 32, 64, 128, 151, 256, 372, 512, 784, 1024, 1134, 2048, 4096]
@@ -293,7 +299,7 @@ def test_causal_conv1d_race_condition(seqlen, width, has_bias, silu_activation, 
 # @pytest.mark.parametrize('silu_activation', [False])
 @pytest.mark.parametrize("has_bias", [False, True])
 # @pytest.mark.parametrize('has_bias', [False])
-@pytest.mark.parametrize("width", [2, 3, 4])
+@pytest.mark.parametrize("width", [2, 3, 4, 5, 7, 8])
 # @pytest.mark.parametrize('width', [2])
 @pytest.mark.parametrize(
     "seqlen", [8, 16, 32, 64, 128, 151, 256, 372, 512, 784, 1024, 1134, 2048, 4096]
@@ -303,6 +309,8 @@ def test_causal_conv1d_race_condition(seqlen, width, has_bias, silu_activation, 
 @pytest.mark.parametrize('dim', [64, 4096 + 32])
 # @pytest.mark.parametrize('dim', [64])
 def test_causal_conv1d_varlen(dim, seqlen, width, has_bias, silu_activation, itype):
+    if itype == torch.float32 and width > 4:
+        pytest.skip("widths 5-8 need 16-bit input")
     device = DEVICE
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:

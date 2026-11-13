@@ -2,7 +2,7 @@
   description = "Flake for AITER SageAttention (AMD ROCm gfx1201) kernels";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/torch-2.15.0-final";
+    kernel-builder.url = "github:huggingface/kernels";
   };
 
   outputs =

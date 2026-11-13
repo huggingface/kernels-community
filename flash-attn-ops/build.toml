@@ -13,5 +13,6 @@ backends = [
 repo-id = "kernels-community/flash-attn-ops"
 
 [torch-noarch]
+pyext = ["py", "pyi", "json"]
 
 [kernel]

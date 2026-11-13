@@ -52,7 +52,7 @@ scale shape** — the format falls out of the data, so it can never disagree wit
 matmul_2d(A, B, As=None, Bs=None, *, activation_format=None, gate=False, act_fn="silu",
           swiglu_alpha=None, swiglu_limit=None, quantize_output=False, output_dtype=None,
           a_global_scale=None, b_global_scale=None, output_global_scale=None)
-matmul_batched(A, B, As, Bs, *, expert_ids, gather_idx=None, scatter_idx=None, ...same keywords...)
+matmul_batched(A, B, As, Bs, *, expert_ids, scatter_idx=None, ...same keywords...)
 matmul_grouped(A, B, As, Bs, *, expert_start, gather_idx=None, scatter_idx=None, ...same keywords...)
 ```
 
@@ -80,7 +80,9 @@ matmul_grouped(A, B, As, Bs, *, expert_start, gather_idx=None, scatter_idx=None,
 - Weight-only FP8 (`activation_format="bf16"`) also accepts coarse block scales and one scale
   per tensor/expert, with unquantized activations. Coarse FP8 entrypoints are inference-only.
 - Routing: `matmul_batched` reads one expert id per row (`expert_ids`, EP sentinels
-  `>= num_experts` skipped); `matmul_grouped` takes the launch maps from
+  `>= num_experts` skipped). Its `A` holds either one row per routed row or one row per token, as
+  the gate|up reads the unexpanded hidden: routed row `s` reads row `s // top_k`, with
+  `top_k = len(expert_ids) // len(A)`. `matmul_grouped` takes the launch maps from
   `compute_grouped_scheduling(expert_ids, num_experts, top_k)` — no pre-sorted input required.
 
 ### Weight format matrix

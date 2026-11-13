@@ -15,6 +15,7 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
+from ._autotune import BACKWARD_KEY, FORWARD_KEY, tuned_configs
 from ._ops import add_op_namespace_prefix
 from .utils.library import triton_op
 from .utils.torch import custom_bwd, custom_fwd
@@ -175,17 +176,10 @@ def rms_norm_ref(
 
 
 @triton.autotune(
+    cache_results=True,
     configs=triton_autotune_configs(),
-    key=[
-        "N",
-        "HAS_RESIDUAL",
-        "STORE_RESIDUAL_OUT",
-        "IS_RMS_NORM",
-        "HAS_BIAS",
-        "HAS_X1",
-        "HAS_W1",
-        "HAS_B1",
-    ],
+    key=FORWARD_KEY,
+    prune_configs_by={"early_config_prune": tuned_configs("layer_norm_fwd", FORWARD_KEY)},
 )
 # torch compile doesn't like triton.heuristics, so we set these manually when calling the kernel
 # @triton.heuristics({"HAS_BIAS": lambda args: args["B"] is not None})
@@ -502,15 +496,10 @@ def _layer_norm_fwd_impl(
 
 
 @triton.autotune(
+    cache_results=True,
     configs=triton_autotune_configs(),
-    key=[
-        "N",
-        "HAS_DRESIDUAL",
-        "STORE_DRESIDUAL",
-        "IS_RMS_NORM",
-        "HAS_BIAS",
-        "HAS_DROPOUT",
-    ],
+    key=BACKWARD_KEY,
+    prune_configs_by={"early_config_prune": tuned_configs("layer_norm_bwd", BACKWARD_KEY)},
 )
 # torch compile doesn't like triton.heuristics, so we set these manually when calling the kernel
 # @triton.heuristics({"HAS_BIAS": lambda args: args["B"] is not None})
