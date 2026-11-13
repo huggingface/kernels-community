@@ -3112,12 +3112,13 @@ print(f"wrote {out_png}" + ("" if REPLOT else f" + bench_moe{suffix}.csv"))
 
 
 def _plot_summary(csv_path, out_path):
-    """The whole run on one page: per problem, finegrained-kernels' speedup over the fastest rival (best rival time /
-    ours, > 1: ours is faster) in each regime, as markers on a log axis around the 1x parity line, CUDA graph and
-    torch.compile side by side (eager is left out: decode runs in a CUDA graph). A loss is labeled with the rival
-    that wins it; speedups past the axis are pinned to its edge and labeled with their value."""
+    """The whole run on one page: finegrained-kernels' speedup over the fastest rival (best rival time / ours, > 1:
+    ours is faster) per problem, one panel per regime, CUDA graph filled and torch.compile hollow (eager is left out:
+    decode runs in a CUDA graph), on a log axis around the 1x parity line. A loss is labeled with the rival that wins
+    it; speedups past the axis are pinned to its edge and labeled with their value."""
     import csv
     import math
+    import re
 
     ours = "finegrained-kernels"
     rival_names = {
@@ -3126,7 +3127,9 @@ def _plot_summary(csv_path, out_path):
         "torch": "torch scaled_grouped_mm", "torch_rowwise": "torch scaled_mm/expert",
         "torch_weight_only": "torch dequant+GEMM", "transformers": "torch grouped_mm",
         "transformers@main": "transformers@main", "flashinfer_mxint4": "FlashInfer mxint4",
-        "flashinfer_cutlass_moe": "FlashInfer CUTLASS",
+        "flashinfer_cutlass_moe": "FlashInfer CUTLASS", "flashinfer_svdquant": "FlashInfer SVDQuant",
+        "humming": "humming", "sonicmoe": "SonicMoE", "deepgemm": "DeepGEMM", "deepgemm_bf16": "DeepGEMM",
+        "megablocks": "MegaBlocks", "fbgemm": "FBGEMM", "triton_kernels": "triton_kernels",
     }
     categories = {"linear quantized": "Quantized linear", "quantized": "Quantized MoE", "unquantized": "BF16 MoE"}
     cells, order = {}, {}
@@ -3145,67 +3148,70 @@ def _plot_summary(csv_path, out_path):
         rival, best = min(rivals.items(), key=lambda kv: kv[1])
         return best / times[ours], rival_names.get(rival, rival)
 
-    regimes = (("decode", "o", "#2a78d6"), ("batch", "s", "#eb6834"), ("prefill", "^", "#1baf7a"))
-    modes = (("cudagraph", "CUDA graph"), ("compile", "torch.compile"))
+    regimes = (("decode", "decode (1 token)"), ("batch", "batch (64 tokens)"), ("prefill", "prefill (8192 tokens)"))
+    modes = (("cudagraph", "CUDA graph", "#2a78d6", -0.14), ("compile", "torch.compile", "#2a78d6", 0.14))
     problems = [p for p in sorted(order, key=lambda p: (list(categories).index(order[p]) if order[p] in categories else 9, p))
-                if any(speedup(p, r, m) for r, _, _ in regimes for m, _ in modes)]
-    # rows top to bottom, a blank row between categories for its label
-    rows, y, labels = {}, 0, []
+                if any(speedup(p, r, m) for r, _ in regimes for m, *_ in modes)]
+    rows, y, headers = {}, 0, []
     for i, problem in enumerate(problems):
         if i == 0 or order[problem] != order[problems[i - 1]]:
-            labels.append((y, categories.get(order[problem], order[problem])))
+            headers.append((y, categories.get(order[problem], order[problem])))
             y += 1
         rows[problem] = y
         y += 1
     lo, hi = math.log2(0.5), math.log2(4)
 
-    def short(problem):  # the model without its org
+    def short(problem):  # "model · recipe": no org, no shape, no boilerplate
         name = problem.split("/", 1)[-1] if "/" in problem.split(" ", 1)[0] else problem
-        return name if len(name) <= 60 else name[:59] + "…"
+        name = re.sub(r"\s*\((?:N=|E\d)[^)]*\)", "", name)
+        name = name.replace("unknown model ", "").replace("-Instruct", "").replace("qkv-shaped", "qkv")
+        model, _, recipe = name.partition(" ")
+        label = f"{model} · {recipe}" if recipe else model
+        return label if len(label) <= 52 else label[:51] + "…"
 
-    fig_s, axes = plt.subplots(1, 2, figsize=(16, 0.3 * y + 1.8), sharey=True)
+    fig_s, axes = plt.subplots(1, 3, figsize=(17, 0.34 * y + 1.6), sharey=True)
     wins = total = 0
-    for ax_s, (mode, mode_title) in zip(axes, modes):
-        ax_s.axvspan(lo - 0.2, 0, color="#f7e9e7", zorder=0)  # the loss side
+    for ax_s, (regime, regime_title) in zip(axes, regimes):
+        ax_s.axvspan(lo - 0.25, 0, color="#f7e9e7", zorder=0)  # the loss side
         ax_s.axvline(0, color="#52514e", linewidth=1, zorder=1)
         for problem, row in rows.items():
-            ax_s.axhline(row, color="#e4e3df", linewidth=0.6, zorder=0)
-            for k, (regime, marker, color) in enumerate(regimes):
+            ax_s.axhline(row, color="#ecebe7", linewidth=0.6, zorder=0)
+            for mode, _, color, dy in modes:
                 hit = speedup(problem, regime, mode)
                 if hit is None:
                     continue
                 ratio, rival = hit
                 total += 1
                 wins += ratio > 1
-                x = math.log2(ratio)
-                pinned = not lo <= x <= hi
-                x = min(max(x, lo), hi)
-                ax_s.scatter(x, row + (k - 1) * 0.22, marker=marker, s=34, color=color, edgecolor="#fcfcfb",
-                             linewidth=0.8, zorder=3)
-                if pinned:
-                    ax_s.annotate(f"{ratio:.1f}x", (x, row + (k - 1) * 0.22), xytext=(-4 if x > 0 else 4, 0),
-                                  textcoords="offset points", ha="right" if x > 0 else "left", va="center",
-                                  fontsize=6.5, color="#52514e")
-                if ratio < 0.98:
-                    ax_s.annotate(f"{ratio:.2f}x {rival}", (x, row + (k - 1) * 0.22), xytext=(-6, 0),
-                                  textcoords="offset points", ha="right", va="center", fontsize=6.5, color="#0b0b0b")
+                x = min(max(math.log2(ratio), lo), hi)
+                filled = mode == "cudagraph"
+                ax_s.scatter(x, row + dy, marker="o", s=30, zorder=3, linewidth=1.3,
+                             facecolor=color if filled else "#fcfcfb", edgecolor=color)
+                if not lo <= math.log2(ratio) <= hi:
+                    ax_s.annotate(f"{ratio:.1f}x", (x, row + dy), xytext=(-5 if x > 0 else 5, 0), textcoords="offset points",
+                                  ha="right" if x > 0 else "left", va="center", fontsize=6.5, color="#52514e")
+                elif ratio < 0.98:
+                    ax_s.annotate(f"{ratio:.2f}x {rival}", (x, row + dy), xytext=(-6, 0), textcoords="offset points",
+                                  ha="right", va="center", fontsize=6.5, color="#0b0b0b")
         ticks = [0.5, 0.71, 1, 1.41, 2, 4]
         ax_s.set_xticks([math.log2(t) for t in ticks], [f"{t:g}x" for t in ticks], fontsize=8)
-        ax_s.set_xlim(lo - 0.2, hi + 0.1)
-        ax_s.set_title(mode_title, fontsize=10)
-        ax_s.set_xlabel("speedup over the fastest rival (best rival time / ours)", fontsize=8)
+        ax_s.set_xlim(lo - 0.25, hi + 0.1)
+        ax_s.set_title(regime_title, fontsize=10)
         for side in ("top", "right", "left"):
             ax_s.spines[side].set_visible(False)
         ax_s.tick_params(axis="y", length=0)
-    axes[0].set_yticks(list(rows.values()), [short(p) for p in rows], fontsize=7.5)
-    for row, text in labels:
+    axes[1].set_xlabel("speedup over the fastest rival (best rival time / ours); right of the line we win", fontsize=8.5)
+    axes[0].set_yticks(list(rows.values()), [short(p) for p in rows], fontsize=8)
+    for row, text in headers:
         axes[0].annotate(text, (0, row), xycoords=("axes fraction", "data"), xytext=(-8, 0), textcoords="offset points",
-                         ha="right", va="center", fontsize=9, fontweight="bold", color="#0b0b0b")
+                         ha="right", va="center", fontsize=9.5, fontweight="bold", color="#0b0b0b")
     axes[0].set_ylim(y - 0.5, -0.8)
-    handles = [plt.Line2D([], [], marker=m, linestyle="", color=c, markersize=7, label=r) for r, m, c in regimes]
-    fig_s.legend(handles=handles, loc="upper center", ncol=3, frameon=False, fontsize=9, bbox_to_anchor=(0.55, 0.995))
-    fig_s.suptitle(f"finegrained-kernels vs the fastest rival ({device_name}): faster in {wins} of {total} cells; "
-                   "right of the line we win, left we lose", fontsize=10.5, y=1.02)
+    handles = [plt.Line2D([], [], marker="o", linestyle="", markersize=6, markeredgewidth=1.3, color=c,
+                          markerfacecolor=c if m == "cudagraph" else "#fcfcfb", label=title)
+               for m, title, c, _ in modes]
+    fig_s.legend(handles=handles, loc="upper center", ncol=2, frameon=False, fontsize=9, bbox_to_anchor=(0.57, 0.995))
+    fig_s.suptitle(f"finegrained-kernels vs the fastest rival ({device_name}, cold weights): faster in {wins} of {total} cells",
+                   fontsize=11, y=1.02)
     fig_s.tight_layout()
     fig_s.savefig(out_path, dpi=130, bbox_inches="tight")
     print(f"wrote {out_path}")
