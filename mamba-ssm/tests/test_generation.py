@@ -48,6 +48,23 @@ def test_generation():
     assert torch.allclose(out_scores, out_ref[:, prompt_len - 1: -1], rtol=1e-3, atol=1e-2)
 
 
+@pytest.mark.parametrize("top_k", [1, 10])
+def test_generate_return_dict(top_k):
+    # Regression test: decode() used to build its output with the removed transformers classes
+    # GreedySearchDecoderOnlyOutput / SampleDecoderOnlyOutput and raised NameError.
+    from transformers.generation import GenerateDecoderOnlyOutput
+
+    batch, prompt_len, max_length = 2, 8, 16
+    config = MambaConfig(d_model=256, n_layer=2, vocab_size=1024, ssm_cfg=dict(layer="Mamba2"), pad_vocab_size_multiple=16)
+    torch.manual_seed(0)
+    model = MambaLMHeadModel(config, device="cuda", dtype=torch.float16)
+    x = torch.randint(0, 1000, (batch, prompt_len), device="cuda", dtype=torch.long)
+    out = model.generate(input_ids=x, max_length=max_length, top_k=top_k, output_scores=True, return_dict_in_generate=True)
+    assert isinstance(out, GenerateDecoderOnlyOutput)
+    assert out.sequences.shape == (batch, max_length)
+    assert len(out.scores) == max_length - prompt_len
+
+
 def test_generation_varlen():
     seqlens = [170, 65, 100]
     genlen = 20
