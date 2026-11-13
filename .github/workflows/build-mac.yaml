@@ -13,12 +13,12 @@ on:
         required: false
         type: string
       mode:
-        description: "Build mode: pr (CI only) or release (build + upload)"
+        description: "Build mode: pr (build + test), stage (build + upload + test), or release (build + upload)"
         required: false
         type: string
         default: "release"
       skip_build:
-        description: "Skip build and upload steps (for testing workflow plumbing)"
+        description: "Skip build, test, and upload steps (for testing workflow plumbing)"
         required: false
         type: boolean
         default: false
@@ -78,15 +78,16 @@ concurrency:
 permissions: {}
 
 jobs:
-  # Build the Metal kernel; PR mode builds .#ci, release builds the full bundle and uploads.
-  build-kernel:
+  # Validate inputs and resolve the kernel before starting either build job.
+  setup:
     permissions:
       contents: read
-      id-token: write
       statuses: write
-    runs-on: macos-26
-    strategy:
-      fail-fast: false
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.validate.outputs.skip }}
+      kernel: ${{ steps.validate.outputs.kernel }}
+      config: ${{ steps.validate.outputs.config }}
     steps:
       # Reject kernel names outside the safe charset before any step uses them.
       # Accepts e.g.: flash-attn3, rejects: $(myevilcommand).
@@ -141,21 +142,6 @@ jobs:
         if: inputs.pr_number == ''
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Nix toolchain + binary cache setup.
-      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
-        with:
-          extra-conf: |
-            max-jobs = 1
-            cores = 3
-            sandbox = relaxed
-      - name: Nix info
-        run: nix-shell -p nix-info --run "nix-info -m"
-      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
-        with:
-          name: huggingface
-        env:
-          USER: runner
-
       # Ensure the kernel directory exists and has the required config files.
       - name: Validate kernel directory
         id: validate
@@ -180,21 +166,62 @@ jobs:
         env:
           CONFIG: ${{ steps.validate.outputs.config }}
         run: |
-          if ! cat $CONFIG/build.toml | nix run nixpkgs#dasel -- -i toml '$root.general.hub.get("repo-id")' &> /dev/null ; then
-            echo "Mandatory repo-id is missing in $CONFIG/build.toml"
-            exit 1
-          fi
+          python3 - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          config = Path(os.environ["CONFIG"]) / "build.toml"
+          with config.open("rb") as f:
+              manifest = tomllib.load(f)
+          if not manifest.get("general", {}).get("hub", {}).get("repo-id"):
+              raise SystemExit(f"Mandatory repo-id is missing in {config}")
+          PY
+
+  # Build the Metal kernel; PR mode builds .#ci, release builds the full bundle and uploads.
+  build-kernel:
+    needs: setup
+    if: needs.setup.outputs.skip == 'false' && inputs.skip_build != true
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: macos-26
+    strategy:
+      fail-fast: false
+    steps:
+      - name: Checkout PR branch
+        if: inputs.pr_number != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/pull/${{ inputs.pr_number }}/head
+          fetch-depth: 0
+      - name: Checkout default branch
+        if: inputs.pr_number == ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Nix toolchain + binary cache setup.
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        with:
+          extra-conf: |
+            max-jobs = 1
+            cores = 3
+            sandbox = relaxed
+      - name: Nix info
+        run: nix-shell -p nix-info --run "nix-info -m"
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: huggingface
+        env:
+          USER: runner
 
       # Metal toolchain is required for macOS GPU kernel compilation.
       - name: Install Metal toolchain
-        if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true
         run: xcodebuild -downloadComponent MetalToolchain
 
       # PR mode builds the CI target (.#ci); release builds the full bundle.
       - name: Build kernel
-        if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true
         env:
-          KERNEL: ${{ steps.validate.outputs.kernel }}
+          KERNEL: ${{ needs.setup.outputs.kernel }}
           MODE: ${{ inputs.mode }}
         run: |
           if [ "$MODE" = "pr" ]; then
@@ -208,26 +235,26 @@ jobs:
           chmod -R u+w build
 
       - name: Set up Python for signing
-        if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true && inputs.mode != 'pr'
+        if: inputs.mode != 'pr'
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
       # Sign metadata.json for each built variant.
       - name: Sign kernel metadata
-        if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true && inputs.mode != 'pr'
+        if: inputs.mode != 'pr'
         uses: sigstore/gh-action-sigstore-python@790bc6befb9d733738f18d8f895854b453640ec9 # v3.5.0
         with:
-          inputs: ${{ steps.validate.outputs.kernel }}/build/*/metadata.json
+          inputs: ${{ needs.setup.outputs.kernel }}/build/*/metadata.json
           # Not a release event; never attach to releases.
           release-signing-artifacts: false
 
       # The action writes `<file>.sigstore.json`, but kernels expects the bundle
       # at `metadata.json.sigstore` (and excludes only that name from the digest).
       - name: Rename signature bundles
-        if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true && inputs.mode != 'pr'
+        if: inputs.mode != 'pr'
         env:
-          KERNEL: ${{ steps.validate.outputs.kernel }}
+          KERNEL: ${{ needs.setup.outputs.kernel }}
         run: |
           for bundle in "$KERNEL"/build/*/metadata.json.sigstore.json; do
             mv "$bundle" "${bundle%.json}"
@@ -235,10 +262,10 @@ jobs:
 
       # Upload built artifacts to both model and kernel Hub repos.
       - name: Upload kernel to Hub
-        if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true && inputs.mode != 'pr' && inputs.upload != false
+        if: inputs.mode != 'pr' && inputs.upload != false
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          KERNEL: ${{ steps.validate.outputs.kernel }}
+          KERNEL: ${{ needs.setup.outputs.kernel }}
           REPO_PREFIX: ${{ inputs.repo_prefix }}
           TARGET_BRANCH: ${{ inputs.target_branch }}
         run: |
@@ -254,11 +281,11 @@ jobs:
 
       # v1 kernels without an explicit branch override also get uploaded to main.
       - name: Upload v1 kernels to main
-        if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true && inputs.mode != 'pr' && inputs.upload != false && inputs.target_branch == ''
+        if: inputs.mode != 'pr' && inputs.upload != false && inputs.target_branch == ''
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          KERNEL: ${{ steps.validate.outputs.kernel }}
-          CONFIG: ${{ steps.validate.outputs.config }}
+          KERNEL: ${{ needs.setup.outputs.kernel }}
+          CONFIG: ${{ needs.setup.outputs.config }}
           REPO_PREFIX: ${{ inputs.repo_prefix }}
         run: |
           TARGET_FLAG=$(python3 .github/scripts/hub_pr_upload_args.py upload-args "$KERNEL" "$REPO_PREFIX")
@@ -277,17 +304,113 @@ jobs:
           fi
 
       - name: Upload Hub upload summary
-        if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true && inputs.mode != 'pr' && inputs.upload != false
+        if: inputs.mode != 'pr' && inputs.upload != false
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: hub-upload-macos
           path: ${{ runner.temp }}/upload*.json
           retention-days: 1
 
-  # Report the final build outcome as a commit status on the PR head SHA.
+  # Build the test closure independently of the kernel bundle, as on Linux.
+  build-ci-test:
+    permissions:
+      contents: read
+    needs: setup
+    if: needs.setup.outputs.skip == 'false' && inputs.skip_build != true && (inputs.mode == 'pr' || inputs.mode == 'stage')
+    runs-on: macos-26
+    outputs:
+      ci-test-path: ${{ steps.export-closure.outputs.ci-test-path }}
+    steps:
+      - name: Checkout PR branch
+        if: inputs.pr_number != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/pull/${{ inputs.pr_number }}/head
+          fetch-depth: 0
+      - name: Checkout default branch
+        if: inputs.pr_number == ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        with:
+          extra-conf: |
+            max-jobs = 1
+            cores = 3
+            sandbox = relaxed
+      - name: Nix info
+        run: nix-shell -p nix-info --run "nix-info -m"
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: huggingface
+        env:
+          USER: runner
+
+      - name: Install Metal toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+
+      # On aarch64-darwin, ci-test selects Metal ahead of CPU.
+      - name: Build and export Metal ci-test
+        id: export-closure
+        shell: bash
+        env:
+          KERNEL: ${{ needs.setup.outputs.kernel }}
+        run: |
+          CI_TEST_PATH=$(cd "$KERNEL" && nix build -L .#ci-test --no-link --print-out-paths)
+          echo "ci-test-path=$CI_TEST_PATH" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/metal-ci"
+          nix-store --export $(nix-store -qR "$CI_TEST_PATH") | nix run nixpkgs#zstd -- -T0 > "$RUNNER_TEMP/metal-ci/ci-test-closure.nar.zst"
+          cp .github/scripts/require_mps.py "$RUNNER_TEMP/metal-ci/"
+
+      - name: Upload Metal ci-test closure
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: metal-ci-test-closure
+          path: ${{ runner.temp }}/metal-ci/
+          retention-days: 1
+          if-no-files-found: error
+
+  # Execute the prebuilt test environment on a Mac with access to the Metal GPU.
+  # Wait for both builds so staging tests run after the kernel upload.
+  test-kernel-metal:
+    permissions: {}
+    needs: [setup, build-kernel, build-ci-test]
+    if: needs.setup.outputs.skip == 'false' && inputs.skip_build != true && (inputs.mode == 'pr' || inputs.mode == 'stage')
+    runs-on:
+      group: hfc-mac-mini-m1-16
+    timeout-minutes: 60
+    steps:
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        with:
+          extra-conf: |
+            max-jobs = 1
+            cores = 2
+
+      - name: Download Metal ci-test closure
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: metal-ci-test-closure
+          path: ${{ runner.temp }}/metal-ci
+
+      - name: Import Metal ci-test closure
+        working-directory: ${{ runner.temp }}/metal-ci
+        shell: bash
+        run: |
+          nix run nixpkgs#zstd -- -d ci-test-closure.nar.zst -c | nix-store --import
+
+      - name: Run Metal tests
+        # ci-test invokes python -m pytest, which puts this directory on sys.path.
+        # The plugin checks MPS in the exact Torch environment used by the tests.
+        working-directory: ${{ runner.temp }}/metal-ci
+        env:
+          CI_TEST_PATH: ${{ needs.build-ci-test.outputs.ci-test-path }}
+          PYTEST_ADDOPTS: "-p require_mps"
+          PYTORCH_ENABLE_MPS_FALLBACK: "0"
+        run: '"$CI_TEST_PATH/bin/ci-test"'
+
+  # Report the final build/test outcome as a commit status on the PR head SHA.
   report-status:
     if: always() && inputs.head_sha != ''
-    needs: [build-kernel]
+    needs: [setup, build-kernel, build-ci-test, test-kernel-metal]
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -304,18 +427,17 @@ jobs:
           HEAD_SHA: ${{ inputs.head_sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           STATUS_CONTEXT: ${{ github.workflow }} / ${{ inputs.kernel_name }}
+          BUILD: ${{ needs.build-kernel.result }}
         run: |
-          BUILD="${{ needs.build-kernel.result }}"
-
-          if [ "$BUILD" = "success" ]; then
+          if [ "${{ contains(needs.*.result, 'failure') }}" = "true" ]; then
+            STATE="failure"
+            DESC="Build or Metal tests failed"
+          elif [ "$BUILD" = "success" ] && [ "${{ contains(needs.*.result, 'cancelled') }}" != "true" ]; then
             STATE="success"
             DESC="Build passed"
-          elif [ "$BUILD" = "failure" ]; then
-            STATE="failure"
-            DESC="Build failed"
           else
             STATE="error"
-            DESC="Build did not complete (${BUILD})"
+            DESC="Build or Metal tests did not complete"
           fi
 
           gh api "repos/$REPO/statuses/$HEAD_SHA" \
@@ -353,8 +475,8 @@ jobs:
   # PR code never runs here: the PR head is fetched as data (build.toml,
   # flake.lock), never executed, because this job holds a Hub write token.
   emit-status-event:
-    if: always() && inputs.skip_build != true
-    needs: [build-kernel]
+    if: always() && inputs.skip_build != true && needs.setup.outputs.skip != 'true'
+    needs: [setup, build-kernel, build-ci-test, test-kernel-metal]
     continue-on-error: true
     runs-on: ubuntu-latest
     permissions:
