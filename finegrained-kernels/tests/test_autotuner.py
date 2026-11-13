@@ -17,6 +17,7 @@ activation-quant arm equivalence, and cross-process determinism; each docstring
 carries its incident."""
 
 import itertools
+import json
 import logging
 import os
 import subprocess
@@ -28,7 +29,7 @@ import torch
 import triton
 import triton.language as tl
 
-from utils import finegrained_kernels, internals, make_weights, TEST_DEVICE  # type: ignore
+from utils import internals, make_weights, TEST_DEVICE  # type: ignore
 
 bayesian_autotune = internals.bayesian_autotuner.bayesian_autotune
 is_sm10x = internals.compat.is_sm10x
@@ -37,6 +38,7 @@ mx_config_pruner = internals.pruners.mx_config_pruner
 gemm_cold_banks = internals.bench.gemm_cold_banks
 routed_banks = internals.bench.routed_banks
 active_experts = internals.bench.active_experts
+path_autotune = internals.path_autotuner.path_autotune
 
 
 @pytest.fixture
@@ -354,14 +356,12 @@ def test_act_quant_arms_are_bit_equal():
         weight_dtype=torch.float8_e4m3fn,
         scale_dtype=torch.float8_e8m0fnu,
     )
-    A = torch.randn(4, 512, device=TEST_DEVICE, dtype=torch.bfloat16)  # below the M gate
-    inline_out = finegrained_kernels.matmul_2d(A, B, None, Bs, output_dtype=torch.bfloat16)
-    saved = internals.matmul.MX_MATMUL_ACT_PREQUANT_MIN_M
-    try:
-        internals.matmul.MX_MATMUL_ACT_PREQUANT_MIN_M = 1  # force offline
-        offline_out = finegrained_kernels.matmul_2d(A, B, None, Bs, output_dtype=torch.bfloat16)
-    finally:
-        internals.matmul.MX_MATMUL_ACT_PREQUANT_MIN_M = saved
+    A = torch.randn(4, 512, device=TEST_DEVICE, dtype=torch.bfloat16)
+    # each arm pinned through the op's path tuner (affine scales: no cuBLAS route, so the Triton kernel runs)
+    op = internals.matmul.mx_dynamic_matmul
+    inline_out, offline_out = (
+        op.paths._run(arm, (A, B, None, Bs), {"output_dtype": torch.bfloat16})[0] for arm in ("inline_quant", "offline_quant")
+    )
     assert torch.equal(inline_out, offline_out)
 
 
@@ -522,3 +522,88 @@ def test_coupled_axes_cross_refinement_valley(monkeypatch):
         winner = kernel._bayesian_search(configs, (), {}, ())
         winners.append((winner.kwargs["BLOCK_SIZE_K"], winner.num_stages))
     assert winners == [(128, 2), (256, 3)]
+
+
+@pytest.mark.kernels_ci
+def test_force_restricts_tuning_to_matching_configs(monkeypatch):
+    """``force`` in FINEGRAINED_AUTOTUNE_CONFIG tunes only the pruned configs carrying the forced values (an
+    axis the kernel lacks is ignored), and raises when none survives."""
+
+    def tuned(force):
+        monkeypatch.setenv("FINEGRAINED_AUTOTUNE_CONFIG", json.dumps({"strict": True, "force": force}))
+
+        @bayesian_autotune(
+            [triton.Config({"BLOCK": b}, num_warps=w) for b in (32, 64, 128) for w in (2, 4)],
+            ["N"],
+            n_trials=6,
+            cache_results=False,
+        )
+        @triton.jit
+        def _force_kernel(X, Y, N, BLOCK: tl.constexpr):
+            offs = tl.arange(0, BLOCK)
+            tl.store(Y + offs, tl.load(X + offs, mask=offs < N), mask=offs < N)
+
+        x = torch.randn(256, device=TEST_DEVICE)
+        _force_kernel[(1,)](x, torch.empty_like(x), 16)
+        return _force_kernel.best_config
+
+    best = tuned({"BLOCK": 64, "num_warps": 4, "PIPELINE": "tile_loop"})
+    assert best.kwargs["BLOCK"] == 64 and best.num_warps == 4
+    with pytest.raises(RuntimeError, match="no pruned config matches"):
+        tuned({"BLOCK": 16})
+
+
+def _matmul_chain(x, rounds):
+    for _ in range(rounds):
+        x = x @ x
+    return x
+
+
+@pytest.mark.kernels_ci
+def test_path_tuner_takes_and_keeps_the_faster_path():
+    """A size-threshold branch turned into a measured choice: an untuned key times every offered path and keeps the
+    faster one; later calls take it without timing again, and a single offered path needs no timing."""
+    taken = []
+
+    @path_autotune(("slow", "fast"))
+    def chain(x, offered=None):
+        path = chain.paths.choose((x.shape[0],), offered)
+        taken.append(path)
+        return _matmul_chain(x, 32 if path == "slow" else 1)
+
+    x = torch.randn(1024, 1024, device=TEST_DEVICE) / 32
+    chain(x)
+    assert chain.paths.cache == {(1024, "slow", "fast"): "fast"}
+    taken.clear()
+    chain(x)
+    chain(x, offered=("slow",))
+    assert taken == ["fast", "slow"]
+    assert set(chain.paths.cache) == {(1024, "slow", "fast")}
+
+
+@pytest.mark.kernels_ci
+def test_path_tuner_force_and_graph_capture(monkeypatch):
+    """``{"force": {name: path}}`` pins a path wherever it is offered, and inside CUDA-graph capture, where nothing can
+    be timed, an undecided key takes the first path without caching a decision."""
+    monkeypatch.setenv("FINEGRAINED_AUTOTUNE_CONFIG", json.dumps({"force": {"forced_chain": "slow"}}))
+
+    @path_autotune(("fast", "slow"))
+    def forced_chain(x):
+        return _matmul_chain(x, 2 if forced_chain.paths.choose((x.shape[0],)) == "slow" else 1)
+
+    @path_autotune(("first", "second"))
+    def captured_chain(x):
+        return _matmul_chain(x, 2 if captured_chain.paths.choose((x.shape[0],)) == "second" else 1)
+
+    x = torch.randn(256, 256, device=TEST_DEVICE) / 16
+    torch.testing.assert_close(forced_chain(x), _matmul_chain(x, 2))
+    assert forced_chain.paths.cache == {}
+    y = torch.randn(512, 512, device=TEST_DEVICE) / 16
+    _matmul_chain(y, 1)  # cuBLAS initializes outside the capture
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = captured_chain(y)
+    graph.replay()
+    torch.testing.assert_close(out, _matmul_chain(y, 1))
+    assert (512, "first", "second") not in captured_chain.paths.cache
+

@@ -27,6 +27,7 @@ exhaustive bench-all.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import logging
 import json
@@ -36,6 +37,7 @@ import traceback
 import random
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -43,6 +45,9 @@ import torch
 
 from typing import Dict, List
 
+from triton.runtime._async_compile import AsyncCompileMode
+from triton.runtime.errors import OutOfResources
+from triton.tools.tensor_descriptor import TensorDescriptor
 from triton.runtime.autotuner import (
     Autotuner,
     Config,
@@ -96,6 +101,7 @@ class BayesianAutotuner(Autotuner):
         runoff: bool = True,
         basin_probes: bool = True,
         max_refine_iters: int = 5,
+        max_pair_trials: int = 24,
         log_path: str | None = None,
         path_anchor_axes: tuple[str, ...] = (),
         coupled_axes: tuple[tuple[str, ...], ...] = (),
@@ -106,6 +112,8 @@ class BayesianAutotuner(Autotuner):
         super().__init__(*args, **kwargs)
         self.fn_name = getattr(self.fn, "__name__", str(self.fn))
         overrides = load_autotune_config()
+        force = overrides.get("force", {})
+        self.force = {**{k: v for k, v in force.items() if not isinstance(v, dict)}, **force.get(self.fn_name, {})}
         self.cold_banks = cold_banks
         self._tmp_cold_banks = None  # (banks, complete), built and freed per tune
         # Bayesian trial budget — the per-decorator default, overridable via ``n_trials`` in
@@ -126,6 +134,7 @@ class BayesianAutotuner(Autotuner):
         self.runoff = overrides.get("runoff", runoff)
         self.basin_probes = overrides.get("basin_probes", basin_probes)
         self.max_refine_iters = overrides.get("max_refine_iters", max_refine_iters)
+        self.max_pair_trials = overrides.get("max_pair_trials", max_pair_trials)
         # Branch axes (by kwarg name) that relocate the TILE optimum — the caller's
         # declaration, since it is configuration knowledge (the tuner never hardcodes
         # axis names). Each distinct value combination of these axes gets one guaranteed
@@ -148,12 +157,112 @@ class BayesianAutotuner(Autotuner):
         self.log_path = log_path or overrides.get("log_path")
         self.key_log_path = overrides.get("key_log_path")
         self.tracebacks = overrides.get("tracebacks", False)
+        # Threads compiling a tune's configs ahead of timing when it times every pruned config
+        # (no search trajectory to wait on); timing stays serial. 0 = compile on first launch.
+        self.compile_workers = overrides.get("compile_workers", 0)
+        self._precompile_pending = None
         # steady-state launch support: key extraction without dict builds (eager decode
         # is host-bound; the cache-hit path of run() is on the per-token critical path)
         self._arg_position = {name: i for i, name in enumerate(self.arg_names)}
         self._arg_name_set = frozenset(self.arg_names)
         self._dtype_tag_cache: Dict[tuple, str] = {}
         self._dtype_str_cache: Dict[torch.dtype, str] = {}
+
+    def prune_configs(self, kwargs):
+        pruned = super().prune_configs(kwargs)
+        if self.force:
+            pruned = self._forced(pruned)
+        if self.compile_workers > 1 and len(pruned) <= self.n_trials:
+            # deferred to the first bench, so a disk-cached crown compiles nothing
+            self._precompile_pending = (pruned, self.launch_snapshot({**self.nargs, **kwargs}))
+        return pruned
+
+    def _forced(self, configs: List[Config]) -> List[Config]:
+        """The pruned configs that carry every ``force`` value (FINEGRAINED_AUTOTUNE_CONFIG) on an axis this kernel
+        has: a new axis can be tuned in isolation (e.g. only two-CTA pairs) without editing the grids. Filtering
+        after the pruners keeps their fences; the disk-cache key hashes the surviving configs, so a forced crown
+        never answers an unforced tune."""
+        axes = {k: v for k, v in self.force.items() if any(k in c.all_kwargs() for c in configs)}
+        kept = [c for c in configs if all(c.all_kwargs().get(k) == v for k, v in axes.items())]
+        if not kept:
+            raise RuntimeError(f"[autotune] {self.fn_name}: no pruned config matches force={axes}")
+        return kept
+
+    @staticmethod
+    def launch_snapshot(nargs: dict) -> dict:
+        """``nargs`` with private copies of its host-TMA descriptors: a config's ``pre_hook``
+        rebinds a box in place, and a pointer config leaves the (unused) box as found, yet the box
+        is part of the compile key, so each precompiled config must start from the launch's own."""
+        return {k: copy.copy(v) if isinstance(v, TensorDescriptor) else v for k, v in nargs.items()}
+
+    def precompile(self, configs: List[Config], nargs: dict, workers: int | None = None):
+        """Compile ``configs`` for the launch ``nargs`` on a thread pool (Triton's
+        ``AsyncCompileMode``) so the serial timing loop then hits the compile cache. Each
+        config's ``pre_hook`` runs first, as at launch: descriptor boxes are part of the
+        specialization. Failures are left for the bench to record. B200, Triton 3.8, 96
+        full-precision grouped configs from a cold cache: 25.9 s serial, 11.5 s on 16 threads
+        (part of the compile holds the GIL, so more threads stop helping).
+
+        Configs compile in waves of rising ``num_stages``, each config's ladder (the same config at
+        every admitted stage count) one rung per wave, and each compiled rung runs Triton's own load-time
+        resource check. A rung that overflows shared or tensor memory is memoized as a failure, so no
+        tune compiles it again. Shared memory never shrinks as stages are added (0 of 44,174 adjacent
+        pairs over the forced-config sweep's admitted lists, B200, Triton 3.8), so a shared-memory
+        overflow also memoizes every rung above it, uncompiled. The pruners' bounds are keep-side and
+        miss most of these: the compiler adds a stage or a decoded tile depending on the tile shape."""
+        workers = workers or self.compile_workers
+        if workers <= 1 or len(configs) <= 1:
+            return
+        nargs = {k: v for k, v in nargs.items() if k not in ("grid", "warmup")}
+        memo = self._failed_compile_memo()
+        ladders = defaultdict(list)
+        for config in configs:
+            rung = {k: v for k, v in config.all_kwargs().items() if k != "num_stages"}
+            ladders[str(sorted(rung.items()))].append(config)
+        ladders = [sorted(ladder, key=lambda c: c.num_stages) for ladder in ladders.values()]
+        overflowed = False
+        for rung in range(max(map(len, ladders))):
+            wave = [ladder for ladder in ladders if len(ladder) > rung]
+            with AsyncCompileMode(ThreadPoolExecutor(workers), ignore_errors=True):
+                for ladder in wave:
+                    self._warmup(ladder[rung], nargs, memo)
+            for ladder in wave:
+                kernel = self._warmup(ladder[rung], nargs, memo)  # compiled above: an in-memory hit
+                try:
+                    if kernel is not None:
+                        kernel._init_handles()  # Triton's shared/tensor memory check at load
+                except OutOfResources as e:
+                    # the memo skips this rung from here on; a shared-memory overflow also ends the ladder
+                    stop = len(ladder) if e.name == "shared memory" else rung + 1
+                    err = f"OutOfResources: {e} (num_stages={ladder[rung].num_stages})"
+                    for config in ladder[rung:stop]:
+                        memo[self._compile_signature(config, nargs)] = err
+                    if e.name == "shared memory":
+                        del ladder[rung:]
+                    overflowed = True
+                except Exception:  # the bench records it
+                    pass
+        if overflowed:
+            self._persist_failed_compile_memo()
+
+    def _warmup(self, config, nargs, memo):
+        """Compile (or look up) ``config`` for ``nargs``; None for a memoized or failing compile."""
+        if self._compile_signature(config, nargs) in memo:
+            return None  # a known failure the bench skips too
+        full = {**self.launch_snapshot(nargs), **config.all_kwargs()}
+        try:
+            if config.pre_hook:
+                config.pre_hook(full)
+            return self.fn.run(**full, grid=(1,), warmup=True)
+        except Exception:  # the bench records it
+            return None
+
+    def known_failure(self, config, nargs) -> str | None:
+        """The memoized failure of ``config`` for the launch ``nargs`` (a compile error, or a shared-memory
+        overflow ``precompile`` measured), or None when it has none on record."""
+        return self._failed_compile_memo().get(
+            self._compile_signature(config, {k: v for k, v in nargs.items() if k not in ("grid", "warmup")})
+        )
 
     def _owns_timing(self) -> bool:
         """Whether this tuner may time on rotated cold weights: on CUDA, with no user ``do_bench`` or
@@ -199,6 +308,9 @@ class BayesianAutotuner(Autotuner):
         invalidating env), so the next fresh tune of ANY shape skips the doomed compile
         outright (~40-66 wasted compiles per nvfp4 tune before this). The memo dies with
         the kernel source (``fn.cache_key``); bench-stage errors are never persisted."""
+        if self._precompile_pending is not None:
+            pending, self._precompile_pending = self._precompile_pending, None
+            self.precompile(*pending)
         sig = self._compile_signature(config, meta)
         memo = self._failed_compile_memo()
         if sig is not None and sig in memo:
@@ -430,7 +542,7 @@ class BayesianAutotuner(Autotuner):
             try:
                 ret = super().run(*args, **kwargs)
             finally:
-                self._tmp_cold_banks = None
+                self._tmp_cold_banks = self._precompile_pending = None
             self._report_bench_failures()
             return ret
 
@@ -501,7 +613,7 @@ class BayesianAutotuner(Autotuner):
                 else:
                     benchmark()
             finally:
-                self._tmp_cold_banks = None
+                self._tmp_cold_banks = self._precompile_pending = None
 
         config = self.cache[key]
         self.best_config = config
@@ -657,21 +769,51 @@ class BayesianAutotuner(Autotuner):
 
         # Coordinate-descent refinement: try single-dim perturbations around
         # the current best until no neighbor improves.
-        for _ in range(self.max_refine_iters):
+        def refine():
+            for _ in range(self.max_refine_iters):
+                best_idx = min(timings, key=timings.get)
+                best_sig = sigs[best_idx]
+                best_ms = timings[best_idx]
+                improved = False
+                for i, s in enumerate(sigs):
+                    if i in timings:
+                        continue
+                    diff = sum(1 for (_, a), (_, b) in zip(best_sig, s) if a != b)
+                    if diff != 1:
+                        continue
+                    if bench_idx(i) < best_ms:
+                        improved = True
+                if not improved:
+                    break
+
+        refine()
+        # Pair step: coordinate descent stops where the winner is two coupled flips away — a narrower tile wants
+        # fewer warps (Qwen3 INT4 gate|up T=64 crowned BN=256/8 warps at 83us over BN=128/4 warps at 67us), a
+        # deeper K tile a different memory mode (GPT-OSS MXFP4 T=2048: BK=128 + pointer A at 837us vs the crowned
+        # BK=64 + descriptor A at 922us) — and each single flip measures worse. Bench the two-axis neighbors whose
+        # BOTH new values already won somewhere (ranked by the worse of their best measured times), then descend
+        # again from any winner.
+        if self.max_pair_trials:
+            best_by_value: Dict = defaultdict(lambda: float("inf"))
+            for i, t in timings.items():
+                for dv in sigs[i]:
+                    best_by_value[dv] = min(best_by_value[dv], t)
             best_idx = min(timings, key=timings.get)
-            best_sig = sigs[best_idx]
-            best_ms = timings[best_idx]
-            improved = False
+            best_sig, best_ms = sigs[best_idx], timings[best_idx]
+            pairs = []
             for i, s in enumerate(sigs):
                 if i in timings:
                     continue
-                diff = sum(1 for (_, a), (_, b) in zip(best_sig, s) if a != b)
-                if diff != 1:
-                    continue
+                changed = [b for a, b in zip(best_sig, s) if a != b]
+                if len(changed) == 2:
+                    pairs.append((max(best_by_value[dv] for dv in changed), i))
+            pairs.sort()
+            improved = False
+            for _, i in pairs[: self.max_pair_trials]:
                 if bench_idx(i) < best_ms:
                     improved = True
-            if not improved:
-                break
+            if improved:
+                refine()
 
         # Crown RUNOFF: the search's single-shot timings carry enough noise to flip crowns
         # between same-code tune rolls (gpt-oss prefill grouped rolled 1727-2150us on identical
@@ -761,10 +903,13 @@ class BayesianAutotuner(Autotuner):
             # do not outweigh axes with few; the anchor is the config closest to 0.5 on
             # all of them (smallest squared distance), i.e. the basin's interior.
             values = [configs[i].all_kwargs() for i in idxs]
+            # only the axes every config of the basin carries: a grid concatenated from several
+            # generators can leave an axis (e.g. K_SLICES) off the configs of the others
+            shared = set(values[0]).intersection(*values[1:])
             axes = {
                 k: sorted({v[k] for v in values})
                 for k, value in values[0].items()
-                if isinstance(value, (int, float)) and not isinstance(value, bool)
+                if k in shared and isinstance(value, (int, float)) and not isinstance(value, bool)
             }
 
             def distance(i):
@@ -844,7 +989,7 @@ class BayesianAutotuner(Autotuner):
             # without n_trials a 3-trial exploratory winner gets replayed at 100 trials.
             str(self.keys),
             f"n_trials={self.n_trials},n_startup_trials={self.n_startup_trials},gamma={self.gamma},"
-            f"runoff={self.runoff},basin_probes={self.basin_probes},max_refine_iters={self.max_refine_iters},"
+            f"runoff={self.runoff},basin_probes={self.basin_probes},max_refine_iters={self.max_refine_iters},max_pair_trials={self.max_pair_trials},"
             f"coupled_axes={self.coupled_axes},cold_banks={self.cold_banks is not None}",
             str(tuning_key),
         ] + [str(c) for c in configs]  # str(Config) is pre_hook-free and process-stable
@@ -984,6 +1129,7 @@ def bayesian_autotune(
     runoff: bool = True,
     basin_probes: bool = True,
     max_refine_iters: int = 5,
+    max_pair_trials: int = 24,
     log_path: str | None = None,
     path_anchor_axes: tuple[str, ...] = (),
     coupled_axes: tuple[tuple[str, ...], ...] = (),
@@ -1006,6 +1152,8 @@ def bayesian_autotune(
                               (runtime override: ``basin_probes``)
     max_refine_iters:         coordinate-descent iterations after the TPE (0 disables)
                               (runtime override: ``max_refine_iters``)
+    max_pair_trials:          two-axis neighbors of the converged winner benched after the
+                              coordinate descent (0 disables) (runtime override: ``max_pair_trials``)
     path_anchor_axes:         branch axes (kwarg names) whose values relocate the tile
                               optimum — one guaranteed max-tile anchor per value combo
                               (see _basin_anchor_indices); the kernel declares them, the
@@ -1040,6 +1188,7 @@ def bayesian_autotune(
             runoff=runoff,
             basin_probes=basin_probes,
             max_refine_iters=max_refine_iters,
+            max_pair_trials=max_pair_trials,
             log_path=log_path,
             path_anchor_axes=path_anchor_axes,
             coupled_axes=coupled_axes,
