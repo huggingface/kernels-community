@@ -2173,17 +2173,9 @@ def mx_weight_only_matmul_batched(
     # loop; unlike the block-FP8 band this never inverts (GPT-OSS shape: 48.0->39.7µs at S=4,
     # still ahead at S=512; 2026-08-06).
     output_dtype = resolve_output_dtype(output_dtype, A, None)
-    # the SwiGLU runs in the GEMM's epilogue over the interleaved rows' pairs (PAIRED_GLU); the unfused-reference
-    # rounding (simulate_unfused) keeps the separate fused_glu launch
-    paired = gate and act_fn is not None and not simulate_unfused
-    if gate and act_fn is not None and not paired:
-        return unstacked_gate(
-            lambda intermediate_dtype: mx_weight_only_matmul_batched(
-                A, B, Bs, expert_ids, output_dtype=intermediate_dtype,
-                gather_idx=gather_idx, scatter_idx=scatter_idx, b_global_scale=b_global_scale, bias=bias,
-            ),
-            output_dtype, simulate_unfused, act_fn, swiglu_alpha, swiglu_limit,
-        )
+    # the SwiGLU runs in the GEMM's epilogue over the interleaved rows' pairs (PAIRED_GLU), the unfused-reference
+    # rounding (simulate_unfused) included: SIMULATE_UNFUSED rounds the pair through the output dtype first
+    paired = gate and act_fn is not None
     K = A.shape[1]
     S = expert_ids.shape[0]
     WEIGHT_VALUES_PER_BYTE = 2 if B.dtype == torch.int8 else 1
@@ -2287,22 +2279,13 @@ def int_weight_only_matmul_batched(
     smoothquant = a_scale is not None and b_scale2 is None
     a_scale = normalize_global_scale(a_scale, B.shape[0])
     b_scale2 = normalize_global_scale(b_scale2, B.shape[0])
-    # gate runs unstacked (``unstacked_gate``), like the MX weight-only op; per-row group scales make
-    # the raw gate|up output (act_fn=None) just the plain GEMM over the interleaved rows
+    # per-row group scales make the raw gate|up output (act_fn=None) just the plain GEMM over the interleaved rows
     output_dtype = resolve_output_dtype(output_dtype, A, None)
     if gate and act_fn is None:
         gate = False
-    # the SwiGLU runs in the GEMM's epilogue over the interleaved rows' pairs (PAIRED_GLU); the unfused-reference
-    # rounding (simulate_unfused) keeps the separate fused_glu launch
-    paired = gate and not simulate_unfused
-    if gate and not paired:
-        return unstacked_gate(
-            lambda intermediate_dtype: int_weight_only_matmul_batched(
-                A, B, Bs, expert_ids, output_dtype=intermediate_dtype,
-                gather_idx=gather_idx, scatter_idx=scatter_idx, b_zero=b_zero, bias=bias, b_perm=b_perm, a_pre_quant_scale=a_pre_quant_scale, a_scale=a_scale, b_scale2=b_scale2,
-            ),
-            output_dtype, simulate_unfused, act_fn, swiglu_alpha, swiglu_limit,
-        )
+    # the SwiGLU runs in the GEMM's epilogue over the interleaved rows' pairs (PAIRED_GLU), the unfused-reference
+    # rounding (simulate_unfused) included: SIMULATE_UNFUSED rounds the pair through the output dtype first
+    paired = gate
     K = A.shape[1]
     S = expert_ids.shape[0]
     num_experts, N, K_b = B.shape
