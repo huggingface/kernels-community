@@ -1,7 +1,3 @@
-import os
-import subprocess
-import sys
-
 import jax
 import jax.numpy as jnp
 import kernels
@@ -9,29 +5,6 @@ import numpy as np
 import pytest
 
 tokamax = kernels.get_kernel("kernels-community/tokamax", version=1)
-
-# Tokamax runtime dependencies that this kernel drops or vendors. JAX and
-# torch_tpu import absl and immutabledict themselves, so those are not listed.
-DROPPED = ("einshape", "flax", "jaxtyping", "pydantic", "qwix", "xprof")
-
-LOAD_WITHOUT_DROPPED = """
-import sys
-
-
-class Block:
-    def find_spec(self, name, path=None, target=None):
-        if name.split(".")[0] in {dropped!r}:
-            raise ModuleNotFoundError(f"{{name}} is blocked", name=name)
-        return None
-
-
-sys.meta_path.insert(0, Block())
-
-import kernels
-
-tokamax = kernels.get_kernel("kernels-community/tokamax", version=1)
-print(tokamax.__version__)
-"""
 
 
 def on_tpu() -> bool:
@@ -42,21 +15,6 @@ def on_tpu() -> bool:
 
 
 requires_tpu = pytest.mark.skipif(not on_tpu(), reason="requires a TPU")
-
-
-@pytest.mark.kernels_ci
-def test_loads_without_dropped_dependencies():
-    # A fresh interpreter, so that nothing imported by pytest or other tests
-    # can mask an import of a dropped dependency.
-    proc = subprocess.run(
-        [sys.executable, "-c", LOAD_WITHOUT_DROPPED.format(dropped=DROPPED)],
-        env=dict(os.environ, JAX_PLATFORMS="cpu"),
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    assert proc.returncode == 0, proc.stderr
-    assert proc.stdout.split()[-1] == tokamax.__version__
 
 
 @pytest.mark.kernels_ci

@@ -136,6 +136,10 @@ expect in="torch-ext/tokamax/**/*.py" find="from qwix" count=0
 // The only qwix imports are the three rewritten to the vendored copy.
 expect in="torch-ext/tokamax/**/*.py" find="import qwix\n" count=3
 expect in="torch-ext/tokamax/**/*.py" find="\nimport immutabledict" count=0
+expect in="torch-ext/tokamax/**/*.py" find="einshape" count=0
+// Not a bare "xprof": the kernels name their metadata `xprof_metadata`.
+expect in="torch-ext/tokamax/**/*.py" find="import xprof" count=0
+expect in="torch-ext/tokamax/**/*.py" find="from xprof" count=0
 
 // The public API and the smoke tests.
 overlay from="overlay"
