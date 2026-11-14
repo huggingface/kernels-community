@@ -1,20 +1,9 @@
 {
   lib,
   stdenv,
-  writeText,
 
-  hash-kernel-hook,
   jq,
   patchelf-old,
-  remove-bytecode-hook,
-
-
-  get-kernel-check,
-  generate-symbols-hook,
-
-  python3,
-  torch,
-  overrideTorch,
 
   # The native FlyDSL build (Python package with the extensions), and the LLVM it
   # was built against.
@@ -34,10 +23,6 @@ let
   kernelName = "flydsl";
 
   kernelId = "_${kernelName}_${lib.replaceStrings [ "-" "." ] [ "_" "_" ] variant}_${rev}";
-
-  # Torch is not used by FlyDSL, it is only needed in the environment of the
-  # load check, which provides the ROCm libraries.
-  dependencies = [ torch ];
 in
 stdenv.mkDerivation {
   pname = "${kernelName}-kernel-${variant}";
@@ -51,25 +36,9 @@ stdenv.mkDerivation {
   nativeBuildInputs = [
     jq
     patchelf-old
-    # Order matters: remove bytecode, then hash.
-    remove-bytecode-hook
-    hash-kernel-hook
-    (get-kernel-check.override {
-      python3 = python3.withPackages (_: dependencies);
-      kernels = overrideTorch python3.pkgs.kernels;
-    })
-    (generate-symbols-hook.override {
-      python3 = python3.withPackages (_: dependencies);
-      kernels = overrideTorch python3.pkgs.kernels;
-    })
   ];
 
-  # Required by the get-kernel-check and generate-symbols hooks.
-  moduleName = kernelName;
-  kernelDeps = writeText "kernel-deps" "[]";
   inherit variant kernelId;
-
-  doInstallCheck = true;
 
   installPhase = ''
     runHook preInstall
