@@ -24,25 +24,30 @@ import triton.language as tl
 from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
 from .bayesian_autotuner import bayesian_autotune
+from .path_autotuner import path_autotune
 from .bench import gemm_cold_banks
 
 from ._ops import add_op_namespace_prefix
-from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype, pdl_launch_kwargs
-from .descriptors import rebind_batched_mx_bs_descriptor
-from .formats import check_activation_format, global_scale_stride, gate_out_cols, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, is_per_expert_global, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
+from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, narrow_scalar_autotuning_configs, tl_dtype, pdl_launch_kwargs, block_fp8_scale_mode_configs
+from .descriptors import batched_weight_descriptor, rebind_batched_mx_bs_descriptor, rebind_batched_weight_descriptor
+from .formats import block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, is_per_expert_global, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_operands, weight_block_size, validate_int_operands, INT_WEIGHT_DTYPES
 from .epilogue import fused_glu
-from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, static_expert_act_operands, tensor_wide_act_operands
+from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, prepare_fp8_mx_inputs, permute_routed_rows, static_expert_act_operands, tensor_wide_act_operands
 from .swizzle import swizzled_scale_descriptor
 from .scheduling import is_off_rank, routed_expert_start
-from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
-from .loading.scales import csf_weight_scales, weight_scale_rows
+from .mma import block_dynamic_dot, block_fp8_weight_only_dot, fp8_dot, mx_compute, mx_weight_only_compute, plain_dot, static_dot, MMA_N_ATOM, int_weight_only_compute
+from .loading.scales import apply_row_scale, weight_scale_rows, csf_weight_scales
 from .loading.tiles import (
     advance_ptrs,
     load_act_block_dynamic,
     load_act_mx,
+    gather_act_cols,
+    load_act_k_permuted,
     load_act_plain,
     load_act_static,
     load_weight_block_dynamic,
+    load_weight_int,
+    load_weight_int_group,
     load_weight_mx,
     load_weight_plain,
     load_weight_static,
@@ -51,7 +56,7 @@ from .loading.tiles import (
     weight_tile_ptrs,
 )
 from .epilogue import acc_init, bias_strides, gemm_epilogue
-from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, dot_scaled_staging_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, gate_tile_cap_pruner, mx_config_pruner, require_moe_dims_aligned, scale_subblock_pruner, smem_pruner, swizzled_scale_config_pruner, weight_only_swap_scope_pruner
+from .pruners import PATH_ANCHOR_AXES, block_fp8_scale_mode_pruner, fp8_dot_warp_pruner, dot_scaled_staging_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gate_tile_cap_pruner, mx_config_pruner, require_moe_dims_aligned, scale_subblock_pruner, single_row_tile_pruner, smem_pruner, swizzled_scale_config_pruner, weight_only_swap_scope_pruner, int_scale_group_tile_pruner
 
 
 @triton.jit
@@ -100,8 +105,33 @@ def expert_setup(
     return batch_id, pid_n, expert_id, A, B, C, Bs, in_row, out_row
 
 
+def with_weight_stream(configs):
+    """Cross the weight-stream axis into a batched kernel's configs: ``B_MEMORY_MODE`` pointer or a
+    host TMA descriptor over the expert stack (``batched_weight_descriptor``), the box re-bound per
+    config after the config's own pre_hook."""
+    def stream(config, mode):
+        def pre_hook(nargs, own=config.pre_hook):
+            if own is not None:
+                own(nargs)
+            rebind_batched_weight_descriptor(nargs)
+        return triton.Config(
+            dict(config.kwargs, B_MEMORY_MODE=mode), num_warps=config.num_warps, num_stages=config.num_stages,
+            num_ctas=config.num_ctas, maxnreg=config.maxnreg, pre_hook=pre_hook,
+        )
+    return [stream(config, mode) for config in configs for mode in ("pointer", "host_descriptor")]
+
+
+@triton.jit
+def batched_weight_row(expert_id, pid_n, N, n_width: tl.constexpr, GATE: tl.constexpr):
+    """The weight tile's first row in the expert stack viewed as one matrix — the TMA coordinate of
+    ``batched_weight_descriptor`` (an expert spans ``2N`` rows under GATE). The weight stream is
+    asynchronous and staged over ``num_stages`` buffers there; the pointer loads of a reduce that
+    feeds no dot are never pipelined (one K tile in flight per program)."""
+    return (expert_id * (2 * N if GATE else N) + pid_n * n_width).to(tl.int32)
+
+
 @bayesian_autotune(
-    get_accelerator_autotuning_configs(swap_ab=True, tune_block_n=True),
+    with_weight_stream(get_accelerator_autotuning_configs(swap_ab=True, tune_block_n=True)),
     # one winner per (shape, requant): requant narrows the legal tiles to the quant block, so a
     # shared entry could replay a sub-block winner on a launch whose output scale needs the block.
     # GATE stacks a 2*BN-wide dot — a distinct config space that must not share a winner.
@@ -115,6 +145,7 @@ def expert_setup(
         "early_config_prune": compose_pruners(
             scale_subblock_pruner(),
             fp8_dot_warp_pruner(),
+            descriptor_box_pruner(),
         )
     },
 )
@@ -123,6 +154,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     A,  # (S, K) E4M3 activations (pre-quantized once by the wrapper)
     As,  # (S, K // BLOCK_SIZE_K) fp32 per-row, per-K-block activation scales
     B,  # (num_experts, N, K) FP8 weights; under GATE the (num_experts, 2N, K) gate|up stack
+    BDescriptor,  # host TMA descriptor over B viewed (E * rows, K_stored); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (num_experts, N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales (2N under GATE)
     C,  # (S, N) output; under an OUTPUT_FORMAT the FP8-requantized intermediate
     Cs,  # (S, N // BLOCK_SIZE_N) per-(row, block) output scale; written iff OUTPUT_FORMAT
@@ -170,6 +202,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     OUTPUT_FORMAT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+    B_MEMORY_MODE: tl.constexpr = "pointer",
     PDL: tl.constexpr = False,
 ):
     """Block-scale batched FP8 expert matmul kernel.
@@ -227,8 +260,9 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
             a_ptrs, as_ptrs, None, None, 0, 0, 0, 0, 0, "pointer", False, False, False
         )
         w, b_s = load_weight_block_dynamic(
-            b_ptrs, b_ptrs, bs_ptr + bs_off, None, 0, 0, 0, 0, 0, 0,
-            GATE, False, "pointer", SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
+            b_ptrs, BDescriptor, bs_ptr + bs_off, None, 0, 0,
+            batched_weight_row(expert_id, pid_n, N, n_width, GATE), k * BLOCK_SIZE_K, 0, 0,
+            GATE, False, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
         )
         acc = block_dynamic_dot(acc, a, a_s, w, b_s, BLOCK_SIZE_K, SWAP_AB, False, True)
         a_ptrs, as_ptrs, b_ptrs, bs_ptr, _, _ = advance_ptrs(
@@ -250,7 +284,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
 
 
 @bayesian_autotune(
-    get_accelerator_autotuning_configs(swap_ab=True, tune_block_n=True),
+    with_weight_stream(get_accelerator_autotuning_configs(swap_ab=True, tune_block_n=True)),
     # keyed like the block-dynamic sibling: requant narrows the legal tiles to the quant block
     ["N", "K", "S", "OUTPUT_FORMAT", "GATE", "BLOCK_N", "BLOCK_K"],
     n_trials=100,
@@ -260,6 +294,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
         "early_config_prune": compose_pruners(
             scale_subblock_pruner(),
             fp8_dot_warp_pruner(),
+            descriptor_box_pruner(),
         )
     },
 )
@@ -268,6 +303,7 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
     A,  # (S, K) E4M3 activations (pre-quantized against the static scale by the wrapper)
     As,  # calibrated (static) activation scale: one value, or one per expert
     B,  # (num_experts, N, K) FP8 weights; under GATE the (num_experts, 2N, K) gate|up stack
+    BDescriptor,  # host TMA descriptor over B viewed (E * rows, K_stored); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (num_experts, N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales (2N under GATE)
     C,  # (S, N) output; under an OUTPUT_FORMAT the FP8-requantized intermediate
     Cs,  # (S, N // BLOCK_SIZE_N) per-(row, block) output scale; written iff OUTPUT_FORMAT
@@ -312,6 +348,7 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
     OUTPUT_FORMAT: tl.constexpr = None,  # None | "fp8" (per-(row, block) requant of the intermediate)
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+    B_MEMORY_MODE: tl.constexpr = "pointer",
     PDL: tl.constexpr = False,
 ):
     """Block-scale batched FP8 expert matmul with a static (per-tensor) activation scale — the
@@ -361,8 +398,9 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
         # (fake-batch replicated) takes the other arm and ignores it
         a, _ = load_act_static(a_ptrs, 0, 0, 0, None, 0, a_s_static, "pointer", False)
         w, b_s = load_weight_static(
-            b_ptrs, b_ptrs, bs_ptr + bs_off, None, 0, 0, 0, 0, 0, 0,
-            GATE, False, "pointer", SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
+            b_ptrs, BDescriptor, bs_ptr + bs_off, None, 0, 0,
+            batched_weight_row(expert_id, pid_n, N, n_width, GATE), k * BLOCK_SIZE_K, 0, 0,
+            GATE, False, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
         )
         acc = static_dot(acc, a, w, b_s, SWAP_AB, BLOCK_SIZE_K, True)
         a_ptrs, _, b_ptrs, bs_ptr, _, _ = advance_ptrs(
@@ -386,8 +424,10 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
 
 @bayesian_autotune(
     # S (routed rows) keyed like the block-dynamic/mx batched siblings — decode re-tunes per batch.
-    get_accelerator_autotuning_configs(tune_block_nk=True, swap_ab=True),
-    ["N", "K", "S"],
+    with_weight_stream(get_accelerator_autotuning_configs(tune_block_nk=True, swap_ab=True)),
+    # GATE keys the gate|up arm separately: its 2*BN tile is a different config space, and an
+    # ungated crown replayed under GATE can overflow shared memory
+    ["N", "K", "S", "GATE"],
     n_trials=100,
     cold_banks=gemm_cold_banks,
     path_anchor_axes=PATH_ANCHOR_AXES,
@@ -398,6 +438,8 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
             fp8_dot_warp_pruner(),
             block_within_dim_pruner("K"),
             block_within_dim_pruner("N", "BLOCK_SIZE_N"),
+            single_row_tile_pruner(),
+            descriptor_box_pruner(),
         )
     },
 )
@@ -406,7 +448,8 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     A,  # (S, K) pre-quantized FP8 activations
     As,  # per-token activation scales (S,), or a calibrated (static) one: shared, or per expert
     B,  # (num_experts, N, K) FP8 weights; under GATE the (num_experts, 2N, K) gate|up stack
-    Bs,  # (num_experts, 1, 1) per-tensor weight scales
+    BDescriptor,  # host TMA descriptor over B viewed (E * rows, K_stored); read iff B_MEMORY_MODE != "pointer"
+    Bs,  # (num_experts, N, 1) row-wise weight scales, or (num_experts, 1, 1) per tensor (stride_bs_n 0)
     C,  # (S, N) output; under GATE the bf16 GLU intermediate
     Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     ExpertIds,  # (S,) — which expert each batch element routes to
@@ -424,6 +467,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     stride_b_k,
     stride_b_n,
     stride_bs_e,
+    stride_bs_n,
     stride_c_m,
     stride_c_n,
     stride_bias_e,
@@ -443,18 +487,19 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+    B_MEMORY_MODE: tl.constexpr = "pointer",
     PDL: tl.constexpr = False,
 ):
-    """Tensor-scale batched FP8 expert matmul kernel.
+    """Tensor-scale / row-wise batched FP8 expert matmul kernel.
 
     Activations are already quantized; the kernel applies per-token activation
-    scales and per-expert tensor weight scales.
+    scales and per-expert weight scales constant along K (per tensor, or per output row).
 
     ``SWAP_AB`` (tuner axis, M=1 decode): weight output rows in the MMA M dim (``B`` as ``[BN, BK]``,
     single token padded to N=16); column 0 of the ``[BN, 16]`` accumulator is the result. Both
-    scales are per-token/per-tensor scalars, applied once after the loop, orientation-agnostic.
-    ``GATE`` fuses the gate|up projection (``B`` the interleaved (2N, K) stack, one per-tensor
-    scale over both halves) into one tile + SwiGLU, emitting the bf16 intermediate; ``GATE=False``
+    scales are applied once after the loop, the weight's on the acc's weight-row axis.
+    ``GATE`` fuses the gate|up projection (``B`` the interleaved (2N, K) stack, its scales
+    interleaved alike) into one tile + SwiGLU, emitting the bf16 intermediate; ``GATE=False``
     is the plain GEMM (bit-identical)."""
     if PDL:
         gdc_wait()
@@ -482,14 +527,14 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = operand_tile_ptrs(A, tl.arange(0, BLOCK_SIZE_M) * 0, offs_k, stride_a_m, stride_a_k, "pointer", True)
     b_ptrs = oriented_tile_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB)
-    b_s = tl.load(Bs)
     a_s = tl.load(As + in_row * stride_as_m + expert_id * stride_as_e)
 
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
-    for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a, _ = load_act_static(a_ptrs, 0, 0, 0, None, 0, a_s, "pointer", False)
-        b, _ = load_weight_plain(
-            b_ptrs, b_ptrs, 0, 0, 0, GATE, False, "pointer", SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a, unused_act_scale = load_act_static(a_ptrs, 0, 0, 0, None, 0, a_s, "pointer", False)
+        b, unused_weight_scale = load_weight_plain(
+            b_ptrs, BDescriptor, 0, batched_weight_row(expert_id, pid_n, N, n_width, GATE), k * BLOCK_SIZE_K,
+            GATE, False, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K
         )
         accumulator = accumulator + fp8_dot(a, b, SWAP_AB, BLOCK_SIZE_K)
         a_ptrs, _, b_ptrs, _, _, _ = advance_ptrs(
@@ -498,11 +543,11 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
             "pointer", "pointer", False, False, False,
         )
 
-    # per-tensor scales fold on the raw accumulator; `gemm_epilogue` owns the finalize.
+    # the scales fold on the raw accumulator; `gemm_epilogue` owns the finalize.
     # Finalizing here too was invisible under no-swap (a pass-through) and collapsed the
     # swapped tile twice, so every SWAP_AB config failed to compile and the tuner quietly
     # dropped the whole swap arm at this shape.
-    accumulator = accumulator * a_s * b_s
+    accumulator = apply_row_scale(accumulator * a_s, Bs, offs_bn, stride_bs_n, SWAP_AB)
     if PDL:
         gdc_launch_dependents()
     gemm_epilogue(
@@ -521,13 +566,13 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
 # implemented for future shapes but is not fielded. Swap verdicts are B200 (sm_100) — re-measure
 # on H100 or the target device before inheriting.
 @bayesian_autotune(
-    get_accelerator_autotuning_configs(
+    with_weight_stream(get_accelerator_autotuning_configs(
         mx=True,
         tune_block_nk=True,
         compute_modes=("dot_scaled", "scalar"),
         swap_ab=True,
         pre_hook=rebind_batched_mx_bs_descriptor,
-    ),
+    )),
     # ACTIVATION_FORMAT keys the inline act-quant grid: A stays raw bf16 under every
     # format, so the tuner's dtype-appended key can't split W4A8 from W4A4 itself.
     # SWIZZLED_SCALES keys the weight-scale load: it constrains the config space (BK % 128 == 0)
@@ -546,9 +591,10 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     # native scaled-MMA; smaller-BN swap configs never win and mislead the TPE).
     prune_configs_by={
         "early_config_prune": compose_pruners(
-            mx_config_pruner("K", "N"), swizzled_scale_config_pruner(allow_gate_subblock=True), smem_pruner(),
+            mx_config_pruner("K", "N"), swizzled_scale_config_pruner(allow_gate_subblock=True), smem_pruner(staged_weights=True),
             gate_tile_cap_pruner(),
             dot_scaled_staging_pruner(),
+            descriptor_box_pruner(),
         )
     },
 )
@@ -557,6 +603,7 @@ def mx_dynamic_matmul_batched_kernel(
     A,  # (S, K) activations: raw BF16/FP16 (inline-quant) or E4M3 (pre-quantized, As set)
     As,  # (S, K // SCALE_GROUP_K) UE8M0 act scales; None ⇒ inline-quant, read iff not None
     B,  # (num_experts, N, K[/2]); under GATE the (num_experts, 2N, K[/2]) gate|up stack
+    BDescriptor,  # host TMA descriptor over B viewed (num_experts * (2N|N), K_bytes); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (num_experts, N, K // SCALE_GROUP_K) UE8M0 weight scales (2N under GATE)
     BSDescriptor,  # host TMA descriptor over Bs when SWIZZLED (BN=128 bulk load); dummy otherwise
     C,  # (S, N[/2]) output; under an OUTPUT_FORMAT the MX-requantized intermediate
@@ -615,6 +662,7 @@ def mx_dynamic_matmul_batched_kernel(
     # single Bs pointer (+ BSDescriptor for the BN=128 bulk load); un-swizzled Bs takes the affine
     # arm in the same leaf. The op never swizzles — a 3D caller runs un-swizzled at no penalty.
     SWIZZLED_SCALES: tl.constexpr = False,
+    B_MEMORY_MODE: tl.constexpr = "pointer",
     PDL: tl.constexpr = False,
 ):
     """Unified batched microscaled expert matmul (MXFP8/MXFP4/NVFP4, W4A8/W4A4) with
@@ -689,9 +737,11 @@ def mx_dynamic_matmul_batched_kernel(
             BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K, ACTIVATION_FORMAT,
         )
         b, b_s = load_weight_mx(
-            b_ptrs, b_ptrs, Bs, None, BSDescriptor, Bs, 0, 0, 0, 0, expert_id, pid_n, k, N, K,
+            b_ptrs, BDescriptor, Bs, None, BSDescriptor, Bs, 0,
+            batched_weight_row(expert_id, pid_n, N, n_width, GATE), k * (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE),
+            0, expert_id, pid_n, k, N, K,
             stride_bs_e, stride_bs_n, stride_bs_k,
-            GATE, False, True, "pointer", SWAP_AB, SWIZZLED_SCALES,
+            GATE, False, True, B_MEMORY_MODE, SWAP_AB, SWIZZLED_SCALES,
             BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, WEIGHT_VALUES_PER_BYTE,
         )
         accumulator = mx_compute(
@@ -731,9 +781,9 @@ def mx_dynamic_matmul_batched_kernel(
 @bayesian_autotune(
     # weight-only plain bf16 dot (fp4/fp8 weight upcast per-group in-loop), plus the swapped
     # decode reduce (weight output rows lead the tile, no MMA — see the scope pruner).
-    get_accelerator_autotuning_configs(
+    with_weight_stream(get_accelerator_autotuning_configs(
         tune_block_nk=True, compute_modes=("dot", "dot_scaled", "scalar"), swap_ab=True
-    ),
+    )),
     ["N", "K", "S", "GATE"],
     n_trials=100,
     cold_banks=gemm_cold_banks,
@@ -747,6 +797,7 @@ def mx_dynamic_matmul_batched_kernel(
             block_within_dim_pruner("N", "BLOCK_SIZE_N"),
             mx_config_pruner("K", "N", block_within_k=False),  # dot_scaled shape gates
             weight_only_swap_scope_pruner(),
+            descriptor_box_pruner(),
         )
     },
 )
@@ -754,6 +805,7 @@ def mx_dynamic_matmul_batched_kernel(
 def mx_weight_only_matmul_batched_kernel(
     A,  # (rows, K) raw BF16/FP16 activations — NOT quantized
     B,  # (num_experts, N, K[/2]) MXFP4/NVFP4/MXFP8 weights; 2N under GATE
+    BDescriptor,  # host TMA descriptor over B viewed (E * rows, K_stored); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (num_experts, N, K // SCALE_GROUP_K) group scales — UE8M0 (MX) or E4M3 (NVFP4)
     BsGlobal,  # (num_experts,) fp32 NVFP4 per-expert global — recovers on the accumulator; read iff not None
     C,
@@ -792,7 +844,11 @@ def mx_weight_only_matmul_batched_kernel(
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+    B_MEMORY_MODE: tl.constexpr = "pointer",
     PDL: tl.constexpr = False,
+    # gate|up as an ungated GEMM over the interleaved 2N rows (no stacked tile: same footprint as ungated), its
+    # SwiGLU in the epilogue over each tile's (gate, up) row pairs — the separate fused_glu launch folded in
+    PAIRED_GLU: tl.constexpr = False,
 ):
     """weight-only batched (decode) expert matmul: raw bf16 activations against MXFP4/MXFP8 weights upcast
     to bf16 in-loop (unpack + per-group group-scale), plain ``tl.dot``. One routed row + one N-tile
@@ -844,9 +900,11 @@ def mx_weight_only_matmul_batched_kernel(
             a = tl.where(tl.arange(0, BLOCK_SIZE_K)[None, :] >= overlap, a, 0.0)
         b_k = b_ptrs + (k_start // WEIGHT_VALUES_PER_BYTE) * stride_b_k
         w, w_s = load_weight_mx(
-            b_k, b_k, Bs, None, None, Bs, 0, 0, 0, 0, expert_id, pid_n, k, N, K,
+            b_k, BDescriptor, Bs, None, None, Bs, 0,
+            batched_weight_row(expert_id, pid_n, N, n_width, GATE), k_start // WEIGHT_VALUES_PER_BYTE,
+            0, expert_id, pid_n, k, N, K,
             stride_bs_e, stride_bs_n, stride_bs_k,
-            GATE, False, True, "pointer", SWAP_AB, False,
+            GATE, False, True, B_MEMORY_MODE, SWAP_AB, False,
             BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, WEIGHT_VALUES_PER_BYTE,
             k_col_off=-(overlap // SCALE_GROUP_K),
         )
@@ -857,11 +915,13 @@ def mx_weight_only_matmul_batched_kernel(
 
     if PDL:
         gdc_launch_dependents()
+    # PAIRED_GLU: the tile's BLOCK_SIZE_N interleaved rows are BLOCK_SIZE_N // 2 (gate, up) pairs, the gated
+    # epilogue's [BM, 2 * BN] form with BN halved; it writes N // 2 columns
     gemm_epilogue(
         C, None, accumulator, out_row, pid_n, 0, out_row, 1, stride_c_n, 1, 1,
-        BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, BLOCK_SIZE_K,
+        BLOCK_SIZE_M, BLOCK_SIZE_N // 2 if PAIRED_GLU else BLOCK_SIZE_N, GATE or PAIRED_GLU, None, BLOCK_SIZE_K,
         ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
-        COMPUTE_MODE=COMPUTE_MODE, SWAP_AB=SWAP_AB, FAKE_BATCH=True, N_COLS=N,
+        COMPUTE_MODE=COMPUTE_MODE, SWAP_AB=SWAP_AB, FAKE_BATCH=True, N_COLS=N // 2 if PAIRED_GLU else N,
         GlobalScale=BsGlobal,
         stride_global_e=stride_bs_global,
         global_row=expert_id,
@@ -872,7 +932,168 @@ def mx_weight_only_matmul_batched_kernel(
 
 
 @bayesian_autotune(
-    get_accelerator_autotuning_configs(tune_block_nk=True, swap_ab=True),
+    # the MX weight-only batched kernel's space minus dot_scaled: the upcast dot, plus the swapped decode reduce at
+    # the MMA tiles and at narrow ones (8 / 16 rows: a decode grid of N / 8 programs, the measured winner)
+    with_weight_stream(
+        get_accelerator_autotuning_configs(tune_block_nk=True, compute_modes=("dot", "scalar"), swap_ab=True)
+        + narrow_scalar_autotuning_configs(block_ns=(8, 16), SWAP_AB=True)
+    ),
+    # the width and the scale group decide which tiles fit and compile: part of the key
+    ["N", "K", "S", "GATE", "INT_BITS", "SCALE_GROUP_K"],
+    n_trials=100,
+    cold_banks=gemm_cold_banks,
+    path_anchor_axes=PATH_ANCHOR_AXES,
+    prune_configs_by={
+        # the tail K tile slides back in bounds (see the K-loop), so BK need only fit K
+        "early_config_prune": compose_pruners(
+            block_fits_dim_pruner("K"),
+            block_within_dim_pruner("N", "BLOCK_SIZE_N"),
+            weight_only_swap_scope_pruner(),
+            int_scale_group_tile_pruner(divides_k=False),
+            descriptor_box_pruner(),
+        )
+    },
+)
+@triton.jit
+def int_weight_only_matmul_batched_kernel(
+    A,  # (rows, K) prepared bf16/fp16, FP8 (W4A8), or INT8 (SmoothQuant) activations
+    AsGlobal,  # fp32 calibrated input scale; None for weight-only
+    B,  # (num_experts, N, K // VPW) interleaved uint32 words of VPW = 32 // INT_BITS values; 2N under GATE
+    BDescriptor,  # host TMA descriptor over B viewed (E * rows, K_stored); read iff B_MEMORY_MODE != "pointer"
+    Bs,  # (num_experts, N, K // SCALE_GROUP_K) float group scales
+    Bz,  # (num_experts, N, K // SCALE_GROUP_K) integer zero points; None for a symmetric weight
+    BsGlobal,  # fp32 W4A8 second-level weight scale; None otherwise
+    BPerm,  # (num_experts, K) int32 act-order K orders, tile column j reading A[:, BPerm[e, j]]; None: natural order
+    C,
+    Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
+    ExpertIds,
+    top_k,  # routed rows per source row of A: program batch_id reads row batch_id // top_k
+    ScatterIdx,
+    S,
+    N,
+    K,
+    stride_a_m,
+    stride_a_k,
+    stride_asglobal_e,
+    stride_b_e,
+    stride_b_k,
+    stride_b_n,
+    stride_bs_e,
+    stride_bs_n,
+    stride_bs_k,
+    stride_bz_e,
+    stride_bz_n,
+    stride_bz_k,
+    stride_bsglobal_e,
+    stride_perm_e,
+    stride_c_m,
+    stride_c_n,
+    stride_bias_e,
+    stride_bias_n,
+    stride_eid,
+    num_experts,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    SCALE_GROUP_K: tl.constexpr,
+    COMPUTE_MODE: tl.constexpr = "dot",
+    SWAP_AB: tl.constexpr = False,
+    GATE: tl.constexpr = False,
+    ACT_FN: tl.constexpr = "silu",
+    SWIGLU_ALPHA: tl.constexpr = None,
+    SWIGLU_LIMIT: tl.constexpr = None,
+    SIMULATE_UNFUSED: tl.constexpr = False,
+    INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+    B_MEMORY_MODE: tl.constexpr = "pointer",
+    PDL: tl.constexpr = False,
+    INT_BITS: tl.constexpr = 4,
+    # gate|up as an ungated GEMM over the interleaved 2N rows, its SwiGLU in the epilogue over each tile's
+    # (gate, up) row pairs (see mx_weight_only_matmul_batched_kernel)
+    PAIRED_GLU: tl.constexpr = False,
+):
+    """Integer batched expert matmul: bf16/fp16 weight-only, calibrated INT4/FP8, or INT8 SmoothQuant.
+    One routed row + one N-tile per
+    program (expert from ``ExpertIds``). ``SWAP_AB`` puts the dequantized weight on the MMA lhs or selects
+    the scalar decode reduce. ``GATE`` fuses gate|up."""
+    if PDL:
+        gdc_wait()
+    batch_id, pid_n, expert_id, A, B, C, Bs, in_row, out_row = expert_setup(
+        A, B, C, Bs, ExpertIds, top_k, ScatterIdx,
+        stride_a_m, stride_b_e, stride_c_m, stride_bs_e, stride_eid, ADVANCE_BS=False,
+    )
+    if is_off_rank(expert_id, num_experts):  # EP sentinel: non-local expert, output left uninit
+        return
+    n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
+    # a non-128 N's last tile wraps back into the tensor; the epilogue's N_COLS masks those columns
+    offs_bn = (pid_n * n_width + tl.arange(0, n_width)) % (2 * N if GATE else N)
+    # Repeat this routed token across the swapped MMA's N atom; FAKE_BATCH stores column zero.
+    ACT_ROWS: tl.constexpr = MMA_N_ATOM if SWAP_AB and COMPUTE_MODE == "dot" else BLOCK_SIZE_M
+    a_ptrs = operand_tile_ptrs(
+        A, tl.arange(0, ACT_ROWS) * 0, tl.arange(0, BLOCK_SIZE_K), stride_a_m, stride_a_k, "pointer", True,
+    )
+    k_perm = None
+    a_rows = None
+    if BPerm is not None:
+        k_perm = BPerm + expert_id * stride_perm_e
+        a_rows = A + (tl.arange(0, ACT_ROWS) * 0)[:, None] * stride_a_m
+    # output-rows-major: the scalar reduce and the BM <= 16 mma.sync tiles (int_dequant_tile)
+    VPW: tl.constexpr = 32 // INT_BITS  # values per uint32 word
+    b_ptrs = weight_tile_ptrs(B, offs_bn, tl.arange(0, BLOCK_SIZE_K // VPW), stride_b_n, stride_b_k, True)
+    accumulator = acc_init(COMPUTE_MODE, BLOCK_SIZE_M, n_width, SWAP_AB, tl.int32 if A.dtype.element_ty == tl.int8 else tl.float32)
+    k_last = tl.cdiv(K, BLOCK_SIZE_K) - 1
+    a_next = None
+    if BPerm is not None:  # BK fits K: the first tile never slides
+        a_next = gather_act_cols(a_rows, k_perm, 0, None, stride_a_k, BLOCK_SIZE_K)
+    # maskless K-loop indexed off the base tile; the last tile slides back to end at K and zeroes the
+    # activation lanes the previous trip already accumulated
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        k_start = tl.minimum(k * BLOCK_SIZE_K, K - BLOCK_SIZE_K)
+        overlap = k * BLOCK_SIZE_K - k_start
+        a = load_act_k_permuted(a_ptrs + k_start * stride_a_k, 0, 0, k_start, None, 0, a_next, "pointer", False)
+        if BPerm is not None:
+            k_next = tl.minimum(tl.minimum(k + 1, k_last) * BLOCK_SIZE_K, K - BLOCK_SIZE_K)
+            a_next = gather_act_cols(a_rows, k_perm, k_next, None, stride_a_k, BLOCK_SIZE_K)
+        if overlap > 0:
+            a = tl.where(tl.arange(0, BLOCK_SIZE_K)[None, :] >= overlap, a, 0)
+        b_k = b_ptrs + (k_start // VPW) * stride_b_k
+        w, w_s = load_weight_int(
+            b_k, BDescriptor, Bs, Bs, 0, batched_weight_row(expert_id, pid_n, N, n_width, GATE), k_start // VPW,
+            expert_id, pid_n, k, N, K, stride_bs_e, stride_bs_n, stride_bs_k,
+            GATE, True, B_MEMORY_MODE, True, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K,
+            k_col_off=-(overlap // SCALE_GROUP_K), BITS=INT_BITS,
+        )
+        w_z = None
+        if Bz is not None:
+            w_z = load_weight_int_group(
+                Bz, Bz, expert_id, pid_n, k, N, K, stride_bz_e, stride_bz_n, stride_bz_k,
+                GATE, True, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, k_col_off=-(overlap // SCALE_GROUP_K),
+            )
+        accumulator = int_weight_only_compute(
+            accumulator, a, w, w_s, w_z, BLOCK_SIZE_K, n_width, SCALE_GROUP_K, COMPUTE_MODE, True, INT_BITS, SWAP_AB,
+            weight_global=None if BsGlobal is None else tl.load(BsGlobal + expert_id * stride_bsglobal_e),
+        )
+
+    if PDL:
+        gdc_launch_dependents()
+    output_scale = BsGlobal
+    output_scale_stride = stride_bsglobal_e
+    if A.dtype.element_ty == tl.int8:
+        output_scale = Bs + offs_bn * stride_bs_n
+        output_scale_stride = stride_bs_e
+    gemm_epilogue(
+        C, None, accumulator, out_row, pid_n, 0, out_row, 1, stride_c_n, 1, 1,
+        BLOCK_SIZE_M, BLOCK_SIZE_N // 2 if PAIRED_GLU else BLOCK_SIZE_N, GATE or PAIRED_GLU, None, BLOCK_SIZE_K,
+        ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
+        COMPUTE_MODE=COMPUTE_MODE, SWAP_AB=SWAP_AB, FAKE_BATCH=True, N_COLS=N // 2 if PAIRED_GLU else N,
+        global_row=expert_id,
+        Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
+        GlobalScale=output_scale, stride_global_e=output_scale_stride,
+        GlobalScaleA=AsGlobal, stride_global_a=stride_asglobal_e,
+    )
+
+
+@bayesian_autotune(
+    with_weight_stream(get_accelerator_autotuning_configs(tune_block_nk=True, swap_ab=True, swap_block_sizes_m=(1, 2))),
     # S (routed rows) keyed like the fp8/mx batched siblings — decode re-tunes per batch;
     # GATE keys the gate|up arm separately (its stacked dot is 2*BN wide).
     ["N", "K", "S", "GATE"],
@@ -885,6 +1106,8 @@ def mx_weight_only_matmul_batched_kernel(
         "early_config_prune": compose_pruners(
             block_within_dim_pruner("K"),
             block_within_dim_pruner("N", "BLOCK_SIZE_N"),
+            descriptor_box_pruner(),
+            smem_pruner(),
         )
     },
 )
@@ -892,6 +1115,7 @@ def mx_weight_only_matmul_batched_kernel(
 def full_precision_matmul_batched_kernel(
     A,  # (rows, K) BF16/FP16 activations
     B,  # (num_experts, N, K) weights in A's dtype; under GATE the (num_experts, 2N, K) gate|up stack
+    BDescriptor,  # host TMA descriptor over B viewed (E * rows, K_stored); read iff B_MEMORY_MODE != "pointer"
     C,  # (S, N) output; under GATE the GLU intermediate
     Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     ExpertIds,  # (S,) — which expert each batch element routes to
@@ -926,16 +1150,17 @@ def full_precision_matmul_batched_kernel(
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+    B_MEMORY_MODE: tl.constexpr = "pointer",
     PDL: tl.constexpr = False,
 ):
     """Full-precision batched expert matmul kernel: plain ``tl.dot`` over unquantized
     BF16/FP16 activations and weights, fp32 accumulation, no scales anywhere. ``GATE``
     computes gate|up as ONE stacked tile + dot (straight-line, both orientations) and
-    applies the ``ACT_FN``/SwiGLU ``glu``. ``SWAP_AB`` (tuner axis, M=1 decode): weight
-    output rows in the MMA M dim, the single token padded to the N=16 atom."""
+    applies the ``ACT_FN``/SwiGLU ``glu``. ``SWAP_AB`` (tuner axis, decode): weight
+    output rows in the MMA M dim, the logical ``[BM, N]`` accumulator kept (``plain_dot``)."""
     if PDL:
         gdc_wait()
-    batch_id, pid_n, expert_id, A, B, C, _, in_row, out_row = expert_setup(
+    batch_id, pid_n, expert_id, A, B, C, unused_scale_base, in_row, out_row = expert_setup(
         A,
         B,
         C,
@@ -964,13 +1189,14 @@ def full_precision_matmul_batched_kernel(
         B, offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB
     )
 
-    accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
-    for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a, _ = load_act_plain(a_ptrs, 0, 0, 0, None, 0, "pointer", False)
-        w, _ = load_weight_plain(
-            b_ptrs, b_ptrs, 0, 0, 0, GATE, False, "pointer", SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K
+    accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a, unused_act_scale = load_act_plain(a_ptrs, 0, 0, 0, None, 0, "pointer", False)
+        w, unused_weight_scale = load_weight_plain(
+            b_ptrs, BDescriptor, 0, batched_weight_row(expert_id, pid_n, N, n_width, GATE), k * BLOCK_SIZE_K,
+            GATE, False, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K
         )
-        accumulator = accumulator + fp8_dot(a, w, SWAP_AB, BLOCK_SIZE_K)
+        accumulator = plain_dot(accumulator, a, w, SWAP_AB)
         a_ptrs, _, b_ptrs, _, _, _ = advance_ptrs(
             a_ptrs, a_ptrs, b_ptrs, b_ptrs, b_ptrs, b_ptrs,
             BLOCK_SIZE_K * stride_a_k, 0, BLOCK_SIZE_K * stride_b_k, 0,
@@ -983,9 +1209,139 @@ def full_precision_matmul_batched_kernel(
         C, None, accumulator, out_row, pid_n, 0, out_row, 1, stride_c_n, 1, 1,
         BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, BLOCK_SIZE_K,
         ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
-        COMPUTE_MODE="dot", SWAP_AB=SWAP_AB, FAKE_BATCH=True,
+        COMPUTE_MODE="dot", FAKE_BATCH=True,
         Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
         global_row=expert_id,
+    )
+
+
+@bayesian_autotune(
+    block_fp8_scale_mode_configs(
+        with_weight_stream(get_accelerator_autotuning_configs(tune_block_nk=True, swap_ab=True, swap_block_sizes_m=(1, 2)))
+    ),
+    # S (routed rows) keyed like the fp8/mx batched siblings — decode re-tunes per batch;
+    # GATE keys the gate|up arm separately (its stacked dot is 2*BN wide).
+    ["N", "K", "S", "GATE", "BLOCK_N", "BLOCK_K", "GATE_SCALES"],
+    n_trials=100,
+    cold_banks=gemm_cold_banks,
+    path_anchor_axes=PATH_ANCHOR_AXES,
+    # BLOCK_SIZE_K/N are tuned axes; the K-loop is maskless and the N-tile store is
+    # row-masked only — veto non-dividing tiles on both.
+    prune_configs_by={
+        "early_config_prune": compose_pruners(
+            block_within_dim_pruner("K"),
+            block_within_dim_pruner("N", "BLOCK_SIZE_N"),
+            descriptor_box_pruner(),
+            smem_pruner(),
+            block_fp8_scale_mode_pruner(),
+        )
+    },
+)
+@triton.jit
+def block_fp8_weight_only_matmul_batched_kernel(
+    A,  # (rows, K) BF16/FP16 activations
+    B,  # (num_experts, N, K) FP8 weights; under GATE the (num_experts, 2N, K) gate|up stack
+    BDescriptor,  # host TMA descriptor over B viewed (E * rows, K_stored); read iff B_MEMORY_MODE != "pointer"
+    Bs,  # coarse FP8 weight scales
+    C,  # (S, N) output; under GATE the GLU intermediate
+    Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
+    ExpertIds,  # (S,) — which expert each batch element routes to
+    top_k,  # routed rows per source row of A: program batch_id reads row batch_id // top_k
+    ScatterIdx,  # (S,) int — batch_id -> destination row of C; read only when not None
+    # Shape
+    S,
+    N,
+    K,
+    num_experts,
+    # Strides
+    stride_a_m,
+    stride_a_k,
+    stride_b_e,
+    stride_b_k,
+    stride_b_n,
+    stride_bs_e,
+    stride_bs_n,
+    stride_bs_k,
+    stride_c_m,
+    stride_c_n,
+    stride_bias_e,
+    stride_bias_n,
+    stride_eid,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SWAP_AB: tl.constexpr = False,
+    GATE: tl.constexpr = False,
+    GATE_SCALES: tl.constexpr = False,
+    ACT_FN: tl.constexpr = "silu",
+    SWIGLU_ALPHA: tl.constexpr = None,
+    SWIGLU_LIMIT: tl.constexpr = None,
+    SIMULATE_UNFUSED: tl.constexpr = False,
+    INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+    B_MEMORY_MODE: tl.constexpr = "pointer",
+    PDL: tl.constexpr = False,
+    SCALE_MODE: tl.constexpr = "tile",  # where the coarse block scale lands (block_fp8_weight_only_dot)
+    SCALE_POST: tl.constexpr = False,  # one scale block spans K (set at launch): "post", the output scale
+):
+    """Batched FP8 W8A16 expert GEMM with optional fused gate/up activation."""
+    MODE: tl.constexpr = "post" if SCALE_POST else SCALE_MODE
+    if PDL:
+        gdc_wait()
+    batch_id, pid_n, expert_id, A, B, C, unused_scale_base, in_row, out_row = expert_setup(
+        A,
+        B,
+        C,
+        Bs,  # the scale leaf applies the expert offset
+        ExpertIds,
+        top_k,
+        ScatterIdx,
+        stride_a_m,
+        stride_b_e,
+        stride_c_m,
+        stride_bs_e,
+        stride_eid,
+        ADVANCE_BS=False,
+    )
+    # EP sentinel: row routed to a non-local expert; output is left uninit.
+    if is_off_rank(expert_id, num_experts):
+        return
+
+    n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
+    offs_bn = pid_n * n_width + tl.arange(0, n_width)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = operand_tile_ptrs(A, tl.arange(0, BLOCK_SIZE_M) * 0, offs_k, stride_a_m, stride_a_k, "pointer", True)
+    b_ptrs = weight_tile_ptrs(
+        B, offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB
+    )
+
+    accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a, unused_activation = load_act_plain(a_ptrs, 0, 0, 0, None, 0, "pointer", False)
+        accumulator = block_fp8_weight_only_dot(
+            accumulator, a, b_ptrs, BDescriptor, Bs, 0, batched_weight_row(expert_id, pid_n, N, n_width, GATE),
+            k * BLOCK_SIZE_K, expert_id, offs_bn, k * BLOCK_SIZE_K + offs_k,
+            stride_bs_e, stride_bs_n, stride_bs_k,
+            GATE, False, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
+            BLOCK_N, BLOCK_K, GATE_SCALES, MODE,
+        )
+        a_ptrs += BLOCK_SIZE_K * stride_a_k
+        b_ptrs += BLOCK_SIZE_K * stride_b_k
+
+    if PDL:
+        gdc_launch_dependents()
+    gemm_epilogue(
+        C, None, accumulator, out_row, pid_n, 0, out_row, 1, stride_c_n, 1, 1,
+        BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, BLOCK_SIZE_K,
+        ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
+        COMPUTE_MODE="dot", FAKE_BATCH=True,
+        Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
+        global_row=expert_id,
+        # "post": one scale block spans K, so the weight scale is a per-column output scale
+        GlobalScale=Bs + weight_scale_rows(offs_bn, BLOCK_N, GATE_SCALES) * stride_bs_n if MODE == "post" else None,
+        stride_global_e=stride_bs_e,
     )
 
 
@@ -1010,6 +1366,15 @@ def routed_rows_per_row(A: torch.Tensor, expert_ids: torch.Tensor) -> int:
     S, rows = expert_ids.shape[0], A.shape[0]
     assert rows == 0 or S % rows == 0, f"{S} routed rows do not split evenly over A's {rows} rows"
     return S // rows if rows else 1
+
+
+def routed_source_rows(A: torch.Tensor, expert_ids: torch.Tensor) -> torch.Tensor | None:
+    """Each routed row's source row of ``A`` (``s // top_k``) for a pass that lays the routed rows out, or ``None``
+    when ``A`` already holds one row per routed row."""
+    top_k = routed_rows_per_row(A, expert_ids)
+    if top_k == 1:
+        return None
+    return torch.arange(expert_ids.shape[0], device=A.device, dtype=torch.int32) // top_k
 
 
 @compile_time_only_triton_op(
@@ -1081,12 +1446,11 @@ def w8a8_block_dynamic_fp8_matmul_batched(
         f"the fused 'fp8' requant needs square quant blocks, got {block_size}"
     )
     # The decode band runs the ``gate`` contract UNSTACKED (``unstacked_gate``): this same op
-    # with ``act_fn=None`` (the raw gate|up output), then the one-kernel ``fused_glu``. Holding the gate AND up tiles per CTA
-    # doubles the smem footprint and halves occupancy precisely where the launch is
-    # weight-bandwidth-bound, and the fp8 ``tl.dot`` — unlike the MX/NVFP4 scaled MMA, whose
-    # wide M operand earns the native instruction — gains nothing back: DSV3 shape, same 235MB
-    # weight read, stacked 69.8µs vs unstacked 49.8µs at S=8, a wash by S=32. A requant is the
-    # same offline quant the raw activation gets below, applied to the GLU output.
+    # with ``act_fn=None`` (the raw gate|up output), then the one-kernel ``fused_glu``. Both forms
+    # read the same interleaved 2*BN-row tile; the fused epilogue's requant pins the output tile to
+    # the quant block, which takes the narrower N grids the raw output tunes to at a few rows.
+    # DeepSeek-V3 MoE decode (T=1, cold weights, graph): 73.2us unstacked vs 73.6 fused, bit-identical.
+    # A requant is the same offline quant the raw activation gets below, applied to the GLU output.
     if gate and act_fn is not None and S <= GATE_UNSTACK_MAX_S:
         return unstacked_gate(
             lambda intermediate_dtype: w8a8_block_dynamic_fp8_matmul_batched(
@@ -1126,6 +1490,7 @@ def w8a8_block_dynamic_fp8_matmul_batched(
             A_q,
             A_s,
             B,
+            batched_weight_descriptor(B),
             bs_u8,
             C,
             Cs,
@@ -1249,6 +1614,7 @@ def w8a8_block_static_fp8_matmul_batched(
             A_q,
             As,
             B,
+            batched_weight_descriptor(B),
             bs_u8,
             C,
             Cs,
@@ -1311,8 +1677,9 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
     output_dtype: torch.dtype | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
+    activation_scale_ub: float | None = None,
 ) -> torch.Tensor:
-    """Tensor-scale batched FP8 matmul: C[s] = A[s] @ B[expert_ids[s]].T. ``A`` raw
+    """Tensor-scale / row-wise batched FP8 matmul: C[s] = A[s] @ B[expert_ids[s]].T. ``A`` raw
     (``As`` None) -> quantized here (offline, per-token); else pre-quantized (``As`` given).
     Program ``s`` reads row ``s // top_k`` of A and writes row ``scatter_idx[s]`` of C (None = row s).
 
@@ -1320,7 +1687,8 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
     B:  (num_experts, N, K) FP8 expert weights; under ``gate`` the (num_experts, 2N, K) stack
     As: (rows,) per-token scales alongside a pre-quantized A, or — on a raw A — the calibrated
         (static) activation scale: one value, or one per expert
-    Bs: (num_experts,) or (num_experts, 1, 1) per-expert weight scales
+    Bs: (num_experts,) or (num_experts, 1, 1) per-expert weight scales, or (num_experts, N, 1)
+        row-wise (2N rows under ``gate``)
     """
     validate_dense_operands(A, B)
 
@@ -1332,11 +1700,12 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
     # under gate|up fusion B is the (E, 2N, K) stack; N is the per-projection output width
     N = rows // 2 if gate else rows
 
-    # Normalize Bs to (num_experts, 1, 1)
     Bs = normalize_per_expert_scale(Bs, num_experts)
 
     bs_u8 = ue8m0_as_uint8(Bs)
-    qA, As, as_stride_m, as_stride_e = tensor_wide_act_operands(A, As, num_experts)
+    qA, As, as_stride_m, as_stride_e = tensor_wide_act_operands(
+        A, As, num_experts, activation_scale_ub=activation_scale_ub
+    )
     C = A.new_empty(S, gate_out_cols(N, gate, act_fn), dtype=output_dtype)
 
     def grid(META):
@@ -1350,6 +1719,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
             qA,
             As,
             B,
+            batched_weight_descriptor(B),
             bs_u8,
             C,
             bias,
@@ -1366,6 +1736,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
             B.stride(2),
             B.stride(1),
             bs_u8.stride(0),
+            row_scale_stride(bs_u8),
             C.stride(0),
             C.stride(1),
             bias_stride_e,
@@ -1406,6 +1777,7 @@ def mx_dynamic_matmul_batched(
     b_global_scale: torch.Tensor | None = None,
     output_global_scale: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
+    a_pre_quant_scale: torch.Tensor | None = None,
 ) -> List[torch.Tensor]:
     """Batched MX matmul ``C[s] = A[s] @ B[expert_ids[s]].T``; activations quantized
     inline in the kernel (decode: one act row per program, inline is free). The
@@ -1430,6 +1802,20 @@ def mx_dynamic_matmul_batched(
     activation_format = resolve_activation_format(activation_format, B, Bs)
     output_format = activation_format if quantize_output else None
     requant = quantize_output
+    if a_pre_quant_scale is not None and activation_format != "fp8":
+        assert As is None, "pre_quant_scale applies before activation quantization; pass raw inputs"
+        A = permute_routed_rows(
+            A, None, expert_ids.numel(), routed_source_rows(A, expert_ids), expert_ids=expert_ids,
+            pre_quant_scale=a_pre_quant_scale, num_experts=B.shape[0],
+        )
+    if activation_format == "fp8":
+        assert not quantize_output and a_global_scale is None, "ordinary FP8 inputs use As=input_scale and no fused requant"
+        output_dtype = resolve_output_dtype(output_dtype, A, None)
+        group = mx_scale_family(Bs, A.shape[-1])
+        A, As, a_global_scale = prepare_fp8_mx_inputs(
+            A, As, ue8m0_as_uint8(Bs).dtype, group, B.shape[0], expert_ids.numel(),
+            routed_source_rows(A, expert_ids), expert_ids=expert_ids, pre_quant_scale=a_pre_quant_scale,
+        )
     if As is not None:
         assert (As.dtype == torch.float8_e4m3fn) == (Bs.dtype == torch.float8_e4m3fn), (
             f"activation scales ({As.dtype}) must match the weight scale family ({Bs.dtype})"
@@ -1550,6 +1936,7 @@ def mx_dynamic_matmul_batched(
             a_u8,
             as_u8,  # None when raw (A quantized inline)
             b_u8,
+            batched_weight_descriptor(b_u8, B),
             bs_u8,
             bs_descriptor,
             C,
@@ -1651,6 +2038,7 @@ def full_precision_matmul_batched(
         compile_time_only_triton_wrap(full_precision_matmul_batched_kernel)[grid](
             A,
             B,
+            batched_weight_descriptor(B),
             C,
             bias,
             expert_ids,
@@ -1671,6 +2059,90 @@ def full_precision_matmul_batched(
             top_k,
             num_experts=num_experts,
             GATE=gate,
+            ACT_FN=act_fn,
+            SWIGLU_ALPHA=swiglu_alpha,
+            SWIGLU_LIMIT=swiglu_limit,
+            SIMULATE_UNFUSED=simulate_unfused,
+            INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
+            **pdl_launch_kwargs(),
+        )
+
+    return [C]
+
+
+@compile_time_only_triton_op(
+    add_op_namespace_prefix("block_fp8_weight_only_matmul_batched"),
+    mutates_args=(),
+    opaque=True,
+)
+def block_fp8_weight_only_matmul_batched(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    expert_ids: torch.Tensor,
+    gate: bool = False,
+    act_fn: str | None = "silu",
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
+    simulate_unfused: bool = False,
+    activation_format: str | None = None,
+    quantize_output: bool = False,
+    output_dtype: torch.dtype | None = None,
+    scatter_idx: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+) -> List[torch.Tensor]:
+    """FP8 W8A16 expert GEMM with in-tile weight rescaling. Program ``s`` reads row ``s // top_k`` of A."""
+    validate_dense_operands(A, B)
+    assert A.dtype in (torch.bfloat16, torch.float16), "FP8 weight-only takes raw BF16/FP16 activations"
+    Bs, scale_block_n, scale_block_k = block_fp8_weight_scale_grid(B, Bs, gate)
+    Bs = ue8m0_as_uint8(Bs)
+    assert activation_format in (None, "bf16") and not quantize_output, (
+        "FP8 weight-only requires unquantized activations and output"
+    )
+
+    output_dtype = resolve_output_dtype(output_dtype, A, None)
+    K = A.shape[1]
+    S = expert_ids.shape[0]
+    num_experts, _, N = expert_weight_shape(B, gate)
+    C = A.new_empty(S, gate_out_cols(N, gate, act_fn), dtype=output_dtype)
+
+    def grid(META):
+        return (S, triton.cdiv(N, META["BLOCK_SIZE_N"]))
+
+    with device_context(A.device):
+        bias_stride_e, bias_stride_n = bias_strides(bias)
+        compile_time_only_triton_wrap(block_fp8_weight_only_matmul_batched_kernel)[grid](
+            A,
+            B,
+            batched_weight_descriptor(B),
+            Bs,
+            C,
+            bias,
+            expert_ids,
+            routed_rows_per_row(A, expert_ids),
+            scatter_idx,  # None = C is expert-sorted; read only when not None (folds at trace time)
+            S,
+            N,
+            K,
+            num_experts,
+            A.stride(0),
+            A.stride(1),
+            B.stride(0),
+            B.stride(2),
+            B.stride(1),
+            Bs.stride(0),
+            Bs.stride(1),
+            Bs.stride(2),
+            C.stride(0),
+            C.stride(1),
+            bias_stride_e,
+            bias_stride_n,
+            expert_ids.stride(0),
+            BLOCK_N=scale_block_n,
+            BLOCK_K=scale_block_k,
+            GATE=gate,
+            GATE_SCALES=gate and Bs.shape[1] > 1,
+            SCALE_POST=scale_block_k >= K,
             ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha,
             SWIGLU_LIMIT=swiglu_limit,
@@ -1717,14 +2189,9 @@ def mx_weight_only_matmul_batched(
     # loop; unlike the block-FP8 band this never inverts (GPT-OSS shape: 48.0->39.7µs at S=4,
     # still ahead at S=512; 2026-08-06).
     output_dtype = resolve_output_dtype(output_dtype, A, None)
-    if gate and act_fn is not None:
-        return unstacked_gate(
-            lambda intermediate_dtype: mx_weight_only_matmul_batched(
-                A, B, Bs, expert_ids, output_dtype=intermediate_dtype,
-                scatter_idx=scatter_idx, b_global_scale=b_global_scale, bias=bias,
-            ),
-            output_dtype, simulate_unfused, act_fn, swiglu_alpha, swiglu_limit,
-        )
+    # the SwiGLU runs in the GEMM's epilogue over the interleaved rows' pairs (PAIRED_GLU), the unfused-reference
+    # rounding (simulate_unfused) included: SIMULATE_UNFUSED rounds the pair through the output dtype first
+    paired = gate and act_fn is not None
     K = A.shape[1]
     S = expert_ids.shape[0]
     top_k = routed_rows_per_row(A, expert_ids)
@@ -1733,10 +2200,11 @@ def mx_weight_only_matmul_batched(
     assert K == WEIGHT_VALUES_PER_BYTE * K_b, (
         f"K ({K}) must equal {WEIGHT_VALUES_PER_BYTE} * B.shape[2] ({K_b})"
     )
-    N = rows // 2 if gate else rows
+    N = rows if paired else rows // 2 if gate else rows
     scale_group = mx_scale_family(Bs, K)
+    assert Bs.dtype != torch.float8_e4m3fn or scale_group == NVFP4_SCALE_GROUP_K, "group-32 E4M3 FP4 weights require calibrated FP8 activations"
     b_global_scale = normalize_global_scale(b_global_scale, num_experts)
-    C = A.new_empty(S, gate_out_cols(N, gate, act_fn), dtype=output_dtype)
+    C = A.new_empty(S, rows // 2 if paired else gate_out_cols(N, gate, act_fn), dtype=output_dtype)
     b_u8 = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)
 
@@ -1748,6 +2216,7 @@ def mx_weight_only_matmul_batched(
         compile_time_only_triton_wrap(mx_weight_only_matmul_batched_kernel)[grid](
             A,
             b_u8,
+            batched_weight_descriptor(b_u8, B),
             bs_u8,
             b_global_scale,
             C,
@@ -1775,7 +2244,125 @@ def mx_weight_only_matmul_batched(
             num_experts=num_experts,
             SCALE_GROUP_K=scale_group,
             WEIGHT_VALUES_PER_BYTE=WEIGHT_VALUES_PER_BYTE,
-            GATE=gate,
+            GATE=gate and not paired,
+            PAIRED_GLU=paired,
+            ACT_FN=act_fn,
+            SWIGLU_ALPHA=swiglu_alpha,
+            SWIGLU_LIMIT=swiglu_limit,
+            SIMULATE_UNFUSED=simulate_unfused,
+            INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
+            **pdl_launch_kwargs(),
+        )
+
+    return [C]
+
+
+@compile_time_only_triton_op(
+    add_op_namespace_prefix("int_weight_only_matmul_batched"),
+    mutates_args=(),
+    opaque=True,
+)
+@path_autotune(("gather", "permute"))
+def int_weight_only_matmul_batched(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    expert_ids: torch.Tensor,
+    gate: bool = False,
+    act_fn: str | None = "silu",
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
+    simulate_unfused: bool = False,
+    output_dtype: torch.dtype | None = None,
+    scatter_idx: torch.Tensor | None = None,
+    b_zero: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    b_perm: torch.Tensor | None = None,
+    a_pre_quant_scale: torch.Tensor | None = None,
+    a_scale: torch.Tensor | None = None,
+    b_scale2: torch.Tensor | None = None,
+) -> List[torch.Tensor]:
+    """Integer weight-only batched (decode) matmul: ``C[s] = A[s] @ B[expert_ids[s]].T`` with raw bf16/fp16
+    activations against 2/4/8-bit integer weights, ``B`` ``(E, N, K // VPW)`` interleaved uint32 words
+    (``int_weight_only_matmul_2d``), ``Bs`` ``(E, N, K // group)`` float
+    group scales, ``b_zero`` the matching integer zero points (``None``: symmetric) and ``b_perm`` ``(E, K)`` int32
+    the act-order K orders (``None``: natural): the kernel gathers each row's columns itself, or one
+    ``permute_routed_rows`` launch lays the rows out first, as the path tuner timed it (B200, Qwen3-30B-A3B gate|up:
+    S=8 8.8 vs 9.8us for the gather, S=32 a tie, S=128 70.6 vs 68.0us and S=512 236.6 vs 224.4us for the permute). Returns ``[C]``. The weight
+    is dequantized to the activation dtype (``((q - zero) * scale)`` rounded in the scale dtype, then cast), as the torch
+    "dequantize, then matmul" reference does, so results match it up to fp32 summation order."""
+    bits = validate_int_operands(A, B, Bs, b_zero, b_perm, a_scale, b_scale2)
+    smoothquant = a_scale is not None and b_scale2 is None
+    a_scale = normalize_global_scale(a_scale, B.shape[0])
+    b_scale2 = normalize_global_scale(b_scale2, B.shape[0])
+    # per-row group scales make the raw gate|up output (act_fn=None) just the plain GEMM over the interleaved rows
+    output_dtype = resolve_output_dtype(output_dtype, A, None)
+    if gate and act_fn is None:
+        gate = False
+    # the SwiGLU runs in the GEMM's epilogue over the interleaved rows' pairs (PAIRED_GLU), the unfused-reference
+    # rounding (simulate_unfused) included: SIMULATE_UNFUSED rounds the pair through the output dtype first
+    paired = gate
+    K = A.shape[1]
+    S = expert_ids.shape[0]
+    num_experts, N, K_b = B.shape
+    if a_scale is not None or a_pre_quant_scale is not None or (
+        b_perm is not None
+        and int_weight_only_matmul_batched.paths.choose(
+            (N, K, num_experts, S.bit_length(), gate, str(A.dtype)), offered=("gather", "permute")
+        ) == "permute"
+    ):
+        A = permute_routed_rows(
+            A, b_perm, S, routed_source_rows(A, expert_ids), expert_ids=expert_ids,
+            pre_quant_scale=a_pre_quant_scale, num_experts=num_experts, quant_scale=a_scale,
+            quant_dtype=torch.int8 if smoothquant else FP8_DTYPE,
+        )
+        b_perm = None
+    C = A.new_empty(S, N // 2 if paired else N, dtype=output_dtype)
+
+    def grid(META):
+        return (S, triton.cdiv(N, META["BLOCK_SIZE_N"]))
+
+    with device_context(A.device):
+        bias_stride_e, bias_stride_n = bias_strides(bias)
+        compile_time_only_triton_wrap(int_weight_only_matmul_batched_kernel)[grid](
+            A,
+            a_scale,
+            B,
+            batched_weight_descriptor(B),
+            Bs,
+            b_zero,
+            b_scale2,
+            b_perm,
+            C,
+            bias,
+            expert_ids,
+            routed_rows_per_row(A, expert_ids),
+            scatter_idx,
+            S,
+            N,
+            K,
+            A.stride(0),
+            A.stride(1),
+            global_scale_stride(a_scale),
+            B.stride(0),
+            B.stride(2),
+            B.stride(1),
+            Bs.stride(0),
+            Bs.stride(1),
+            Bs.stride(2),
+            *(b_zero.stride() if b_zero is not None else (0, 0, 0)),
+            global_scale_stride(b_scale2),
+            b_perm.stride(0) if b_perm is not None else 0,
+            C.stride(0),
+            C.stride(1),
+            bias_stride_e,
+            bias_stride_n,
+            expert_ids.stride(0),
+            num_experts=num_experts,
+            SCALE_GROUP_K=K // Bs.shape[2],
+            INT_BITS=bits,
+            GATE=False,
+            PAIRED_GLU=paired,
             ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha,
             SWIGLU_LIMIT=swiglu_limit,
@@ -1796,6 +2383,7 @@ def matmul_batched(
     expert_ids: torch.Tensor,
     bias: torch.Tensor | None = None,  # (E, N_out) per-expert output bias; (N_out,) for 2D
     activation_format: str | None = None,
+    activation_scale_ub: float | None = None,
     gate: bool = False,
     act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
@@ -1809,6 +2397,9 @@ def matmul_batched(
     b_scale_exceptions: torch.Tensor | None = None,
     b_scale_exception_offsets: torch.Tensor | None = None,
     output_global_scale: torch.Tensor | None = None,
+    b_zero: torch.Tensor | None = None,
+    b_perm: torch.Tensor | None = None,
+    a_pre_quant_scale: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Batched matmul dispatcher (W8A8 FP8, W4A8/W4A4 FP4, or full-precision). Routes one
     program per routed row (``expert_ids`` gives its expert).
@@ -1842,32 +2433,39 @@ def matmul_batched(
     - ``Bs`` None → ``full_precision_matmul_batched`` (plain dot, no scales anywhere).
     - MX weights — ``int8`` (packed E2M1) or ``float8_e4m3fn`` (E4M3) with UE8M0
       group-32 ``Bs`` → ``mx_dynamic_matmul_batched``.
-    - one scale per expert (``Bs`` ``(E,)``/``(E, 1, 1)``) →
+    - one scale per expert (``Bs`` ``(E,)``/``(E, 1, 1)``) or per output row (``(E, N, 1)``) →
       ``w8a8_tensor_dynamic_fp8_matmul_batched``.
     - block scales (``Bs`` ``(E, N/bn, K/bk)``) → ``w8a8_block_dynamic_fp8_matmul_batched``.
+    - uint32 integer weights → ``int_weight_only_matmul_batched`` (weight-only), ``b_zero`` their zero points
+      (``None``: symmetric), ``b_perm`` ``(E, K)`` their act-order K orders (``None``: natural).
     - CSF-compressed NVFP4 weight scales (``prepare_nvfp4_csf_scales``): ``Bs`` is the fixed
       stream, ``b_scale_exceptions``/``b_scale_exception_offsets`` its exceptions and expert
       offsets; the op decodes them before the GEMM (only the routed experts when routing allows).
+
+    ``activation_scale_ub`` caps the dynamic per-token amax for row-wise FP8;
+    it requires raw activations and applies before conversion to E4M3.
     """
     if b_scale_exceptions is not None:
         Bs = csf_weight_scales(
             Bs, b_scale_exceptions, b_scale_exception_offsets,
             routed_expert_start(expert_ids, B.shape[0]),
         )
-    check_activation_format(activation_format, quantize_output)
-    assert act_fn is not None or not quantize_output, "the raw gate|up output (act_fn=None) is not requantized"
-    assert (a_global_scale is None and b_global_scale is None) or (
-        Bs is not None and weight_format(B, Bs) == "nvfp4"
-    ), "two-level globals (a_global_scale / b_global_scale) are NVFP4-only"
-    assert output_global_scale is None or (
-        Bs is not None and quantize_output and resolve_activation_format(activation_format, B, Bs) == "nvfp4"
-    ), (
-        "output_global_scale is the NVFP4 requant second level — it requires quantize_output=True on NVFP4 "
-        "(the epilogue would otherwise normalize by it with nothing downstream to compensate)"
+    _validate_quantization_args(
+        A, As, B, Bs, a_global_scale, b_global_scale, output_global_scale,
+        b_zero, b_perm, a_pre_quant_scale, activation_format, quantize_output, activation_scale_ub,
     )
+    assert act_fn is not None or not quantize_output, "the raw gate|up output (act_fn=None) is not requantized"
+    if B.dtype == FP8_DTYPE and Bs is not None and not is_mx(B, Bs) and activation_format == "bf16":
+        assert As is None and not quantize_output, "weight-only takes raw activations without requantization"
+        out = block_fp8_weight_only_matmul_batched(
+            A, B, Bs, expert_ids, gate, act_fn, swiglu_alpha, swiglu_limit,
+            simulate_unfused, activation_format, quantize_output, output_dtype,
+            scatter_idx, bias=bias,
+        )
+        return out[0]
     # a calibrated (static) scale on a raw A (see `tensor_wide_act_operands`): block-scale weights
     # have a dedicated static kernel, per-tensor ones read the same As on the tensor-wide arm
-    static_act = As is not None and As.ndim <= 1 and As.numel() in (1, B.shape[0]) and A.dtype != FP8_DTYPE
+    static_act = B.dtype not in INT_WEIGHT_DTYPES and not is_mx(B, Bs) and As is not None and As.ndim <= 1 and As.numel() in (1, B.shape[0]) and A.dtype != FP8_DTYPE
     if static_act:
         assert Bs is not None and not is_mx(B, Bs), (
             "a calibrated (static) activation scale is an FP8 form — MX activations carry a scale "
@@ -1913,6 +2511,11 @@ def matmul_batched(
             scatter_idx,
             bias=bias,
         )
+    elif B.dtype in INT_WEIGHT_DTYPES:  # packed integer weights
+        out = int_weight_only_matmul_batched(
+            A, B, Bs, expert_ids, gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, output_dtype,
+            scatter_idx, b_zero=b_zero, bias=bias, b_perm=b_perm, a_pre_quant_scale=a_pre_quant_scale, a_scale=As, b_scale2=b_global_scale,
+        )
     elif is_mx(B, Bs) and activation_format == "bf16":  # weight-only: raw bf16 acts, MX weight upcast in-MMA
         assert As is None and a_global_scale is None and not quantize_output, (
             "weight-only (activation_format='bf16') takes a raw activation, no As/global/requant"
@@ -1954,7 +2557,7 @@ def matmul_batched(
             a_global_scale,
             b_global_scale,
             output_global_scale,
-            bias=bias,
+            bias=bias, a_pre_quant_scale=a_pre_quant_scale,
         )
     elif (block_size := weight_block_size(B, Bs)) is None:
         assert activation_format in (None, "fp8") and not quantize_output, (
@@ -1963,6 +2566,7 @@ def matmul_batched(
         out = w8a8_tensor_dynamic_fp8_matmul_batched(
             A, B, As, Bs, expert_ids, gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused,
             output_dtype, scatter_idx, bias=bias,
+            activation_scale_ub=activation_scale_ub,
         )
     else:
         out = w8a8_block_dynamic_fp8_matmul_batched(

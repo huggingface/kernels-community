@@ -23,7 +23,8 @@ from ..compat import (
     compile_time_only_triton_op, compile_time_only_triton_wrap,
     device_context, sm_count,
 )
-from ..quant import fp8_act_quant_inline, mx_act_quant_inline
+from ..formats import block_fp8_weight_scale_grid, ue8m0_as_uint8
+from ..quant import e2m1_cols_to_f32, fp8_act_quant_inline, mx_act_quant_inline
 
 
 @triton.jit
@@ -141,6 +142,25 @@ def load_swizzled_scale_tile(
         + col[None, :] % 4
     )
     return tl.load(ptr + off)
+
+
+@triton.jit
+def load_swizzled_rows_scale(ptr, rows, row_mask, k_idx, K, SCALE_COLS: tl.constexpr, SCALE_GROUP_K: tl.constexpr):
+    """The SWIZZLE_32_4_4 scales of arbitrary logical ``rows`` for K-tile ``k_idx``: ``load_swizzled_scale_tile``'s
+    gather byte map with the rows given rather than one contiguous block — a swapped grouped token tile's rows sit
+    at an offset inside their expert's 128-padded slab. Masked rows read nothing (their tokens are zero and their
+    output columns are dropped)."""
+    cols4 = (K // SCALE_GROUP_K + 3) // 4
+    blk = rows // 128
+    row = rows % 128
+    col = k_idx * SCALE_COLS + tl.arange(0, SCALE_COLS)
+    off = (
+        (blk[:, None] * cols4 + col[None, :] // 4) * 512
+        + (row[:, None] % 32) * 16
+        + (row[:, None] // 32) * 4
+        + col[None, :] % 4
+    )
+    return tl.load(ptr + off, mask=row_mask[:, None])
 
 
 @triton.jit
@@ -280,12 +300,26 @@ def load_mx_act_tile(
 
 
 @triton.jit
+def apply_row_scale(acc, Scale, offs_rows, stride_rows, SWAP_AB: tl.constexpr = False):
+    """Fold a K-constant weight scale onto the fp32 accumulator after the K-loop: weight row ``n``
+    reads ``Scale + n * stride_rows`` — a row-wise scale, or a per-tensor one broadcast by stride
+    0. It lands on the acc's weight-row axis (axis 0 under ``SWAP_AB``)."""
+    s = tl.load(Scale + offs_rows * stride_rows)
+    if SWAP_AB:
+        out = acc * s[:, None]
+    else:
+        out = acc * s[None, :]
+    return out
+
+
+@triton.jit
 def apply_global_scale(acc, GlobalScale, stride_gs_e, GlobalScaleA, stride_gsa_e, expert_id):
-    """Fold the NVFP4 second-level globals onto the fp32 accumulator: the weight global ``g_b``
-    and the activation global ``g_a``, each per tensor (stride 0, broadcast) or per expert.
-    ``None`` folds the arm out."""
+    """Apply output scales before bias/GLU: a weight global or a tile of per-channel weight
+    scale pointers, then the activation global. Expert strides select each expert's scales;
+    stride 0 broadcasts a shared scale. INT32 accumulators convert here, after the full K sum.
+    Scales decode by dtype (``decode_group_scale``: UE8M0 bytes, E4M3, or float). ``None`` folds the arm out."""
     if GlobalScale is not None:
-        acc = acc * tl.load(GlobalScale + expert_id * stride_gs_e).to(tl.float32)
+        acc = acc.to(tl.float32) * decode_group_scale(tl.load(GlobalScale + expert_id * stride_gs_e)).to(tl.float32)
     if GlobalScaleA is not None:
         acc = acc * tl.load(GlobalScaleA + expert_id * stride_gsa_e).to(tl.float32)
     return acc
@@ -339,6 +373,197 @@ def mx_2d_scale_ptrs(
     as_mask = offs_am_lin < M
     bs_mask = offs_bn_lin < (2 * N if GATE else N)
     return as_ptrs, bs_ptrs, as_mask, bs_mask
+
+
+@triton.jit
+def dequant_block_fp8_weight_tile(
+    w, Scales, expert, offs_n, offs_k,
+    stride_scale_e, stride_scale_n, stride_scale_k,
+    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GATE_SCALES: tl.constexpr = False,
+    SWAP_AB: tl.constexpr = False,
+    DTYPE: tl.constexpr = tl.bfloat16,
+):
+    """Rescale an FP8 tile to the raw activation dtype, retaining coarse block scales.
+
+    Gate/up weight rows alternate per value; their scale rows alternate per block.
+    ``offs_k`` is a contiguous K tile starting at a multiple of its width.
+    """
+    scale_n = weight_scale_rows(offs_n, BLOCK_N, GATE_SCALES)
+    tile_k: tl.constexpr = offs_k.shape[0]
+    first_k = tl.min(offs_k, 0)
+    tl.device_assert(first_k % tile_k == 0, "weight K tiles must start on their tile grid")
+    if BLOCK_K % tile_k == 0 or tile_k % BLOCK_K == 0:
+        # Broadcast compact K-group scales rather than staging a full FP32 tile.
+        groups: tl.constexpr = max(tile_k // BLOCK_K, 1)
+        ptrs = (Scales + expert * stride_scale_e + scale_n[:, None] * stride_scale_n
+                + (first_k // BLOCK_K + tl.arange(0, groups)[None, :]) * stride_scale_k)
+        scales = decode_group_scale(tl.load(ptrs))
+        if SWAP_AB:
+            w = (w.to(tl.float32).reshape(offs_n.shape[0], groups, tile_k // groups)
+                 * scales[:, :, None]).reshape(offs_n.shape[0], tile_k)
+        else:
+            w = (w.to(tl.float32).reshape(groups, tile_k // groups, offs_n.shape[0])
+                 * tl.trans(scales)[:, None, :]).reshape(tile_k, offs_n.shape[0])
+    else:
+        ptrs = (Scales + expert * stride_scale_e
+                + scale_n[:, None] * stride_scale_n
+                + (offs_k[None, :] // BLOCK_K) * stride_scale_k)
+        scales = decode_group_scale(tl.load(ptrs))
+        if not SWAP_AB:
+            scales = tl.trans(scales)
+        w = w.to(tl.float32) * scales
+    return w.to(DTYPE)
+
+
+@triton.jit
+def block_fp8_weight_scale_cols(
+    Scales, expert, offs_n, k_off,
+    stride_scale_e, stride_scale_n, stride_scale_k,
+    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GATE_SCALES: tl.constexpr = False,
+):
+    """The coarse FP8 block scale of each weight row at K offset ``k_off``, as a vector over the
+    output columns. Scaling a K step's ``[M, N]`` partial (or the whole accumulator when one block
+    spans K) instead of every weight value leaves the in-loop decode a plain FP8 cast."""
+    scale_n = weight_scale_rows(offs_n, BLOCK_N, GATE_SCALES)
+    return decode_group_scale(tl.load(
+        Scales + expert * stride_scale_e + scale_n * stride_scale_n + (k_off // BLOCK_K) * stride_scale_k
+    ))
+
+
+@triton.jit
+def block_fp8_scaled_act(
+    a, Scales, expert, offs_n, k_off,
+    stride_scale_e, stride_scale_n, stride_scale_k,
+    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """An ``[M, BK]`` activation tile times its weight tile's coarse block scale per K group, for a weight tile
+    whose rows all sit in one scale block: ``M x BK`` multiplies in place of the ``BK x N`` weight rescale."""
+    BM: tl.constexpr = a.shape[0]
+    BK: tl.constexpr = a.shape[1]
+    groups: tl.constexpr = max(BK // BLOCK_K, 1)
+    scale_row = tl.min(offs_n, 0) // BLOCK_N
+    s = decode_group_scale(tl.load(
+        Scales + expert * stride_scale_e + scale_row * stride_scale_n
+        + (k_off // BLOCK_K + tl.arange(0, groups)) * stride_scale_k
+    ))
+    scaled = a.to(tl.float32).reshape(BM, groups, BK // groups) * s[None, :, None]
+    return scaled.reshape(BM, BK).to(a.dtype)
+
+
+@triton.jit
+def _dequant_block_fp8_weight_kernel(
+    B, Bs, Out, ExpertStart,
+    N: tl.constexpr, K: tl.constexpr,
+    stride_b_e, stride_b_n, stride_b_k,
+    stride_bs_e, stride_bs_n, stride_bs_k,
+    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GATE_SCALES: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    expert = tl.program_id(1).to(tl.int64)
+    active = True
+    if ExpertStart is not None:
+        active = tl.load(ExpertStart + expert) < tl.load(ExpertStart + expert + 1)
+    if active:
+        offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        n, k = offsets // K, offsets % K
+        # Full tiles avoid masked-load codegen; the final partial tile stays bounded.
+        mask = offsets < N * K if (N * K) % BLOCK_SIZE else tl.full((BLOCK_SIZE,), True, tl.int1)
+        scale_n = weight_scale_rows(n, BLOCK_N, GATE_SCALES)
+        weight = tl.load(B + expert * stride_b_e + n * stride_b_n + k * stride_b_k, mask, 0.0)
+        scale = tl.load(
+            Bs + expert * stride_bs_e + scale_n * stride_bs_n + (k // BLOCK_K) * stride_bs_k,
+            mask, 0.0,
+        )
+        value = weight.to(tl.float32) * decode_group_scale(scale)
+        tl.store(Out + expert * N * K + offsets, value, mask)
+
+
+def dequant_block_fp8_weight(B, Bs, dtype, *, gate=False, expert_start=None):
+    """Materialize FP8 weights for one prefill GEMM, rounding after the FP32 scale multiply.
+
+    Grouped weights retain their expert indices; inactive expert planes are allocated
+    but untouched, and the subsequent grouped GEMM never reads them.
+    """
+    assert dtype in (torch.bfloat16, torch.float16)
+    Bs, block_n, block_k = block_fp8_weight_scale_grid(B, Bs, gate)
+    Bs = ue8m0_as_uint8(Bs)
+    experts = B.shape[0] if B.ndim == 3 else 1
+    if expert_start is not None:
+        assert (B.ndim == 3 and expert_start.is_contiguous()
+                and expert_start.numel() >= experts + 1 and expert_start.device == B.device)
+    rows, K = B.shape[-2:]
+    output = B.new_empty(B.shape, dtype=dtype)
+    with device_context(B.device):
+        compile_time_only_triton_wrap(_dequant_block_fp8_weight_kernel)[
+            (triton.cdiv(rows * K, 2048), experts)
+        ](
+            B, Bs, output, expert_start, rows, K,
+            B.stride(0) if B.ndim == 3 else 0, B.stride(-2), B.stride(-1),
+            Bs.stride(0) if Bs.ndim == 3 else 0, Bs.stride(-2), Bs.stride(-1),
+            BLOCK_N=block_n, BLOCK_K=block_k,
+            GATE_SCALES=gate and Bs.shape[-2] > 1,
+            BLOCK_SIZE=2048,
+        )
+    return output
+
+
+
+@triton.jit
+def _dequant_mx_weight_kernel(
+    B, Bs, Out, ExpertStart,
+    N, K,
+    stride_b_e, stride_b_n, stride_bs_e, stride_bs_n,
+    PACKED: tl.constexpr, SCALE_GROUP_K: tl.constexpr,
+    BLOCK_R: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    expert = tl.program_id(2).to(tl.int64)
+    active = True
+    if ExpertStart is not None:
+        active = tl.load(ExpertStart + expert) < tl.load(ExpertStart + expert + 1)
+    if active:
+        rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
+        offs_k = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
+        mask = (rows < N)[:, None] & (offs_k < K)[None, :]
+        row_ptrs = B + expert * stride_b_e + rows[:, None].to(tl.int64) * stride_b_n
+        if PACKED:  # two E2M1 values per byte along K, low nibble first
+            offs_byte = tl.program_id(1) * (BLOCK_K // 2) + tl.arange(0, BLOCK_K // 2)
+            packed = tl.load(row_ptrs + offs_byte[None, :], mask=(rows < N)[:, None] & (offs_byte < K // 2)[None, :], other=0)
+            w = e2m1_cols_to_f32(packed)
+        else:
+            w = tl.load(row_ptrs + offs_k[None, :], mask=mask, other=0.0).to(tl.float32)
+        scale = tl.load(
+            Bs + expert * stride_bs_e + rows[:, None].to(tl.int64) * stride_bs_n + (offs_k // SCALE_GROUP_K)[None, :],
+            mask=mask, other=0,
+        )
+        out = Out + expert * N * K + rows[:, None].to(tl.int64) * K + offs_k[None, :]
+        tl.store(out, (w * decode_group_scale(scale)).to(Out.dtype.element_ty), mask=mask)
+
+
+def dequant_mx_weight(B, Bs, dtype, *, expert_start=None):
+    """Materialize MXFP4 / MXFP8 / NVFP4 weights (``(E, N, K // 2)`` packed E2M1 or ``(E, N, K)`` E4M3, with
+    ``(E, N, K // group)`` UE8M0 or E4M3 group scales) for one prefill GEMM, each value times its group scale,
+    rounded once. An E2M1 or E4M3 value times a UE8M0 scale is exact in BF16. As with
+    ``dequant_block_fp8_weight``, planes of experts with no routed rows are allocated but left untouched."""
+    assert dtype in (torch.bfloat16, torch.float16) and B.ndim == 3 and Bs.ndim == 3
+    packed = B.dtype in (torch.int8, torch.uint8)
+    E, N, K_b = B.shape
+    K = 2 * K_b if packed else K_b
+    group = K // Bs.shape[-1]
+    Bs = ue8m0_as_uint8(Bs)
+    output = B.new_empty((E, N, K), dtype=dtype)
+    block_r, block_k = 32, 128
+    with device_context(B.device):
+        compile_time_only_triton_wrap(_dequant_mx_weight_kernel)[
+            (triton.cdiv(N, block_r), triton.cdiv(K, block_k), E)
+        ](
+            B.view(torch.uint8) if packed else B, Bs, output, expert_start, N, K,
+            B.stride(0), B.stride(1), Bs.stride(0), Bs.stride(1),
+            PACKED=packed, SCALE_GROUP_K=group, BLOCK_R=block_r, BLOCK_K=block_k,
+        )
+    return output
 
 
 # CSF byte-window scales: stream preparation and staged decoding before ordinary GEMMs.

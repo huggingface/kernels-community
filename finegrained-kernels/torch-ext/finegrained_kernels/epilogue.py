@@ -45,7 +45,8 @@ def store_masked(
     c = accumulator.to(C.dtype.element_ty)
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = C + stride_c_m * offs_cm[:, None] + stride_c_n * offs_cn[None, :]
+    # 64-bit rows: M x stride_c_m passes 2**31 on long prefills
+    c_ptrs = C + stride_c_m * offs_cm.to(tl.int64)[:, None] + stride_c_n * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
 
@@ -100,21 +101,26 @@ def acc_init(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     SWAP_AB: tl.constexpr,
+    DTYPE: tl.constexpr = tl.float32,
+    K_SLICES: tl.constexpr = 1,
 ):
     """Zero accumulator shaped for the layout: swapped scalar reduces into ``[1, N]``; any other
     swapped mode keeps the ``[N, M]`` MMA acc (weight rows in M, act tile in N — padded up to
     the ``MMA_N_ATOM`` when the caller is the single-token decode GEVM, col 0 taken after the
-    K-loop); no-swap uses ``[M, N]``. ``COMPUTE_MODE`` matters only under swap — kernels with no
+    K-loop); no-swap uses ``[M, N]``. INT8 SmoothQuant selects INT32; other callers keep FP32.
+    ``COMPUTE_MODE`` matters only under swap — kernels with no
     mode axis (fp8 ``tl.dot``) pass ``"dot"``. ``N`` is the weight-output tile (``BLOCK_SIZE_H``
     for the fp8 down projection). Single return: only the taken branch compiles."""
-    if SWAP_AB and COMPUTE_MODE == "scalar":
-        acc = tl.zeros((1, BLOCK_SIZE_N), dtype=tl.float32)
+    if K_SLICES > 1:  # the in-CTA K split (plain_dot)
+        acc = tl.zeros((K_SLICES, BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=DTYPE)
+    elif SWAP_AB and COMPUTE_MODE == "scalar":
+        acc = tl.zeros((1, BLOCK_SIZE_N), dtype=DTYPE)
     elif SWAP_AB and BLOCK_SIZE_M < MMA_N_ATOM:
-        acc = tl.zeros((BLOCK_SIZE_N, MMA_N_ATOM), dtype=tl.float32)
+        acc = tl.zeros((BLOCK_SIZE_N, MMA_N_ATOM), dtype=DTYPE)
     elif SWAP_AB:
-        acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+        acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=DTYPE)
     else:
-        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=DTYPE)
     return acc
 
 
@@ -282,7 +288,7 @@ def _glu_kernel(
     materializes), so the two are bit-identical."""
     if PDL:
         gdc_wait()
-    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)  # flat offsets past 2**31 elements
     mask = offs < n_out
     # gate|up columns alternate (gate 2j, up 2j+1) — the interleaved row order the GEMM emits
     base = (offs // INTER) * 2 * INTER + 2 * (offs % INTER)
@@ -374,8 +380,10 @@ def fused_glu(
                           dtype=out_dtype or gate_up.dtype, device=gate_up.device)
         n = out.numel()
         with device_context(gate_up.device):
+            # Explicit defaults keep torch.compile's Triton argument analysis consistent.
             compile_time_only_triton_wrap(_glu_kernel)[(triton.cdiv(n, 1024),)](
                 gate_up, out, None, n, inter_dim, act_fn, swiglu_alpha, swiglu_limit, BLOCK=1024,
+                QUANT_GROUP=128, UE8M0=False,
                 **pdl_launch_kwargs(),
             )
         return out
@@ -427,6 +435,9 @@ def split_gate_up_glu(
     """Gate|up epilogue in one step: split the finalized stacked tile into its (gate, up) pair
     (``split_gate_up``) and apply the ``ACT_FN``/SwiGLU gated linear unit (``glu``), returning
     the combined intermediate. See those two for the orientation and activation details."""
+    # Materialize before the layout split so it can move narrow values through shared memory.
+    if SIMULATE_UNFUSED:
+        flat = flat.to(INTERMEDIATE_DTYPE)
     gate, up = split_gate_up(flat, BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
     return glu(
         gate,
@@ -459,7 +470,8 @@ def _store_out(
         c_ptrs = C + offs_cm[:, None] * 0 + stride_c_n * offs_cn[None, :]
         tl.store(c_ptrs, c, mask=(offs_cm == 0)[:, None] & col_ok[None, :])
     else:
-        c_ptrs = C + stride_c_m * out_row[:, None] + stride_c_n * offs_cn[None, :]
+        # 64-bit rows: out_row x stride_c_m passes 2**31 on long prefills (131072 rows x N=28672)
+        c_ptrs = C + stride_c_m * out_row.to(tl.int64)[:, None] + stride_c_n * offs_cn[None, :]
         tl.store(c_ptrs, c, mask=row_mask[:, None] & col_ok[None, :])
 
 
@@ -488,7 +500,7 @@ def _epilogue_requant_mx(
     CSDescriptor, CsGlobal, cs_global_row,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, SCALE_GROUP_K: tl.constexpr,
     OUTPUT_FORMAT: tl.constexpr, SWIZZLED_OUT: tl.constexpr, FAKE_BATCH: tl.constexpr,
-    N_COLS: tl.constexpr,
+    N_COLS: tl.constexpr, scale_rows=None,
 ):
     """Requantize the SwiGLU intermediate to MX group-``SCALE_GROUP_K`` (mxfp8 UE8M0 / mxfp4 / nvfp4
     E4M3 — the fp4 formats pack nibble pairs so ``C`` halves). ``SWIZZLED_OUT`` writes ``Cs`` straight
@@ -505,7 +517,19 @@ def _epilogue_requant_mx(
     width: tl.constexpr = BLOCK_SIZE_N if OUTPUT_FORMAT == "mxfp8" else BLOCK_SIZE_N // 2
     _store_out(C, q, out_row, pid_n, row_mask, stride_c_m, stride_c_n, BLOCK_SIZE_M, width, FAKE_BATCH,
                N_COLS if OUTPUT_FORMAT == "mxfp8" else N_COLS // 2)
-    if SWIZZLED_OUT:
+    if SWIZZLED_OUT and BLOCK_SIZE_M < 128:
+        # a swapped token tile scatters its rows' scales into the swizzled slab by byte address (the
+        # load_swizzled_rows_scale map): ``scale_rows`` are its rows inside their expert's 128-padded slab
+        cols = pid_n * (BLOCK_SIZE_N // SCALE_GROUP_K) + tl.arange(0, BLOCK_SIZE_N // SCALE_GROUP_K)
+        cols4 = (N_COLS // SCALE_GROUP_K + 3) // 4
+        off = (
+            ((scale_rows // 128)[:, None] * cols4 + cols[None, :] // 4) * 512
+            + (scale_rows % 32)[:, None] * 16
+            + ((scale_rows % 128) // 32)[:, None] * 4
+            + cols[None, :] % 4
+        )
+        tl.store(Cs + off, q_s, mask=row_mask[:, None] & (cols < N_COLS // SCALE_GROUP_K)[None, :])
+    elif SWIZZLED_OUT:
         # group scales straight into the down proj's SWIZZLE_32_4_4 layout (inverse of
         # load_swizzled_scale) at block (pid_m, pid_n) — BM/BN pinned 128.
         REP_K_CS: tl.constexpr = (BLOCK_SIZE_N // SCALE_GROUP_K) // 4
@@ -533,9 +557,49 @@ def _epilogue_requant_mx(
 
 
 @triton.jit
+def add_low_rank(
+    acc, LoraInput, LoraWeight, out_row, row_mask, pid_n,
+    stride_li_m, stride_li_r, stride_lw_n, stride_lw_r,
+    BLOCK_SIZE_M: tl.constexpr, WIDTH: tl.constexpr, RANK: tl.constexpr, SPLIT_K: tl.constexpr,
+    GATE: tl.constexpr, N_COLS: tl.constexpr, SIMULATE_UNFUSED: tl.constexpr,
+    INTERMEDIATE_DTYPE: tl.constexpr,
+):
+    """SVDQuant's BF16 correction, after dequantization/bias and before GLU/requant."""
+    if LoraInput is not None:
+        cols = pid_n * WIDTH + tl.arange(0, WIDTH)
+        col_mask = cols < (2 * N_COLS if GATE else N_COLS)
+        rank = tl.arange(0, triton.next_power_of_2(RANK))
+        w = tl.load(LoraWeight + cols[:, None] * stride_lw_n + rank[None, :] * stride_lw_r,
+                    mask=col_mask[:, None] & (rank[None, :] < RANK), other=0)
+        if SPLIT_K > 1:
+            # Decode has one row: finish the split reduction here, without a launch.
+            splits = tl.arange(0, triton.next_power_of_2(SPLIT_K))
+            parts = tl.load(LoraInput + splits[:, None] * RANK + rank[None, :],
+                            mask=(splits[:, None] < SPLIT_K) & (rank[None, :] < RANK), other=0)
+            x = tl.sum(parts, 0).to(LoraWeight.dtype.element_ty)
+            correction = tl.sum(w.to(tl.float32) * x.to(tl.float32)[None, :], 1)[None, :]
+        elif BLOCK_SIZE_M < 16:
+            x = tl.load(LoraInput + out_row[:, None] * stride_li_m + rank[None, :] * stride_li_r,
+                        mask=row_mask[:, None] & (rank[None, :] < RANK), other=0)
+            correction = tl.sum(x.to(tl.float32)[:, None, :] * w.to(tl.float32)[None, :, :], 2)
+        else:
+            x = tl.load(LoraInput + out_row[:, None] * stride_li_m + rank[None, :] * stride_li_r,
+                        mask=row_mask[:, None] & (rank[None, :] < RANK), other=0)
+            correction = tl.dot(x, tl.trans(w))
+        if SIMULATE_UNFUSED:
+            # ModelOpt materializes both linear outputs before their BF16 addition.
+            acc = acc.to(INTERMEDIATE_DTYPE).to(tl.float32)
+            correction = correction.to(INTERMEDIATE_DTYPE).to(tl.float32)
+        acc = acc + correction
+        if SIMULATE_UNFUSED:
+            acc = acc.to(INTERMEDIATE_DTYPE).to(tl.float32)
+    return acc
+
+
+@triton.jit
 def gemm_epilogue(
     C,
-    Cs,  # row-major requant-scale pointer (None under SWIZZLED_OUT — CSDescriptor writes instead)
+    Cs,  # row-major requant-scale pointer; under SWIZZLED_OUT the swizzled buffer itself (BM < 128 tiles scatter into it, 128-row tiles store via CSDescriptor)
     acc,
     out_row,
     pid_n,
@@ -561,9 +625,10 @@ def gemm_epilogue(
     FAKE_BATCH: tl.constexpr = False,
     N_COLS: tl.constexpr = 0,  # >0 masks the column tail (2D dense N isn't BN-aligned); 0 = no mask
     CSDescriptor=0,  # SWIZZLE_32_4_4 requant-scale descriptor; read only under SWIZZLED_OUT (else dummy)
+    scale_rows=None,  # a swapped (BM < 128) tile's rows inside their expert's 128-padded slab; SWIZZLED_OUT scatters there
     CsGlobal=None,  # fp32 NVFP4 output global (the NEXT proj's provided input_scale), per tensor or per expert; normalizes the requant, None folds out
     stride_cs_global=0,  # expert stride of CsGlobal (0 broadcasts a scalar)
-    GlobalScale=None,  # fp32 NVFP4 weight global g_b, per tensor or per expert; applied PRE-GLU, None folds out
+    GlobalScale=None,  # weight global or per-channel pointer tile; applied before bias/GLU, None folds out
     stride_global_e=0,  # expert stride of GlobalScale (global_scale_stride; 0 broadcasts a scalar)
     global_row=0,  # expert id indexing the globals and the bias (0 for the 2D case)
     GlobalScaleA=None,  # fp32 NVFP4 activation global g_a, per tensor or per expert; multiplied in-register with GlobalScale
@@ -574,6 +639,14 @@ def gemm_epilogue(
     Bias=None,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; row is `global_row`
     stride_bias_e=0,
     stride_bias_n=0,
+    LoraInput=None,
+    LoraWeight=None,
+    stride_li_m=0,
+    stride_li_r=0,
+    stride_lw_n=0,
+    stride_lw_r=0,
+    LORA_RANK: tl.constexpr = 0,
+    LORA_SPLIT_K: tl.constexpr = 1,
 ):
     """Unified output epilogue for grouped (a real scatter tile) and batched (fake-batch decode:
     one token replicated across the BM lanes) GEMMs. Plain: cast + store the accumulator. ``GATE``:
@@ -598,6 +671,12 @@ def gemm_epilogue(
             ),
             Bias, stride_bias_e, stride_bias_n, global_row, pid_n,
             2 * BLOCK_SIZE_N, 2 * N_COLS if N_COLS > 0 else 0,
+        )
+        flat = add_low_rank(
+            flat, LoraInput, LoraWeight, out_row, row_mask, pid_n,
+            stride_li_m, stride_li_r, stride_lw_n, stride_lw_r,
+            BLOCK_SIZE_M, 2 * BLOCK_SIZE_N, LORA_RANK, LORA_SPLIT_K, True, N_COLS,
+            SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
         )
         # SAVE_PREACT: the GLU backward needs Z, the 2*BN-wide pre-activation. Interleaved, that
         # tile IS an ungated output tile at doubled width (pid_n * 2BN == 2 * pid_n * BN), so the
@@ -631,6 +710,7 @@ def gemm_epilogue(
                     C, Cs, out, out_row, pid_n, pid_m, row_mask, stride_c_m, stride_c_n, stride_cs_m,
                     stride_cs_n, CSDescriptor, CsGlobal, global_row * stride_cs_global,
                     BLOCK_SIZE_M, BLOCK_SIZE_N, SCALE_GROUP_K, OUTPUT_FORMAT, SWIZZLED_OUT, FAKE_BATCH, N_COLS,
+                    scale_rows=scale_rows,
                 )
             else:  # bf16 (unquantized) SwiGLU output
                 _store_out(C, out, out_row, pid_n, row_mask, stride_c_m, stride_c_n, BLOCK_SIZE_M, BLOCK_SIZE_N, FAKE_BATCH, N_COLS)
@@ -641,5 +721,11 @@ def gemm_epilogue(
                 GlobalScale, stride_global_e, GlobalScaleA, stride_global_a, global_row,
             ),
             Bias, stride_bias_e, stride_bias_n, global_row, pid_n, BLOCK_SIZE_N, N_COLS,
+        )
+        acc = add_low_rank(
+            acc, LoraInput, LoraWeight, out_row, row_mask, pid_n,
+            stride_li_m, stride_li_r, stride_lw_n, stride_lw_r,
+            BLOCK_SIZE_M, BLOCK_SIZE_N, LORA_RANK, LORA_SPLIT_K, False, N_COLS,
+            SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
         )
         _store_out(C, acc, out_row, pid_n, row_mask, stride_c_m, stride_c_n, BLOCK_SIZE_M, BLOCK_SIZE_N, FAKE_BATCH, N_COLS)

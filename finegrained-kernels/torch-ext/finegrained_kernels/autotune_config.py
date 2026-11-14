@@ -30,8 +30,11 @@ ENV_VAR = "FINEGRAINED_AUTOTUNE_CONFIG"
 # ``tracebacks``) and the cross-rank tune lock wait.
 KEYS = {
     "n_trials": int, "strict": bool, "runoff": bool, "basin_probes": bool,
-    "max_refine_iters": int, "log_path": str,
-    "key_log_path": str, "call_count_path": str, "tracebacks": bool, "lock_timeout": float,
+    "max_refine_iters": int, "max_pair_trials": int, "log_path": str,
+    "key_log_path": str, "call_count_path": str, "tracebacks": bool, "lock_timeout": float, "compile_workers": int,
+    # restrict tuning to configs with these values: {"num_ctas": 2, "PIPELINE": "tile_loop"} for every kernel
+    # (axes a kernel does not have are ignored), or {"<kernel name>": {...}} for one kernel
+    "force": dict,
 }
 
 MODES = {
