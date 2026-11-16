@@ -11,6 +11,11 @@ import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
 
 
+if dist.is_available():
+    from torch.distributed._functional_collectives import AsyncCollectiveTensor
+    from torch.distributed.fsdp import FSDPModule
+
+
 class LigerTiledMLPFunction:
     """Compatibility entry point for checkpointed tiled MLP computation.
 
@@ -33,9 +38,6 @@ class LigerTiledMLPFunction:
         fsdp_modules = []
         collective_tensor_types = ()
         if dist.is_available() and dist.is_initialized():
-            from torch.distributed._functional_collectives import AsyncCollectiveTensor
-            from torch.distributed.fsdp import FSDPModule
-
             collective_tensor_types = (AsyncCollectiveTensor,)
 
             fsdp_modules = [module for module in mlp_module.modules() if isinstance(module, FSDPModule)]
