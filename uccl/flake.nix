@@ -1,8 +1,8 @@
 {
-  description = "Flake for the UCCL kernel (repackaged upstream wheels)";
+  description = "Flake for the UCCL SDK (repackaged upstream wheels)";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/sdk-variants";
+    kernel-builder.url = "github:huggingface/kernels/gen-sdk-outputs";
   };
 
   outputs =
@@ -10,38 +10,30 @@
     let
       inherit (kernel-builder.inputs.nixpkgs) lib;
 
-      systems = [
-        "aarch64-darwin"
-        "aarch64-linux"
-        "x86_64-linux"
-      ];
-      forAllSystems = lib.genAttrs systems;
-
-      rev = lib.replaceStrings [ "-" ] [ "_" ] (
-        self.shortRev or self.dirtyShortRev or self.lastModifiedDate
-      );
-
-      repoId = "kernels-community/uccl";
       version = "0.1.1";
       releaseUrl = "https://github.com/uccl-project/uccl/releases/download/v${version}";
 
+      # The upstream wheel for each backend (and CUDA major version). The CUDA 12
+      # wheel is built with CUDA 12.8, but all CUDA runtime symbols that it uses
+      # are in the CUDA 12.6 runtime.
       wheelFor = {
         cu12 = {
-          variant = "sdk-cuda-12.6-abi3-x86_64-linux";
           name = "uccl-${version}-cp312-abi3-manylinux_2_35_x86_64.whl";
           hash = "sha256-OQwTIJGJciBlRuRNebEymI8oGOwH4jr80FlfcYORbOw=";
         };
         cu13 = {
-          variant = "sdk-cuda-13.0-abi3-x86_64-linux";
           name = "uccl-${version}+cu13-cp312-abi3-manylinux_2_35_x86_64.whl";
           hash = "sha256-wlHJ0sLM25Omm+DwQzW5JLSnLcjApqyEusQznzQMzHw=";
         };
         rocm = {
-          variant = "sdk-rocm-7.1-abi3-x86_64-linux";
           name = "uccl-${version}+rocm-cp312-abi3-manylinux_2_35_x86_64.whl";
           hash = "sha256-+f+pTq35ZeWsQbEUBSRysjfSWJ56QG7uw8l+Nu5dqw8=";
         };
       };
+
+      wheelKeyOf =
+        buildConfig:
+        if buildConfig ? cudaVersion then "cu${lib.versions.major buildConfig.cudaVersion}" else "rocm";
 
       # The EP component requires 9.0 or later (9.0+PTX), but the other components
       # seem compatible with any capability, so let's add 8.x capabilities as well.
@@ -53,246 +45,89 @@
         "9.0+PTX"
       ];
 
-      builderLib = kernel-builder + "/nix-builder/lib";
-      builderProvenance = import (builderLib + "/flake-provenance.nix") { inherit lib; } kernel-builder;
-      inherit
-        (import (builderLib + "/build-sets.nix") {
-          inherit (kernel-builder.inputs) nixpkgs rust-overlay;
-          inherit builderProvenance;
-        })
-        mkBuildSets
-        ;
-      inherit (import (builderLib + "/torch-version-utils.nix") { inherit lib; }) flattenSystems;
-      torchVersions = flattenSystems (import (kernel-builder + "/nix-builder/versions.nix"));
-
-      wheelKeyOf =
-        buildSet:
-        if buildSet.torch.cudaSupport then
-          "cu${buildSet.torch.cudaPackages.cudaMajorVersion}"
-        else
-          "rocm";
-
-      # Order build sets by how suitable they are as the build set that is used
-      # to load-check and test an SDK variant (Torch is only needed for that,
-      # the first build set for each wheel is used):
+      # Backend versions that the SDK is built for. The variants are named after
+      # the backend version, so we build one variant for each wheel, with the
+      # oldest backend version that the wheel supports:
       #
-      # - Prefer CUDA over ROCm.
-      # - Prefer newer Torch versions over older.
-      # - Prefer older backend versions over newer (best compatibility).
-      backendOrder = {
-        cuda = 0;
-        rocm = 1;
-      };
-      backendVersion = buildConfig: buildConfig.cudaVersion or buildConfig.rocmVersion;
-      buildSetCompare =
-        setA: setB:
+      # - CUDA 12 wheel: CUDA 12.6 (compatible with all later CUDA 12 versions).
+      # - CUDA 13 wheel: CUDA 13.0.
+      # - ROCm wheel: ROCm 7.1 (the version that the wheel is built with).
+      #
+      # Torch is only needed to load-check and test the SDK, so any Torch version
+      # that has the backend version is fine (the first one is used).
+      torchVersions =
+        versions:
         let
-          a = setA.buildConfig;
-          b = setB.buildConfig;
-        in
-        if a.backend != b.backend then
-          backendOrder.${a.backend} < backendOrder.${b.backend}
-        else if a.torchVersion != b.torchVersion then
-          builtins.compareVersions a.torchVersion b.torchVersion > 0
-        else
-          builtins.compareVersions (backendVersion a) (backendVersion b) < 0;
+          backendVersion = version: version.cudaVersion or version.rocmVersion;
 
-      mkSystemOutputs =
-        system:
-        let
-          # Only x86_64-linux CUDA and ROCm build sets get a UCCL variant (the
-          # upstream wheels are x86_64-linux only). Other systems get empty
-          # outputs.
-          allBuildSets = lib.optionals (system == "x86_64-linux") (
-            lib.sort buildSetCompare (
-              builtins.filter (
-                buildSet: builtins.elem buildSet.buildConfig.backend (builtins.attrNames backendOrder)
-              ) (mkBuildSets [ ] torchVersions [ system ])
+          candidates = lib.filter (
+            version:
+            version.system == "x86_64-linux"
+            && (
+              (version ? cudaVersion && lib.versionAtLeast version.cudaVersion "12.6")
+              # Newer ROCm versions are packaged differently.
+              || (
+                version ? rocmVersion
+                && lib.versionAtLeast version.rocmVersion "7.1"
+                && lib.versionOlder version.rocmVersion "7.3"
+              )
             )
-          );
+          ) versions;
 
-          # The most suitable build set for each wheel, i.e. one per SDK variant.
-          buildSets = lib.filter (buildSet: buildSet != null) (
-            lib.mapAttrsToList (
-              key: _: lib.findFirst (buildSet: wheelKeyOf buildSet == key) null allBuildSets
-            ) wheelFor
-          );
-
-          variantOf = buildSet: wheelFor.${wheelKeyOf buildSet}.variant;
-
-          mkVariant =
-            buildSet:
-            let
-              inherit (buildSet)
-                pkgs
-                python3
-                torch
-                overrideTorch
-                ;
-              wheelInfo = wheelFor.${wheelKeyOf buildSet};
-              inherit (wheelInfo) variant;
-              wheel = pkgs.fetchurl {
-                inherit (wheelInfo) name hash;
-                url = "${releaseUrl}/${builtins.replaceStrings [ "+" ] [ "%2B" ] wheelInfo.name}";
-              };
-
-              kernel = pkgs.callPackage ./uccl-kernel.nix {
-                inherit
-                  python3
-                  torch
-                  overrideTorch
-                  rev
-                  variant
-                  version
-                  wheel
-                  cudaArchs
-                  ;
-              };
-
-              testPython = python3.withPackages (ps: [
-                torch
-                (overrideTorch python3.pkgs.kernels)
-                ps.pytest
-              ]);
-            in
-            {
-              inherit
-                kernel
-                pkgs
-                python3
-                testPython
-                ;
-            };
-
-          variantSets = builtins.listToAttrs (
-            map (buildSet: {
-              name = variantOf buildSet;
-              value = mkVariant buildSet;
-            }) buildSets
-          );
-          variantDrvs = lib.mapAttrs (_: set: set.kernel) variantSets;
-
-          bundleBuildSets = buildSets;
-
-          backends = lib.unique (map (buildSet: buildSet.buildConfig.backend) bundleBuildSets);
-          buildSetsOfBackend =
-            backend: builtins.filter (buildSet: buildSet.buildConfig.backend == backend) bundleBuildSets;
-          bestVariant = variantOf (builtins.head bundleBuildSets);
-
-          pkgs = (builtins.head buildSets).pkgs;
-
-          mkBundle =
-            buildSets:
-            pkgs.runCommand "torch-ext-bundle"
-              {
-                preferLocalBuild = true;
-                allowSubstitutes = false;
-              }
-              ''
-                mkdir -p $out
-                ${lib.concatMapStringsSep "\n" (
-                  buildSet: "cp -r ${variantDrvs.${variantOf buildSet}}/* $out/"
-                ) buildSets}
-
-                ${pkgs.kernel-builder}/bin/kernel-builder fill-card ${cardSource} $out/CARD.md
-              '';
-
-          cardSource = lib.fileset.toSource {
-            root = ./.;
-            fileset = lib.fileset.unions [
-              ./build.toml
-              ./CARD.md
-            ];
-          };
-
-          bundle = mkBundle bundleBuildSets;
-
-          backendCi = lib.genAttrs backends (
-            backend: mkBundle [ (builtins.head (buildSetsOfBackend backend)) ]
-          );
-
-          ciTests = lib.mapAttrs (
-            variant: set:
-            pkgs.writeShellScriptBin "ci-test" ''
-              if [ -d ${./tests} ]; then
-                unset LD_LIBRARY_PATH
-                export LOCAL_KERNELS="${repoId}=${set.kernel}"
-                # Accept exit code 5: no tests are selected
-                ${set.testPython}/bin/python3 -m pytest ${./tests} -m kernels_ci -p no:cacheprovider || test $? -eq 5
-              fi
-            ''
-          ) variantSets;
-
-          testShells = lib.mapAttrs (
-            variant: set:
-            set.pkgs.mkShell {
-              buildInputs = [ set.testPython ];
-              shellHook = ''
-                # This is run from `nix develop`, which provides the existing
-                # environment. We clear the LD_LIBRARY_PATH to make testing as
-                # pure as possible.
-                unset LD_LIBRARY_PATH
-                export PYTHONPATH=${set.kernel}/${variant}
-                export LOCAL_KERNELS="${repoId}=${set.kernel}"
-              '';
-            }
-          ) variantSets;
+          # The version with the oldest backend version for a wheel.
+          oldestFor =
+            key:
+            lib.foldl' (
+              best: version:
+              if best == null || builtins.compareVersions (backendVersion version) (backendVersion best) < 0 then
+                version
+              else
+                best
+            ) null (lib.filter (version: wheelKeyOf version == key) candidates);
         in
+        lib.filter (version: version != null) (map oldestFor (builtins.attrNames wheelFor));
+
+      mkVariant =
         {
-          packages = {
-            backendBundle = lib.genAttrs backends (backend: mkBundle (buildSetsOfBackend backend));
-            inherit backendCi ciTests;
-            redistributable = variantDrvs;
-            variants = builtins.attrNames variantDrvs;
-            archVariants = builtins.attrNames variantDrvs;
-          }
-          // lib.optionalAttrs (variantDrvs != { }) {
-            inherit bundle;
-            default = bundle;
+          buildSet,
+          variant,
+          rev,
+          ...
+        }:
+        let
+          inherit (buildSet) pkgs python3 buildConfig;
 
-            # One variant per backend.
-            ci = mkBundle (map (backend: builtins.head (buildSetsOfBackend backend)) backends);
-
-            ci-test = ciTests.${bestVariant};
-
-            build-and-copy = pkgs.writeShellScriptBin "build-and-copy" ''
-              set -euo pipefail
-
-              if [ ! -d build ]; then
-                mkdir build
-              fi
-
-              for build_variant in ${bundle}/*; do
-                build_variant=$(basename $build_variant)
-                if [ -e build/$build_variant ]; then
-                  rm -rf build/$build_variant
-                fi
-
-                cp -r ${bundle}/$build_variant build/
-              done
-
-              chmod -R +w build
-            '';
-
-            build-and-upload = pkgs.writeShellScriptBin "build-and-upload" ''
-              set -euo pipefail
-              ${pkgs.kernel-builder}/bin/kernel-builder upload --repo-id ${repoId} ${bundle}
-            '';
+          wheelInfo = wheelFor.${wheelKeyOf buildConfig};
+          wheel = pkgs.fetchurl {
+            inherit (wheelInfo) name hash;
+            url = "${releaseUrl}/${builtins.replaceStrings [ "+" ] [ "%2B" ] wheelInfo.name}";
           };
-
-          # There is nothing to compile, so there are no development shells,
-          # only test shells.
-          devShells = lib.optionalAttrs (variantDrvs != { }) {
-            inherit testShells;
-            test = testShells.${bestVariant};
-          };
+        in
+        pkgs.callPackage ./uccl-kernel.nix {
+          inherit
+            python3
+            rev
+            variant
+            version
+            wheel
+            cudaArchs
+            ;
+          backend = buildConfig.backend;
+          cudaMajorVersion = lib.versions.major (buildConfig.cudaVersion or "0");
         };
     in
-    {
-      packages = forAllSystems (system: (mkSystemOutputs system).packages);
-      devShells = forAllSystems (system: (mkSystemOutputs system).devShells);
-      formatter = forAllSystems (
-        system: kernel-builder.inputs.nixpkgs.legacyPackages.${system}.nixfmt-tree
-      );
+    kernel-builder.lib.genSdkFlakeOutputs {
+      inherit self torchVersions mkVariant;
+
+      name = "uccl";
+      repoId = "kernels-community/uccl";
+
+      # The upstream wheels are for Python 3.12 and later (abi3).
+      python = {
+        version = "3.12";
+        abi = "abi3";
+      };
+
+      tests = ./tests;
     };
 }

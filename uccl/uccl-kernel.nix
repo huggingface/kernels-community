@@ -1,27 +1,23 @@
 {
   lib,
   stdenv,
-  writeText,
 
-  hash-kernel-hook,
   jq,
   patchelf-old,
-  remove-bytecode-hook,
   unzip,
 
-  get-kernel-check,
-  generate-symbols-hook,
-
   python3,
-  torch,
-  overrideTorch,
 
-  # The upstream wheel (a fetchurl result) for this build set's backend.
+  # The upstream wheel (a fetchurl result) for this variant's backend.
   wheel,
   version,
 
-  # The build variant to produce, e.g. `sdk-cuda-13.0-abi3-x86_64-linux`.
+  # The build variant to produce, e.g. `sdk-cuda-13.0-cpython-3.12-abi3-x86_64-linux`.
   variant,
+
+  # The backend (`cuda` or `rocm`) and, for CUDA, the major CUDA version.
+  backend,
+  cudaMajorVersion,
 
   # The (short) Git revision of the kernel, with dashes replaced by underscores
   # (e.g. `7a4e5a7` or `7a4e5a7_dirty`). Used to make the kernel id unique.
@@ -32,21 +28,11 @@
 }:
 
 let
-  inherit (torch) cudaSupport cudaPackages;
-
-  backend =
-    if cudaSupport then
-      "cuda"
-    else if torch.rocmSupport then
-      "rocm"
-    else
-      throw "UCCL is only available for CUDA and ROCm";
+  cudaSupport = backend == "cuda";
 
   kernelName = "uccl";
 
   kernelId = "_${kernelName}_${lib.replaceStrings [ "-" "." ] [ "_" "_" ] variant}_${rev}";
-
-  dependencies = [ torch ];
 
   intervaltree = python3.pkgs.intervaltree;
   sortedcontainers = python3.pkgs.sortedcontainers;
@@ -69,7 +55,7 @@ let
       '';
 in
 stdenv.mkDerivation {
-  pname = "${kernelName}-kernel-${variant}";
+  pname = "${kernelName}-sdk-${variant}";
   inherit version;
 
   dontUnpack = true;
@@ -81,25 +67,9 @@ stdenv.mkDerivation {
     jq
     patchelf-old
     unzip
-    # Order matters: remove bytecode, then hash.
-    remove-bytecode-hook
-    hash-kernel-hook
-    (get-kernel-check.override {
-      python3 = python3.withPackages (_: dependencies);
-      kernels = overrideTorch python3.pkgs.kernels;
-    })
-    (generate-symbols-hook.override {
-      python3 = python3.withPackages (_: dependencies);
-      kernels = overrideTorch python3.pkgs.kernels;
-    })
   ];
 
-  # Required by the get-kernel-check and generate-symbols hooks.
-  moduleName = kernelName;
-  kernelDeps = writeText "kernel-deps" "[]";
   inherit variant kernelId;
-
-  doInstallCheck = true;
 
   installPhase = ''
     runHook preInstall
@@ -143,7 +113,7 @@ stdenv.mkDerivation {
         for needed in $(patchelf --print-needed $lib); do
           case $needed in
             libcudart-*)
-              patchelf --replace-needed $needed libcudart.so.${cudaPackages.cudaMajorVersion} $lib
+              patchelf --replace-needed $needed libcudart.so.${cudaMajorVersion} $lib
               ;;
           esac
         done
@@ -184,7 +154,7 @@ stdenv.mkDerivation {
   '';
 
   meta = {
-    description = "UCCL repackaged as a kernel (build variant ${variant})";
+    description = "UCCL repackaged as an SDK (build variant ${variant})";
     homepage = "https://github.com/uccl-project/uccl";
     license = lib.licenses.asl20;
     sourceProvenance = with lib.sourceTypes; [ binaryNativeCode ];
