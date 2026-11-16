@@ -16,10 +16,43 @@ if dist.is_available():
     from torch.distributed.fsdp import FSDPModule
 
 
+def _prepare_fsdp_checkpoint(mlp_module, x):
+    """Prepare FSDP parameters and checkpoint recomputation contexts."""
+    if not (dist.is_available() and dist.is_initialized()):
+        return x, {}
+
+    fsdp_modules = [module for module in mlp_module.modules() if isinstance(module, FSDPModule)]
+    if not fsdp_modules:
+        return x, {}
+
+    for module in fsdp_modules:
+        module.unshard()
+
+    # An outer checkpoint can re-enter after FSDP skips its input-casting
+    # hooks. Keep the same computation dtype at our checkpoint boundary.
+    parameter = next(mlp_module.parameters(), None)
+    if parameter is not None and parameter.dtype in (torch.float16, torch.bfloat16):
+        x = x.to(parameter.dtype)
+
+    @contextmanager
+    def recompute_context():
+        # A projection can have been resharded by an earlier tile's backward.
+        # FSDP2 skips its pre-forward unshard during checkpoint recomputation,
+        # so explicitly materialize those parameters for each new tile.
+        for module in fsdp_modules:
+            module.unshard()
+        yield
+
+    # checkpoint's context_fn returns (forward context, recomputation context).
+    # Only recomputation needs the extra FSDP unsharding.
+    return x, {"context_fn": lambda: (nullcontext(), recompute_context())}
+
+
 class LigerTiledMLPFunction:
     """Compatibility entry point for checkpointed tiled MLP computation.
 
-    Each shard is recomputed during backward to reduce activation memory.
+    Each shard is checkpointed and recomputed during backward to reduce activation
+    memory, matching the original custom autograd implementation.
     Non-reentrant checkpointing records the parameter dependencies even when
     the input does not require gradients, and supports ``torch.autograd.grad``.
     """
@@ -35,31 +68,9 @@ class LigerTiledMLPFunction:
         # Keep compute_params in the public API; autograd discovers the weights
         # used by fn without registering them through a separate parameter list.
         x = x.contiguous()
-        fsdp_modules = []
-        collective_tensor_types = ()
-        if dist.is_available() and dist.is_initialized():
-            collective_tensor_types = (AsyncCollectiveTensor,)
+        x, checkpoint_kwargs = _prepare_fsdp_checkpoint(mlp_module, x)
+        collective_tensor_types = (AsyncCollectiveTensor,) if dist.is_available() and dist.is_initialized() else ()
 
-            fsdp_modules = [module for module in mlp_module.modules() if isinstance(module, FSDPModule)]
-        if fsdp_modules:
-            for module in fsdp_modules:
-                module.unshard()
-            # An outer checkpoint can re-enter after FSDP skips its input-casting
-            # hooks. Keep the same computation dtype at our checkpoint boundary.
-            parameter = next(mlp_module.parameters(), None)
-            if parameter is not None and parameter.dtype in (torch.float16, torch.bfloat16):
-                x = x.to(parameter.dtype)
-
-        @contextmanager
-        def recompute_context():
-            # A projection can have been resharded by an earlier tile's backward.
-            # FSDP2 skips its pre-forward unshard during checkpoint recomputation,
-            # so explicitly materialize those parameters for each new tile.
-            for module in fsdp_modules:
-                module.unshard()
-            yield
-
-        checkpoint_kwargs = {"context_fn": lambda: (nullcontext(), recompute_context())} if fsdp_modules else {}
         output_shards = []
         for x_shard in torch.tensor_split(x, shards, dim=-2):
             output = checkpoint(fn, mlp_module, x_shard, use_reentrant=False, **checkpoint_kwargs)

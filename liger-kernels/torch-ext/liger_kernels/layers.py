@@ -132,18 +132,20 @@ class LigerTiledScaledSwiGLUMLP(nn.Module):
 class LigerTiledClampedSwiGLUMLP(nn.Module):
     """SwiGLU with upper gate clipping and symmetric up clipping before SiLU.
 
-    The module supplies the clipping bound as ``limit`` or ``swiglu_limit``.
+    The module supplies the clipping bound as ``swiglu_limit``.
     """
 
     gate_proj: nn.Linear
     up_proj: nn.Linear
     down_proj: nn.Linear
 
+    swiglu_limit: float
+
     can_torch_compile = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         def _mlp_forward(module, x):
-            limit = module.limit if hasattr(module, "limit") else module.swiglu_limit
+            limit = module.swiglu_limit
             gate = module.gate_proj(x).clamp(max=limit)
             up = module.up_proj(x).clamp(min=-limit, max=limit)
             return module.down_proj(LigerSiLUMulFunction.apply(gate, up))
