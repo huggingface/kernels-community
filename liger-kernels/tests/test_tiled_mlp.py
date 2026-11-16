@@ -143,3 +143,55 @@ def test_tiled_compile_with_frozen_inputs():
     torch.testing.assert_close(actual, expected)
     for actual, expected in zip(tiled.parameters(), reference.parameters()):
         torch.testing.assert_close(actual.grad, expected.grad)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("variant", ["scaled", "limit", "swiglu_limit"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("requires_grad", [False, True])
+def test_tiled_swiglu_variants(variant, dtype, requires_grad):
+    if DEVICE == "cpu":
+        pytest.skip("needs an accelerator")
+
+    class MLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_proj = nn.Linear(16, 32)
+            self.up_proj = nn.Linear(16, 32)
+            self.down_proj = nn.Linear(32, 16)
+            self.num_shards = 4
+            self.gate_multiplier = 0.8838834764831844
+            self.down_multiplier = 0.5859375
+            if variant != "scaled":
+                setattr(self, variant, 0.5)
+
+        def forward(self, x):
+            gate, up = self.gate_proj(x), self.up_proj(x)
+            if variant == "scaled":
+                gate = gate * self.gate_multiplier
+            else:
+                gate = gate.clamp(max=0.5)
+                up = up.clamp(min=-0.5, max=0.5)
+            output = self.down_proj(nn.functional.silu(gate) * up)
+            return output * self.down_multiplier if variant == "scaled" else output
+
+    torch.manual_seed(0)
+    reference = MLP().to(device=DEVICE, dtype=dtype)
+    tiled = copy.deepcopy(reference)
+    adapter = (
+        liger_kernels.layers.LigerTiledScaledSwiGLUMLP
+        if variant == "scaled"
+        else liger_kernels.layers.LigerTiledClampedSwiGLUMLP
+    )
+    x_ref = torch.randn(2, 41, 16, device=DEVICE, dtype=dtype, requires_grad=requires_grad)
+    x_tiled = x_ref.detach().clone().requires_grad_(requires_grad)
+    expected = torch.cat([reference(tile) for tile in torch.tensor_split(x_ref, 4, dim=-2)], dim=-2)
+    actual = adapter.forward(tiled, x_tiled)
+    expected.sum().backward()
+    actual.sum().backward()
+    atol, rtol = (0.05, 0.05) if dtype == torch.bfloat16 else (1e-4, 1e-5)
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+    if requires_grad:
+        torch.testing.assert_close(x_tiled.grad, x_ref.grad, atol=atol, rtol=rtol)
+    for actual, expected in zip(tiled.parameters(), reference.parameters()):
+        torch.testing.assert_close(actual.grad, expected.grad, atol=atol, rtol=rtol)
