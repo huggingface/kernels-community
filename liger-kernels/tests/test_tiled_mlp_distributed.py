@@ -57,7 +57,8 @@ class MLP(nn.Module):
 @pytest.mark.parametrize("layout", ["ddp", "fsdp2", "tp", "cp", "fsdp2_tp", "fsdp2_cp", "tp_cp", "dp_cp"])
 @pytest.mark.parametrize("outer_checkpoint", [False, True])
 @pytest.mark.parametrize("requires_grad", [False, True])
-def test_distributed_tiled_mlp(distributed, layout, outer_checkpoint, requires_grad):
+@pytest.mark.parametrize("mixed_precision", [False, True], ids=["fp32", "bf16"])
+def test_distributed_tiled_mlp(distributed, layout, outer_checkpoint, requires_grad, mixed_precision):
     device = distributed
     world_size = dist.get_world_size()
     if "_" in layout:
@@ -80,11 +81,16 @@ def test_distributed_tiled_mlp(distributed, layout, outer_checkpoint, requires_g
             {"gate_proj": ColwiseParallel(), "up_proj": ColwiseParallel(), "down_proj": RowwiseParallel()},
         )
     if "fsdp" in names:
-        from torch.distributed.fsdp import fully_shard
+        from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
+        policy = (
+            MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+            if mixed_precision
+            else MixedPrecisionPolicy()
+        )
         for child in tiled.children():
-            fully_shard(child, mesh=mesh["fsdp"])
-        fully_shard(tiled, mesh=mesh["fsdp"])
+            fully_shard(child, mesh=mesh["fsdp"], mp_policy=policy)
+        fully_shard(tiled, mesh=mesh["fsdp"], mp_policy=policy)
     wrapped = tiled
     if "dp" in names:
         wrapped = DistributedDataParallel(tiled, device_ids=[device.index], process_group=mesh["dp"].get_group())
@@ -104,18 +110,20 @@ def test_distributed_tiled_mlp(distributed, layout, outer_checkpoint, requires_g
     # and no parameter state is accidentally carried across iterations.
     optimizer_ref = torch.optim.SGD(reference.parameters(), lr=0.01)
     optimizer_tiled = torch.optim.SGD(wrapped.parameters(), lr=0.01)
+    atol, rtol = (0.002, 0.03) if mixed_precision else (1e-5, 1e-5)
     for _ in range(2):
         optimizer_ref.zero_grad(set_to_none=True)
         optimizer_tiled.zero_grad(set_to_none=True)
         x_ref = x.detach().clone().requires_grad_(requires_grad)
         x_tiled = x.detach().clone().requires_grad_(requires_grad)
-        expected = reference(x_ref)
-        actual = checkpoint(wrapped, x_tiled, use_reentrant=False) if outer_checkpoint else wrapped(x_tiled)
-        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=mixed_precision):
+            expected = reference(x_ref)
+            actual = checkpoint(wrapped, x_tiled, use_reentrant=False) if outer_checkpoint else wrapped(x_tiled)
+        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
         expected.square().sum().backward()
         actual.square().sum().backward()
         if requires_grad:
-            torch.testing.assert_close(x_tiled.grad, x_ref.grad, atol=1e-5, rtol=1e-5)
+            torch.testing.assert_close(x_tiled.grad, x_ref.grad, atol=atol, rtol=rtol)
         for (name, expected_param), actual_param in zip(reference.named_parameters(), tiled.parameters()):
             assert actual_param.grad is not None, name
             if "cp" in names:
@@ -131,7 +139,9 @@ def test_distributed_tiled_mlp(distributed, layout, outer_checkpoint, requires_g
             actual_grad = (
                 actual_param.grad.full_tensor() if isinstance(actual_param.grad, DTensor) else actual_param.grad
             )
-            torch.testing.assert_close(actual_grad, expected_param.grad, atol=1e-5, rtol=1e-5, msg=name)
+            torch.testing.assert_close(
+                actual_grad, expected_param.grad, atol=0.02 if mixed_precision else atol, rtol=rtol, msg=name
+            )
         optimizer_ref.step()
         optimizer_tiled.step()
 
