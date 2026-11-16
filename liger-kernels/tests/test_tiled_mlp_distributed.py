@@ -37,6 +37,11 @@ def distributed():
     dist.destroy_process_group()
 
 
+@pytest.fixture(scope="module")
+def meshes(distributed):
+    return {}
+
+
 class MLP(nn.Module):
     def __init__(self, tiled, variant="swiglu"):
         super().__init__()
@@ -80,7 +85,7 @@ class MLP(nn.Module):
 @pytest.mark.parametrize("requires_grad", [False, True])
 @pytest.mark.parametrize("mixed_precision", [False, True], ids=["fp32", "bf16"])
 @pytest.mark.parametrize("variant", ["swiglu", "scaled", "clamped"])
-def test_distributed_tiled_mlp(distributed, layout, outer_checkpoint, requires_grad, mixed_precision, variant):
+def test_distributed_tiled_mlp(distributed, meshes, layout, outer_checkpoint, requires_grad, mixed_precision, variant):
     device = distributed
     pending_collectives = getattr(torch._C._distributed_c10d, "_get_work_registry_size", None)
     pending_before = pending_collectives() if pending_collectives else None
@@ -93,7 +98,9 @@ def test_distributed_tiled_mlp(distributed, layout, outer_checkpoint, requires_g
     else:
         names = ({"ddp": "dp", "fsdp2": "fsdp"}.get(layout, layout),)
         shape = (world_size,)
-    mesh = init_device_mesh("cuda", shape, mesh_dim_names=names)
+    if layout not in meshes:
+        meshes[layout] = init_device_mesh("cuda", shape, mesh_dim_names=names)
+    mesh = meshes[layout]
     torch.manual_seed(0)
     reference = MLP(tiled=False, variant=variant).to(device)
     tiled = copy.deepcopy(reference)
