@@ -154,6 +154,7 @@ def test_tiled_zero3(distributed, requires_grad, outer_checkpoint):
         config={
             "train_micro_batch_size_per_gpu": 2,
             "gradient_accumulation_steps": 1,
+            "gradient_clipping": 0.0,
             "zero_allow_untested_optimizer": True,
             "zero_optimization": {"stage": 3, "stage3_param_persistence_threshold": 0},
         },

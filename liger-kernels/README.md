@@ -38,5 +38,7 @@ TP × CP, and DP × CP. Each layout checks outputs, input and parameter gradient
 and optimizer updates over two iterations, with frozen or differentiable inputs
 and with or without an outer checkpoint. CP cases use uneven local sequence
 shards and reduce weight gradients across the CP group; they do not test attention.
+When DeepSpeed is installed, the distributed suite also checks ZeRO-3 with
+parameter persistence disabled, so even the tiny test weights are partitioned.
 The same pytest module can run across nodes with a distributed launcher that sets
 `RANK`, `WORLD_SIZE`, `MASTER_ADDR`, `MASTER_PORT`, and `LOCAL_RANK`.
