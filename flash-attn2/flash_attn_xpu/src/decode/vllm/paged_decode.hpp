@@ -23,6 +23,20 @@
 #include <cute/tensor.hpp>
 
 #include "../splitkv_decode.hpp"
+
+#if !FLASH_XPU_HAS_VLLM_DECODE
+// No 512-GRF Xe35 build: flash_api.cpp's vllm_supported() is false, so these
+// are never called; they only satisfy the link.
+#define FLASH_XPU_VLLM_INSTANTIATE(HD, NAME, ELEMENT)                         \
+  namespace flash_xpu_splitkv {                                              \
+  template <>                                                                \
+  void vllm_paged_decode_##NAME<FLASH_XPU_SPLITKV_TARGET_ARCH, HD>(          \
+      sycl::queue&, const vllm_decode_args_t&) {                             \
+    TORCH_CHECK(false, "vllm paged decode needs DPC++ >= 2026.2");           \
+  }                                                                          \
+  }
+#else
+
 #include "chunk_prefill_scheduler.hpp"
 #include "chunk_prefill_epilogue.hpp"
 #include "paged_decode_kernel.hpp"
@@ -66,6 +80,26 @@ struct decode_policy_qpacked_head {
           cute::is_same_v<kv_tile, _64> || cute::is_same_v<kv_tile, _128>,
       "Unsupported kv_tile for decode_policy_qpacked_head "
       "(supported: _16, _32, _64, _128)");
+};
+
+// kv_tile == _16 (block_size == 16)
+template <typename q_packed, typename head_dim>
+struct decode_policy_qpacked_head<q_packed, head_dim, _16> {
+  using HeadDim = head_dim;
+  using ShapeQK = Shape<q_packed, _16, _64>;
+  using ShapePV = Shape<q_packed, _32, _16>;
+  using ShapeOut = Shape<q_packed, decode_shapeout_v<q_packed, head_dim>>;
+  using SubgroupLayoutQK = Layout<Shape<_1, _1, _1>>;
+};
+
+// kv_tile == _32 (block_size == 32)
+template <typename q_packed, typename head_dim>
+struct decode_policy_qpacked_head<q_packed, head_dim, _32> {
+  using HeadDim = head_dim;
+  using ShapeQK = Shape<q_packed, _32, _64>;
+  using ShapePV = Shape<q_packed, _32, _32>;
+  using ShapeOut = Shape<q_packed, decode_shapeout_v<q_packed, head_dim>>;
+  using SubgroupLayoutQK = Layout<Shape<_1, _2, _1>>;
 };
 
 // kv_tile == _64; any page size that is a positive multiple of 64.
@@ -543,7 +577,7 @@ struct PagedDecodeConfig {
 
 // decode_policy_dispatch_impl / dispatch_by_page_size /
 // cutlass_paged_decode_impl, for Q = K = V = O = Element, no causal mask (as
-// vllm passes for decode), no sink, page size a multiple of 64.
+// vllm passes for decode), no sink, page size 16, 32 or a multiple of 64.
 template <typename decode_policy, bool Local, typename Element>
 void decode_policy_dispatch_impl(
     sycl::queue& queue, const paged_decode_args_t& args) {
@@ -564,12 +598,12 @@ void decode_policy_dispatch_impl(
       Element>::kernel_dispatch(queue, args);
 }
 
-template <typename QGroup, typename Element, int HeadDim>
-void dispatch_local(sycl::queue& queue, const paged_decode_args_t& args) {
+template <typename QGroup, typename Element, int HeadDim, typename KVTile>
+void dispatch_local_tile(sycl::queue& queue, const paged_decode_args_t& args) {
   using policy = cute::conditional_t<
       HeadDim == 256 && cute::is_same_v<QGroup, _16>,
       decode_policy_q16_h256_p64,
-      decode_policy_qpacked_head<QGroup, Int<HeadDim>, _64>>;
+      decode_policy_qpacked_head<QGroup, Int<HeadDim>, KVTile>>;
   if (args.is_local) {
     decode_policy_dispatch_impl<policy, true, Element>(queue, args);
   } else {
@@ -577,17 +611,31 @@ void dispatch_local(sycl::queue& queue, const paged_decode_args_t& args) {
   }
 }
 
+// paged_decode_utils.hpp dispatch_by_page_size / get_paged_decode_kv_tile.
+template <typename QGroup, typename Element, int HeadDim>
+void dispatch_local(sycl::queue& queue, const paged_decode_args_t& args) {
+  if (args.block_size == 16) {
+    dispatch_local_tile<QGroup, Element, HeadDim, _16>(queue, args);
+  } else if (args.block_size == 32) {
+    dispatch_local_tile<QGroup, Element, HeadDim, _32>(queue, args);
+  } else {
+    dispatch_local_tile<QGroup, Element, HeadDim, _64>(queue, args);
+  }
+}
+
 template <typename Element, int HeadDim>
 void paged_decode(sycl::queue& queue, const paged_decode_args_t& args) {
   TORCH_CHECK(
-      args.block_size > 0 && args.block_size % 64 == 0,
-      "paged decode: page size must be a multiple of 64");
+      args.block_size == 16 || args.block_size == 32 ||
+          (args.block_size > 0 && args.block_size % 64 == 0),
+      "paged decode: page size must be 16, 32 or a multiple of 64");
   // paged_decode_xe3.cpp: head sizes above 128 use the 8-row tile (the
   // 16-row reduction needs 64 KB SLM at head_dim 256 and hangs), except
-  // head_dim 256 with GQA ratio 9..16, which uses decode_policy_q16_h256_p64.
+  // head_dim 256 with GQA ratio 9..16 and a page size that is a multiple of
+  // 64, which uses decode_policy_q16_h256_p64.
   const int group = args.num_heads_q / args.num_heads_k;
   if constexpr (HeadDim == 256) {
-    if (group > 8 && group <= 16) {
+    if (group > 8 && group <= 16 && args.block_size % 64 == 0) {
       dispatch_local<_16, Element, HeadDim>(queue, args);
       return;
     }
@@ -612,3 +660,5 @@ void paged_decode(sycl::queue& queue, const paged_decode_args_t& args) {
     vllm::paged_decode<ELEMENT, HD>(q, a);                                   \
   }                                                                          \
   }
+
+#endif  // FLASH_XPU_HAS_VLLM_DECODE

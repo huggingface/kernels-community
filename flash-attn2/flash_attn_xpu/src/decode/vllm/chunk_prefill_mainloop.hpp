@@ -46,6 +46,7 @@
 #include "cute/util/sycl_vec.hpp"
 #include "../../collective/fmha_fusion.hpp"
 #include "paged_decode_tuning.h"
+#include "xe2d_payloads.hpp"
 
 #ifndef VLLM_GRF_SIZE
   #define VLLM_GRF_SIZE 256
@@ -143,13 +144,9 @@ xe_kv_retarget_payload(int* payload, Tensor2D const& t, int surf) {
 }
 
 // Re-point every payload of a prepared K/V copy at sub-surface `surf`.
-// (vllm's internal cutlass types this Xe2DPreparedPayloads<N, BaseT>; public
-// sycl-tla has Xe2DPreparedPayloads<N>. Only FMHAFwdMainloop, the prefill
-// mainloop that kc does not instantiate, calls it.)
-template <int RowMode, class Prepared, class Tensor2D>
-CUTLASS_DEVICE void
-xe_kv_retarget_payloads(Prepared& prepared, Tensor2D const& t, int surf) {
-  constexpr int N = sizeof(prepared.payloads) / sizeof(prepared.payloads[0]);
+template <int RowMode, int N, class BaseT, class Tensor2D>
+CUTLASS_DEVICE void xe_kv_retarget_payloads(
+    XePreparedPayloads<N, BaseT>& prepared, Tensor2D const& t, int surf) {
   CUTLASS_PRAGMA_UNROLL
   for (int i = 0; i < N; ++i) {
     xe_kv_retarget_payload<RowMode>(prepared.payloads[i], t, surf);
@@ -899,9 +896,9 @@ struct FMHAFwdMainloop<
         if (D == 0) {
           // Null-src0 DPAS on the first K atom initializes tSrS without a
           // clear(). SYCL-TLA v0.1.0_next selects it through the MMA atom
-          // (without_acc) instead of the former gemm<NoAcc> parameter.
-          cute::gemm(
-              mma_qk.without_acc(), tSrQ_d(_, _, 0), tSrK(_, _, 0), tSrS);
+          // (without_acc); public sycl-tla 0.9.3 through gemm<NoAcc>.
+          cute::gemm</*NoAcc=*/true>(
+              mma_qk, tSrQ_d(_, _, 0), tSrK(_, _, 0), tSrS);
           CUTLASS_PRAGMA_UNROLL
           for (int k = 1; k < kAtomsPerD; k++) {
             cute::gemm(mma_qk, tSrQ_d(_, _, k), tSrK(_, _, k), tSrS);

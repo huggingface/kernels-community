@@ -31,6 +31,15 @@
 #define FLASH_XPU_VLLM_NS vllm_xe20
 #endif
 
+// The vllm Xe35 decode kernel runs with 512 GRF, which needs
+// maximum_registers (DPC++ 2026.2+); grf_size only takes 128/256. With an
+// older compiler CRI keeps the split-KV kernel above.
+#if defined(__INTEL_LLVM_COMPILER) && __INTEL_LLVM_COMPILER >= 20260200
+#define FLASH_XPU_HAS_VLLM_DECODE 1
+#else
+#define FLASH_XPU_HAS_VLLM_DECODE 0
+#endif
+
 namespace flash_xpu_splitkv {
 
 // Work-group shape of the decode kernel (kv_tile 64, 4 subgroups of 16).

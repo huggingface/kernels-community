@@ -179,23 +179,6 @@ class XeFMHAFwdKernelXe2 {
   }
 
   CUTLASS_DEVICE
-  int calculate_longest_non_masked_length(
-      const int& seq_len_kv, const int& seq_len_qo,
-      const int& last_seq_coord, const int& first_non_masked_sequence) {
-    int longest_non_masked_length = 0;
-    if (seq_len_kv > seq_len_qo) {
-      int elements_in_first_line = seq_len_kv - (seq_len_qo - 1);
-      longest_non_masked_length = elements_in_first_line + last_seq_coord;
-    } else {
-      longest_non_masked_length = cute::min(
-          seq_len_kv,
-          cute::max(0, last_seq_coord - first_non_masked_sequence + 1));
-    }
-    longest_non_masked_length = cute::min(seq_len_kv, longest_non_masked_length);
-    return longest_non_masked_length;
-  }
-
-  CUTLASS_DEVICE
   void operator()(Params const& params, char* smem_buf) {
     using namespace sycl::ext::oneapi::this_work_item;
 
@@ -354,65 +337,62 @@ class XeFMHAFwdKernelXe2 {
           sycl::group_barrier(get_work_group<3>());
         }
       }
-      if (effective_seq_kv <= 0) continue;
+      // Only the varlen / fixed paths get here with an empty K/V: they still
+      // run the epilogue so the output rows are written as zeros.
+      const bool empty_kv = effective_seq_kv <= 0;
 
       auto full_tile_offset = effective_seq_kv - seq_len_qo;
       int seq_coord = cute::min(
           seq_len_qo, (blk_q * get<0>(TileShapeQK{}) + q_offset_sg));
-      int last_seq_coord = seq_coord + q_sg_tile - 1;
-      int first_non_masked_sequence = seq_len_qo - effective_seq_kv;
 
-      // Causal-only early-exit: skip SGs that are fully masked. With
-      // LocalMask we can't easily do this here, so let the loop body mask.
-      const bool sg_skip = CausalMask && !LocalMask &&
-          first_non_masked_sequence > last_seq_coord;
-
-      // Per-SG effective KV length.
-      int seq_len;
+      // Per-SG K/V bounds (as in vllm's chunk_prefill kernel).
+      const int sg_causal_seq_len = cute::min(
+          effective_seq_kv, full_tile_offset + seq_coord + q_sg_tile);
+      int sg_seq_len;
       if constexpr (CausalMask && LocalMask) {
-        seq_len = cute::min(
+        sg_seq_len = cute::min(
             effective_seq_kv,
             full_tile_offset + seq_coord + q_sg_tile +
                 params.mainloop.local.local_right);
       } else if constexpr (CausalMask) {
-        seq_len = calculate_longest_non_masked_length(
-            effective_seq_kv, seq_len_qo, last_seq_coord,
-            first_non_masked_sequence);
+        sg_seq_len = sg_causal_seq_len;
       } else {
-        seq_len = effective_seq_kv;
+        sg_seq_len = effective_seq_kv;
       }
-      if (seq_len < 0) seq_len = 0;
-
-      int k_block0;
+      if (sg_seq_len < 0) sg_seq_len = 0;
+      int sg_k_block0 = 0;
       if constexpr (LocalMask) {
-        k_block0 = cute::max(
+        sg_k_block0 = cute::max(
             seq_coord + full_tile_offset - params.mainloop.local.local_left,
             0) / get<1>(TileShapeQK{});
-      } else {
-        k_block0 = 0;
       }
-      const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
-      const int total_blk = k_blocks - k_block0;
+      const int sg_k_blocks = cute::ceil_div(sg_seq_len, get<1>(TileShapeQK{}));
+      const int sg_k_blocks_causal = CausalMask
+          ? (seq_coord + full_tile_offset) / get<1>(TileShapeQK{})
+          : sg_k_blocks;
 
       // The mainloop runs a work-group split barrier per K block, so every
-      // sub-group must arrive the same number of times. With causal/local
-      // masks the K range is per sub-group: pad the shorter (and skipped)
-      // sub-groups with empty barrier rounds up to the work-group maximum.
-      const int sg_iters = sg_skip ? 0 : cute::max(0, total_blk);
-      int wg_iters = sg_iters;
-      if constexpr (CausalMask || LocalMask) {
-        wg_iters = sycl::reduce_over_group(
-            get_work_group<3>(), sg_iters, sycl::maximum<int>());
+      // sub-group must run the same K range. Reduce the per-SG bounds over
+      // the work-group; the per-element masks handle the widened range:
+      //   k_block0        = min (start no later than any SG)
+      //   k_blocks        = max (end no earlier than any SG)
+      //   seq_len         = max (common LocalMask remainder bound)
+      //   k_blocks_causal = min (mask no later than any SG needs it)
+      auto wg = get_work_group<3>();
+      int k_block0 = sg_k_block0;
+      int k_blocks = sg_k_blocks;
+      int seq_len = sg_seq_len;
+      int k_blocks_causal = sg_k_blocks_causal;
+      if constexpr (LocalMask) {
+        k_block0 = sycl::reduce_over_group(wg, sg_k_block0, sycl::minimum<int>());
+        seq_len = sycl::reduce_over_group(wg, sg_seq_len, sycl::maximum<int>());
       }
-      auto pad_barriers = [&] {
-        for (int i = sg_iters; i < wg_iters; i++) {
-          barrier_arrive(ScopeWorkgroup);
-          barrier_wait(ScopeWorkgroup);
-        }
-      };
-      if (sg_skip) {
-        pad_barriers();
-        continue;
+      if constexpr (CausalMask || LocalMask) {
+        k_blocks = sycl::reduce_over_group(wg, sg_k_blocks, sycl::maximum<int>());
+      }
+      if constexpr (CausalMask) {
+        k_blocks_causal = sycl::reduce_over_group(
+            wg, sg_k_blocks_causal, sycl::minimum<int>());
       }
 
       int offset_q = 0, offset_k = 0, offset_v = 0, offset_o = 0;
@@ -507,29 +487,48 @@ class XeFMHAFwdKernelXe2 {
       int l_coord_kv = is_var_len ? 0
                        : (PagedKV ? 0 : bidx);
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
-      mainloop(
-          Q(_, _, head_q, l_coord_q),
-          K(_, _, head, l_coord_kv),
-          V(_, _, head, l_coord_kv),
-          tArA,
-          tA_max,
-          tA_sum,
-          blk_qv,
-          k_block0,
-          k_blocks,
-          total_blk,
-          thr_id,
-          seq_len,
-          seq_len_qo,
-          effective_seq_kv,
-          idx_b,
-          tile_row_idx,
-          rows_of_maxima,
-          head_q,
-          s.num_heads_q,
-          q_offset_sg,
-          p.cache_seqlens ? p.cache_seqlens[idx_b] : 0);
-      pad_barriers();
+      auto run_mainloop = [&](auto large_surface) {
+        mainloop.template operator()<decltype(large_surface)::value>(
+            Q(_, _, head_q, l_coord_q),
+            K(_, _, head, l_coord_kv),
+            V(_, _, head, l_coord_kv),
+            tArA,
+            tA_max,
+            tA_sum,
+            blk_qv,
+            k_block0,
+            k_blocks,
+            k_blocks_causal,
+            thr_id,
+            seq_len,
+            seq_len_qo,
+            effective_seq_kv,
+            idx_b,
+            tile_row_idx,
+            rows_of_maxima,
+            head_q,
+            s.num_heads_q,
+            q_offset_sg,
+            p.cache_seqlens ? p.cache_seqlens[idx_b] : 0);
+      };
+      if (empty_kv) {
+        clear(tArA);
+        fill(tA_max, cutlass::platform::numeric_limits<
+                         typename FragA::value_type>::lowest());
+        clear(tA_sum);
+        cutlass::fmha::collective::get_LSE_metadata(
+            thr_id, TileShapePV{}, TiledMMAPV{}, rows_of_maxima,
+            tile_row_idx);
+      } else if constexpr (PagedKV) {
+        // The 2D block surface height is a 24-bit field.
+        if (kv_surface_len > (1 << 24)) {
+          run_mainloop(cute::true_type{});
+        } else {
+          run_mainloop(cute::false_type{});
+        }
+      } else {
+        run_mainloop(cute::false_type{});
+      }
 
       if constexpr (
           !is_empty_v<MainloopSharedStorage> &&

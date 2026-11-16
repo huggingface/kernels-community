@@ -208,8 +208,12 @@ class FMHAFwdEpilogue {
 
     // Collapse the deferred per-lane partial row sums into the full row sum,
     // unless the caller already performed the horizontal reduction.
-    auto tA_sum_full =
-        reduce<0, ReduceMode::Horizontal>(tA_sum, sycl::plus<void>{});
+    auto tA_sum_full = [&] {
+      if constexpr (SumIsReduced)
+        return tA_sum;
+      else
+        return reduce<0, ReduceMode::Horizontal>(tA_sum, sycl::plus<void>{});
+    }();
 
     // Reduce k-blocks of A and A_sum across WG, if needed.
     auto [rA, rA_sum, active] = reduce_A(tArA, tA_max, tA_sum_full, thr_id);
