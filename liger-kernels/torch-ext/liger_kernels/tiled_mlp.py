@@ -64,7 +64,8 @@ class LigerTiledMLPFunction:
             # An outer checkpoint can stop before cat consumes the TP outputs.
             # Resolve each tile now so its collective is never abandoned.
             if isinstance(output, collective_tensor_types):
-                output = output.wait()
+                # Keep the wrapper: wait() returns its detached local tensor.
+                output.wait()
             output_shards.append(output)
         return torch.cat(output_shards, dim=-2)
 
