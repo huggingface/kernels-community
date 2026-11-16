@@ -35,6 +35,14 @@ class LigerTiledMLPFunction:
             from torch.distributed.fsdp import FSDPModule
 
             fsdp_modules = [module for module in mlp_module.modules() if isinstance(module, FSDPModule)]
+        if fsdp_modules:
+            for module in fsdp_modules:
+                module.unshard()
+            # An outer checkpoint can re-enter after FSDP skips its input-casting
+            # hooks. Keep the same computation dtype at our checkpoint boundary.
+            parameter = next(mlp_module.parameters(), None)
+            if parameter is not None and parameter.dtype in (torch.float16, torch.bfloat16):
+                x = x.to(parameter.dtype)
 
         @contextmanager
         def recompute_context():
