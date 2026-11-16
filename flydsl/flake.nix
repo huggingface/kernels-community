@@ -1,5 +1,5 @@
 {
-  description = "Flake for the FlyDSL SDK (repackaged upstream wheel)";
+  description = "Flake for the FlyDSL SDK (built from source)";
 
   inputs = {
     kernel-builder.url = "github:huggingface/kernels/gen-sdk-outputs";
@@ -73,17 +73,14 @@
 
           native = pkgs.callPackage ./flydsl.nix { inherit flydslSrc llvm; };
         in
-        {
-          inherit native llvm;
-          kernel = pkgs.callPackage ./sdk.nix {
-            inherit
-              rev
-              variant
-              version
-              native
-              llvm
-              ;
-          };
+        pkgs.callPackage ./sdk.nix {
+          inherit
+            rev
+            variant
+            version
+            native
+            llvm
+            ;
         };
     in
     kernel-builder.lib.genSdkFlakeOutputs {
@@ -99,13 +96,6 @@
       };
 
       tests = ./tests;
-
-      extraPackages =
-        { variantSets, buildSets, ... }:
-        {
-          native = lib.mapAttrs (_: variantSet: variantSet.native) variantSets;
-          inherit (mkShared buildSets) llvm;
-        };
     }
     // {
       formatter = lib.genAttrs systems (
