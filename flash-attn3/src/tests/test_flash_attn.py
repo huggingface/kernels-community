@@ -16,7 +16,12 @@ from einops import rearrange, repeat
 try:
     from flash_attn.layers.rotary import apply_rotary_emb
 except ImportError:
-    apply_rotary_emb = None
+    try:
+        import kernels
+
+        apply_rotary_emb = kernels.get_kernel("kernels-community/flash-attn-ops", version=1).rotary.apply_rotary
+    except Exception:
+        apply_rotary_emb = None
 
 from .padding import pad_input, unpad_input
 from .test_util import (

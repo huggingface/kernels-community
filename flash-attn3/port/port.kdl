@@ -114,6 +114,18 @@ kernelize_imports \
     version=2 \
     changes=4
 
+// The kvcache rotary reference needs fa2's rotary; fall back to the same
+// Triton rotary from flash-attn-ops so those cases are not dropped.
+rewrite in="tests/test_flash_attn.py" changes=1 pattern="except ImportError: apply_rotary_emb = None" with=#"""
+except ImportError:
+    try:
+        import kernels
+
+        apply_rotary_emb = kernels.get_kernel("kernels-community/flash-attn-ops", version=1).rotary.apply_rotary
+    except Exception:
+        apply_rotary_emb = None
+"""#
+
 // Fail on new upstream sources so they get reviewed rather than silently
 // compiled in or dropped.
 expect in="flash-attn/*" files=36
