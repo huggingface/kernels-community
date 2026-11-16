@@ -103,62 +103,6 @@ class LigerTiledSwiGLUMLP(nn.Module):
         )
 
 
-class LigerTiledScaledSwiGLUMLP(nn.Module):
-    """SwiGLU with gate scaling before SiLU and output scaling after down_proj."""
-
-    gate_proj: nn.Linear
-    up_proj: nn.Linear
-    down_proj: nn.Linear
-    gate_multiplier: float
-    down_multiplier: float
-
-    can_torch_compile = True
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        def _mlp_forward(module, x):
-            gate = module.gate_proj(x) * module.gate_multiplier
-            up = module.up_proj(x)
-            return module.down_proj(LigerSiLUMulFunction.apply(gate, up)) * module.down_multiplier
-
-        return apply_tiled_mlp(
-            fn=_mlp_forward,
-            mlp_module=self,
-            x=x,
-            num_shards=getattr(self, "num_shards", None),
-            compute_params=[p for p in self.parameters() if p.requires_grad],
-        )
-
-
-class LigerTiledClampedSwiGLUMLP(nn.Module):
-    """SwiGLU with upper gate clipping and symmetric up clipping before SiLU.
-
-    The module supplies the clipping bound as ``swiglu_limit``.
-    """
-
-    gate_proj: nn.Linear
-    up_proj: nn.Linear
-    down_proj: nn.Linear
-
-    swiglu_limit: float
-
-    can_torch_compile = True
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        def _mlp_forward(module, x):
-            limit = module.swiglu_limit
-            gate = module.gate_proj(x).clamp(max=limit)
-            up = module.up_proj(x).clamp(min=-limit, max=limit)
-            return module.down_proj(LigerSiLUMulFunction.apply(gate, up))
-
-        return apply_tiled_mlp(
-            fn=_mlp_forward,
-            mlp_module=self,
-            x=x,
-            num_shards=getattr(self, "num_shards", None),
-            compute_params=[p for p in self.parameters() if p.requires_grad],
-        )
-
-
 class LigerTiledGEGLUMLP(nn.Module):
     gate_proj: nn.Linear
     up_proj: nn.Linear
@@ -392,8 +336,6 @@ __all__ = [
     "LigerSwiGLUMLP",
     "LigerGEGLUMLP",
     "LigerTiledSwiGLUMLP",
-    "LigerTiledScaledSwiGLUMLP",
-    "LigerTiledClampedSwiGLUMLP",
     "LigerTiledGEGLUMLP",
     "liger_rotary_pos_emb",
     "liger_rotary_pos_emb_layer",

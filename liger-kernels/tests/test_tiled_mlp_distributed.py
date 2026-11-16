@@ -52,49 +52,26 @@ def meshes(distributed):
 
 
 class MLP(nn.Module):
-    def __init__(self, variant="swiglu"):
+    def __init__(self):
         super().__init__()
         self.gate_proj = nn.Linear(16, 32, bias=False)
         self.up_proj = nn.Linear(16, 32, bias=False)
         self.down_proj = nn.Linear(32, 16, bias=False)
-        self.variant = variant
         self.num_shards = 4
-        self.gate_multiplier = 0.8838834764831844
-        self.down_multiplier = 0.5859375
-        self.swiglu_limit = 0.5
 
     def forward(self, x):
-        if self.variant == "swiglu":
-            return liger_kernels.layers.LigerSwiGLUMLP.forward(self, x)
-
-        gate, up = self.gate_proj(x), self.up_proj(x)
-        if self.variant == "scaled":
-            gate = gate * self.gate_multiplier
-        else:
-            gate = gate.clamp(max=self.swiglu_limit)
-            up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
-
-        output = self.down_proj(nn.functional.silu(gate) * up)
-        return output * self.down_multiplier if self.variant == "scaled" else output
+        return liger_kernels.layers.LigerSwiGLUMLP.forward(self, x)
 
 
 class TiledMLP(MLP):
     def forward(self, x):
-        if self.variant == "swiglu":
-            # 6 tokens / 4 requested chunks produces only 3 torch.chunk outputs.
-            return apply_tiled_mlp(
-                liger_kernels.layers.LigerSwiGLUMLP.forward,
-                self,
-                x,
-                num_shards=self.num_shards,
-            )
-
-        adapter = (
-            liger_kernels.layers.LigerTiledScaledSwiGLUMLP
-            if self.variant == "scaled"
-            else liger_kernels.layers.LigerTiledClampedSwiGLUMLP
+        # 6 tokens / 4 requested chunks produces only 3 torch.chunk outputs.
+        return apply_tiled_mlp(
+            liger_kernels.layers.LigerSwiGLUMLP.forward,
+            self,
+            x,
+            num_shards=self.num_shards,
         )
-        return adapter.forward(self, x)
 
 
 @pytest.mark.parametrize(
@@ -103,7 +80,6 @@ class TiledMLP(MLP):
 @pytest.mark.parametrize("outer_checkpoint", [False, True])
 @pytest.mark.parametrize("requires_grad", [False, True])
 @pytest.mark.parametrize("mixed_precision", [False, True], ids=["fp32", "bf16"])
-@pytest.mark.parametrize("variant", ["swiglu", "scaled", "clamped"])
 def test_distributed_tiled_mlp(
     distributed,
     meshes,
@@ -111,7 +87,6 @@ def test_distributed_tiled_mlp(
     outer_checkpoint,
     requires_grad,
     mixed_precision,
-    variant,
 ):
     device = distributed
     pending_collectives = getattr(
@@ -132,8 +107,8 @@ def test_distributed_tiled_mlp(
     mesh = meshes[layout]
 
     torch.manual_seed(0)
-    reference = MLP(variant=variant).to(device)
-    tiled = TiledMLP(variant=variant).to(device)
+    reference = MLP().to(device)
+    tiled = TiledMLP().to(device)
     tiled.load_state_dict(reference.state_dict())
 
     if "tp" in names:
@@ -247,16 +222,15 @@ def test_distributed_tiled_mlp(
 
 @pytest.mark.parametrize("requires_grad", [False, True])
 @pytest.mark.parametrize("outer_checkpoint", [False, True])
-@pytest.mark.parametrize("variant", ["swiglu", "scaled", "clamped"])
-def test_tiled_zero3(distributed, requires_grad, outer_checkpoint, variant):
+def test_tiled_zero3(distributed, requires_grad, outer_checkpoint):
     deepspeed = pytest.importorskip("deepspeed")
     from deepspeed.utils import safe_get_full_grad
 
     device = distributed
 
     torch.manual_seed(0)
-    reference = MLP(variant=variant).to(device)
-    tiled = TiledMLP(variant=variant).to(device)
+    reference = MLP().to(device)
+    tiled = TiledMLP().to(device)
     tiled.load_state_dict(reference.state_dict())
     optimizer_ref = torch.optim.SGD(reference.parameters(), lr=0.01)
 
