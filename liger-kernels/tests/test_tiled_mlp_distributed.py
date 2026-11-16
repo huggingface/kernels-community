@@ -5,7 +5,6 @@ be launched with one rank per node to check cross-node collectives.
 """
 
 import os
-from datetime import timedelta
 
 import pytest
 import torch
@@ -35,20 +34,6 @@ pytestmark = [
         not torch.cuda.is_available(), reason="distributed tests need CUDA or ROCm GPUs"
     ),
 ]
-
-
-@pytest.fixture(scope="module")
-def distributed():
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group("nccl", timeout=timedelta(seconds=120))
-    yield torch.device("cuda", local_rank)
-    dist.destroy_process_group()
-
-
-@pytest.fixture(scope="module")
-def meshes(distributed):
-    return {}
 
 
 class MLP(nn.Module):
