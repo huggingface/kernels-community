@@ -117,3 +117,29 @@ def test_tiled_mlp_layer(activation):
     torch.testing.assert_close(x_tiled.grad, x_ref.grad, atol=1e-5, rtol=1e-5)
     for actual, expected in zip(tiled.parameters(), reference.parameters()):
         torch.testing.assert_close(actual.grad, expected.grad, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.kernels_ci
+def test_tiled_compile_with_frozen_inputs():
+    class TiledLinear(nn.Linear):
+        def forward(self, x):
+            return apply_tiled_mlp(
+                lambda module, tile: nn.functional.linear(tile, module.weight, module.bias),
+                self,
+                x,
+                num_shards=3,
+            )
+
+    torch.manual_seed(0)
+    reference = nn.Linear(8, 12).to(DEVICE)
+    tiled = TiledLinear(8, 12).to(DEVICE)
+    tiled.load_state_dict(reference.state_dict())
+    compiled = torch.compile(tiled, backend="aot_eager", fullgraph=True)
+    x = torch.randn(2, 17, 8, device=DEVICE)
+    expected = reference(x)
+    actual = compiled(x)
+    expected.sum().backward()
+    actual.sum().backward()
+    torch.testing.assert_close(actual, expected)
+    for actual, expected in zip(tiled.parameters(), reference.parameters()):
+        torch.testing.assert_close(actual.grad, expected.grad)

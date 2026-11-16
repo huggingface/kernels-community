@@ -1,4 +1,5 @@
 import math
+from contextlib import contextmanager, nullcontext
 
 from typing import Callable
 from typing import List
@@ -29,8 +30,24 @@ class LigerTiledMLPFunction:
         # Keep compute_params in the public API; autograd discovers the weights
         # used by fn without registering them through a separate parameter list.
         x = x.contiguous()
+        fsdp_modules = []
+        if dist.is_available() and dist.is_initialized():
+            from torch.distributed.fsdp import FSDPModule
+
+            fsdp_modules = [module for module in mlp_module.modules() if isinstance(module, FSDPModule)]
+
+        @contextmanager
+        def recompute_context():
+            # A projection can have been resharded by an earlier tile's backward.
+            # FSDP2 skips its pre-forward unshard during checkpoint recomputation,
+            # so explicitly materialize those parameters for each new tile.
+            for module in fsdp_modules:
+                module.unshard()
+            yield
+
+        checkpoint_kwargs = {"context_fn": lambda: (nullcontext(), recompute_context())} if fsdp_modules else {}
         output_shards = [
-            checkpoint(fn, mlp_module, x_shard, use_reentrant=False)
+            checkpoint(fn, mlp_module, x_shard, use_reentrant=False, **checkpoint_kwargs)
             for x_shard in torch.tensor_split(x, shards, dim=-2)
         ]
         return torch.cat(output_shards, dim=-2)
