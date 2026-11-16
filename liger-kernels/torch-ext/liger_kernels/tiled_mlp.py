@@ -31,8 +31,12 @@ class LigerTiledMLPFunction:
         # used by fn without registering them through a separate parameter list.
         x = x.contiguous()
         fsdp_modules = []
+        collective_tensor_types = ()
         if dist.is_available() and dist.is_initialized():
+            from torch.distributed._functional_collectives import AsyncCollectiveTensor
             from torch.distributed.fsdp import FSDPModule
+
+            collective_tensor_types = (AsyncCollectiveTensor,)
 
             fsdp_modules = [module for module in mlp_module.modules() if isinstance(module, FSDPModule)]
         if fsdp_modules:
@@ -54,10 +58,14 @@ class LigerTiledMLPFunction:
             yield
 
         checkpoint_kwargs = {"context_fn": lambda: (nullcontext(), recompute_context())} if fsdp_modules else {}
-        output_shards = [
-            checkpoint(fn, mlp_module, x_shard, use_reentrant=False, **checkpoint_kwargs)
-            for x_shard in torch.tensor_split(x, shards, dim=-2)
-        ]
+        output_shards = []
+        for x_shard in torch.tensor_split(x, shards, dim=-2):
+            output = checkpoint(fn, mlp_module, x_shard, use_reentrant=False, **checkpoint_kwargs)
+            # An outer checkpoint can stop before cat consumes the TP outputs.
+            # Resolve each tile now so its collective is never abandoned.
+            if isinstance(output, collective_tensor_types):
+                output = output.wait()
+            output_shards.append(output)
         return torch.cat(output_shards, dim=-2)
 
 

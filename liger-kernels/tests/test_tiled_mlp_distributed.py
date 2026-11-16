@@ -60,6 +60,8 @@ class MLP(nn.Module):
 @pytest.mark.parametrize("mixed_precision", [False, True], ids=["fp32", "bf16"])
 def test_distributed_tiled_mlp(distributed, layout, outer_checkpoint, requires_grad, mixed_precision):
     device = distributed
+    pending_collectives = getattr(torch._C._distributed_c10d, "_get_work_registry_size", None)
+    pending_before = pending_collectives() if pending_collectives else None
     world_size = dist.get_world_size()
     if "_" in layout:
         if world_size < 4 or world_size % 2:
@@ -144,6 +146,8 @@ def test_distributed_tiled_mlp(distributed, layout, outer_checkpoint, requires_g
             )
         optimizer_ref.step()
         optimizer_tiled.step()
+    if pending_collectives:
+        assert pending_collectives() == pending_before, "checkpoint recomputation left an unwaited collective"
 
 
 @pytest.mark.parametrize("requires_grad", [False, True])
