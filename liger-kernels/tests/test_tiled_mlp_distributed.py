@@ -134,3 +134,49 @@ def test_distributed_tiled_mlp(distributed, layout, outer_checkpoint, requires_g
             torch.testing.assert_close(actual_grad, expected_param.grad, atol=1e-5, rtol=1e-5, msg=name)
         optimizer_ref.step()
         optimizer_tiled.step()
+
+
+@pytest.mark.parametrize("requires_grad", [False, True])
+@pytest.mark.parametrize("outer_checkpoint", [False, True])
+def test_tiled_zero3(distributed, requires_grad, outer_checkpoint):
+    deepspeed = pytest.importorskip("deepspeed")
+    from deepspeed.utils import safe_get_full_grad
+
+    device = distributed
+    torch.manual_seed(0)
+    reference = MLP(tiled=False).to(device)
+    tiled = copy.deepcopy(reference)
+    tiled.tiled = True
+    optimizer_ref = torch.optim.SGD(reference.parameters(), lr=0.01)
+    engine, _, _, _ = deepspeed.initialize(
+        model=tiled,
+        optimizer=torch.optim.SGD(tiled.parameters(), lr=0.01),
+        config={
+            "train_micro_batch_size_per_gpu": 2,
+            "gradient_accumulation_steps": 1,
+            "zero_allow_untested_optimizer": True,
+            "zero_optimization": {"stage": 3, "stage3_param_persistence_threshold": 0},
+        },
+        dist_init_required=False,
+    )
+    torch.manual_seed(100 + dist.get_rank())
+    x = torch.randn(2, 6 + dist.get_rank() % 2, 16, device=device)
+    for _ in range(2):
+        optimizer_ref.zero_grad(set_to_none=True)
+        x_ref = x.detach().clone().requires_grad_(requires_grad)
+        x_tiled = x.detach().clone().requires_grad_(requires_grad)
+        expected = reference(x_ref)
+        actual = checkpoint(engine, x_tiled, use_reentrant=False) if outer_checkpoint else engine(x_tiled)
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+        expected.square().sum().backward()
+        engine.backward(actual.square().sum())
+        if requires_grad:
+            torch.testing.assert_close(x_tiled.grad, x_ref.grad, atol=1e-5, rtol=1e-5)
+        for (name, expected_param), actual_param in zip(reference.named_parameters(), tiled.parameters()):
+            dist.all_reduce(expected_param.grad)
+            expected_param.grad.div_(dist.get_world_size())
+            actual_grad = safe_get_full_grad(actual_param)
+            assert actual_grad is not None, name
+            torch.testing.assert_close(actual_grad, expected_param.grad, atol=1e-5, rtol=1e-5, msg=name)
+        optimizer_ref.step()
+        engine.step()
