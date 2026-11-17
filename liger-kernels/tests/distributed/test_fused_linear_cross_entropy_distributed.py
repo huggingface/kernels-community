@@ -1,4 +1,8 @@
-"""Run with torchrun on four GPUs to include composed parallel meshes."""
+"""Run with torchrun --standalone --nproc-per-node=2 -m pytest <this file>.
+
+Four ranks also exercise composed two-dimensional meshes. The same tests can
+be launched with one rank per node to check cross-node collectives.
+"""
 
 import os
 
