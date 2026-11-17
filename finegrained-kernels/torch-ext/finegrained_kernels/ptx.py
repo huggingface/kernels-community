@@ -50,22 +50,23 @@ def int4_nibbles_to_16bit_lanes(w, EXPONENT: tl.constexpr):
 @triton.jit
 def add_x2(a, b, FP16: tl.constexpr):
     """``a + b`` per 16-bit lane, bf16x2 (``FP16``: f16x2), as ``fma(a, 1, b)``: exact when the sum is
-    representable, as it is for the offset-lifted integers it subtracts zero points from."""
+    representable, as it is for the offset-lifted integers it subtracts zero points from. ``b`` is one 16-bit value
+    the asm copies into both lanes (a ``mov`` the half-selecting FMA absorbs, not an integer multiply per word)."""
     return tl.inline_asm_elementwise(
-        "{ .reg .b32 one; mov.b32 one, 0x3C003C00; fma.rn.f16x2 $0, $1, one, $2; }" if FP16
-        else "{ .reg .b32 one; mov.b32 one, 0x3F803F80; fma.rn.bf16x2 $0, $1, one, $2; }",
-        "=r,r,r", [a, b], dtype=tl.uint32, is_pure=True, pack=1,
+        "{ .reg .b32 one, b2; mov.b32 one, 0x3C003C00; mov.b32 b2, {$2, $2}; fma.rn.f16x2 $0, $1, one, b2; }" if FP16
+        else "{ .reg .b32 one, b2; mov.b32 one, 0x3F803F80; mov.b32 b2, {$2, $2}; fma.rn.bf16x2 $0, $1, one, b2; }",
+        "=r,r,h", [a, b], dtype=tl.uint32, is_pure=True, pack=1,
     )
 
 
 @triton.jit
 def add_mul_x2(a, b, c, FP16: tl.constexpr):
     """``(a + b) * c`` per 16-bit lane, bf16x2 (``FP16``: f16x2): the exact ``add_x2`` then one rounding of the product
-    (``mul.rn.bf16x2`` lowers from sm_90)."""
+    (``mul.rn.bf16x2`` lowers from sm_90). ``b`` and ``c`` are 16-bit values copied into both lanes, as in ``add_x2``."""
     return tl.inline_asm_elementwise(
-        "{ .reg .b32 one, d; mov.b32 one, 0x3C003C00; fma.rn.f16x2 d, $1, one, $2; mul.rn.f16x2 $0, d, $3; }" if FP16
-        else "{ .reg .b32 one, d; mov.b32 one, 0x3F803F80; fma.rn.bf16x2 d, $1, one, $2; mul.rn.bf16x2 $0, d, $3; }",
-        "=r,r,r,r", [a, b, c], dtype=tl.uint32, is_pure=True, pack=1,
+        "{ .reg .b32 one, d, b2, c2; mov.b32 one, 0x3C003C00; mov.b32 b2, {$2, $2}; mov.b32 c2, {$3, $3}; fma.rn.f16x2 d, $1, one, b2; mul.rn.f16x2 $0, d, c2; }" if FP16
+        else "{ .reg .b32 one, d, b2, c2; mov.b32 one, 0x3F803F80; mov.b32 b2, {$2, $2}; mov.b32 c2, {$3, $3}; fma.rn.bf16x2 d, $1, one, b2; mul.rn.bf16x2 $0, d, c2; }",
+        "=r,r,h,h", [a, b, c], dtype=tl.uint32, is_pure=True, pack=1,
     )
 
 

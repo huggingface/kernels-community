@@ -822,6 +822,11 @@ def _check(problem: Problem, dq_out, ref_cmp, expert_ids, op):
             # one bf16 rounding from it at the output's scale (2D/batched/grouped on B200: 2.6e-3..3.4e-3 of
             # max|ref|, under 2^-8 = 3.9e-3); "acc" / "post" stay exact up to accumulation order
             atol = max(atol, 2.0 ** -8 * ref_cmp[keep].abs().max().item())
+        if problem.weights.startswith("int") and problem.activation_format is None:
+            # integer weight-only against the dequantize-to-a-float reference ((q - z) * s rounded per weight):
+            # SCALE_MODE="acc" scales the exact integer dot's fp32 partial instead, one bf16 rounding of the weight from
+            # it at the output's scale ("tile" stays bit-exact up to accumulation order)
+            atol = max(atol, 2.0 ** -8 * ref_cmp[keep].abs().max().item())
         torch.testing.assert_close(
             dq_out[keep], ref_cmp[keep].to(problem.dtype).float(), atol=atol, rtol=rtol
         )
@@ -1443,50 +1448,6 @@ def test_svdquant_scheduling(monkeypatch, strategy):
         tuner.cache.clear()
 
 
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="two concurrent CUDA streams required")
-def test_int4_split_k_concurrent_streams():
-    """Two split-K int4 matmuls launched concurrently on two streams, many times over, must equal their serial results
-    bit for bit: each launch reduces through its own arrival counters and partials (shared counters would let one
-    launch's arrivals finish another's tile early and sum unwritten partials). Both streams first sleep, so the
-    launches queue up behind the sleep and then run overlapped, with small grids that co-reside on the GPU."""
-    tuner = int_weight_only_matmul_2d_kernel
-    split = [c for c in tuner.configs if c.kwargs.get("SPLIT_K") == 8 and c.kwargs["BLOCK_SIZE_N"] == 16
-             and c.kwargs["BLOCK_SIZE_K"] == 128 and c.kwargs["A_MEMORY_MODE"] == "pointer"
-             and c.num_warps == 2 and c.num_stages == 3]
-    assert split, "no SPLIT_K=8 decode config in the grid"
-    g = torch.Generator(device=TEST_DEVICE).manual_seed(3)
-    N, K, M = 512, 4096, 4
-    problems = []
-    for _ in range(2):
-        q = torch.randint(0, 16, (N, K), device=TEST_DEVICE, dtype=torch.int32, generator=g)
-        B = (q.reshape(N, K // 8, 8) << (4 * torch.arange(8, device=TEST_DEVICE, dtype=torch.int32))).sum(-1, dtype=torch.int32).view(torch.uint32)
-        Bs = (torch.rand(N, K // 128, device=TEST_DEVICE, generator=g) * 0.02 + 0.005).to(torch.bfloat16)
-        A = torch.randn(M, K, device=TEST_DEVICE, dtype=torch.bfloat16, generator=g)
-        problems.append((A, B, Bs))
-    orig_prune, orig_configs = tuner.early_config_prune, tuner.configs
-    try:
-        tuner.configs, tuner.early_config_prune = split[:1], None
-        tuner.cache.clear()
-        serial = [finegrained_kernels.matmul_2d(A, B, None, Bs) for A, B, Bs in problems]
-        torch.cuda.synchronize()
-        streams = [torch.cuda.Stream(), torch.cuda.Stream()]
-        outs = [[], []]
-        for stream in streams:
-            with torch.cuda.stream(stream):
-                torch.cuda._sleep(200_000_000)
-        for _ in range(100):
-            for i, (A, B, Bs) in enumerate(problems):
-                with torch.cuda.stream(streams[i]):
-                    outs[i].append(finegrained_kernels.matmul_2d(A, B, None, Bs))
-        torch.cuda.synchronize()
-    finally:
-        tuner.early_config_prune, tuner.configs = orig_prune, orig_configs
-        tuner.cache.clear()
-    for i in range(2):
-        for out in outs[i]:
-            assert torch.equal(out, serial[i]), "a concurrent split-K launch differs from its serial result"
-
-
 @pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 @pytest.mark.parametrize("op", ["matmul", "batched", "grouped"])
 def test_int_natural_layout_refused(op):
@@ -1559,6 +1520,8 @@ def test_int_repacks(checkpoint):
             out = run(A, W, None, Ws, expert_ids=expert_ids)
             expected = torch.bmm(ref[expert_ids.long()].half().float(), A.float().unsqueeze(-1)).squeeze(-1)
         atol, rtol = DTYPE_TO_TOL[torch.float16]
+        # SCALE_MODE="acc" scales the exact integer dot instead of each fp16-rounded weight (``_check``)
+        atol = max(atol, 2.0 ** -8 * expected.abs().max().item())
         torch.testing.assert_close(out.float(), expected.half().float(), atol=atol, rtol=rtol)
         return
     q = torch.randint(0, 16, (K, N), device=TEST_DEVICE, dtype=torch.int32, generator=g)

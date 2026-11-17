@@ -325,7 +325,7 @@ How operands and scales are read.
 
 #### Compute
 
-How much of the MMA each tile uses. *Scale off weight tile*: a coarse weight scale lands on the K step's partial, the activation tile or the output instead of every decoded weight value (the FP8 weight-only `SCALE_MODE` axis; the W8A8 recipes always scale the partial or the output).
+How much of the MMA each tile uses. *Scale off weight tile*: a coarse weight scale lands on the K step's partial, the activation tile or the output instead of every decoded weight value (the FP8 and integer weight-only `SCALE_MODE` axes; the W8A8 recipes always scale the partial or the output).
 
 | Family | Kernel | native scaled MMA | swap-AB decode | scalar GEMV | split-K | tile pipeline | weight on MMA lhs | cuBLAS route | scale off weight tile |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -335,7 +335,7 @@ How much of the MMA each tile uses. *Scale off weight tile*: a coarse weight sca
 | 2D | MXFP8 / MXFP4 / NVFP4 | 🟠 | 🟠 | 🟠 | 🟢 | 🟢 | ⚪ | 🟠 | ⚪ |
 | 2D | MX weight-only (W4A16 / W8A16) | 🟠 | 🔴 | 🔴 | 🔴 | ⚪ | 🟢 | 🔴 | ⚪ |
 | 2D | FP8 weight-only | ⚪ | 🟠 | 🔴 | ⚪† | ⚪ | 🔴 | 🟠 | 🟠 |
-| 2D | INT2/4/8 (GPTQ, AWQ, SmoothQuant) | ⚪ | 🟠 | 🟠 | 🟠 | ⚪ | 🔴 | 🟠 | ⚪ |
+| 2D | INT2/4/8 (GPTQ, AWQ, SmoothQuant) | ⚪ | 🟠 | 🟠 | 🟠 | ⚪ | 🔴 | 🟠 | 🟠 |
 | 2D | BF16 / FP16 | ⚪ | 🟠 | ⚪ | ⚪ | ⚪ | ⚪ | 🟠 | ⚪ |
 | batched | block FP8 (dynamic act) | 🔴 | 🟠 | 🔴 | ⚪† | ⚪ | ⚪ | ⚪ | 🟢* |
 | batched | block FP8 (static act) | ⚪ | 🟠 | 🔴 | ⚪† | ⚪ | ⚪ | ⚪ | 🟢* |
@@ -343,7 +343,7 @@ How much of the MMA each tile uses. *Scale off weight tile*: a coarse weight sca
 | batched | MXFP8 / MXFP4 / NVFP4 | 🟠 | 🟠 | 🟢 | ⚪† | ⚪ | ⚪ | ⚪ | ⚪ |
 | batched | MX weight-only (W4A16 / W8A16) | 🟠 | 🟠 | 🟢 | 🔴 | ⚪ | ⚪ | ⚪ | ⚪ |
 | batched | FP8 weight-only | ⚪ | 🟢 | 🔴 | ⚪ | ⚪ | ⚪ | ⚪ | 🟠 |
-| batched | INT2/4/8 (GPTQ, AWQ, SmoothQuant) | ⚪ | 🟠 | 🟢 | ⚪† | ⚪ | ⚪ | ⚪ | ⚪ |
+| batched | INT2/4/8 (GPTQ, AWQ, SmoothQuant) | ⚪ | 🟠 | 🟢 | ⚪† | ⚪ | ⚪ | ⚪ | 🟠 |
 | batched | BF16 / FP16 | ⚪ | 🟢 | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
 | grouped | block FP8 (dynamic act) | 🟠 | 🟢 | ⚪ | ⚪ | 🟢 | ⚪ | ⚪ | 🟢* |
 | grouped | block FP8 (static act) | ⚪ | ⚪ | ⚪ | ⚪ | 🟢 | ⚪ | ⚪ | 🟢* |
@@ -351,7 +351,7 @@ How much of the MMA each tile uses. *Scale off weight tile*: a coarse weight sca
 | grouped | MXFP8 / MXFP4 / NVFP4 | 🟠 | ⚪ | ⚪ | ⚪ | 🟢 | 🟢 | 🔴 | ⚪ |
 | grouped | MX weight-only (W4A16 / W8A16) | 🟠 | ⚪ | 🟠 | ⚪ | 🟢 | 🟢 | ⚪ | ⚪ |
 | grouped | FP8 weight-only | ⚪ | 🟢 | ⚪ | ⚪ | 🟢 | 🟢 | ⚪ | 🟠 |
-| grouped | INT2/4/8 (GPTQ, AWQ, SmoothQuant) | ⚪ | ⚪ | 🟠 | ⚪ | 🟢 | 🟢 | ⚪ | ⚪ |
+| grouped | INT2/4/8 (GPTQ, AWQ, SmoothQuant) | ⚪ | ⚪ | 🟠 | ⚪ | 🟢 | 🟢 | ⚪ | 🟠 |
 | grouped | BF16 / FP16 | ⚪ | ⚪ | ⚪ | ⚪ | 🟢 | ⚪ | ⚪ | ⚪ |
 
 #### Fusion

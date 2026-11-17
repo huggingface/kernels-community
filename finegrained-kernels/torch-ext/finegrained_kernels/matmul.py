@@ -27,7 +27,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from .bayesian_autotuner import bayesian_autotune
 from .path_autotuner import path_autotune
 from ._ops import add_op_namespace_prefix
-from .compat import FP8_DTYPE, is_sm10x, launches_skipped, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, pdl_launch_kwargs, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, narrow_dot_autotuning_configs, narrow_scalar_autotuning_configs, split_k_autotuning_configs, persistent_program_count, pipeline_autotuning_configs, block_fp8_scale_mode_configs, FP8_MAX, is_triton_greater_or_equal
+from .compat import FP8_DTYPE, is_sm10x, launches_skipped, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, pdl_launch_kwargs, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, narrow_dot_autotuning_configs, narrow_scalar_autotuning_configs, split_k_autotuning_configs, persistent_program_count, pipeline_autotuning_configs, block_fp8_scale_mode_configs, int_scale_mode_configs, FP8_MAX, is_triton_greater_or_equal
 from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_tiled_descriptors, rebind_weight_only_descriptors, weight_descriptor
 from .formats import block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, normalize_global_scale, e2m1_as_uint8, is_mx, is_rowwise, mx_scale_family, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_2d_operands, weight_format, validate_int_operands, validate_svdquant_operands, INT_WEIGHT_DTYPES
 from .bench import gemm_cold_banks
@@ -1199,7 +1199,7 @@ def split_k_reduce(acc, Partials, TileCounters, tile, num_tiles, BM: tl.constexp
 @bayesian_autotune(
     # the MX weight-only kernel's tuning space minus dot_scaled (the scaled MMA takes float formats only): tile + WS +
     # host-TMA memory modes on both operands, scales affine; plus the decode-sized scalar reduce's narrow tiles
-    get_accelerator_autotuning_configs(
+    int_scale_mode_configs(get_accelerator_autotuning_configs(
         group_sizes_m=DENSE_GROUP_SIZES_M,
         tune_block_nk=True,
         tune_block_m=True,
@@ -1220,7 +1220,7 @@ def split_k_reduce(acc, Partials, TileCounters, tile, num_tiles, BM: tl.constexp
         block_ms=(16, 32, 64, 128), block_ns=(64, 128), pre_hook=rebind_weight_only_descriptors, WARP_SPEC=False,
         SWAP_AB=True,
     )
-    + narrow_scalar_autotuning_configs(block_ms=(1, 2, 4)),
+    + narrow_scalar_autotuning_configs(block_ms=(1, 2, 4))),
     # the width and the scale group decide which tiles fit and compile: part of the key
     ["N", "K", "m_bit_length", "GATE", "INT_BITS", "SCALE_GROUP_K", "ACT_QUANT"],
     n_trials=100,
@@ -1283,6 +1283,7 @@ def int_weight_only_matmul_2d_kernel(
     A_MEMORY_MODE: tl.constexpr = "pointer",
     B_MEMORY_MODE: tl.constexpr = "pointer",
     COMPUTE_MODE: tl.constexpr = "dot",
+    SCALE_MODE: tl.constexpr = "tile",  # where the group scale lands (int_weight_only_compute)
     SWAP_AB: tl.constexpr = False,
     WARP_SPEC: tl.constexpr = False,
     GATE: tl.constexpr = False,
@@ -1393,6 +1394,7 @@ def int_weight_only_matmul_2d_kernel(
         accumulator = int_weight_only_compute(
             accumulator, a, b, b_s, b_z, BLOCK_SIZE_K, n_width, SCALE_GROUP_K, COMPUTE_MODE, ROWS_MAJOR,
             INT_BITS, SWAP_AB, weight_global=None if BsGlobal is None else tl.load(BsGlobal), K_SLICES=K_SLICES,
+            SCALE_MODE=SCALE_MODE,
         )
         a_ptrs += BLOCK_SIZE_K * stride_a_k
         b_ptrs += (BLOCK_SIZE_K // VPW) * stride_b_k

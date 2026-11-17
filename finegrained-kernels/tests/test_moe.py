@@ -469,12 +469,21 @@ def _common_kwargs(problem: MoEProblem, hidden, top_k_index, gate_up, gate_up_s,
     return kwargs
 
 
+def _fused_tolerance(problem: MoEProblem, ref):
+    """``assert_close`` tolerances between two of our launches (or one against the unfused reference). Integer
+    weight-only launches tune independently and can place the group scale differently (SCALE_MODE "tile" rounds each
+    dequantized weight, "acc" scales the exact integer dot), one weight rounding apart at the output's scale."""
+    atol, rtol = DTYPE_TO_TOL[problem.dtype]
+    if problem.weights in INT_BITS and problem.activation_format in (None, "bf16"):
+        atol = max(atol, 2.0 ** -8 * ref.float().abs().max().item())
+    return dict(atol=atol, rtol=rtol)
+
+
 def _assert_fused_correctness(out, ref, problem: MoEProblem):
     """Shape, dtype, and value checks against the unfused reference."""
     assert out.shape == (problem.num_tokens, problem.hidden_dim)
     assert out.dtype == problem.dtype
-    atol, rtol = DTYPE_TO_TOL[problem.dtype]
-    torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
+    torch.testing.assert_close(out, ref, **_fused_tolerance(problem, ref))
 
 
 def _fused_scales(problem: MoEProblem, gate_up_s, down_s):
@@ -703,8 +712,7 @@ def _run_compiled_across_shapes(fused_fn, weights):
         ref = fused_fn(
             hidden, top_k_index, top_k_weights, gate_up, down, gate_up_s, down_s, **kw
         )
-        atol, rtol = DTYPE_TO_TOL[problem.dtype]
-        torch.testing.assert_close(out, ref, atol=atol, rtol=rtol, msg=problem.id)
+        torch.testing.assert_close(out, ref, **_fused_tolerance(problem, ref), msg=problem.id)
 
 
 @pytest.mark.kernels_ci

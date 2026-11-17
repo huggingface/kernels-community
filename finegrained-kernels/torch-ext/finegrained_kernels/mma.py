@@ -314,8 +314,8 @@ def int8_words_to_bf16(w, K_MAJOR: tl.constexpr):
 @triton.jit
 def int_scale_words(w_scale, WORDS_PER_GROUP: tl.constexpr, K_MAJOR: tl.constexpr):
     """``[R, G]`` bf16/fp16 group scales to ``int_words_to_offset``'s ``[R, G * WORDS_PER_GROUP]`` scale words (``K_MAJOR``:
-    ``[G, R]`` to ``[G * WORDS_PER_GROUP, R]``), the scale in both 16-bit lanes."""
-    lane = w_scale.to(tl.uint16, bitcast=True).to(tl.uint32) * 0x00010001
+    ``[G, R]`` to ``[G * WORDS_PER_GROUP, R]``), the 16-bit scale ``add_mul_x2`` copies into both lanes."""
+    lane = w_scale.to(tl.uint16, bitcast=True)
     if K_MAJOR:
         G: tl.constexpr = w_scale.shape[0]
         R: tl.constexpr = w_scale.shape[1]
@@ -330,11 +330,11 @@ def int_scale_words(w_scale, WORDS_PER_GROUP: tl.constexpr, K_MAJOR: tl.constexp
 @triton.jit
 def int_zero_words(w_zero, WORDS_PER_GROUP: tl.constexpr, BITS: tl.constexpr, K_MAJOR: tl.constexpr, FP16: tl.constexpr = False):
     """``[R, G]`` per-group zero points to ``int_words_to_offset``'s ``[R, G * WORDS_PER_GROUP]`` zero words
-    (``K_MAJOR``: ``[G, R]`` to ``[G * WORDS_PER_GROUP, R]``): CUDA, the packed float ``-(OFFSET + z)`` pair (bf16
-    ``0xC300 | z``, fp16 ``0xE400 | z``); elsewhere the lift ``2 ** BITS - z`` in both lanes."""
+    (``K_MAJOR``: ``[G, R]`` to ``[G * WORDS_PER_GROUP, R]``): CUDA, the 16-bit float ``-(OFFSET + z)`` that ``add_x2``
+    copies into both lanes (bf16 ``0xC300 | z``, fp16 ``0xE400 | z``); elsewhere the lift ``2 ** BITS - z`` in both lanes."""
     z = w_zero.to(tl.uint32)
     if _PTX:
-        lane = (z | (0xC300 if BITS < 8 and not FP16 else 0xE400)) * 0x00010001
+        lane = (z | (0xC300 if BITS < 8 and not FP16 else 0xE400)).to(tl.uint16)
     else:
         lane = ((1 << BITS) - z) * 0x00010001
     if K_MAJOR:
@@ -354,9 +354,11 @@ def int_dequant(q, zero, scale, OUT_DTYPE: tl.constexpr, divisor=None):
     reference (compressed-tensors' ``_dequantize``, what transformers and Marlin users compare against), bit for bit.
     ``q`` holds ``q - z`` plus a constant offset and ``zero`` (a scalar) that offset, both exact in ``q``'s dtype;
     their difference is exact in every float dtype, and a bf16/fp16 scale's product with it is exact in fp32, so its
-    one rounding is the reference's."""
-    qz = (q - zero).to(scale.dtype)
-    value = qz * scale
+    one rounding is the reference's. ``scale`` ``None``: the exact ``q - z``, for a scale applied to the accumulator."""
+    if scale is None:
+        value = q - zero
+    else:
+        value = (q - zero).to(scale.dtype) * scale
     if divisor is not None:
         # ModelOpt's second sequential quantizer rounds the reconstructed INT4 weight to E4M3.
         value = tl.clamp(value.to(tl.float32) / divisor, -448.0, 448.0)
@@ -532,11 +534,24 @@ def int_dequant_tile(
     ``[N, BK // VPW]`` (``ROWS_MAJOR``) or K-major ``[BK // VPW, N]`` (VPW = ``32 // BITS`` values per word),
     dequantized (``int_dequant``) into the K-major ``[BK, N]`` MMA rhs. The tile spans ``BK // SCALE_GROUP_K`` whole
     groups: ``w_scale`` and ``w_zero`` (``None``: symmetric, zero point ``2 ** (BITS - 1)``) are
-    ``[N, BK // SCALE_GROUP_K]``. Rows-major INT4 into E4M3 takes the table lookup (``int4_e4m3_tile``)."""
+    ``[N, BK // SCALE_GROUP_K]``; ``w_scale`` ``None`` leaves the exact ``q - z`` for the accumulator to scale. Rows-major INT4 into E4M3 takes the table lookup (``int4_e4m3_tile``)."""
     if _PTX and BITS == 4 and OUT_DTYPE == tl.float8e4nv and ROWS_MAJOR:
         out = int4_e4m3_tile(w, w_scale, w_zero, ROWS_MAJOR, SCALE_GROUP_K, divisor)
     else:
         out = int_offset_dequant_tile(w, w_scale, w_zero, ROWS_MAJOR, SCALE_GROUP_K, BITS, OUT_DTYPE, WHOLE_WORD, divisor)
+    return out
+
+
+@triton.jit
+def _group_scale(w_scale, K_MAJOR: tl.constexpr):
+    """``[N, G]`` group scales broadcast over their group's K values (``[N, G, 1]``, ``K_MAJOR``: ``[G, 1, N]``);
+    ``None`` stays ``None``."""
+    if w_scale is None:
+        out = None
+    elif K_MAJOR:
+        out = tl.trans(w_scale)[:, None, :]
+    else:
+        out = w_scale[:, :, None]
     return out
 
 
@@ -548,7 +563,9 @@ def int_offset_dequant_tile(
     """``int_dequant_tile`` by arithmetic: the values ``int_words_to_offset`` lifts under a float exponent, then
     ``int_dequant`` per value."""
     VPW: tl.constexpr = 32 // BITS
-    FP16: tl.constexpr = w_scale.dtype == tl.float16
+    # the 16-bit float the integers are lifted into: the scale's, or the output's when the accumulator takes the scale
+    LIFT_DTYPE: tl.constexpr = OUT_DTYPE if w_scale is None else w_scale.dtype
+    FP16: tl.constexpr = LIFT_DTYPE == tl.float16
     OFFSET: tl.constexpr = 128.0 if BITS < 8 and not FP16 else 1024.0  # int_words_to_offset
     # what int_words_to_offset leaves on top of q - z
     if w_zero is None:
@@ -560,32 +577,32 @@ def int_offset_dequant_tile(
     WPG: tl.constexpr = SCALE_GROUP_K // VPW  # words per scale group
     # a zero-point tile already in the scale's dtype takes its scale inside int_words_to_offset's packed asm
     PACKED_SCALE: tl.constexpr = (_PTX and w_zero is not None and divisor is None and BITS < 8
-                                  and OUT_DTYPE == w_scale.dtype)
+                                  and OUT_DTYPE == LIFT_DTYPE and w_scale is not None)
     if ROWS_MAJOR:
         N: tl.constexpr = w.shape[0]
         BK: tl.constexpr = VPW * w.shape[1]
         NG: tl.constexpr = BK // SCALE_GROUP_K
-        if SM10X and BITS == 8 and w_scale.dtype == tl.bfloat16:
+        if SM10X and BITS == 8 and LIFT_DTYPE == tl.bfloat16:
             q = int8_words_to_bf16(w, False).reshape(N, NG, SCALE_GROUP_K)
             center = 0 if w_zero is None else (w_zero.to(tl.bfloat16) - 128)[:, :, None]
-            v = int_dequant(q, center, w_scale[:, :, None], OUT_DTYPE, divisor)
+            v = int_dequant(q, center, _group_scale(w_scale, False), OUT_DTYPE, divisor)
         else:
             zero_words = None if w_zero is None else int_zero_words(w_zero, WPG, BITS, False, FP16)
             if PACKED_SCALE:
                 v = int_words_to_offset(w, zero_words, BITS, False, WHOLE_WORD, FP16, int_scale_words(w_scale, WPG, False))
             else:
                 q = int_words_to_offset(w, zero_words, BITS, False, WHOLE_WORD, FP16).reshape(N, NG, SCALE_GROUP_K)
-                v = int_dequant(q, ZERO, w_scale[:, :, None], OUT_DTYPE, divisor)
+                v = int_dequant(q, ZERO, _group_scale(w_scale, False), OUT_DTYPE, divisor)
 
         out = tl.trans(v.reshape(N, BK))
     else:
         BK: tl.constexpr = VPW * w.shape[0]
         N: tl.constexpr = w.shape[1]
         NG: tl.constexpr = BK // SCALE_GROUP_K
-        if SM10X and BITS == 8 and w_scale.dtype == tl.bfloat16:
+        if SM10X and BITS == 8 and LIFT_DTYPE == tl.bfloat16:
             q = int8_words_to_bf16(w, True).reshape(NG, SCALE_GROUP_K, N)
             center = 0 if w_zero is None else (tl.trans(w_zero).to(tl.bfloat16) - 128)[:, None, :]
-            v = int_dequant(q, center, tl.trans(w_scale)[:, None, :], OUT_DTYPE, divisor)
+            v = int_dequant(q, center, _group_scale(w_scale, True), OUT_DTYPE, divisor)
         else:
             zero_words = None if w_zero is None else int_zero_words(tl.trans(w_zero), WPG, BITS, True, FP16)
             if PACKED_SCALE:
@@ -593,7 +610,7 @@ def int_offset_dequant_tile(
                                         int_scale_words(tl.trans(w_scale), WPG, True))
             else:
                 q = int_words_to_offset(w, zero_words, BITS, True, WHOLE_WORD, FP16).reshape(NG, SCALE_GROUP_K, N)
-                v = int_dequant(q, ZERO, tl.trans(w_scale)[:, None, :], OUT_DTYPE, divisor)
+                v = int_dequant(q, ZERO, _group_scale(w_scale, True), OUT_DTYPE, divisor)
         out = v.reshape(BK, N)
     return out
 
@@ -754,9 +771,14 @@ def int_weight_only_compute(
     SWAP_AB: tl.constexpr = False,
     weight_global=None,
     K_SLICES: tl.constexpr = 1,
+    SCALE_MODE: tl.constexpr = "tile",
 ):
     """Integer-weight GEMM step: dequantize a ``BITS``-wide tile to the activation dtype (``int_dequant``),
     then accumulate with the MMA (``"dot"``) or the small-token CUDA-core reduce (``"scalar"``).
+    ``SCALE_MODE`` places the group scale on the MMA path: ``"tile"`` on every decoded weight (the dequantize-to-a-float
+    reference, bit for bit); ``"acc"``, for a tile inside one scale group (``int_scale_group_tile_pruner``), on the
+    step's fp32 partial: the decoded tile holds exact integers and drops the replicated scale, whose registers capped
+    the occupancy of the wide decode tiles, and the scale rounds once per tile instead of once per weight.
     Floating operands accumulate in FP32; SmoothQuant keeps its signed integer dot in INT32 until the epilogue.
     ``ROWS_MAJOR`` is the weight tile's orientation (``int_dequant_tile``); the scalar arm's is always
     output-rows-major. ``SWAP_AB`` puts token rows on the MMA's N axis; keep that accumulator orientation
@@ -783,10 +805,16 @@ def int_weight_only_compute(
             # below the tcgen05 M the fp8 dot is a 16-bit mma.sync: hand it fp16 operands (exact E4M3 values)
             rhs = int4_e4m3_tile(w, w_scale, w_zero, ROWS_MAJOR, TILE_GROUP, weight_global, F16=True)
             a = a.to(tl.float16)
+        elif SCALE_MODE == "acc":
+            rhs = int_dequant_tile(w, None, w_zero, ROWS_MAJOR, TILE_GROUP, BITS, a.dtype, WHOLE_WORD)
         else:
             rhs = int_dequant_tile(w, w_scale, w_zero, ROWS_MAJOR, TILE_GROUP, BITS, a.dtype, WHOLE_WORD, weight_global)
         DOT_DTYPE: tl.constexpr = tl.int32 if a.dtype == tl.int8 else tl.float32
-        if SWAP_AB:
+        if SCALE_MODE == "acc" and SWAP_AB:
+            acc += tl.dot(tl.trans(rhs), tl.trans(a), out_dtype=tl.float32) * w_scale.to(tl.float32)
+        elif SCALE_MODE == "acc":
+            acc += plain_dot(tl.zeros(acc.shape, tl.float32), a, rhs, False, K_SLICES) * tl.trans(w_scale).to(tl.float32)
+        elif SWAP_AB:
             # Put the token rows on the MMA's smaller N axis (8 lanes instead of 16).
             acc = tl.dot(tl.trans(rhs), tl.trans(a), acc, out_dtype=DOT_DTYPE)
         else:

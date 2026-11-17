@@ -616,6 +616,28 @@ def pipeline_autotuning_configs(configs, pipelines, *, num_warps=None):
     ]
 
 
+def int_scale_mode_configs(configs):
+    """Cross the integer weight-only ``SCALE_MODE`` axis into a kernel's configs: every tile keeps ``"tile"``; ``"acc"``
+    goes onto the decode tiles' MMA configs (BM <= 32), where the replicated scale's registers capped occupancy (B200,
+    Qwen3-30B-A3B INT4 grouped T=64, BM16 BN128 BK128: 237-255 -> 93-178 registers, MoE 108-110 -> 104-106 us
+    symmetric, 125 -> 118 us with zero points); prefill tiles accumulate in tensor memory, where a second accumulator
+    costs a round trip per K step (and BM128 x BN256 runs out of registers). ``int_scale_group_tile_pruner`` admits
+    ``"acc"`` only where one scale group spans the K tile."""
+    return [
+        triton.Config(
+            dict(config.kwargs, SCALE_MODE=mode),
+            num_warps=config.num_warps,
+            num_stages=config.num_stages,
+            num_ctas=config.num_ctas,
+            maxnreg=config.maxnreg,
+            pre_hook=config.pre_hook,
+        )
+        for config in configs
+        for mode in ("tile", "acc")
+        if mode == "tile" or (config.kwargs.get("COMPUTE_MODE", "dot") == "dot" and config.kwargs["BLOCK_SIZE_M"] <= 32)
+    ]
+
+
 def block_fp8_scale_mode_configs(configs):
     """Cross the FP8 weight-only ``SCALE_MODE`` axis into a kernel's configs: every tile keeps ``"tile"``; ``"acc"`` and
     ``"act"`` go only onto the decode tiles where they measured a win (B200, 2D N=8192 K=6144 block-128: acc M=1 13.0 ->

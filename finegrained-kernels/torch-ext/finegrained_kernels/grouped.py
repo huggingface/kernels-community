@@ -25,7 +25,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from .bayesian_autotuner import bayesian_autotune
 from .path_autotuner import path_autotune
 from ._ops import add_op_namespace_prefix
-from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, persistent_program_count, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, pipeline_autotuning_configs, persistent_programs_per_sm, is_sm10x, block_fp8_scale_mode_configs, narrow_scalar_autotuning_configs, is_triton_greater_or_equal
+from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, persistent_program_count, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, pipeline_autotuning_configs, persistent_programs_per_sm, is_sm10x, block_fp8_scale_mode_configs, int_scale_mode_configs, narrow_scalar_autotuning_configs, is_triton_greater_or_equal
 from .bench import gemm_cold_banks
 from .descriptors import build_grouped_operand_descriptors, rebind_grouped_descriptors, rebind_grouped_mx_descriptors
 from .formats import WEIGHT_ONLY_STAGE_MIN_ROWS, block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, row_scale_stride, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, validate_int_operands, INT_WEIGHT_DTYPES
@@ -1388,7 +1388,7 @@ def _int_grouped_configs():
     )
     for config in scalar:
         config.pre_hook = grouped_pre_hook
-    return configs + scalar
+    return int_scale_mode_configs(configs) + scalar
 
 
 @bayesian_autotune(
@@ -1478,6 +1478,7 @@ def int_weight_only_matmul_grouped_kernel(
     # "scalar": the CUDA-core reduce over 1-4 row tiles and 8-32 weight rows (the batched kernel's decode arm), for
     # experts holding a row or two, where an MMA tile is mostly padding and the decode grid too coarse
     COMPUTE_MODE: tl.constexpr = "dot",
+    SCALE_MODE: tl.constexpr = "tile",  # where the group scale lands (int_weight_only_compute)
 ):
     """Integer grouped expert matmul: bf16/fp16 weight-only, calibrated INT4/FP8, or INT8 SmoothQuant.
     Persistent grid-stride; pointer or host-TMA operands, affine scales.
@@ -1570,6 +1571,7 @@ def int_weight_only_matmul_grouped_kernel(
             acc = int_weight_only_compute(
                 acc, a, w, w_s, w_z, BLOCK_SIZE_K, n_width, SCALE_GROUP_K, COMPUTE_MODE, ROWS_MAJOR, INT_BITS, SWAP_AB,
                 weight_global=None if BsGlobal is None else tl.load(BsGlobal + expert_id64 * stride_bsglobal_e),
+                SCALE_MODE=SCALE_MODE,
             )
             a_ptrs += BLOCK_SIZE_K * stride_a_k
             b_ptrs += (BLOCK_SIZE_K // VPW) * stride_b_k

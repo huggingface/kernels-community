@@ -28,7 +28,7 @@ from .path_autotuner import path_autotune
 from .bench import gemm_cold_banks
 
 from ._ops import add_op_namespace_prefix
-from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, narrow_scalar_autotuning_configs, tl_dtype, pdl_launch_kwargs, block_fp8_scale_mode_configs
+from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, narrow_scalar_autotuning_configs, tl_dtype, pdl_launch_kwargs, block_fp8_scale_mode_configs, int_scale_mode_configs
 from .descriptors import batched_weight_descriptor, rebind_batched_mx_bs_descriptor, rebind_batched_weight_descriptor
 from .formats import block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, is_per_expert_global, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_operands, weight_block_size, validate_int_operands, INT_WEIGHT_DTYPES
 from .epilogue import fused_glu
@@ -935,7 +935,9 @@ def mx_weight_only_matmul_batched_kernel(
     # the MX weight-only batched kernel's space minus dot_scaled: the upcast dot, plus the swapped decode reduce at
     # the MMA tiles and at narrow ones (8 / 16 rows: a decode grid of N / 8 programs, the measured winner)
     with_weight_stream(
-        get_accelerator_autotuning_configs(tune_block_nk=True, compute_modes=("dot", "scalar"), swap_ab=True)
+        int_scale_mode_configs(get_accelerator_autotuning_configs(
+            tune_block_nk=True, compute_modes=("dot", "scalar"), swap_ab=True,
+        ))
         + narrow_scalar_autotuning_configs(block_ns=(8, 16), SWAP_AB=True)
     ),
     # the width and the scale group decide which tiles fit and compile: part of the key
@@ -997,6 +999,7 @@ def int_weight_only_matmul_batched_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
     COMPUTE_MODE: tl.constexpr = "dot",
+    SCALE_MODE: tl.constexpr = "tile",  # where the group scale lands (int_weight_only_compute)
     SWAP_AB: tl.constexpr = False,
     GATE: tl.constexpr = False,
     ACT_FN: tl.constexpr = "silu",
@@ -1071,6 +1074,7 @@ def int_weight_only_matmul_batched_kernel(
         accumulator = int_weight_only_compute(
             accumulator, a, w, w_s, w_z, BLOCK_SIZE_K, n_width, SCALE_GROUP_K, COMPUTE_MODE, True, INT_BITS, SWAP_AB,
             weight_global=None if BsGlobal is None else tl.load(BsGlobal + expert_id * stride_bsglobal_e),
+            SCALE_MODE=SCALE_MODE,
         )
 
     if PDL:

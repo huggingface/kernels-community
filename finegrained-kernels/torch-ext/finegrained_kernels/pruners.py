@@ -201,7 +201,8 @@ def int_scale_group_tile_pruner(divides_k: bool = True):
     tile, per-channel included), and a tile that divides K wherever the K-loop has no tail (``divides_k``: the 2D and
     grouped kernels) or a group spans tiles (a slid-back tail tile would straddle two groups). The batched loop slides
     its last tile back in bounds otherwise. Newly admitted within-group tiles start at 128, preserving
-    the existing group-128 grid; narrower tiles add K-loop and metadata traffic."""
+    the existing group-128 grid; narrower tiles add K-loop and metadata traffic. ``SCALE_MODE="acc"``
+    (``int_weight_only_compute``) needs one group over the tile and a bf16/fp16 MMA without a second-level scale."""
 
     def ok(c, args):
         # The packed scalar decode helpers support bf16/fp16 and INT8; FP8 operands only against INT4 weights
@@ -213,6 +214,12 @@ def int_scale_group_tile_pruner(divides_k: bool = True):
         if activation_dtype(args) == torch.int8 and c.kwargs.get("SPLIT_K", 1) != 1:
             return False
         bk, group = c.kwargs["BLOCK_SIZE_K"], args["SCALE_GROUP_K"]
+        if c.kwargs.get("SCALE_MODE", "tile") == "acc" and not (
+            # the scale on the step's fp32 partial: one group over the tile, a float MMA, no second-level scale
+            bk <= group and activation_dtype(args) in (torch.bfloat16, torch.float16)
+            and c.kwargs.get("COMPUTE_MODE", "dot") == "dot" and args.get("BsGlobal") is None
+        ):
+            return False
         if group > bk:
             return group % bk == 0 and args["K"] % bk == 0
         return bk % group == 0 and (not divides_k or args["K"] % bk == 0)
