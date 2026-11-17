@@ -165,9 +165,10 @@ struct append_args_t {
 
 void splitkv_append_kv(sycl::queue& queue, const append_args_t& args);
 
-// Paged decode (src/decode/paged_decode.hpp, adapted from vllm-xpu-kernels
-// csrc/xpu/attn/xe_3), fp16/bf16. Same fields as vllm-xpu-kernels'
-// paged_decode_args_t, plus lse_row_stride. Built for Xe35 (CRI) only.
+// Paged decode, fp16/bf16, adapted from vllm-xpu-kernels: Xe35 (CRI) from
+// csrc/xpu/attn/xe_3 (src/decode/paged_decode.hpp), Xe2 (BMG) from
+// csrc/xpu/attn/xe_2 (src/decode/xe2/paged_decode.hpp). Same fields as
+// vllm-xpu-kernels' paged_decode_args_t, plus lse_row_stride.
 struct paged_decode_args_t {
   void* query;
   void* key;
@@ -222,6 +223,7 @@ struct paged_decode_args_t {
   int lse_row_stride = 1;  // between query tokens
   // Packed speculative decode: num_heads_q holds spec_q_len query positions
   // per KV head group, position-major (spec_q_len of vllm-xpu-kernels).
+  // Xe35 only.
   int spec_q_len = 1;
 };
 
@@ -230,17 +232,21 @@ void paged_decode_fp16(sycl::queue& queue, const paged_decode_args_t& args);
 template <int Arch, int HeadDim>
 void paged_decode_bf16(sycl::queue& queue, const paged_decode_args_t& args);
 
-#define FLASH_XPU_PAGED_DECODE_DECLARE(HD)                                   \
+#define FLASH_XPU_PAGED_DECODE_DECLARE(ARCH, HD)                             \
   template <>                                                                \
-  void paged_decode_fp16<35, HD>(sycl::queue&, const paged_decode_args_t&);  \
+  void paged_decode_fp16<ARCH, HD>(sycl::queue&, const paged_decode_args_t&); \
   template <>                                                                \
-  void paged_decode_bf16<35, HD>(sycl::queue&, const paged_decode_args_t&);
-FLASH_XPU_PAGED_DECODE_DECLARE(64)
-FLASH_XPU_PAGED_DECODE_DECLARE(96)
-FLASH_XPU_PAGED_DECODE_DECLARE(128)
-FLASH_XPU_PAGED_DECODE_DECLARE(192)
-FLASH_XPU_PAGED_DECODE_DECLARE(256)
-FLASH_XPU_PAGED_DECODE_DECLARE(512)
+  void paged_decode_bf16<ARCH, HD>(sycl::queue&, const paged_decode_args_t&);
+#define FLASH_XPU_PAGED_DECODE_DECLARE_ARCH(ARCH)                            \
+  FLASH_XPU_PAGED_DECODE_DECLARE(ARCH, 64)                                   \
+  FLASH_XPU_PAGED_DECODE_DECLARE(ARCH, 96)                                   \
+  FLASH_XPU_PAGED_DECODE_DECLARE(ARCH, 128)                                  \
+  FLASH_XPU_PAGED_DECODE_DECLARE(ARCH, 192)                                  \
+  FLASH_XPU_PAGED_DECODE_DECLARE(ARCH, 256)                                  \
+  FLASH_XPU_PAGED_DECODE_DECLARE(ARCH, 512)
+FLASH_XPU_PAGED_DECODE_DECLARE_ARCH(20)
+FLASH_XPU_PAGED_DECODE_DECLARE_ARCH(35)
+#undef FLASH_XPU_PAGED_DECODE_DECLARE_ARCH
 #undef FLASH_XPU_PAGED_DECODE_DECLARE
 
 }  // namespace flash_xpu_splitkv

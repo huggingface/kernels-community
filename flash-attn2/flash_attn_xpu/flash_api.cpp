@@ -319,9 +319,10 @@ inline void run(sycl::queue& queue, const at::Tensor& q, int rows,
 }
 
 // ---------------------------------------------------------------------------
-// Paged single-query decode on Xe35 (CRI) and newer: the paged decode kernel
-// (src/decode/paged_decode.hpp, adapted from vllm-xpu-kernels), launched the
-// way vllm-xpu-kernels' mha_varlen_fwd does.
+// Paged single-query decode on Xe35 (CRI) and newer, and on Xe2 for pages of
+// 16 or 32 rows: the paged decode kernels (src/decode/paged_decode.hpp,
+// src/decode/xe2/paged_decode.hpp, adapted from vllm-xpu-kernels), launched
+// the way vllm-xpu-kernels' mha_varlen_fwd does.
 // FLASH_ATTN_XPU_DISABLE_PAGED_DECODE=1 keeps the kernel above.
 // ---------------------------------------------------------------------------
 
@@ -382,15 +383,16 @@ inline int paged_decode_num_splits(sycl::queue& queue, int batch_size,
 }
 
 // Inputs as checked by supported(q, k, v, /*paged=*/true), plus the head
-// sizes the paged decode kernel is built for.
-inline bool paged_decode_supported(const at::Tensor& q) {
-    if (!FLASH_XPU_HAS_XE3_KERNELS) return false;
+// sizes the paged decode kernel is built for. Xe35 runs every page size; Xe2
+// only pages smaller than the split-KV kernel's KV tile (16 or 32 rows).
+inline bool paged_decode_supported(const at::Tensor& q, const at::Tensor& k) {
     if (env_int("FLASH_ATTN_XPU_DISABLE_PAGED_DECODE", 0) != 0) return false;
     switch (q.size(-1)) {
         case 64: case 96: case 128: case 192: case 256: case 512: break;
         default: return false;
     }
-    return is_xe35(q);
+    if (is_xe35(q)) return FLASH_XPU_HAS_XE3_KERNELS;
+    return small_page(k);
 }
 
 // One query per batch with a query: q rows (tokens) q_stride_seq apart, out
@@ -496,10 +498,16 @@ inline bool run_paged_decode(sycl::queue& queue, const at::Tensor& q, int tokens
 
     using namespace flash_xpu_splitkv;
     const bool fp16 = q.scalar_type() == at::kHalf;
+    const bool xe35 = is_xe35(q);
 #define PAGED_DECODE_CASE(HD)                                                  \
     case HD:                                                                   \
-        if (fp16) paged_decode_fp16<35, HD>(queue, a);                         \
-        else      paged_decode_bf16<35, HD>(queue, a);                         \
+        if (xe35) {                                                            \
+            if (fp16) paged_decode_fp16<35, HD>(queue, a);                     \
+            else      paged_decode_bf16<35, HD>(queue, a);                     \
+        } else {                                                               \
+            if (fp16) paged_decode_fp16<20, HD>(queue, a);                     \
+            else      paged_decode_bf16<20, HD>(queue, a);                     \
+        }                                                                      \
         break;
     switch (head_size) {
         PAGED_DECODE_CASE(64)
@@ -1023,7 +1031,7 @@ mha_varlen_fwd(
                 skv_causal = false;
             }
             if (skv_paged && splitkv::small_page(k) &&
-                (skv_q_per_batch != 1 || skv_mixed || !splitkv::paged_decode_supported(q)))
+                (skv_q_per_batch != 1 || skv_mixed || !splitkv::paged_decode_supported(q, k)))
                 skv_q_per_batch = 0;
         }
         if (skv_q_per_batch > 0) {
@@ -1104,9 +1112,10 @@ mha_varlen_fwd(
         }
         auto opts = q.options().dtype(torch::kFloat32);
         at::Tensor softmax_lse = torch::empty({num_heads, total_q}, opts);
-        // Paged decode on Xe35: the paged decode kernel (see mha_fwd_kvcache).
+        // Paged decode on Xe35, and on Xe2 with small pages: the paged decode
+        // kernel (see mha_fwd_kvcache).
         bool done = false;
-        if (skv_paged && skv_q_per_batch == 1 && splitkv::paged_decode_supported(q)) {
+        if (skv_paged && skv_q_per_batch == 1 && splitkv::paged_decode_supported(q, k)) {
             auto queue = c10::xpu::getCurrentXPUStream(device_idx).queue();
             at::Tensor cu_q = cu_seqlens_q.contiguous();
             at::Tensor cu_k = cu_seqlens_k.contiguous();
@@ -1163,12 +1172,16 @@ mha_varlen_fwd(
     v_padded = ensure_contiguous(v_padded);
 
     // Chunk-prefill kernel (adapted from vllm-xpu-kernels): src/prefill (Xe2)
-    // and src/prefill/xe3 (Xe35, CRI image).
+    // and src/prefill/xe3 (Xe35, CRI image). On Xe2, head sizes 64 and 256
+    // take it only for pages of 16 or 32 rows, which the kernel below lacks.
     constexpr int64_t kInt32Max = std::numeric_limits<int>::max();
     const bool xe35 = splitkv::is_xe35(q);
+    const bool xe2_small_page = !xe35 && is_paged && k_padded.dim() == 4 &&
+        splitkv::small_page(k_padded);
     const bool use_chunk_prefill =
         (head_size_og == 128 ||
-         (xe35 && (head_size_og == 64 || head_size_og == 256))) &&
+         ((xe35 || xe2_small_page) &&
+          (head_size_og == 64 || head_size_og == 256))) &&
         !needs_padding && !is_local &&
         p_dropout == 0.0f && !return_softmax && softcap == 0.0f &&
         !(alibi_slopes_.has_value() && alibi_slopes_->defined()) &&
@@ -1297,8 +1310,21 @@ mha_varlen_fwd(
             namespace vp = flash_xpu_prefill::xe2;
             vp::chunk_prefill_args_t a{};
             fill(a);
-            chunk_prefill_done = bf16 ? vp::chunk_prefill<128, true>(queue, a)
-                                      : vp::chunk_prefill<128, false>(queue, a);
+            switch (head_size_og) {
+                case 64:
+                    chunk_prefill_done =
+                        bf16 ? vp::chunk_prefill_impl<64, true, true>(queue, a)
+                             : vp::chunk_prefill_impl<64, false, true>(queue, a);
+                    break;
+                case 256:
+                    chunk_prefill_done =
+                        bf16 ? vp::chunk_prefill_impl<256, true, true>(queue, a)
+                             : vp::chunk_prefill_impl<256, false, true>(queue, a);
+                    break;
+                default:
+                    chunk_prefill_done = bf16 ? vp::chunk_prefill<128, true>(queue, a)
+                                              : vp::chunk_prefill<128, false>(queue, a);
+            }
         }
         if (!chunk_prefill_done) softmax_lse.zero_();
     }
@@ -1634,7 +1660,7 @@ mha_fwd_kvcache(
         splitkv::supported(q, kcache, vcache, paged_KV) &&
         (!paged_KV || !splitkv::small_page(kcache) ||
          (seqlen_q == 1 && !k_.has_value() && seqlens_k_.has_value() &&
-          splitkv::paged_decode_supported(q)))) {
+          splitkv::paged_decode_supported(q, kcache)))) {
         bool knew_ok = true;
         at::Tensor knew, vnew;
         if (k_.has_value()) {
@@ -1658,11 +1684,11 @@ mha_fwd_kvcache(
             seqlen_k, paged_KV, q_row_stride,
             num_splits > 1 ? num_splits : 0);
         if (knew_ok && splits > 0) {
-            // Paged decode without appended KV on Xe35: the paged decode
-            // kernel. The right window does not mask anything for a single
-            // query.
+            // Paged decode without appended KV on Xe35, and on Xe2 with small
+            // pages: the paged decode kernel. The right window does not mask
+            // anything for a single query.
             if (seqlen_q == 1 && paged_KV && seqlens_k_.has_value() &&
-                !knew.defined() && splitkv::paged_decode_supported(q)) {
+                !knew.defined() && splitkv::paged_decode_supported(q, kcache)) {
                 at::Tensor out = out_.has_value() ? out_.value()
                                                   : at::empty(q.sizes(), q.options());
                 auto softmax_lse = torch::empty({batch_size, num_heads, 1},
@@ -1687,7 +1713,7 @@ mha_fwd_kvcache(
             // head, so the cache is read once for all of them.
             if (seqlen_q > 1 && skv_causal && window_size_left < 0 &&
                 paged_KV && seqlens_k_.has_value() && !knew.defined() &&
-                splitkv::paged_decode_supported(q)) {
+                splitkv::is_xe35(q) && splitkv::paged_decode_supported(q, kcache)) {
                 const int hg = num_heads / num_heads_k;
                 const int hp = num_heads * seqlen_q;
                 at::Tensor qp = q.unflatten(2, {num_heads_k, hg})
