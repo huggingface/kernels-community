@@ -41,15 +41,16 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1794312977,
-        "narHash": "sha256-+lTE7zLY3gZ3UKs6MIkBGiO3uWeeJArRmmHIyuh6Fuo=",
+        "lastModified": 1794840796,
+        "narHash": "sha256-0SCTktjoTe5S9T7IWct9pGV4LzPDikb1bt6D8iIdBYc=",
         "owner": "huggingface",
         "repo": "kernels",
-        "rev": "cc2f64bb00ee6ba65331972d9adf8e31c941c985",
+        "rev": "0f349866a85bf0241e6b5fbf41bde6362e7492a8",
         "type": "github"
       },
       "original": {
         "owner": "huggingface",
+        "ref": "rocm-parallel-driver",
         "repo": "kernels",
         "type": "github"
       }
