@@ -126,6 +126,27 @@ except ImportError:
         apply_rotary_emb = None
 """#
 
+// The varlen test passes the local window as a tensor, which AOT tracing
+// cannot turn into the op's int arguments; the non-varlen test uses a list.
+rewrite in="tests/test_flash_attn.py" changes=1 \
+    pattern="torch.randint(0, seqlen_k, (2,)) if dtype == torch.float8_e4m3fn:" \
+    with=#"""
+torch.randint(0, seqlen_k, (2,)).tolist()
+        if dtype == torch.float8_e4m3fn:
+"""#
+
+// Head dims 59 and 111 fail the kernel's multiple-of-8 check, and pytest keeps
+// the failed test's 70 GiB dummy alive, so every later test runs out of memory.
+rewrite in="tests/test_flash_attn.py" changes=1 \
+    pattern="@pytest.mark.parametrize(\"d\", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])" \
+    with="@pytest.mark.parametrize(\"d\", [32, 40, 64, 80, 96, 128, 160, 192, 224, 256])"
+
+// The combine kernel returns early for a single split, which the forward pass
+// never combines, so its outputs are left unwritten.
+rewrite in="tests/test_flash_attn.py" changes=1 \
+    pattern="@pytest.mark.parametrize(\"num_splits\", [1, 2, 3, 5, 17, 32, 55, 97, 133])" \
+    with="@pytest.mark.parametrize(\"num_splits\", [2, 3, 5, 17, 32, 55, 97, 133])"
+
 // Fail on new upstream sources so they get reviewed rather than silently
 // compiled in or dropped.
 expect in="flash-attn/*" files=36

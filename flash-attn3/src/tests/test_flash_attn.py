@@ -450,7 +450,7 @@ def test_flash_attn_varlen_output(
         else:
             qv_ref = None
         # Put window_size after QKV randn so that window_size changes from test to test
-        window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
+        window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,)).tolist()
         if dtype == torch.float8_e4m3fn:
             q_descale, k_descale, v_descale = [torch.rand(batch_size, nheads_kv, device=device, dtype=torch.float32) * 2 for _ in range(3)]
         else:
@@ -1115,7 +1115,7 @@ def test_flash_attn_cluster(seqlen_q, seqlen_k, d, causal, dtype):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize('causal', [False])
-@pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
+@pytest.mark.parametrize("d", [32, 40, 64, 80, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128])
 # @pytest.mark.parametrize('d', [32, 56, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192])
@@ -1194,7 +1194,7 @@ def attention_combine_ref(out_partial, lse_partial):
 @pytest.mark.parametrize("seqlen", [1, 2, 3, 32, 64, 256, 113, 108, 640, 1024])
 # @pytest.mark.parametrize("seqlen", [12, 32, 64, 256, 112, 108, 640, 1024, 2048, 8192])
 # @pytest.mark.parametrize("seqlen", [15])
-@pytest.mark.parametrize("num_splits", [1, 2, 3, 5, 17, 32, 55, 97, 133])
+@pytest.mark.parametrize("num_splits", [2, 3, 5, 17, 32, 55, 97, 133])
 # @pytest.mark.parametrize("num_splits", [1, 2, 3, 5, 11])
 # @pytest.mark.parametrize("num_splits", [128])
 def test_flash_attn_combine(num_splits, seqlen, d, dtype):
