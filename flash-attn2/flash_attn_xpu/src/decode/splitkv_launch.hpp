@@ -105,7 +105,7 @@ struct SplitKVConfig {
 
   template <bool Paged, bool Local>
   static void run_mode(sycl::queue& queue, decode_args_t const& args) {
-    // Single-query decode gets the vllm mainloop: one Q surface and no
+    // Single-query decode gets the single-Q mainloop: one Q surface and no
     // per-row causal mask.
     bool multi_q = args.q_per_batch > 1;
     if (Paged && args.total_rows_kv > (int64_t(1) << 24)) {

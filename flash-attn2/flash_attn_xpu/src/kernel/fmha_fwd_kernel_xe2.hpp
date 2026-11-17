@@ -345,7 +345,7 @@ class XeFMHAFwdKernelXe2 {
       int seq_coord = cute::min(
           seq_len_qo, (blk_q * get<0>(TileShapeQK{}) + q_offset_sg));
 
-      // Per-SG K/V bounds (as in vllm's chunk_prefill kernel).
+      // Per-SG K/V bounds (as in vllm-xpu-kernels' chunk_prefill kernel).
       const int sg_causal_seq_len = cute::min(
           effective_seq_kv, full_tile_offset + seq_coord + q_sg_tile);
       int sg_seq_len;

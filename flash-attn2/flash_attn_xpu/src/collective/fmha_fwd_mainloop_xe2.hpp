@@ -240,7 +240,7 @@ struct FMHAFwdMainloopXe2<
   }
 
   // Physical K tile holding logical K block `K` of batch `idx_b` in the
-  // flat paged cache surface (same as vllm's chunk_prefill mainloop).
+  // flat paged cache surface (same as vllm-xpu-kernels' chunk_prefill mainloop).
   CUTLASS_DEVICE int get_paged_idx(int K, int idx_b) {
     constexpr int tile_k = get<1>(TileShapeQK{});
     int tiles_per_page = params.paged.page_size / tile_k;
@@ -299,7 +299,7 @@ struct FMHAFwdMainloopXe2<
 
     // The Xe 2D block descriptor stores the surface height in 24 bits. A
     // paged cache taller than that is split into page-aligned sub-surfaces
-    // and every tile is routed to the one holding it (as in vllm).
+    // and every tile is routed to the one holding it (as in vllm-xpu-kernels).
     [[maybe_unused]] int tiles_per_surface = 0x3fffffff;
     [[maybe_unused]] int rows_per_surface = 0;
     [[maybe_unused]] int k_rows_total = get<0>(K_2D.shape());
@@ -485,7 +485,7 @@ struct FMHAFwdMainloopXe2<
 
     for (int K = blk_k0; K < blk_k1; K++) {
       // Split barrier to keep the sub-groups of a work-group together, as in
-      // sycl-tla's xe_fmha_fwd_mainloop and vllm's chunk_prefill mainloop.
+      // sycl-tla's xe_fmha_fwd_mainloop and vllm-xpu-kernels' chunk_prefill mainloop.
       // Without it, two work-groups sharing one BMG Xe-core produce wrong
       // results or hang the GPU.
       barrier_arrive(ScopeWorkgroup);

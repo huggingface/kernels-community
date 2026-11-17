@@ -20,24 +20,25 @@
 #if __SYCL_TARGET_INTEL_GPU_CRI__
 #define FLASH_XPU_SPLITKV_TARGET_NS xe35
 #define FLASH_XPU_SPLITKV_TARGET_ARCH 35
-#define FLASH_XPU_VLLM_NS vllm_xe35
-// vllm-xpu-kernels builds its XE3 kernels with 512 GRF (add_xe3_kernel_library).
-#ifndef VLLM_GRF_SIZE
-#define VLLM_GRF_SIZE 512
+#define FLASH_XPU_XE3_NS xe3_xe35
+// The Xe35 paged-decode and chunk-prefill kernels run with 512 GRF, as
+// vllm-xpu-kernels builds its XE3 kernels (add_xe3_kernel_library).
+#ifndef FLASH_XPU_GRF_SIZE
+#define FLASH_XPU_GRF_SIZE 512
 #endif
 #else
 #define FLASH_XPU_SPLITKV_TARGET_NS xe20
 #define FLASH_XPU_SPLITKV_TARGET_ARCH 20
-#define FLASH_XPU_VLLM_NS vllm_xe20
+#define FLASH_XPU_XE3_NS xe3_xe20
 #endif
 
-// The vllm Xe35 decode kernel runs with 512 GRF, which needs
-// maximum_registers (DPC++ 2026.2+); grf_size only takes 128/256. With an
-// older compiler CRI keeps the split-KV kernel above.
+// The Xe35 paged decode and chunk prefill kernels run with 512 GRF, which
+// needs maximum_registers (DPC++ 2026.2+); grf_size only takes 128/256. With
+// an older compiler CRI keeps the split-KV and generic kernels.
 #if defined(__INTEL_LLVM_COMPILER) && __INTEL_LLVM_COMPILER >= 20260200
-#define FLASH_XPU_HAS_VLLM_DECODE 1
+#define FLASH_XPU_HAS_XE3_KERNELS 1
 #else
-#define FLASH_XPU_HAS_VLLM_DECODE 0
+#define FLASH_XPU_HAS_XE3_KERNELS 0
 #endif
 
 namespace flash_xpu_splitkv {
@@ -164,10 +165,10 @@ struct append_args_t {
 
 void splitkv_append_kv(sycl::queue& queue, const append_args_t& args);
 
-// Paged single-query decode of vllm-xpu-kernels (csrc/xpu/attn/xe_3,
-// src/decode/vllm), fp16/bf16, page size a multiple of 64. Same fields as
-// vllm's paged_decode_args_t, plus lse_row_stride. Built for Xe35 (CRI) only.
-struct vllm_decode_args_t {
+// Paged decode (src/decode/paged_decode.hpp, adapted from vllm-xpu-kernels
+// csrc/xpu/attn/xe_3), fp16/bf16. Same fields as vllm-xpu-kernels'
+// paged_decode_args_t, plus lse_row_stride. Built for Xe35 (CRI) only.
+struct paged_decode_args_t {
   void* query;
   void* key;
   void* value;
@@ -220,26 +221,26 @@ struct vllm_decode_args_t {
   int lse_stride = 0;      // between heads
   int lse_row_stride = 1;  // between query tokens
   // Packed speculative decode: num_heads_q holds spec_q_len query positions
-  // per KV head group, position-major (vllm's spec_q_len).
+  // per KV head group, position-major (spec_q_len of vllm-xpu-kernels).
   int spec_q_len = 1;
 };
 
 template <int Arch, int HeadDim>
-void vllm_paged_decode_fp16(sycl::queue& queue, const vllm_decode_args_t& args);
+void paged_decode_fp16(sycl::queue& queue, const paged_decode_args_t& args);
 template <int Arch, int HeadDim>
-void vllm_paged_decode_bf16(sycl::queue& queue, const vllm_decode_args_t& args);
+void paged_decode_bf16(sycl::queue& queue, const paged_decode_args_t& args);
 
-#define FLASH_XPU_VLLM_DECLARE(HD)                                            \
+#define FLASH_XPU_PAGED_DECODE_DECLARE(HD)                                   \
   template <>                                                                \
-  void vllm_paged_decode_fp16<35, HD>(sycl::queue&, const vllm_decode_args_t&); \
+  void paged_decode_fp16<35, HD>(sycl::queue&, const paged_decode_args_t&);  \
   template <>                                                                \
-  void vllm_paged_decode_bf16<35, HD>(sycl::queue&, const vllm_decode_args_t&);
-FLASH_XPU_VLLM_DECLARE(64)
-FLASH_XPU_VLLM_DECLARE(96)
-FLASH_XPU_VLLM_DECLARE(128)
-FLASH_XPU_VLLM_DECLARE(192)
-FLASH_XPU_VLLM_DECLARE(256)
-FLASH_XPU_VLLM_DECLARE(512)
-#undef FLASH_XPU_VLLM_DECLARE
+  void paged_decode_bf16<35, HD>(sycl::queue&, const paged_decode_args_t&);
+FLASH_XPU_PAGED_DECODE_DECLARE(64)
+FLASH_XPU_PAGED_DECODE_DECLARE(96)
+FLASH_XPU_PAGED_DECODE_DECLARE(128)
+FLASH_XPU_PAGED_DECODE_DECLARE(192)
+FLASH_XPU_PAGED_DECODE_DECLARE(256)
+FLASH_XPU_PAGED_DECODE_DECLARE(512)
+#undef FLASH_XPU_PAGED_DECODE_DECLARE
 
 }  // namespace flash_xpu_splitkv
