@@ -124,17 +124,19 @@ struct chunk_policy_head192_b16 {
   using SubgroupLayoutQK = Layout<Shape<_32, _1, _1>>;
 };
 
+// The Xe3 mainloop reduces Q*K over get<1>(ShapeOut) columns only (DTiles),
+// so ShapeOut must span the full head; vllm's <_256, _256> drops half of D.
 struct chunk_policy_head512 {
   using ShapeQK = Shape<_256, _32, _32>;
   using ShapePV = Shape<_256, _32, _32>;
-  using ShapeOut = Shape<_256, _256>;
+  using ShapeOut = Shape<_256, _512>;
   using SubgroupLayoutQK = Layout<Shape<_32, _1, _1>>;
 };
 
 struct chunk_policy_head512_b16 {
   using ShapeQK = Shape<_256, _16, _32>;
   using ShapePV = Shape<_256, _32, _16>;
-  using ShapeOut = Shape<_256, _256>;
+  using ShapeOut = Shape<_256, _512>;
   using SubgroupLayoutQK = Layout<Shape<_32, _1, _1>>;
 };
 
