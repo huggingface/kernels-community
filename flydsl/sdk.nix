@@ -2,8 +2,10 @@
   lib,
   stdenv,
 
+  closureInfo,
   jq,
   patchelf-old,
+  removeReferencesTo,
 
   # The native FlyDSL build (Python package with the extensions), and the LLVM it
   # was built against.
@@ -20,6 +22,13 @@
 
 let
   kernelName = "flydsl";
+
+  buildClosure = closureInfo {
+    rootPaths = [
+      native
+      llvm
+    ];
+  };
 in
 stdenv.mkDerivation {
   pname = "${kernelName}-kernel-${variant}";
@@ -33,7 +42,10 @@ stdenv.mkDerivation {
   nativeBuildInputs = [
     jq
     patchelf-old
+    removeReferencesTo
   ];
+
+  allowedReferences = [ ];
 
   inherit variant sdkId;
 
@@ -88,6 +100,17 @@ stdenv.mkDerivation {
     for lib in $libsDir/*.so $libsDir/*.so.*; do
       patchelf --set-rpath '$ORIGIN' $lib
       strip --strip-unneeded $lib
+    done
+
+    # Remove any paths from the toolchain, LLVM, Python, etc. that are
+    # embedded in the binaries (e.g. in asserts). The SDK cannot refer
+    # to anything in the Nix store, or future fetches will fail.
+    removeRefs=()
+    while read -r path; do
+      removeRefs+=(-t "$path")
+    done < ${buildClosure}/store-paths
+    for lib in $libsDir/*.so $libsDir/*.so.*; do
+      remove-references-to "''${removeRefs[@]}" $lib
     done
 
     # FlyDSL generates device code at runtime. These are the GPUs that its
