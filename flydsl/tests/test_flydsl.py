@@ -50,3 +50,33 @@ def test_native_libraries_found():
 
     dirs = libraries._distribution_dirs()
     assert any((d / "libfly_rocm_aot_runtime.a").is_file() for d in dirs)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "compiler",
+        "compiler.backends.rocm",
+        "compiler.protocol",
+        "expr",
+        "expr.gpu",
+        "expr.meta",
+        "expr.rocdl",
+        "expr.typing",
+        "expr.utils.arith",
+        "runtime.device",
+        "utils.env",
+        "_mlir.ir",
+        "_mlir.extras.types",
+        "_mlir._mlir_libs._mlirDialectsFly",
+        "_mlir.dialects.fly",
+        "_mlir.dialects.llvm",
+        "_mlir.dialects.rocdl",
+    ],
+)
+def test_submodules_are_attributes(path):
+    # A kernel that depends on FlyDSL cannot `import flydsl.<x>`; it uses
+    # attribute access, which requires the submodules to be loaded.
+    module = flydsl
+    for part in path.split("."):
+        module = getattr(module, part)

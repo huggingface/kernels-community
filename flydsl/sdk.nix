@@ -95,6 +95,22 @@ stdenv.mkDerivation {
 
     root = Path(flydsl.__file__).resolve().parent" "    root = Path(__file__).resolve().parent.parent"
 
+    # When used as an SDK, we need to load modules eagerly, so that they are
+    # accessible through `get_kernel(...)`.
+    cat >> $variantDir/__init__.py <<'EOF'
+
+from . import compiler, expr, runtime, utils  # noqa: E402,F401
+from .compiler import protocol  # noqa: E402,F401
+from .compiler.backends import rocm  # noqa: E402,F401
+from .expr import meta, typing  # noqa: E402,F401
+from .expr.utils import arith  # noqa: E402,F401
+from .runtime import device  # noqa: E402,F401
+from ._mlir import ir, passmanager  # noqa: E402,F401
+from ._mlir.extras import types  # noqa: E402,F401
+from ._mlir._mlir_libs import _mlirDialectsFly  # noqa: E402,F401
+from ._mlir.dialects import fly, gpu, llvm, rocdl  # noqa: E402,F401
+EOF
+
     # Replace the RPATHs, which reference the build directory and the Nix store,
     # by one that is relative to the library. Also strip the libraries.
     for lib in $libsDir/*.so $libsDir/*.so.*; do
