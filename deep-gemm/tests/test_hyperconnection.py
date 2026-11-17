@@ -1,8 +1,9 @@
 import torch
 import random
 
+import kernels
 
-from generators import deep_gemm
+deep_gemm = kernels.get_kernel("kernels-community/deep-gemm", version=4)
 
 test_filter = deep_gemm.testing.test_filter
 bench_kineto = deep_gemm.testing.bench_kineto
