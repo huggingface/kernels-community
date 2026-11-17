@@ -10,7 +10,11 @@ from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, parallelize_module
+from torch.distributed.tensor.parallel import (
+    ColwiseParallel,
+    RowwiseParallel,
+    parallelize_module,
+)
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.checkpoint import checkpoint
 
@@ -20,7 +24,8 @@ liger_kernels = kernels.get_kernel("kernels-community/liger-kernels", version=4)
 
 pytestmark = [
     pytest.mark.skipif(
-        int(os.environ.get("WORLD_SIZE", "1")) < 2, reason="launch with torchrun and at least two ranks"
+        int(os.environ.get("WORLD_SIZE", "1")) < 2,
+        reason="launch with torchrun and at least two ranks",
     ),
     pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA or ROCm"),
 ]
@@ -48,7 +53,10 @@ class LossModel(nn.Module):
 
     def loss(self, hidden, target):
         reduction = "none" if self.loss_mode == "none" else "mean"
-        return F.cross_entropy(F.linear(hidden, self.weight, self.bias), target, reduction=reduction)
+        logits = F.linear(hidden, self.weight, self.bias)
+        if self.loss_mode == "causal":
+            logits = 0.5 * (logits / 0.5).tanh()
+        return F.cross_entropy(logits, target, reduction=reduction)
 
 
 class FusedLossModel(LossModel):
@@ -69,6 +77,7 @@ class FusedLossModel(LossModel):
             lm_head_weight=self.weight,
             lm_head_bias=self.bias,
             hidden_size=8,
+            final_logit_softcapping=0.5,
         )
 
 
@@ -80,11 +89,15 @@ def model_pair(device, loss_mode, outer_checkpoint=False):
     return reference, fused
 
 
-@pytest.mark.parametrize("layout", ["ddp", "fsdp2", "tp", "cp", "fsdp2_tp", "fsdp2_cp", "tp_cp", "dp_cp"])
+@pytest.mark.parametrize(
+    "layout", ["ddp", "fsdp2", "tp", "cp", "fsdp2_tp", "fsdp2_cp", "tp_cp", "dp_cp"]
+)
 @pytest.mark.parametrize("outer_checkpoint", [False, True])
 @pytest.mark.parametrize("mixed_precision", [False, True], ids=["fp32", "bf16"])
 @pytest.mark.parametrize("loss_mode", ["none", "causal"])
-def test_distributed_fused_loss(distributed, meshes, layout, outer_checkpoint, mixed_precision, loss_mode):
+def test_distributed_fused_loss(
+    distributed, meshes, layout, outer_checkpoint, mixed_precision, loss_mode
+):
     device = distributed
     world_size = dist.get_world_size()
     if "_" in layout:
@@ -104,7 +117,11 @@ def test_distributed_fused_loss(distributed, meshes, layout, outer_checkpoint, m
     # TP shards the preceding projections. The loss receives replicated hidden
     # states and a complete vocabulary head, as required by the existing API.
     if "tp" in names:
-        parallelize_module(fused, mesh["tp"], {"up_proj": ColwiseParallel(), "down_proj": RowwiseParallel()})
+        parallelize_module(
+            fused,
+            mesh["tp"],
+            {"up_proj": ColwiseParallel(), "down_proj": RowwiseParallel()},
+        )
     if "fsdp" in names:
         policy = (
             MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
@@ -115,7 +132,9 @@ def test_distributed_fused_loss(distributed, meshes, layout, outer_checkpoint, m
 
     wrapped = fused
     if "dp" in names:
-        wrapped = DistributedDataParallel(fused, device_ids=[device.index], process_group=mesh["dp"].get_group())
+        wrapped = DistributedDataParallel(
+            fused, device_ids=[device.index], process_group=mesh["dp"].get_group()
+        )
 
     coordinate = dict(zip(names, mesh.get_coordinate()))
     data_rank = coordinate.get("dp", coordinate.get("fsdp", 0))
@@ -125,7 +144,9 @@ def test_distributed_fused_loss(distributed, meshes, layout, outer_checkpoint, m
     target = torch.randint(17, (tokens,), device=device)
     if "cp" in names:
         x = torch.tensor_split(x, mesh["cp"].size())[coordinate["cp"]].contiguous()
-        target = torch.tensor_split(target, mesh["cp"].size())[coordinate["cp"]].contiguous()
+        target = torch.tensor_split(target, mesh["cp"].size())[
+            coordinate["cp"]
+        ].contiguous()
 
     optimizer_ref = torch.optim.SGD(reference.parameters(), lr=0.01, foreach=False)
     optimizer_fused = torch.optim.SGD(wrapped.parameters(), lr=0.01, foreach=False)
@@ -142,16 +163,24 @@ def test_distributed_fused_loss(distributed, meshes, layout, outer_checkpoint, m
             actual = wrapped(x_fused, target)
 
         torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
-        grad_output = torch.linspace(0.1, 1.5, target.numel(), device=device) if loss_mode == "none" else None
+        grad_output = (
+            torch.linspace(0.1, 1.5, target.numel(), device=device)
+            if loss_mode == "none"
+            else None
+        )
         expected.backward(grad_output)
         actual.backward(grad_output)
         torch.testing.assert_close(x_fused.grad, x_ref.grad, atol=atol, rtol=rtol)
 
-        for (name, expected_param), actual_param in zip(reference.named_parameters(), fused.parameters()):
+        for (name, expected_param), actual_param in zip(
+            reference.named_parameters(), fused.parameters()
+        ):
             assert actual_param.grad is not None, name
             if "cp" in names:
                 local_grad = (
-                    actual_param.grad.to_local() if isinstance(actual_param.grad, DTensor) else actual_param.grad
+                    actual_param.grad.to_local()
+                    if isinstance(actual_param.grad, DTensor)
+                    else actual_param.grad
                 )
                 dist.all_reduce(local_grad, group=mesh["cp"].get_group())
                 local_grad.div_(mesh["cp"].size())
@@ -159,7 +188,9 @@ def test_distributed_fused_loss(distributed, meshes, layout, outer_checkpoint, m
             dist.all_reduce(expected_param.grad)
             expected_param.grad.div_(world_size)
             actual_grad = (
-                actual_param.grad.full_tensor() if isinstance(actual_param.grad, DTensor) else actual_param.grad
+                actual_param.grad.full_tensor()
+                if isinstance(actual_param.grad, DTensor)
+                else actual_param.grad
             )
             # AMP rounds PyTorch linear's bias in BF16; fused CE adds an FP32
             # bias after matmul. Match the existing tiled MLP gradient tolerance.
@@ -209,23 +240,33 @@ def test_fused_loss_zero3(distributed, outer_checkpoint, loss_mode):
 
         expected = reference(x_ref, target)
         actual = (
-            checkpoint(engine, x_fused, target, use_reentrant=False) if outer_checkpoint else engine(x_fused, target)
+            checkpoint(engine, x_fused, target, use_reentrant=False)
+            if outer_checkpoint
+            else engine(x_fused, target)
         )
         torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
         # DeepSpeed's backward takes a scalar; nonuniform token weights exercise
         # the same loss-gradient path as backward(grad_output) above.
-        token_weights = torch.linspace(0.1, 1.5, tokens, device=device) if loss_mode == "none" else 1.0
+        token_weights = (
+            torch.linspace(0.1, 1.5, tokens, device=device)
+            if loss_mode == "none"
+            else 1.0
+        )
         (expected * token_weights).sum().backward()
         engine.backward((actual * token_weights).sum())
         torch.testing.assert_close(x_fused.grad, x_ref.grad, atol=1e-5, rtol=1e-5)
 
-        for (name, expected_param), actual_param in zip(reference.named_parameters(), fused.parameters()):
+        for (name, expected_param), actual_param in zip(
+            reference.named_parameters(), fused.parameters()
+        ):
             dist.all_reduce(expected_param.grad)
             expected_param.grad.div_(dist.get_world_size())
             actual_grad = safe_get_full_grad(actual_param)
             assert actual_grad is not None, name
-            torch.testing.assert_close(actual_grad, expected_param.grad, atol=1e-5, rtol=1e-5, msg=name)
+            torch.testing.assert_close(
+                actual_grad, expected_param.grad, atol=1e-5, rtol=1e-5, msg=name
+            )
 
         optimizer_ref.step()
         engine.step()
