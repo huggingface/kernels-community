@@ -120,11 +120,11 @@ inline int num_splits(
   // reaches the DRAM peak from 1.5 streams per Xe core, or from 1.75 when a
   // KV head's tokens are more than 1 KB apart (8 KV heads in a token-major
   // cache: each stream reads 256-byte pieces of the token rows). Splitting
-  // it further only fragments the reads and adds the reduction (VLLMZ-3208:
+  // it further only fragments the reads and adds the reduction (e.g.
   // Qwen3-30B-A3B at TP4, 8 Q / 1 KV head, 58 sequences of 3.5K-5K tokens
   // ran 14-17% slower with 3 splits).
-  // TODO: packed spec decode (#456) folds q_len positions into the rows, so
-  // q_tiles can grow; re-check this upper bound once it lands.
+  // TODO: packed spec decode folds q_len positions into the rows, so
+  // q_tiles can grow; re-check this upper bound.
   int sat_quarters = cal.sat_quarters;
   if (head_dim > 128) {
     if (kv_tiles <= 16) {

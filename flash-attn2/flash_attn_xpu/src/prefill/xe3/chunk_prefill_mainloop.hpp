@@ -218,10 +218,8 @@ void cvt_f32x2_to_bf16x2_pack(
       : "rw"(tmp));
 }
 
-// FP8 packed conversion primitives (ported from
-// libraries.ai.cutlass.internal/applications/flash_attention_v2/collective/
-// xe_fmha_fwd_mainloop.hpp). Subgroup-vectorized casts used to pack the softmax
-// output P into fp8 (e4m3/e5m2) for the full-fp8 P*V GEMM.
+// FP8 packed conversion primitives. Subgroup-vectorized casts used to pack the
+// softmax output P into fp8 (e4m3/e5m2) for the full-fp8 P*V GEMM.
 CUTE_DEVICE
 void cvt_f32x2_to_e5m2x2_pack(
     float const& src0, float const& src1, cute::intel::uchar2& dst) {

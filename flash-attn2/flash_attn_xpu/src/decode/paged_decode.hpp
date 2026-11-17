@@ -2,7 +2,7 @@
  * Copyright (C) 2025 - 2026 Intel Corporation, All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  **************************************************************************************************/
-// Paged decode launcher. Adapted from vllm-xpu-kernels (internal main efc398e):
+// Paged decode launcher. Adapted from vllm-xpu-kernels:
 //   csrc/xpu/attn/xe_3/paged_decode.hpp  (DecodeKernelLauncher, PagedDecodeConfig)
 //   csrc/xpu/attn/fmha_utils.hpp         (decode_policy_qpacked_head)
 // fp16/bf16 only. Changes: the zero-size workspace is a null pointer
