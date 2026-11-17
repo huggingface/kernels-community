@@ -32,13 +32,22 @@ class _ConditionedNorm(nn.Module):
         return self.norm(states) * (1 + scale[:, None]) + offset[:, None]
 
 
+class _DenseMlp(nn.Module):
+    def __init__(self, inputs, outputs):
+        super().__init__()
+        self.fc1 = nn.Linear(inputs, 16)
+        self.fc2 = nn.Linear(16, outputs)
+        self.activation = torch.nn.functional.gelu
+
+    def forward(self, states):
+        return self.fc2(self.activation(self.fc1(states)))
+
+
 class _Mlp(nn.Module):
     def __init__(self, inputs, outputs):
         super().__init__()
         self.chunk_size = 7
-        self.fc1 = nn.Linear(inputs, 16)
-        self.fc2 = nn.Linear(16, outputs)
-        self.activation_fn = torch.nn.functional.gelu
+        self.mlp = _DenseMlp(inputs, outputs)
         self.norm = _ConditionedNorm(outputs)
 
     def forward(self, states, conditioning, spatial_features=None):
@@ -47,7 +56,7 @@ class _Mlp(nn.Module):
                 states = states.unsqueeze(1).expand(-1, spatial_features.shape[0], -1)
             spatial_features = spatial_features.unsqueeze(0).expand(states.shape[0], -1, -1)
             states = torch.cat([spatial_features, states], dim=-1)
-        return self.norm(self.fc2(self.activation_fn(self.fc1(states))), conditioning)
+        return self.norm(self.mlp(states), conditioning)
 
 
 class _EdgeUpdate(nn.Module):
@@ -105,14 +114,12 @@ class _Head(nn.Module):
     def __init__(self):
         super().__init__()
         self.config = SimpleNamespace(chunk_size=7, grid_latitudes=1, grid_longitudes=19)
-        self.fc1 = nn.Linear(16, 16)
-        self.fc2 = nn.Linear(16, 5)
-        self.activation_fn = torch.nn.functional.gelu
+        self.mlp = _DenseMlp(16, 5)
         self.register_buffer("sigmoid_gate", torch.tensor([False, True, False, True, False]))
         self.register_buffer("sigmoid_shift", torch.tensor([0.0, 2.0, 0.0, 3.0, 0.0]))
 
     def forward(self, states):
-        values = self.fc2(self.activation_fn(self.fc1(states)))
+        values = self.mlp(states)
         values = torch.where(self.sigmoid_gate, torch.sigmoid(values - self.sigmoid_shift), values)
         return values.transpose(1, 2).reshape(states.shape[0], 5, 1, 19)
 

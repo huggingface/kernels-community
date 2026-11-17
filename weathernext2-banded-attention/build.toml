@@ -1,6 +1,6 @@
 [general]
 name = "weathernext2-banded-attention"
-version = 4
+version = 5
 edition = 6
 license = "Apache-2.0"
 backends = [

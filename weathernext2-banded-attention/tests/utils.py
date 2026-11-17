@@ -5,7 +5,7 @@ import pytest
 import torch
 
 
-kernel = kernels.get_kernel("kernels-community/weathernext2-banded-attention", version=4)
+kernel = kernels.get_kernel("kernels-community/weathernext2-banded-attention", version=5)
 banded_attention = kernel.banded_attention
 prepare_mask = kernel.layers._prepare_mask
 
