@@ -80,8 +80,8 @@ class WeatherNext2ConditionedMlp(nn.Module):
         if hidden_states.ndim == 2:
             hidden_states = hidden_states.unsqueeze(1).expand(-1, spatial_features.shape[0], -1)
         batch, points, _ = hidden_states.shape
-        channels = self.fc2.out_features
-        output = hidden_states.new_empty((batch, points, channels), dtype=self.fc2.weight.dtype)
+        channels = self.mlp.fc2.out_features
+        output = hidden_states.new_empty((batch, points, channels), dtype=self.mlp.fc2.weight.dtype)
         fused = not output.is_cpu and output.dtype == torch.float32
         film = self.norm.linear(conditioning) if fused else None
 
@@ -92,9 +92,7 @@ class WeatherNext2ConditionedMlp(nn.Module):
                 spatial = spatial_features[start:end].unsqueeze(0).expand(batch, -1, -1)
                 states = torch.cat([spatial, states], dim=-1)
 
-            values = self.fc1(states)
-            values = self.activation_fn(values)
-            values = self.fc2(values)
+            values = self.mlp(states)
             target = output[:, start:end]
             if not fused:
                 target.copy_(self.norm(values, conditioning))
@@ -196,15 +194,13 @@ class WeatherNext2ForecastHead(nn.Module):
             return type(self).forward(self, grid_states)
 
         batch, points, _ = grid_states.shape
-        channels = self.fc2.out_features
+        channels = self.mlp.fc2.out_features
         output = grid_states.new_empty((batch, points, channels))
         fused = not output.is_cpu and output.dtype == torch.float32
 
         for start in range(0, points, chunk_size):
             end = min(start + chunk_size, points)
-            values = self.fc1(grid_states[:, start:end])
-            values = self.activation_fn(values)
-            values = self.fc2(values)
+            values = self.mlp(grid_states[:, start:end])
             target = output[:, start:end]
             if not fused:
                 target.copy_(torch.where(self.sigmoid_gate, torch.sigmoid(values - self.sigmoid_shift), values))
