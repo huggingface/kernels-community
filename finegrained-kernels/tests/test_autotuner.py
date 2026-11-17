@@ -497,14 +497,15 @@ def test_runoff_winner_uses_remeasured_candidates(monkeypatch):
 
 @pytest.mark.kernels_ci
 def test_coupled_axes_cross_refinement_valley(monkeypatch):
-    """K and pipeline stages must change together when either change alone is slower."""
+    """K and pipeline stages must change together when either change alone is slower: a declared coupling or the
+    pair step (two-axis neighbors of the converged winner) crosses the valley, plain coordinate descent does not."""
     configs = [
         triton.Config({"BLOCK_SIZE_K": bk}, num_stages=stages)
         for bk in (128, 256) for stages in (2, 3)
     ]
     scores = {(128, 2): 10.0, (128, 3): 12.0, (256, 2): 12.0, (256, 3): 1.0}
     winners = []
-    for coupled_axes in ((), (("BLOCK_SIZE_K", "num_stages"),)):
+    for coupled_axes, max_pair_trials in (((), 0), ((("BLOCK_SIZE_K", "num_stages"),), 0), ((), 24)):
         @bayesian_autotune(configs, [], coupled_axes=coupled_axes, cache_results=False)
         @triton.jit
         def kernel(BLOCK_SIZE_K: tl.constexpr):
@@ -515,13 +516,14 @@ def test_coupled_axes_cross_refinement_valley(monkeypatch):
         monkeypatch.setattr(kernel, "runoff", False)
         monkeypatch.setattr(kernel, "basin_probes", True)
         monkeypatch.setattr(kernel, "max_refine_iters", 1)
+        monkeypatch.setattr(kernel, "max_pair_trials", max_pair_trials)
         monkeypatch.setattr(kernel, "_basin_anchor_indices", lambda configs: [0, 1])
         monkeypatch.setattr(
             kernel, "_bench", lambda *args, config, **kwargs: scores[(config.kwargs["BLOCK_SIZE_K"], config.num_stages)]
         )
         winner = kernel._bayesian_search(configs, (), {}, ())
         winners.append((winner.kwargs["BLOCK_SIZE_K"], winner.num_stages))
-    assert winners == [(128, 2), (256, 3)]
+    assert winners == [(128, 2), (256, 3), (256, 3)]
 
 
 @pytest.mark.kernels_ci

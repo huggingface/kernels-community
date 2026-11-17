@@ -1226,6 +1226,10 @@ def split_k_reduce(acc, Partials, TileCounters, tile, num_tiles, BM: tl.constexp
     n_trials=100,
     cold_banks=gemm_cold_banks,
     path_anchor_axes=PATH_ANCHOR_AXES,
+    # the swapped decode wants a deeper K tile than the unswapped one: one slow (swap, BK) sample must not write off the
+    # swap (Qwen2.5 AWQ qkv 4608x3584 M=64: swap BK=256 benched at 16-24us, so the 9.8us swap BK=512 crown went unbenched
+    # in two tunes and a K-sliced BK=256 tile crowned at 13.2us)
+    coupled_axes=(("SWAP_AB", "BLOCK_SIZE_K"),),
     finite_check_args=("C", "Cs"),
     prune_configs_by={
         "early_config_prune": compose_pruners(

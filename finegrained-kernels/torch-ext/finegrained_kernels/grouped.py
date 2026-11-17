@@ -1399,6 +1399,10 @@ def _int_grouped_configs():
     n_trials=100,
     cold_banks=gemm_cold_banks,
     path_anchor_axes=PATH_ANCHOR_AXES,
+    # the decoded tile lives in registers, so its width sets the warp count it wants: one bad (BN, warps) sample must not
+    # write off the BN (Qwen3 INT4 zp gate|up T=64: BN=128 benched once at 2 warps, 201us, so BN=128 at 4 warps, the
+    # 72us crown, was never reached; BN=64 / 2 warps crowned at 80.5us)
+    coupled_axes=(("BLOCK_SIZE_N", "num_warps"),),
     prune_configs_by={
         "early_config_prune": compose_pruners(
             tile_order_pruner(),

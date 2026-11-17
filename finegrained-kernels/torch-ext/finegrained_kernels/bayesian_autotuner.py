@@ -146,6 +146,10 @@ class BayesianAutotuner(Autotuner):
         if any(len(group) < 2 for group in self.coupled_axes) or len(set(coupled_names)) != len(coupled_names):
             raise ValueError("coupled_axes must contain disjoint groups of at least two configuration fields")
         self._coupled_names = frozenset(coupled_names)
+        # checked against the whole grid: a pruned list may lack a field only some config families carry
+        unknown = sorted(self._coupled_names - set().union(*(c.all_kwargs() for c in self.configs)))
+        if unknown:
+            raise ValueError(f"Unknown coupled_axes configuration field: {unknown[0]}")
         # Output arg NAMES (a declaration — the tuner never hardcodes kernel details) whose
         # values are checked for NaN/inf after each config's bench: a config that writes
         # non-finite output scores inf and can never be crowned. The tuner times, it never
@@ -648,10 +652,8 @@ class BayesianAutotuner(Autotuner):
             values = config.all_kwargs()
             signature = {(name,): value for name, value in values.items() if name not in self._coupled_names}
             for group in self.coupled_axes:
-                try:
-                    signature[group] = tuple(values[name] for name in group)
-                except KeyError as exc:
-                    raise ValueError(f"Unknown coupled_axes configuration field: {exc.args[0]}") from exc
+                # a field some grid families leave at the kernel default (e.g. SWAP_AB) couples as None there
+                signature[group] = tuple(values.get(name) for name in group)
             signatures.append(tuple(sorted(signature.items())))
         return signatures
 
