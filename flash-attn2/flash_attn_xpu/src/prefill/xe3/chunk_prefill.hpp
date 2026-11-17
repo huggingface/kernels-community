@@ -96,6 +96,48 @@ struct chunk_policy_head256_b16 {
   using SubgroupLayoutQK = Layout<Shape<_32, _1, _1>>;
 };
 
+struct chunk_policy_head96 {
+  using ShapeQK = Shape<_128, _32, _32>;
+  using ShapePV = Shape<_128, _32, _32>;
+  using ShapeOut = Shape<_128, _96>;
+  using SubgroupLayoutQK = Layout<Shape<_8, _1, _1>>;
+};
+
+struct chunk_policy_head96_b16 {
+  using ShapeQK = Shape<_128, _16, _32>;
+  using ShapePV = Shape<_128, _32, _16>;
+  using ShapeOut = Shape<_128, _96>;
+  using SubgroupLayoutQK = Layout<Shape<_8, _1, _1>>;
+};
+
+struct chunk_policy_head192 {
+  using ShapeQK = Shape<_256, _32, _32>;
+  using ShapePV = Shape<_256, _32, _32>;
+  using ShapeOut = Shape<_256, _192>;
+  using SubgroupLayoutQK = Layout<Shape<_32, _1, _1>>;
+};
+
+struct chunk_policy_head192_b16 {
+  using ShapeQK = Shape<_256, _16, _32>;
+  using ShapePV = Shape<_256, _32, _16>;
+  using ShapeOut = Shape<_256, _192>;
+  using SubgroupLayoutQK = Layout<Shape<_32, _1, _1>>;
+};
+
+struct chunk_policy_head512 {
+  using ShapeQK = Shape<_256, _32, _32>;
+  using ShapePV = Shape<_256, _32, _32>;
+  using ShapeOut = Shape<_256, _256>;
+  using SubgroupLayoutQK = Layout<Shape<_32, _1, _1>>;
+};
+
+struct chunk_policy_head512_b16 {
+  using ShapeQK = Shape<_256, _16, _32>;
+  using ShapePV = Shape<_256, _32, _16>;
+  using ShapeOut = Shape<_256, _256>;
+  using SubgroupLayoutQK = Layout<Shape<_32, _1, _1>>;
+};
+
 // chunk_prefill_common.hpp
 template <typename Policy, bool Causal, typename = void>
 struct chunk_policy_dispatch_shapes {
@@ -488,6 +530,18 @@ template <> struct kc_policy<128> {
 template <> struct kc_policy<256> {
   using std_t = chunk_policy_head256;
   using b16_t = chunk_policy_head256_b16;
+};
+template <> struct kc_policy<96> {
+  using std_t = chunk_policy_head96;
+  using b16_t = chunk_policy_head96_b16;
+};
+template <> struct kc_policy<192> {
+  using std_t = chunk_policy_head192;
+  using b16_t = chunk_policy_head192_b16;
+};
+template <> struct kc_policy<512> {
+  using std_t = chunk_policy_head512;
+  using b16_t = chunk_policy_head512_b16;
 };
 
 template <int HD, bool Bf16, bool Paged>

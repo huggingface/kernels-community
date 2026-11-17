@@ -1178,15 +1178,18 @@ mha_varlen_fwd(
 
     // Chunk-prefill kernel (adapted from vllm-xpu-kernels): src/prefill (Xe2)
     // and src/prefill/xe3 (Xe35, CRI image). On Xe2, head sizes 64 and 256
-    // take it only for pages of 16 or 32 rows, which the kernel below lacks.
+    // take it only for pages of 16 or 32 rows, which the kernel below lacks;
+    // head sizes 96, 192 and 512 only for such pages on both.
     constexpr int64_t kInt32Max = std::numeric_limits<int>::max();
     const bool xe35 = splitkv::is_xe35(q);
-    const bool xe2_small_page = !xe35 && is_paged && k_padded.dim() == 4 &&
+    const bool small_page = is_paged && k_padded.dim() == 4 &&
         splitkv::small_page(k_padded);
     const bool use_chunk_prefill =
         (head_size_og == 128 ||
-         ((xe35 || xe2_small_page) &&
-          (head_size_og == 64 || head_size_og == 256))) &&
+         ((xe35 || small_page) &&
+          (head_size_og == 64 || head_size_og == 256)) ||
+         (small_page && (head_size_og == 96 || head_size_og == 192 ||
+                         head_size_og == 512))) &&
         !needs_padding && !is_local &&
         p_dropout == 0.0f && !return_softmax && softcap == 0.0f &&
         !(alibi_slopes_.has_value() && alibi_slopes_->defined()) &&
@@ -1307,6 +1310,21 @@ mha_varlen_fwd(
                     chunk_prefill_done = bf16 ? vp::chunk_prefill<256, true>(queue, a)
                                               : vp::chunk_prefill<256, false>(queue, a);
                     break;
+                case 96:
+                    chunk_prefill_done =
+                        bf16 ? vp::chunk_prefill_impl<96, true, true>(queue, a)
+                             : vp::chunk_prefill_impl<96, false, true>(queue, a);
+                    break;
+                case 192:
+                    chunk_prefill_done =
+                        bf16 ? vp::chunk_prefill_impl<192, true, true>(queue, a)
+                             : vp::chunk_prefill_impl<192, false, true>(queue, a);
+                    break;
+                case 512:
+                    chunk_prefill_done =
+                        bf16 ? vp::chunk_prefill_impl<512, true, true>(queue, a)
+                             : vp::chunk_prefill_impl<512, false, true>(queue, a);
+                    break;
                 default:
                     chunk_prefill_done = bf16 ? vp::chunk_prefill<128, true>(queue, a)
                                               : vp::chunk_prefill<128, false>(queue, a);
@@ -1325,6 +1343,21 @@ mha_varlen_fwd(
                     chunk_prefill_done =
                         bf16 ? vp::chunk_prefill_impl<256, true, true>(queue, a)
                              : vp::chunk_prefill_impl<256, false, true>(queue, a);
+                    break;
+                case 96:
+                    chunk_prefill_done =
+                        bf16 ? vp::chunk_prefill_impl<96, true, true>(queue, a)
+                             : vp::chunk_prefill_impl<96, false, true>(queue, a);
+                    break;
+                case 192:
+                    chunk_prefill_done =
+                        bf16 ? vp::chunk_prefill_impl<192, true, true>(queue, a)
+                             : vp::chunk_prefill_impl<192, false, true>(queue, a);
+                    break;
+                case 512:
+                    chunk_prefill_done =
+                        bf16 ? vp::chunk_prefill_impl<512, true, true>(queue, a)
+                             : vp::chunk_prefill_impl<512, false, true>(queue, a);
                     break;
                 default:
                     chunk_prefill_done = bf16 ? vp::chunk_prefill<128, true>(queue, a)
