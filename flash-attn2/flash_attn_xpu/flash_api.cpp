@@ -1640,7 +1640,9 @@ mha_fwd_kvcache(
     if (window_size_right >= seqlen_k) { window_size_right = -1; }
 
     // Decode and short queries: split-KV kernel (see mha_fwd). num_splits:
-    // 0 = heuristic, 1 = generic kernel, N > 1 = N splits.
+    // 0 = heuristic, 1 = generic kernel (paged decode kernel with one split
+    // for 16/32-row pages, which the generic kernel does not take), N > 1 =
+    // N splits.
     bool skv_causal = false;
     if (seqlen_q >= 1 && seqlen_q <= splitkv::kMaxQueries &&
         (seqlen_q == 1 ||
@@ -1650,7 +1652,8 @@ mha_fwd_kvcache(
              is_causal, window_size_left,
              window_size_left < 0 && !is_causal ? -1 : window_size_right,
              skv_causal)) &&
-        num_splits != 1 && softcap == 0.0f &&
+        (num_splits != 1 || (paged_KV && splitkv::small_page(kcache))) &&
+        softcap == 0.0f &&
         !rotary_cos_.has_value() && !cache_batch_idx_.has_value() &&
         !leftpad_k_.has_value() && seqlen_k > 0 &&
         (paged_KV || seqlen_k < (1 << 24)) &&
@@ -1706,7 +1709,7 @@ mha_fwd_kvcache(
                         vcache, out, block_table_c, cu_q, seqlens_k,
                         /*kv_cumulative=*/false, batch_size, seqlen_k,
                         softmax_scale, window_size_left, -1,
-                        num_splits > 1 ? num_splits : 0, softmax_lse,
+                        num_splits > 0 ? num_splits : 0, softmax_lse,
                         /*lse_stride=*/1, /*lse_row_stride=*/num_heads))
                     return {out, softmax_lse};
                 TORCH_CHECK(!splitkv::small_page(kcache),
