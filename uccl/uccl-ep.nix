@@ -11,6 +11,9 @@
 
   backend,
   version,
+
+  # Unique ID per SDK build variant.
+  sdkId,
   src,
 
   # The ROCm architectures to build for.
@@ -46,7 +49,7 @@ let
   hipifyPython = python3.withPackages (_: [ torch ]);
 
   commonDefs = [
-    "-DNB_DOMAIN=uccl_ep"
+    "-DNB_DOMAIN=${sdkId}"
     "-DPy_LIMITED_API=0x030C0000"
     "-DNB_STABLE_ABI=1"
     "-DDISABLE_AGGRESSIVE_PTX_INSTRS"

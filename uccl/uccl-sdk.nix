@@ -22,7 +22,8 @@
   # The backend (`cuda` or `rocm`).
   backend,
 
-  rev,
+  # Unique ID for the SDK build variant.
+  sdkId,
 
   # The capabilities/architectures to declare in the metadata.
   archs,
@@ -30,8 +31,6 @@
 
 let
   kernelName = "uccl";
-
-  kernelId = "_${kernelName}_${lib.replaceStrings [ "-" "." ] [ "_" "_" ] variant}_${rev}";
 
   intervaltree = python3.pkgs.intervaltree;
   sortedcontainers = python3.pkgs.sortedcontainers;
@@ -50,7 +49,7 @@ stdenv.mkDerivation {
     patchelf-old
   ];
 
-  inherit variant kernelId;
+  inherit variant sdkId;
 
   installPhase = ''
     runHook preInstall
@@ -97,7 +96,7 @@ stdenv.mkDerivation {
     patchelf --set-rpath '$ORIGIN/uccl.libs' $variantDir/ep.abi3.so
 
     jq -n \
-      --arg id "$kernelId" \
+      --arg id "$sdkId" \
       --arg backend "${backend}" \
       --argjson archs '${builtins.toJSON archs}' \
       '{

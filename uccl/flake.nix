@@ -100,6 +100,9 @@
 
           cuda = backend == "cuda";
 
+          # Unique identifier per SDK build variant.
+          sdkId = "_uccl_${lib.replaceStrings [ "-" "." ] [ "_" "_" ] variant}_${rev}";
+
           src = pkgs.fetchFromGitHub {
             owner = "uccl-project";
             repo = "uccl";
@@ -110,7 +113,7 @@
         pkgs.callPackage ./uccl-sdk.nix {
           inherit
             python3
-            rev
+            sdkId
             variant
             version
             src
@@ -122,13 +125,14 @@
             inherit
               backend
               version
+              sdkId
               src
               torch
               ;
             offloadArchs = rocmArchs;
           };
 
-          p2p = pkgs.callPackage ./uccl-p2p.nix { inherit backend version src; };
+          p2p = pkgs.callPackage ./uccl-p2p.nix { inherit backend version src sdkId; };
 
           ncclPlugin = pkgs.callPackage ./uccl-nccl-plugin.nix { inherit backend version src; };
 

@@ -10,6 +10,9 @@
   backend,
 
   version,
+
+  # Unique ID per SDK build variant.
+  sdkId,
   src,
 }:
 
@@ -29,6 +32,12 @@ stdenv.mkDerivation {
   inherit version src;
 
   sourceRoot = "${src.name}/p2p";
+
+  # Give the extension a nanobind domain that is unique per SDK buil.
+  postPatch = ''
+    substituteInPlace Makefile Makefile.rocm \
+      --replace-fail '-DNB_STABLE_ABI=1' '-DNB_STABLE_ABI=1 -DNB_DOMAIN=${sdkId}'
+  '';
 
   nativeBuildInputs = [ pythonEnv ];
 
