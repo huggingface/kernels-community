@@ -1030,9 +1030,14 @@ mha_varlen_fwd(
                 skv_mixed = true;
                 skv_causal = false;
             }
+            // Small pages: the split-KV kernel cannot run, so the prefill
+            // kernel takes every batch, including the one-query batches of a
+            // mixed batch.
             if (skv_paged && splitkv::small_page(k) &&
-                (skv_q_per_batch != 1 || skv_mixed || !splitkv::paged_decode_supported(q, k)))
+                (skv_q_per_batch != 1 || skv_mixed || !splitkv::paged_decode_supported(q, k))) {
                 skv_q_per_batch = 0;
+                skv_mixed = false;
+            }
         }
         if (skv_q_per_batch > 0) {
             auto queue = c10::xpu::getCurrentXPUStream(device_idx).queue();
