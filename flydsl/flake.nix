@@ -71,11 +71,14 @@
           inherit (buildSet) pkgs;
           inherit (mkShared buildSets) flydslSrc llvm;
 
-          native = pkgs.callPackage ./flydsl.nix { inherit flydslSrc llvm; };
+          # Unique identifier per SDK build variant.
+          sdkId = "_flydsl_${lib.replaceStrings [ "-" "." ] [ "_" "_" ] variant}_${rev}";
+
+          native = pkgs.callPackage ./flydsl.nix { inherit flydslSrc llvm sdkId; };
         in
         pkgs.callPackage ./sdk.nix {
           inherit
-            rev
+            sdkId
             variant
             version
             native

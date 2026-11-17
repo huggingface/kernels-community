@@ -14,15 +14,12 @@
   # The build variant to produce, e.g. `sdk-rocm-7.0-cpython-3.12-abi3-x86_64-linux`.
   variant,
 
-  # The (short) Git revision of the kernel, with dashes replaced by underscores
-  # (e.g. `7a4e5a7` or `7a4e5a7_dirty`). Used to make the kernel id unique.
-  rev,
+  # Unique ID for the SDK build variant.
+  sdkId,
 }:
 
 let
   kernelName = "flydsl";
-
-  kernelId = "_${kernelName}_${lib.replaceStrings [ "-" "." ] [ "_" "_" ] variant}_${rev}";
 in
 stdenv.mkDerivation {
   pname = "${kernelName}-kernel-${variant}";
@@ -38,7 +35,7 @@ stdenv.mkDerivation {
     patchelf-old
   ];
 
-  inherit variant kernelId;
+  inherit variant sdkId;
 
   installPhase = ''
     runHook preInstall
@@ -98,7 +95,7 @@ stdenv.mkDerivation {
     archs='["gfx942", "gfx950", "gfx1201", "gfx1250"]'
 
     jq -n \
-      --arg id "$kernelId" \
+      --arg id "$sdkId" \
       --argjson archs "$archs" \
       '{
         name: "${kernelName}",

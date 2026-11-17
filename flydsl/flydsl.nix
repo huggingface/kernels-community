@@ -8,6 +8,9 @@
 
   llvm,
   flydslSrc,
+
+  # Unique ID per SDK build variant.
+  sdkId,
 }:
 
 let
@@ -52,6 +55,9 @@ manylinux_2_28.stdenv.mkDerivation {
     # environment (it also needs /bin/bash).
     substituteInPlace python/mlir_flydsl/CMakeLists.txt \
       --replace-fail 'COMMAND /bin/bash -c "\' 'COMMAND true "\'
+    # Ensure unique nanobind domain.
+    substituteInPlace python/mlir_flydsl/CMakeLists.txt \
+      --replace-fail 'MLIR_BINDINGS_PYTHON_NB_DOMAIN "mlir"' 'MLIR_BINDINGS_PYTHON_NB_DOMAIN "${sdkId}"'
   '';
 
   buildInputs = [ clr ];
