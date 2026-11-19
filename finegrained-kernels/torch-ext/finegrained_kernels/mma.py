@@ -75,15 +75,9 @@ def mx_dot_rescale(
     SWAP_AB: tl.constexpr = False,
     BLOCK_SIZE_K: tl.constexpr = 0,
 ):
-    """MX 'dot' step: single-group tiles use fp8 dot followed by rescaling;
-    multi-group tiles dequantize each K group before a bf16 dot. E2M1 times an
-    E4M3 scale is exactly representable in bf16 (including subnormal E4M3
-    scales), so the NVFP4 fallback adds no operand rounding.
-    Multi-group tiles only arise for NVFP4 (group 16) under the MX-pinned BK=32; on sm_10x the
-    dot arm is pruned (``dot_arm_ok`` in ``mx_config_pruner``), so this branch never compiles
-    there for typical shapes. Packed E2M1 decodes straight to fp32 here (no E4M3 hop).
-    Single-group path: fp8 ``tl.dot`` on E4M3-decoded operands + per-group
-    software rescale (both UE8M0 scales decoded here), accumulating into ``acc``. Plain: ``a``
+    """MX 'dot' step. If the tile spans one scale group, run an fp8 ``tl.dot`` on E4M3-decoded
+    operands and rescale the product. If it spans several (NVFP4, group 16), dequantize each
+    group to bf16 (exact) before a bf16 ``tl.dot``. Plain: ``a``
     [BM, BK] x ``w`` [BK, BN] with the weight's per-column scale transposed onto the product (the
     batched gate_up kernel passes the INTERLEAVED gate|up 2*BN tile — per-column independence keeps
     that bit-exact). ``SWAP_AB`` (decode): the weight ``w`` [ROWS, BK] is the lhs (E2M1 column-unpacked,
