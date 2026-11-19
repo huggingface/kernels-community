@@ -129,6 +129,13 @@ def build_run(request, uploads):
             "Builds must use the same source commit; rerun merge-and-upload"
         )
     source_sha = sources.pop()
+    # issue_comment starts before merge-and-upload merges the PR. Checkout can
+    # reset origin/main to that event's older SHA even with fetch-depth: 0.
+    # Refresh the remote ref before checking the post-merge build's ancestry.
+    subprocess.run(
+        ["git", "fetch", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main"],
+        check=True,
+    )
     for ancestor, descendant in [
         (pr["merge_commit_sha"], source_sha),
         (source_sha, "origin/main"),
