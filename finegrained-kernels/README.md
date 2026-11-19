@@ -269,7 +269,7 @@ How work is spread over the GPU and how launches overlap.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | 2D | block FP8 (dynamic act) | 🟠 | ⚪† | ⚪ | 🟢 | ⚪ | 🟢* |
 | 2D | block FP8 (static act) | 🟠 | ⚪† | ⚪ | 🟢 | ⚪ | 🟢* |
-| 2D | tensor / row-wise FP8 | 🟠 | ⚪† | ⚪ | 🟢 | ⚪ | 🟢* |
+| 2D | tensor / row-wise FP8 | 🟠 | 🟢 | ⚪ | 🟢 | ⚪ | 🟢* |
 | 2D | MXFP8 / MXFP4 / NVFP4 | 🟢 | 🟠 | ⚪ | 🟢 | ⚪ | 🟢* |
 | 2D | MX weight-only (W4A16 / W8A16) | 🟢 | ⚪† | ⚪ | 🟢 | ⚪ | 🟢* |
 | 2D | FP8 weight-only | 🟢 | ⚪† | ⚪ | 🟢 | ⚪ | 🟢* |
@@ -331,7 +331,7 @@ How much of the MMA each tile uses. *Scale off weight tile*: a coarse weight sca
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | 2D | block FP8 (dynamic act) | 🟠 | ⚪† | 🔴 | 🟢 | 🟠 | ⚪ | 🟠 | 🟢* |
 | 2D | block FP8 (static act) | ⚪ | 🔴 | 🔴 | ⚪† | ⚪ | ⚪ | 🔴 | 🟢* |
-| 2D | tensor / row-wise FP8 | ⚪ | 🟠 | 🔴 | ⚪† | ⚪ | ⚪ | 🟠 | 🟢* |
+| 2D | tensor / row-wise FP8 | ⚪ | 🟠 | 🔴 | ⚪† | 🟢 | ⚪ | 🟠 | 🟢* |
 | 2D | MXFP8 / MXFP4 / NVFP4 | 🟠 | 🟠 | 🟠 | 🟢 | 🟢 | ⚪ | 🟠 | ⚪ |
 | 2D | MX weight-only (W4A16 / W8A16) | 🟠 | 🔴 | 🔴 | 🔴 | ⚪ | 🟢 | 🔴 | ⚪ |
 | 2D | FP8 weight-only | ⚪ | 🟠 | 🔴 | ⚪† | ⚪ | 🔴 | 🟠 | 🟠 |
