@@ -5,6 +5,14 @@
       "cores": 4
     }
   },
+  "flash-attn3": {
+    "cuda": {
+      "aarch64-linux": {
+        "max-jobs": 1,
+        "cores": 12
+      }
+    }
+  },
   "natten": {
     "cuda": {
       "max-jobs": 2,
