@@ -9,7 +9,12 @@ extern "C" AOTITorchError aoti_torch_get_current_cuda_stream(
     int32_t device_index,
     void** ret_stream);
 
+#ifdef USE_ROCM
+#include <hip/hip_runtime.h>
+using cudaStream_t = hipStream_t;
+#else
 #include <cuda_runtime.h>
+#endif
 
 inline cudaStream_t get_current_cuda_stream(const torch::stable::Tensor& t) {
   void* stream_ptr = nullptr;
