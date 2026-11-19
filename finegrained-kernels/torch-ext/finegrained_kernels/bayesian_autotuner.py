@@ -770,20 +770,37 @@ class BayesianAutotuner(Autotuner):
             bench_idx(best_i)
 
         # Coordinate-descent refinement: try single-dim perturbations around
-        # the current best until no neighbor improves.
-        def refine():
+        # the current best (of ``within``, the whole grid by default) until no neighbor improves.
+        # A step changes one axis, unless the pruners dropped that pairing: a deeper K tile admits fewer stages
+        # (Qwen2.5 AWQ qkv M=64: BK128 s6 has no BK512 s6, so descent stalled one step from the BK512 s3 winner,
+        # 11.1 vs 9.9 us), and swapped tiles only pair matching A/B memory modes (Qwen2.5 GPTQ qkv M=64 stalled on
+        # pointer BM32 BN64 BK512 at 16.4 us, its host-descriptor twin 11.4 us). Then the step lands on the nearest
+        # admitted config holding the new value: fewest other axes changed, then the nearest stage count.
+        stage_dim = next((d for d, _ in sigs[0] if d == ("num_stages",)), None) if sigs else None
+
+        def refine(within=None):
             for _ in range(self.max_refine_iters):
-                best_idx = min(timings, key=timings.get)
+                best_idx = min((i for i in timings if within is None or i in within), key=timings.get)
                 best_sig = sigs[best_idx]
                 best_ms = timings[best_idx]
-                improved = False
+                best_stages = dict(best_sig).get(stage_dim)
+                steps, nearest = set(), {}
                 for i, s in enumerate(sigs):
-                    if i in timings:
+                    if within is not None and i not in within:
                         continue
-                    diff = sum(1 for (_, a), (_, b) in zip(best_sig, s) if a != b)
-                    if diff != 1:
-                        continue
-                    if bench_idx(i) < best_ms:
+                    changed = [(d, b) for (d, a), (_, b) in zip(best_sig, s) if a != b]
+                    if len(changed) == 1:
+                        steps.add(i)
+                    elif len(changed) <= 3:
+                        rank = (len(changed), 0 if stage_dim is None else abs(dict(s)[stage_dim] - best_stages))
+                        for step in changed:
+                            if step[0] != stage_dim and (step not in nearest or rank < nearest[step][0]):
+                                nearest[step] = (rank, i)
+                exact = {next((d, b) for (d, a), (_, b) in zip(best_sig, sigs[i]) if a != b) for i in steps}
+                steps |= {i for step, (_, i) in nearest.items() if step not in exact}
+                improved = False
+                for i in sorted(steps):
+                    if i not in timings and bench_idx(i) < best_ms:
                         improved = True
                 if not improved:
                     break
@@ -816,6 +833,17 @@ class BayesianAutotuner(Autotuner):
                     improved = True
             if improved:
                 refine()
+
+        # Branch refinement: descend inside every other declared path branch too, from its own best. A branch is
+        # judged by the few configs the search gave it, and its guaranteed wide anchor can be its worst tile: on the
+        # Qwen2.5 AWQ qkv M=64 tune the swapped branch's anchor (BM64 BN128) took 2.7 ms, the TPE wrote SWAP_AB off
+        # and crowned a 12.0 us unswapped tile, while the swapped BM32 BN64 BK512 tile (9.85 us) sat one step from
+        # the branch's best measured config (BN128).
+        if self.path_anchor_axes and self.max_refine_iters:
+            branch_of = [tuple(c.all_kwargs().get(k) for k in self.path_anchor_axes) for c in configs]
+            winner = branch_of[min(timings, key=timings.get)]
+            for branch in sorted({branch_of[i] for i, t in timings.items() if t != float("inf")} - {winner}, key=str):
+                refine({i for i, b in enumerate(branch_of) if b == branch})
 
         # Crown RUNOFF: the search's single-shot timings carry enough noise to flip crowns
         # between same-code tune rolls (gpt-oss prefill grouped rolled 1727-2150us on identical

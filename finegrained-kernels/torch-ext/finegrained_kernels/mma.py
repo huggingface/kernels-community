@@ -567,8 +567,13 @@ def int_offset_dequant_tile(
     LIFT_DTYPE: tl.constexpr = OUT_DTYPE if w_scale is None else w_scale.dtype
     FP16: tl.constexpr = LIFT_DTYPE == tl.float16
     OFFSET: tl.constexpr = 128.0 if BITS < 8 and not FP16 else 1024.0  # int_words_to_offset
+    # On CUDA a whole-word output-rows-major symmetric tile (the swapped MMA lhs) takes its implicit zero point
+    # 2 ** (BITS - 1) in the packed add an explicit one takes: subtracted per unpacked value it costs a scalar op each
+    # (Qwen3 GPTQ INT4 swapped gate|up T=64: 102 -> 61 us). The pair-split tiles keep the scalar subtract, which
+    # measured faster there (unswapped tile scale: 71 vs 83 us).
+    SYM_ZERO: tl.constexpr = _PTX and w_zero is None and BITS < 8 and ROWS_MAJOR and WHOLE_WORD
     # what int_words_to_offset leaves on top of q - z
-    if w_zero is None:
+    if w_zero is None and not SYM_ZERO:
         ZERO: tl.constexpr = OFFSET + (1 << (BITS - 1))
     elif _PTX:
         ZERO: tl.constexpr = 0.0
@@ -576,7 +581,7 @@ def int_offset_dequant_tile(
         ZERO: tl.constexpr = OFFSET + (1 << BITS)
     WPG: tl.constexpr = SCALE_GROUP_K // VPW  # words per scale group
     # a zero-point tile already in the scale's dtype takes its scale inside int_words_to_offset's packed asm
-    PACKED_SCALE: tl.constexpr = (_PTX and w_zero is not None and divisor is None and BITS < 8
+    PACKED_SCALE: tl.constexpr = (_PTX and (w_zero is not None or SYM_ZERO) and divisor is None and BITS < 8
                                   and OUT_DTYPE == LIFT_DTYPE and w_scale is not None)
     if ROWS_MAJOR:
         N: tl.constexpr = w.shape[0]
@@ -587,6 +592,8 @@ def int_offset_dequant_tile(
             center = 0 if w_zero is None else (w_zero.to(tl.bfloat16) - 128)[:, :, None]
             v = int_dequant(q, center, _group_scale(w_scale, False), OUT_DTYPE, divisor)
         else:
+            if SYM_ZERO:
+                w_zero = tl.full((N, NG), 1 << (BITS - 1), tl.uint8)
             zero_words = None if w_zero is None else int_zero_words(w_zero, WPG, BITS, False, FP16)
             if PACKED_SCALE:
                 v = int_words_to_offset(w, zero_words, BITS, False, WHOLE_WORD, FP16, int_scale_words(w_scale, WPG, False))

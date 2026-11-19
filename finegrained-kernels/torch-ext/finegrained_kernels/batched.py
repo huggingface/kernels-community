@@ -56,7 +56,7 @@ from .loading.tiles import (
     weight_tile_ptrs,
 )
 from .epilogue import acc_init, bias_strides, gemm_epilogue
-from .pruners import PATH_ANCHOR_AXES, block_fp8_scale_mode_pruner, fp8_dot_warp_pruner, dot_scaled_staging_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gate_tile_cap_pruner, mx_config_pruner, require_moe_dims_aligned, scale_subblock_pruner, single_row_tile_pruner, smem_pruner, swizzled_scale_config_pruner, weight_only_swap_scope_pruner, int_scale_group_tile_pruner
+from .pruners import PATH_ANCHOR_AXES, block_fp8_scale_mode_pruner, fp8_dot_warp_pruner, dot_scaled_staging_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gate_tile_cap_pruner, mx_config_pruner, require_moe_dims_aligned, scale_subblock_pruner, single_row_tile_pruner, smem_pruner, swizzled_scale_config_pruner, weight_only_swap_scope_pruner, int_scale_group_tile_pruner, exact_memory_pruner, int_weight_only_batched_smem, mx_batched_smem, tensor_batched_smem, weight_only_grouped_tmem
 
 
 @triton.jit
@@ -440,6 +440,7 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
             block_within_dim_pruner("N", "BLOCK_SIZE_N"),
             single_row_tile_pruner(),
             descriptor_box_pruner(),
+            exact_memory_pruner(tensor_batched_smem, fallback=smem_pruner()),
         )
     },
 )
@@ -591,7 +592,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     # native scaled-MMA; smaller-BN swap configs never win and mislead the TPE).
     prune_configs_by={
         "early_config_prune": compose_pruners(
-            mx_config_pruner("K", "N"), swizzled_scale_config_pruner(allow_gate_subblock=True), smem_pruner(staged_weights=True),
+            mx_config_pruner("K", "N"), swizzled_scale_config_pruner(allow_gate_subblock=True), exact_memory_pruner(mx_batched_smem, fallback=smem_pruner()),
             gate_tile_cap_pruner(),
             dot_scaled_staging_pruner(),
             descriptor_box_pruner(),
@@ -953,6 +954,7 @@ def mx_weight_only_matmul_batched_kernel(
             weight_only_swap_scope_pruner(),
             int_scale_group_tile_pruner(divides_k=False),
             descriptor_box_pruner(),
+            exact_memory_pruner(int_weight_only_batched_smem, weight_only_grouped_tmem),
         )
     },
 )

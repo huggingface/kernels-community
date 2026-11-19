@@ -50,7 +50,7 @@ from .loading.tiles import (
     weight_tile_ptrs,
 )
 from .epilogue import acc_init, bias_strides, gemm_epilogue
-from .pruners import PATH_ANCHOR_AXES, grouped_scalar_decode_pruner, block_fp8_scale_mode_pruner, int_scale_group_tile_pruner, fp8_dot_warp_pruner, raw_activation_pointer_pruner, warp_spec_memory_mode_pruner, packed_schedule_scope_pruner, tile_order_pruner, affine_scale_warp_spec_pruner, block_dynamic_grouped_matmul_pruner, block_static_grouped_matmul_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gate_stacked_tmem_trap_pruner, gated_pointer_weight_warp_spec_pruner, grouped_mx_swap_scope_pruner, mx_config_pruner, require_moe_dims_aligned, smem_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, swizzled_scales_bm_pruner, warp_spec_compile_guard_pruner, weight_only_dot_scaled_warps_pruner, mxfp4_operand_warps_pruner
+from .pruners import PATH_ANCHOR_AXES, grouped_scalar_decode_pruner, block_fp8_scale_mode_pruner, int_scale_group_tile_pruner, fp8_dot_warp_pruner, raw_activation_pointer_pruner, warp_spec_memory_mode_pruner, packed_schedule_scope_pruner, tile_order_pruner, affine_scale_warp_spec_pruner, block_dynamic_grouped_matmul_pruner, block_static_grouped_matmul_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gate_stacked_tmem_trap_pruner, gated_pointer_weight_warp_spec_pruner, grouped_mx_swap_scope_pruner, grouped_swap_scope_pruner, mx_config_pruner, require_moe_dims_aligned, smem_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, swizzled_scales_bm_pruner, warp_spec_compile_guard_pruner, warp_spec_scatter_epilogue_pruner, weight_only_dot_scaled_warps_pruner, mxfp4_operand_warps_pruner, exact_memory_pruner, fp8_dot_smem, mx_grouped_smem, mx_weight_only_grouped_smem, mx_weight_only_grouped_tmem, weight_only_grouped_smem, weight_only_grouped_tmem
 
 
 def grouped_pre_hook(nargs):
@@ -95,6 +95,7 @@ def _mx_grouped_configs():
     ] if is_sm10x() else []
     for config in configs:
         config.kwargs["SWAP_AB"] = False
+    # BK=512 halves the swapped tile's K steps: GLM-5.2 NVFP4 T=64 (E256 H6144 I2048) 762 -> 713 us at 2 stages
     swapped = [
         triton.Config(
             dict(BLOCK_SIZE_M=bm, BLOCK_SIZE_N=bn, BLOCK_SIZE_K=bk, COMPUTE_MODE="dot_scaled", WARP_SPEC=False,
@@ -102,7 +103,7 @@ def _mx_grouped_configs():
                  SWAP_AB=True),
             num_warps=4, num_stages=stages, pre_hook=grouped_mx_pre_hook,
         )
-        for bm in (16, 32, 64) for bn in (64, 128) for bk in (128, 256) for stages in (2, 3, 4)
+        for bm in (16, 32, 64) for bn in (64, 128) for bk in (128, 256, 512) for stages in (2, 3, 4)
         for a_mode in ("pointer", "host_descriptor") for b_mode in ("pointer", "host_descriptor")
     ] if is_sm10x() else []
     return configs + pipeline_autotuning_configs(seeds, ("tile_loop", "flattened")) + swapped
@@ -182,6 +183,7 @@ def _block_dynamic_fp8_grouped_configs():
             packed_schedule_scope_pruner(),
             block_dynamic_grouped_matmul_pruner(),
             warp_spec_compile_guard_pruner(),
+            warp_spec_scatter_epilogue_pruner(),
             warp_spec_memory_mode_pruner(),
             descriptor_box_pruner(),
             smem_pruner(full_stages=True, pointer_ws_extra_stage=True),
@@ -358,8 +360,6 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
             a_ptrs += BLOCK_SIZE_K * stride_a_k
             b_ptrs += BLOCK_SIZE_K * stride_b_k
 
-        if SWAP_AB:
-            acc = tl.trans(acc)
         gemm_epilogue(
             C,
             Cs,
@@ -386,6 +386,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
             stride_bias_e=stride_bias_e,
             stride_bias_n=stride_bias_n,
             global_row=expert_id64,
+            SWAP_AB=SWAP_AB,
         )
 
 
@@ -408,6 +409,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
             block_dynamic_grouped_matmul_pruner(),
             block_static_grouped_matmul_pruner(),
             warp_spec_compile_guard_pruner(),
+            warp_spec_scatter_epilogue_pruner(),
             warp_spec_memory_mode_pruner(),
             descriptor_box_pruner(),
             raw_activation_pointer_pruner(),
@@ -628,9 +630,10 @@ def _tensor_grouped_configs():
             block_within_dim_pruner("K"),
             block_within_dim_pruner("N", "BLOCK_SIZE_N"),
             warp_spec_compile_guard_pruner(),
+            warp_spec_scatter_epilogue_pruner(),
             warp_spec_memory_mode_pruner(),
             descriptor_box_pruner(),
-            smem_pruner(ws_full_stages=True, raw_a_staged=True),
+            exact_memory_pruner(fp8_dot_smem, fallback=smem_pruner(ws_full_stages=True, raw_a_staged=True)),
             raw_activation_pointer_pruner(),
         )
     },
@@ -840,8 +843,9 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
             swizzled_scales_bm_pruner(),
             swizzled_scale_config_pruner(),
             descriptor_box_pruner(),
-            smem_pruner(min_sets=2),  # two full buffer sets: the grouped pipeline's floor (see smem_pruner)
+            exact_memory_pruner(mx_grouped_smem, fallback=smem_pruner()),
             warp_spec_compile_guard_pruner(),
+            warp_spec_scatter_epilogue_pruner(),
             affine_scale_warp_spec_pruner(),
             warp_spec_memory_mode_pruner(),
             grouped_mx_swap_scope_pruner(),
@@ -1073,8 +1077,6 @@ def mx_dynamic_matmul_grouped_kernel(
             b_ptrs += (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE) * stride_b_k
             kb_off += BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE
 
-        if SWAP_AB:
-            acc = tl.trans(acc)
         if SWAP_AB and SWIZZLED_OUT:
             out_scale_rows = scale_rows
         else:
@@ -1116,6 +1118,7 @@ def mx_dynamic_matmul_grouped_kernel(
             Bias=Bias,
             stride_bias_e=stride_bias_e,
             stride_bias_n=stride_bias_n,
+            SWAP_AB=SWAP_AB,
         )
 
 
@@ -1179,8 +1182,9 @@ def _mx_weight_only_grouped_configs():
             mx_config_pruner("K", "N", block_within_k=False),  # dot_scaled shape gates
             gate_stacked_tmem_trap_pruner(),
             descriptor_box_pruner(),
-            smem_pruner(),
+            exact_memory_pruner(mx_weight_only_grouped_smem, mx_weight_only_grouped_tmem, fallback=smem_pruner()),
             warp_spec_compile_guard_pruner(),
+            warp_spec_scatter_epilogue_pruner(),
             gated_pointer_weight_warp_spec_pruner(),
             weight_only_dot_scaled_warps_pruner(),
             grouped_scalar_decode_pruner(),
@@ -1321,8 +1325,6 @@ def mx_weight_only_matmul_grouped_kernel(
             b_ptrs += (step // WEIGHT_VALUES_PER_BYTE) * stride_b_k
             kb_off = tl.minimum((k + 1) * BLOCK_SIZE_K, K - BLOCK_SIZE_K) // WEIGHT_VALUES_PER_BYTE
 
-        if SWAP_AB and COMPUTE_MODE != "scalar":  # the scalar reduce already returns [1, N]
-            acc = tl.trans(acc)
         gemm_epilogue(
             C, C, acc, out_row, pid_n, tile_id // num_n_tiles, row_mask,
             stride_c_m, stride_c_n, 1, 1,
@@ -1335,6 +1337,8 @@ def mx_weight_only_matmul_grouped_kernel(
             Bias=Bias,
             stride_bias_e=stride_bias_e,
             stride_bias_n=stride_bias_n,
+            COMPUTE_MODE=COMPUTE_MODE,
+            SWAP_AB=SWAP_AB,
         )
 
 
@@ -1368,6 +1372,18 @@ def _int_grouped_configs():
                              PACKED_SCHEDULE=packed, PROGRAMS_PER_SM=1, SWAP_AB=True),
                         num_warps=4, num_stages=stages, pre_hook=grouped_pre_hook,
                     ))
+        # Swapped small-token tiles put the weight rows on the MMA M side: Qwen3 AWQ INT4 zp T=64
+        # (E128 H2048 I768 top8) 122 -> 104 us at BM16 BN128 3 stages, bit-identical to the unswapped crown.
+        for bm in (16, 32):
+            for bn in (64, 128):
+                for stages in (3, 4):
+                    for a_mode in ("pointer", "host_descriptor"):
+                        configs.append(triton.Config(
+                            dict(BLOCK_SIZE_M=bm, BLOCK_SIZE_N=bn, BLOCK_SIZE_K=128, WARP_SPEC=False, GROUP_SIZE_M=1,
+                                 A_MEMORY_MODE=a_mode, B_MEMORY_MODE="host_descriptor", PACKED_SCHEDULE=False,
+                                 PROGRAMS_PER_SM=persistent_programs_per_sm(bm), SWAP_AB=True),
+                            num_warps=4, num_stages=stages, pre_hook=grouped_pre_hook,
+                        ))
     for config in configs:
         config.kwargs["PIPELINE"] = "k_loop"
     # Tile overlap and flattening are separate choices: GLU register pressure can favor preserving the K loop.
@@ -1414,8 +1430,9 @@ def _int_grouped_configs():
             int_scale_group_tile_pruner(),
             gate_stacked_tmem_trap_pruner(),
             descriptor_box_pruner(),
-            smem_pruner(),
+            exact_memory_pruner(weight_only_grouped_smem, weight_only_grouped_tmem, fallback=smem_pruner()),
             warp_spec_compile_guard_pruner(),
+            warp_spec_scatter_epilogue_pruner(),
             gated_pointer_weight_warp_spec_pruner(),
             grouped_scalar_decode_pruner(),
         )
@@ -1580,8 +1597,6 @@ def int_weight_only_matmul_grouped_kernel(
             a_ptrs += BLOCK_SIZE_K * stride_a_k
             b_ptrs += (BLOCK_SIZE_K // VPW) * stride_b_k
 
-        if SWAP_AB:
-            acc = tl.trans(acc)
         output_scale = BsGlobal
         output_scale_stride = stride_bsglobal_e
         if A.dtype.element_ty == tl.int8:
@@ -1599,13 +1614,18 @@ def int_weight_only_matmul_grouped_kernel(
             Bias=Bias,
             stride_bias_e=stride_bias_e,
             stride_bias_n=stride_bias_n,
+            SWAP_AB=SWAP_AB,
         )
 
 
 def _full_precision_grouped_configs():
+    """The grouped dot grid, plus on sm_100 the output-tile pipelines, 256-row tiles, and swapped token tiles: weight
+    rows on the tcgen05 M side and a 16-128-row token tile on N, for experts holding a few dozen rows
+    (``grouped_swap_scope_pruner``)."""
     configs = _grouped_dot_configs()
     for config in configs:
         config.kwargs["PIPELINE"] = "k_loop"
+        config.kwargs["SWAP_AB"] = False
     if is_sm10x():
         seeds = [
             c for c in configs
@@ -1614,6 +1634,23 @@ def _full_precision_grouped_configs():
             and (c.kwargs["BLOCK_SIZE_N"], c.num_warps) in ((128, 8), (256, 4))
         ]
         configs.extend(pipeline_autotuning_configs(seeds, ("tile_loop", "flattened")))
+        # 256-row tiles: two M=128 MMAs per CTA read each weight tile once for an expert's ~192-256 rows, where
+        # two 128-row tiles fetch it twice (DeepSeek-V4 gate|up + GLU, B200: 2238 vs 2460us). The packed schedule
+        # is built for BM=128 only.
+        configs.extend(
+            triton.Config(dict(BLOCK_SIZE_M=256, BLOCK_SIZE_N=bn, BLOCK_SIZE_K=64, WARP_SPEC=True, GROUP_SIZE_M=g,
+                               PACKED_SCHEDULE=False, A_MEMORY_MODE="host_descriptor",
+                               B_MEMORY_MODE="host_descriptor", PIPELINE="k_loop", SWAP_AB=False),
+                          num_warps=w, num_stages=st, pre_hook=grouped_pre_hook)
+            for bn in (64, 128) for g in (1, 8) for w in (4, 8) for st in (3, 4)
+        )
+        configs.extend(
+            triton.Config(dict(c.kwargs, SWAP_AB=True), num_warps=c.num_warps, num_stages=c.num_stages,
+                          num_ctas=c.num_ctas, maxnreg=c.maxnreg, pre_hook=c.pre_hook)
+            for c in list(configs)
+            if c.kwargs["BLOCK_SIZE_M"] in (16, 32, 64, 128) and c.kwargs["BLOCK_SIZE_N"] == 128
+            and c.kwargs["PIPELINE"] == "k_loop" and not c.kwargs["SWAP_AB"]
+        )
     return configs
 
 
@@ -1629,13 +1666,18 @@ def _full_precision_grouped_configs():
         "early_config_prune": compose_pruners(
             tile_order_pruner(),
             block_within_dim_pruner("K"),
-            block_within_dim_pruner("N", "BLOCK_SIZE_N"),
+            # a descriptor-loaded weight tile zero-fills past N and the epilogue masks the column tail (N_COLS),
+            # so BN needn't divide N there (GPT-OSS N=2880 otherwise caps BN at 64); the pointer tile would read
+            # past the last expert
+            block_within_dim_pruner("N", "BLOCK_SIZE_N", masked_tail=lambda c: c.kwargs["B_MEMORY_MODE"] != "pointer"),
             warp_spec_compile_guard_pruner(),
+            warp_spec_scatter_epilogue_pruner(),
             warp_spec_memory_mode_pruner(gather_only=True),
             packed_schedule_scope_pruner(),
             descriptor_box_pruner(),
             gate_stacked_tmem_trap_pruner(),
             smem_pruner(),
+            grouped_swap_scope_pruner(),
         )
     },
 )
@@ -1691,6 +1733,8 @@ def full_precision_matmul_grouped_kernel(
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
     PIPELINE: tl.constexpr = "k_loop",
     GROUP_SIZE_M: tl.constexpr = 8,
+    # weight rows on the MMA's M side and the token tile on N (see _full_precision_grouped_configs)
+    SWAP_AB: tl.constexpr = False,
 ):
     """Full-precision grouped expert matmul kernel — persistent grid-stride over tiles.
 
@@ -1756,10 +1800,10 @@ def full_precision_matmul_grouped_kernel(
             offs_k,
             stride_b_n,
             stride_b_k,
-            False,
+            SWAP_AB,
         )
 
-        acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
+        acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, SWAP_AB)
         # Resolve each descriptor operand once per tile: the host-built box as passed, or an
         # in-kernel tensormap where the host cannot build one (a host descriptor IS a TMA
         # descriptor, and Xe has no TMA). The weight box is 2D over THIS expert's slab rather
@@ -1789,10 +1833,13 @@ def full_precision_matmul_grouped_kernel(
             )
             w, _ws = load_weight_plain(
                 b_ptrs, b_desc, row0, n_off, k * BLOCK_SIZE_K,
-                GATE, True, B_MEMORY_MODE, False, BLOCK_SIZE_N, BLOCK_SIZE_K,
+                GATE, True, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
                 B_DESCRIPTOR_IS_2D=B_DESCRIPTOR_IS_2D,
             )
-            acc = acc + fp8_dot(a, w, False, BLOCK_SIZE_K)
+            if SWAP_AB:
+                acc = tl.dot(w, tl.trans(a), acc)
+            else:
+                acc = acc + fp8_dot(a, w, False, BLOCK_SIZE_K)
             if A_MEMORY_MODE == "pointer":
                 a_ptrs += BLOCK_SIZE_K * stride_a_k
             if B_MEMORY_MODE == "pointer":
@@ -1820,10 +1867,12 @@ def full_precision_matmul_grouped_kernel(
             SWIGLU_LIMIT,
             SIMULATE_UNFUSED,
             INTERMEDIATE_DTYPE,
+            N_COLS=N,
             Bias=Bias,
             stride_bias_e=stride_bias_e,
             stride_bias_n=stride_bias_n,
             global_row=expert_id64,
+            SWAP_AB=SWAP_AB,
         )
 
 
@@ -1868,11 +1917,12 @@ def _block_fp8_weight_only_grouped_configs():
             block_within_dim_pruner("K"),
             block_within_dim_pruner("N", "BLOCK_SIZE_N"),
             warp_spec_compile_guard_pruner(),
+            warp_spec_scatter_epilogue_pruner(),
             warp_spec_memory_mode_pruner(gather_only=True),
             packed_schedule_scope_pruner(),
             descriptor_box_pruner(),
             gate_stacked_tmem_trap_pruner(),
-            smem_pruner(raw_a_staged=True),
+            exact_memory_pruner(weight_only_grouped_smem, weight_only_grouped_tmem, fallback=smem_pruner(raw_a_staged=True)),
             block_fp8_scale_mode_pruner(),
         )
     },

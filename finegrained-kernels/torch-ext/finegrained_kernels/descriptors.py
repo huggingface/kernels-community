@@ -40,13 +40,16 @@ def maybe_descriptor(t: torch.Tensor, box: list[int]) -> TensorDescriptor | None
     signal the pointer arms already take for an unused descriptor, and ``descriptor_box_pruner``
     drops the configs that would read it, so the tuner is left with the pointer arms the kernel
     serves stride-generally."""
+    return TensorDescriptor.from_tensor(t, box) if can_back_descriptor(t) else None
+
+
+def can_back_descriptor(t: torch.Tensor | None) -> bool:
+    """Whether ``t``'s layout can back a host-TMA descriptor (see ``maybe_descriptor``)."""
     if t is None or (t.ndim >= 2 and t.stride(-1) != 1):
-        return None
+        return False
     # the allocator aligns storage, so a view's base is aligned when its offset is (fake tensors have no data pointer)
     offsets = (t.storage_offset(), *t.stride()[:-1])
-    if any(offset * t.element_size() % 16 for offset in offsets):
-        return None
-    return TensorDescriptor.from_tensor(t, box)
+    return not any(offset * t.element_size() % 16 for offset in offsets)
 
 
 _WEIGHT_DESCRIPTORS = "_finegrained_descriptors"

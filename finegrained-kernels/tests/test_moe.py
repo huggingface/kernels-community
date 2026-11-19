@@ -20,6 +20,7 @@ skipping at the reduce, and ``format`` forwarding. Op-level coverage (formats,
 epilogues, requant, routing variants against an independent torch oracle) lives in
 ``test_ops.py``; the weight formats come from the shared ``WEIGHTS`` registry."""
 
+import math
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Union
 
@@ -215,8 +216,10 @@ MOE_PROBLEMS = [
     MoEProblem(weights="bf16", num_tokens=1),
     MoEProblem(weights="bf16"),
     # ── contraction dims on the 64 grid but off the 128 grid (gpt-oss H=I=2880): only
-    # BK=64 divides, so the W4A4 chain runs the no-swap BK=64 dot_scaled rows ──
+    # BK=64 divides, so the W4A4 chain runs the no-swap BK=64 dot_scaled rows, and the BF16
+    # chain's descriptor-loaded BN=128/256 weight tiles overhang N ──
     MoEProblem(weights="mxfp4", hidden_dim=320, intermediate_dim=320),
+    MoEProblem(weights="bf16", hidden_dim=320, intermediate_dim=320),
     # ── explicit format forwarding: W4A8 chain on mxfp4 weights (default is W4A4) ──
     MoEProblem(weights="mxfp4", activation_format="mxfp8"),
     # ── weight-only: bf16 activations and intermediate (no requantization) ──
@@ -470,12 +473,16 @@ def _common_kwargs(problem: MoEProblem, hidden, top_k_index, gate_up, gate_up_s,
 
 
 def _fused_tolerance(problem: MoEProblem, ref):
-    """``assert_close`` tolerances between two of our launches (or one against the unfused reference). Integer
+    """``assert_close`` tolerances between two of our launches (or one against the unfused reference). Integer and FP8
     weight-only launches tune independently and can place the group scale differently (SCALE_MODE "tile" rounds each
-    dequantized weight, "acc" scales the exact integer dot), one weight rounding apart at the output's scale."""
+    dequantized weight, "acc" scales the exact dot): one weight rounding plus the output's own, two output ulps at the
+    largest output (a FP8 bias row reached 61184, where one bf16 ulp is 256 but 2^-8 of the max only 239)."""
     atol, rtol = DTYPE_TO_TOL[problem.dtype]
-    if problem.weights in INT_BITS and problem.activation_format in (None, "bf16"):
-        atol = max(atol, 2.0 ** -8 * ref.float().abs().max().item())
+    weight_only = (problem.weights in INT_BITS and problem.activation_format in (None, "bf16")
+                   or problem.weights.startswith("fp8") and problem.activation_format == "bf16")
+    top = ref.float().abs().max().item()
+    if weight_only and top > 0:
+        atol = max(atol, 2 * torch.finfo(problem.dtype).eps * 2.0 ** math.floor(math.log2(top)))
     return dict(atol=atol, rtol=rtol)
 
 

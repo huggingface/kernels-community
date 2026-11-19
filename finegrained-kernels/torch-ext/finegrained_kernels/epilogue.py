@@ -657,8 +657,12 @@ def gemm_epilogue(
     descriptor at block ``(pid_m, pid_n)`` (the tcgen05 fast path, BM/BN pinned 128). ``FAKE_BATCH``
     shims the store: value masks to lane 0 (``C`` pre-advanced), the scale collapses the replicated
     rows with ``tl.max``; else a real BM-row scatter (``out_row`` + ``row_mask``).
-    ``COMPUTE_MODE``/``SWAP_AB`` orient the decode GLU/finalize (grouped passes ``"dot"``/no-swap,
-    both no-ops there). Every arm is constexpr-pruned."""
+    ``SWAP_AB`` takes the accumulator as ``[BN, BM]`` (weight rows on the MMA's M): a tile of at least the MMA atom's
+    real tokens is transposed back to ``[BM, BN]`` here, a decode tile (``FAKE_BATCH``, or one token padded to the
+    atom) collapses to its token in ``acc_finalize``. Every arm is constexpr-pruned."""
+    COLLAPSE: tl.constexpr = SWAP_AB and (FAKE_BATCH or BLOCK_SIZE_M < MMA_N_ATOM)
+    if SWAP_AB and not COLLAPSE and COMPUTE_MODE != "scalar":  # the swapped scalar reduce is already [1, BN]
+        acc = tl.trans(acc)
     # The globals fold on the FINALIZED tile: a swapped accumulator still carries the token dim
     # padded to the MMA atom, so folding before the collapse costs 16x the multiplies.
     if GATE:
@@ -666,7 +670,7 @@ def gemm_epilogue(
         # the pre-activation, so PreAct below has to see it too.
         flat = add_bias(
             apply_global_scale(
-                acc_finalize(acc, COMPUTE_MODE, 2 * BLOCK_SIZE_N, SWAP_AB),
+                acc_finalize(acc, COMPUTE_MODE, 2 * BLOCK_SIZE_N, COLLAPSE),
                 GlobalScale, stride_global_e, GlobalScaleA, stride_global_a, global_row,
             ),
             Bias, stride_bias_e, stride_bias_n, global_row, pid_n,
@@ -697,7 +701,7 @@ def gemm_epilogue(
             )
         else:
             out = split_gate_up_glu(
-                flat, BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB,
+                flat, BLOCK_SIZE_M, BLOCK_SIZE_N, COLLAPSE,
                 ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
             )
             if OUTPUT_FORMAT == "fp8":
@@ -717,7 +721,7 @@ def gemm_epilogue(
     else:  # plain GEMM: cast + store the accumulator (no fused requant on the non-gate path)
         acc = add_bias(
             apply_global_scale(
-                acc_finalize(acc, COMPUTE_MODE, BLOCK_SIZE_N, SWAP_AB),
+                acc_finalize(acc, COMPUTE_MODE, BLOCK_SIZE_N, COLLAPSE),
                 GlobalScale, stride_global_e, GlobalScaleA, stride_global_a, global_row,
             ),
             Bias, stride_bias_e, stride_bias_n, global_row, pid_n, BLOCK_SIZE_N, N_COLS,

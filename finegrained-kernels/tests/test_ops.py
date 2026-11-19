@@ -1054,6 +1054,9 @@ _SWEEP_CELLS = [
     # gathered gate|up rows on the raw-activation dot arms: a TMA-gathered descriptor A under WS
     # is the lowering failure warp_spec_memory_mode_pruner(gather_only=True) fences
     (Problem(weights="bf16", gate=True), "grouped", full_precision_matmul_grouped_kernel),
+    # non-128 N (gpt-oss-style N=320): descriptor-loaded weight tiles overhang N, and 128 rows per expert reach the
+    # 256-row tiles
+    (Problem(weights="bf16", gate=True, N=320, K=320, S=512), "grouped", full_precision_matmul_grouped_kernel),
     # the static block-scale kernel: its own three-stream K-loop under the block-dynamic fences
     (Problem(weights="fp8_128x128", gate=True), "grouped", w8a8_block_dynamic_fp8_matmul_grouped_kernel),
     # the ungated block-dynamic tiles: the swapped token tiles and the weight-scale fold into the activation scale,
@@ -1070,6 +1073,9 @@ _SWEEP_CELLS = [
     (Problem(weights="fp8_rowwise", gate=True, S=257, bias=True, empty_expert=True), "grouped", w8a8_tensor_dynamic_fp8_matmul_grouped_kernel),
     (Problem(weights="fp8_rowwise", gate=True, S=8), "batched", w8a8_tensor_dynamic_fp8_matmul_batched_kernel),
     (Problem(weights="fp8_rowwise", gate=True, S=256), "matmul", w8a8_tensor_dynamic_fp8_matmul_kernel),
+    # more output tiles than SMs: the persistent output-tile pipelines loop over several tiles per program (bias keeps
+    # the launch off the scaled_mm route)
+    (Problem(weights="fp8_rowwise", S=2048, N=1024, bias=True), "matmul", w8a8_tensor_dynamic_fp8_matmul_kernel),
 
     # the int4 weight-only kernels: the 2D kernel's tile x WS x memory-mode space and the batched
     # dot / swapped-reduce arms, asymmetric so the zero-point reads are in every config

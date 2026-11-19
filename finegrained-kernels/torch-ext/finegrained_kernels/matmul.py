@@ -28,7 +28,7 @@ from .bayesian_autotuner import bayesian_autotune
 from .path_autotuner import path_autotune
 from ._ops import add_op_namespace_prefix
 from .compat import FP8_DTYPE, is_sm10x, launches_skipped, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, pdl_launch_kwargs, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, narrow_dot_autotuning_configs, narrow_scalar_autotuning_configs, split_k_autotuning_configs, persistent_program_count, pipeline_autotuning_configs, block_fp8_scale_mode_configs, int_scale_mode_configs, FP8_MAX, is_triton_greater_or_equal
-from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_tiled_descriptors, rebind_weight_only_descriptors, weight_descriptor
+from .descriptors import can_back_descriptor, maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_tiled_descriptors, rebind_weight_only_descriptors, weight_descriptor
 from .formats import block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, normalize_global_scale, e2m1_as_uint8, is_mx, is_rowwise, mx_scale_family, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_2d_operands, weight_format, validate_int_operands, validate_svdquant_operands, INT_WEIGHT_DTYPES
 from .bench import gemm_cold_banks
 from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
@@ -55,7 +55,7 @@ from .loading.tiles import (
     swizzle_offsets,
 )
 from .epilogue import acc_finalize, acc_init, add_bias, bias_strides, gemm_epilogue, store_masked, store_masked_oriented
-from .pruners import PATH_ANCHOR_AXES, block_fp8_scale_mode_pruner, group_size_m_pruner, fp8_dot_warp_pruner, fp4_act_gate_warp_spec_pruner, gate_stacked_tmem_trap_pruner, block_dynamic_2d_warp_spec_pruner, block_dynamic_mma_width_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, descriptor_needs_prequant_pruner, matched_memory_modes_pruner, mx_2d_swap_scope_pruner, native_mma_m_pruner, mx_config_pruner, scalar_max_m_pruner, smem_pruner, swap_decode_scope_pruner, swap_max_m_pruner, k_slices_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, warp_spec_compile_guard_pruner, warp_spec_memory_mode_pruner, mx_auxiliary_pruner, block_m_cap_pruner, int_2d_warp_spec_pruner, int_split_k_pruner, scalar_block_m_pruner, int_scale_group_tile_pruner, nvfp4_requant_warps_pruner
+from .pruners import PATH_ANCHOR_AXES, block_fp8_scale_mode_pruner, group_size_m_pruner, persistent_tmem_pruner, fp8_dot_warp_pruner, fp4_act_gate_warp_spec_pruner, fp4_activation_unpack_pruner, gate_stacked_tmem_trap_pruner, block_dynamic_2d_warp_spec_pruner, block_dynamic_mma_width_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, descriptor_needs_prequant_pruner, matched_memory_modes_pruner, mx_2d_swap_scope_pruner, native_mma_m_pruner, mx_config_pruner, scalar_max_m_pruner, smem_pruner, swap_decode_scope_pruner, swap_max_m_pruner, k_slices_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, warp_spec_compile_guard_pruner, warp_spec_memory_mode_pruner, mx_auxiliary_pruner, block_m_cap_pruner, int_2d_warp_spec_pruner, int_split_k_pruner, scalar_block_m_pruner, int_scale_group_tile_pruner, nvfp4_requant_warps_pruner, exact_memory_pruner, block_dynamic_2d_smem, fp8_dot_smem, fp8_dot_tmem, mx_dynamic_2d_smem, weight_only_2d_smem, weight_only_grouped_tmem
 
 # The 2D-grid kernels' L2-locality swizzle depth is derived per-tile inside
 # ``swizzle_offsets`` (see SWIZZLE_GROUP_A_BYTES there) — no per-kernel constant here.
@@ -155,7 +155,11 @@ def _block_dynamic_2d_configs():
             warp_spec_compile_guard_pruner(),
             matched_memory_modes_pruner(),
             descriptor_box_pruner("block_k"),
-            smem_pruner("block_k"),
+            exact_memory_pruner(
+                block_dynamic_2d_smem, fp8_dot_tmem,
+                fallback=smem_pruner("block_k", pointer_ws_extra_stage=True),
+            ),
+            persistent_tmem_pruner(),
             block_dynamic_mma_width_pruner(),
             block_dynamic_2d_warp_spec_pruner(),
             int_split_k_pruner("M", SPLIT_K_MAX_M, block_k_arg="block_k"),
@@ -359,11 +363,10 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
         gdc_launch_dependents()
 
 
-@bayesian_autotune(
-    # tune_block_m mirrors the block-dynamic kernel (adaptive BM=128 cost it 17% at prefill), and
-    # so do the two memory regimes: pointer loads for decode / short K, host-TMA on both operands
-    # to feed the big prefill tiles. The K tile is free here (no scale block pins it).
-    get_accelerator_autotuning_configs(
+def _tensor_2d_configs():
+    """The k_loop grid, plus its warp-specialized host-TMA prefill tiles over the output-tile pipelines (persistent,
+    WS across tiles: one tile's epilogue overlaps the next tile's MMA), as in the block-dynamic 2D grid."""
+    configs = get_accelerator_autotuning_configs(
         group_sizes_m=DENSE_GROUP_SIZES_M,
         tune_block_nk=True,
         warp_spec=True,
@@ -372,7 +375,20 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
         pre_hook=rebind_tiled_descriptors,
-    ),
+    )
+    for c in configs:
+        c.kwargs["PIPELINE"] = "k_loop"
+    seeds = [c for c in configs if c.kwargs.get("WARP_SPEC") and c.kwargs.get("BLOCK_SIZE_M", 0) >= 64
+             and not c.kwargs.get("SWAP_AB")
+             and c.kwargs.get("A_MEMORY_MODE") == c.kwargs.get("B_MEMORY_MODE") == "host_descriptor"]
+    return configs + pipeline_autotuning_configs(seeds, ("tile_loop", "flattened"))
+
+
+@bayesian_autotune(
+    # tune_block_m mirrors the block-dynamic kernel (adaptive BM=128 cost it 17% at prefill), and
+    # so do the two memory regimes: pointer loads for decode / short K, host-TMA on both operands
+    # to feed the big prefill tiles. The K tile is free here (no scale block pins it).
+    _tensor_2d_configs(),
     # GATE keys the gate|up arm separately (its stacked dot is 2*BN wide, a distinct config space).
     ["N", "K", "m_bit_length", "GATE"],
     n_trials=100,
@@ -393,7 +409,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
             swap_decode_scope_pruner(),
             native_mma_m_pruner(),
             descriptor_box_pruner(),
-            smem_pruner(raw_a_staged=True),
+            exact_memory_pruner(fp8_dot_smem, fp8_dot_tmem, fallback=smem_pruner(raw_a_staged=True)),
         )
     },
 )
@@ -441,6 +457,7 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
     PDL: tl.constexpr = False,
     GROUP_SIZE_M: tl.constexpr = None,
+    PIPELINE: tl.constexpr = "k_loop",
 ):
     """Tensor-scale / row-wise FP8 GEMM kernel.
 
@@ -455,72 +472,79 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
     if PDL:
         gdc_wait()
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
-    pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
-        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GATE=GATE, GROUP_SIZE_M=GROUP_SIZE_M
-    )
-    a_descriptor = operand_tile_descriptor(
-        ADescriptor, A, M, K, stride_a_m, stride_a_k, BLOCK_SIZE_M, BLOCK_SIZE_K, A_MEMORY_MODE
-    )
-    b_descriptor = operand_tile_descriptor(
-        BDescriptor, B, N, K, stride_b_n, stride_b_k, BLOCK_SIZE_N, BLOCK_SIZE_K, B_MEMORY_MODE, GATE,
-    )
-    a_ptrs = operand_tile_ptrs(A, offs_am, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, not SWAP_AB)
-    # Under GATE the weight is the stacked (2N, K) gate|up tile; its scales (per tensor, or per
-    # stacked row) are applied with the per-row act scale before the GLU split.
-    b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, B_MEMORY_MODE, SWAP_AB)
-
-    a_s = tl.load(As + offs_am * stride_as_m, mask=offs_am < M, other=0.0)
-
-    # Accumulate raw dot products, apply scales once after the loop.
-    accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
-    for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
-        a, _as = load_act_plain(
-            a_ptrs, a_descriptor, pid_m * BLOCK_SIZE_M, k * BLOCK_SIZE_K, None, 0, A_MEMORY_MODE, False
+    # persistent under an output-tile PIPELINE: one tile's epilogue overlaps the next tile's MMA
+    tile_start, tile_end, tile_step = output_tile_range(M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, PIPELINE != "k_loop")
+    for tile_id in tl.range(
+        tile_start, tile_end, tile_step,
+        flatten=PIPELINE == "flattened", warp_specialize=WARP_SPEC and PIPELINE != "k_loop",
+    ):
+        pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
+            M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GATE=GATE, tile_id=tile_id, GROUP_SIZE_M=GROUP_SIZE_M
         )
-        b, _bs = load_weight_plain(
-            b_ptrs, b_descriptor, 0, pid_n * n_width, k * BLOCK_SIZE_K,
-            GATE, False, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
+        a_descriptor = operand_tile_descriptor(
+            ADescriptor, A, M, K, stride_a_m, stride_a_k, BLOCK_SIZE_M, BLOCK_SIZE_K, A_MEMORY_MODE
         )
-        accumulator = accumulator + fp8_dot(a, b, SWAP_AB, BLOCK_SIZE_K)
-        a_ptrs, _asp, b_ptrs, _bsp, _, _ = advance_ptrs(
-            a_ptrs, a_ptrs, b_ptrs, b_ptrs, b_ptrs, b_ptrs,
-            BLOCK_SIZE_K * stride_a_k, 0, BLOCK_SIZE_K * stride_b_k, 0,
-            A_MEMORY_MODE, B_MEMORY_MODE, False, False, False,
+        b_descriptor = operand_tile_descriptor(
+            BDescriptor, B, N, K, stride_b_n, stride_b_k, BLOCK_SIZE_N, BLOCK_SIZE_K, B_MEMORY_MODE, GATE,
         )
+        a_ptrs = operand_tile_ptrs(A, offs_am, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, not SWAP_AB)
+        # Under GATE the weight is the stacked (2N, K) gate|up tile; its scales (per tensor, or per
+        # stacked row) are applied with the per-row act scale before the GLU split.
+        b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, B_MEMORY_MODE, SWAP_AB)
 
-    accumulator = acc_finalize(accumulator, "dot", n_width, SWAP_AB)
-    accumulator = apply_row_scale(accumulator * a_s[:, None], Bs, offs_bn, stride_bs_n)
-    if PDL:
+        a_s = tl.load(As + offs_am * stride_as_m, mask=offs_am < M, other=0.0)
+
+        # Accumulate raw dot products, apply scales once after the loop.
+        accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
+        for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC and PIPELINE == "k_loop"):
+            a, _as = load_act_plain(
+                a_ptrs, a_descriptor, pid_m * BLOCK_SIZE_M, k * BLOCK_SIZE_K, None, 0, A_MEMORY_MODE, False
+            )
+            b, _bs = load_weight_plain(
+                b_ptrs, b_descriptor, 0, pid_n * n_width, k * BLOCK_SIZE_K,
+                GATE, False, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
+            )
+            accumulator = accumulator + fp8_dot(a, b, SWAP_AB, BLOCK_SIZE_K)
+            a_ptrs, _asp, b_ptrs, _bsp, _, _ = advance_ptrs(
+                a_ptrs, a_ptrs, b_ptrs, b_ptrs, b_ptrs, b_ptrs,
+                BLOCK_SIZE_K * stride_a_k, 0, BLOCK_SIZE_K * stride_b_k, 0,
+                A_MEMORY_MODE, B_MEMORY_MODE, False, False, False,
+            )
+
+        accumulator = acc_finalize(accumulator, "dot", n_width, SWAP_AB)
+        accumulator = apply_row_scale(accumulator * a_s[:, None], Bs, offs_bn, stride_bs_n)
+        if PDL and PIPELINE == "k_loop":
+            gdc_launch_dependents()
+
+        if GATE:
+            out_row = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+            gemm_epilogue(
+                C, None, accumulator, out_row, pid_n, pid_m, out_row < M,
+                stride_c_m, stride_c_n, 0, 0,
+                BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, BLOCK_SIZE_K,
+                ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
+                COMPUTE_MODE="dot", N_COLS=N,
+                Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
+            )
+        else:
+            accumulator = add_bias(
+                accumulator, Bias, stride_bias_e, stride_bias_n, 0, pid_n,
+                BLOCK_SIZE_N, N, False,
+            )
+            store_masked(
+                C,
+                accumulator,
+                pid_m,
+                pid_n,
+                M,
+                N,
+                stride_c_m,
+                stride_c_n,
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_N,
+            )
+    if PDL and PIPELINE != "k_loop":
         gdc_launch_dependents()
-
-    if GATE:
-        out_row = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-        gemm_epilogue(
-            C, None, accumulator, out_row, pid_n, pid_m, out_row < M,
-            stride_c_m, stride_c_n, 0, 0,
-            BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, BLOCK_SIZE_K,
-            ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
-            COMPUTE_MODE="dot", N_COLS=N,
-            Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
-        )
-    else:
-        accumulator = add_bias(
-            accumulator, Bias, stride_bias_e, stride_bias_n, 0, pid_n,
-            BLOCK_SIZE_N, N, False,
-        )
-        store_masked(
-            C,
-            accumulator,
-            pid_m,
-            pid_n,
-            M,
-            N,
-            stride_c_m,
-            stride_c_n,
-            BLOCK_SIZE_M,
-            BLOCK_SIZE_N,
-        )
-
 
 @bayesian_autotune(
     # tune_block_m + tune_block_n + WARP_SPEC + host-TMA memory modes mirror the block-dynamic
@@ -798,12 +822,13 @@ def _mx_matmul_configs():
             mx_auxiliary_pruner(),
             mx_2d_swap_scope_pruner(),
             scalar_max_m_pruner("M"),
-            smem_pruner(),
+            exact_memory_pruner(mx_dynamic_2d_smem, fallback=smem_pruner()),
             descriptor_box_pruner("BLOCK_SIZE_K"),
             swizzled_scale_config_pruner(),
             nvfp4_requant_warps_pruner(),
             warp_spec_compile_guard_pruner(),
             fp4_act_gate_warp_spec_pruner(),
+            fp4_activation_unpack_pruner(),
         )
     },
 )
@@ -1160,15 +1185,13 @@ def mx_weight_only_matmul_2d_kernel(
     if PDL:
         gdc_launch_dependents()
 
-    if SWAP_AB:
-        accumulator = tl.trans(accumulator)
     out_row = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     gemm_epilogue(
         C, None, accumulator, out_row, pid_n, pid_m, out_row < M,
         stride_c_m, stride_c_n, 0, 0,
         BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, BLOCK_SIZE_K,
         ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
-        COMPUTE_MODE="dot", N_COLS=N,
+        COMPUTE_MODE="dot", SWAP_AB=SWAP_AB, N_COLS=N,
         GlobalScale=BsGlobal, stride_global_e=stride_bs_global,
         GlobalScaleA=AsGlobal, stride_global_a=stride_as_global,
         Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
@@ -1246,7 +1269,7 @@ def split_k_reduce(acc, Partials, TileCounters, tile, num_tiles, BM: tl.constexp
             warp_spec_compile_guard_pruner(),
             int_2d_warp_spec_pruner(),
             descriptor_box_pruner("BLOCK_SIZE_K"),
-            smem_pruner("BLOCK_SIZE_K"),
+            exact_memory_pruner(weight_only_2d_smem, weight_only_grouped_tmem, fallback=smem_pruner("BLOCK_SIZE_K")),
         )
     },
 )
@@ -1456,7 +1479,7 @@ def int_weight_only_matmul_2d_kernel(
             gate_stacked_tmem_trap_pruner(),
             warp_spec_compile_guard_pruner(),
             descriptor_box_pruner(),
-            smem_pruner(),
+            exact_memory_pruner(weight_only_2d_smem, weight_only_grouped_tmem, fallback=smem_pruner()),
             k_slices_pruner(),
             block_fp8_scale_mode_pruner(),
         )
@@ -1995,6 +2018,9 @@ def w8a8_tensor_dynamic_fp8_matmul(
     b_descriptor = weight_descriptor(B, [1, 16])
 
     def grid(META):
+        if META.get("PIPELINE", "k_loop") != "k_loop":
+            tiles = triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"])
+            return (min(tiles, persistent_program_count(A.device.index or 0, META["BLOCK_SIZE_M"])),)
         return (
             triton.cdiv(M, META["BLOCK_SIZE_M"]),
             triton.cdiv(N, META["BLOCK_SIZE_N"]),
@@ -2237,7 +2263,10 @@ def mx_dynamic_matmul(
     a_rows = _padded_rows(M)
     if not _holds_rows(A_q, a_rows):
         a_rows = M
-    a_descriptor = TensorDescriptor(A_q, [a_rows, A_q.shape[1]], [A_q.stride(0), 1], [1, 32])
+    # a row-strided raw activation (the inline-quant arm) can sit off the 16-byte grid: the pointer arms serve it
+    a_descriptor = (
+        TensorDescriptor(A_q, [a_rows, A_q.shape[1]], [A_q.stride(0), 1], [1, 32]) if can_back_descriptor(A_q) else None
+    )
     b_descriptor = weight_descriptor(b_u8, [1, 32], B)
     # One scale pointer per operand (as_u8/bs_u8) — the swizzled buffer on the fast path (also the
     # base for the BM<128 / BN<128 scalar gather), the affine scale otherwise — plus its descriptor,
@@ -2742,8 +2771,8 @@ def int_weight_only_matmul_2d(
 # big-square best case (2846) — the 2-CTA + TMA warp-specialized architecture we cannot reach
 # from Triton, not a tuning gap. Relerr 1.2e-5 against the Triton arm.
 #
-# Inductor refuses to lower scaled_mm with SWIZZLE_32_4_4 scales ("does not yet support
-# non-trivial swizzles" — repros/scaled_mm_swizzle_compile.py). It never sees the call: the routes
+# Inductor before torch 2.14 refuses to lower scaled_mm with SWIZZLE_32_4_4 scales ("does not yet
+# support non-trivial swizzles"); 2.14 and 2.15 hand the call back to the eager op. It never sees the call: the routes
 # run inside the OPAQUE ops, which dynamo captures as leaves, so compiled callers get the cuBLAS
 # path at runtime and eager pays no op dispatch. F.scaled_mm has no autograd formula while our ops
 # carry registered dgrads, so differentiating callers fall through to the Triton ops. CUDA-graph
