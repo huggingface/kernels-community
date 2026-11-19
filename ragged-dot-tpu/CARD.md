@@ -6,7 +6,7 @@ library_name: kernels
 # ragged-dot-tpu
 
 MoE experts forward for torch_tpu, built on tokamax's Pallas grouped matmul
-(`tokamax.ragged_dot`, `implementation="mosaic_tpu_v2"`) and wrapped with
+(GMM v2, from the `kernels-community/tokamax` kernel) and wrapped with
 torch_tpu's `jax_op`. `experts_forward` is a drop-in transformers experts
 implementation for gated experts without bias, with a SiLU (e.g. Qwen3-MoE)
 or GELU-tanh (e.g. Gemma 4) gate, and supports expert parallelism. The whole
@@ -25,7 +25,7 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 ```
 
-Requires torch_tpu, jax and tokamax.
+Requires torch_tpu and jax.
 
 On a TPU v6e-8 (expert parallelism over 8 cores), against transformers'
 default `grouped_mm`:

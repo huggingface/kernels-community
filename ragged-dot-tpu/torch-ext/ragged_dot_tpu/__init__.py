@@ -1,6 +1,6 @@
 """
-MoE experts on torch_tpu with `tokamax.ragged_dot` (Pallas Mosaic TPU grouped
-matmul, Megablocks-style).
+MoE experts on torch_tpu with Tokamax's GMM v2 (Pallas Mosaic TPU grouped
+matmul, Megablocks-style), from the `kernels-community/tokamax` kernel.
 
 `experts_forward` is a transformers experts implementation, a drop-in for
 `grouped_mm_experts_forward`:
@@ -19,31 +19,31 @@ import functools
 
 import jax
 import jax.numpy as jnp
-import tokamax
+import kernels
 import torch
 from torch_tpu._internal.pallas import jax_op
 
 from ._ops import add_op_namespace_prefix
 
-# tokamax's v2 Pallas TPU grouped matmul, with its VMEM-aware tiling
-# heuristic. v1 ("mosaic") only has tuned tiles for TPU7x.
-IMPLEMENTATION = "mosaic_tpu_v2"
-
-# HF experts store weights as [num_experts, out_features, in_features]. These
-# dimension numbers contract lhs dim 1 with rhs dim 2, so the weights are used
-# as stored, without a transposed copy.
-_TRANS_RHS_DIM_NUMS = jax.lax.RaggedDotDimensionNumbers(
-    dot_dimension_numbers=(([1], [2]), ([], [])),
-    lhs_ragged_dimensions=[0],
-    rhs_group_dimensions=[0],
-)
+tokamax = kernels.get_kernel_dep("kernels-community/tokamax")
 
 
 def _ragged_dot_jax(
     lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array
 ) -> jax.Array:
-    return tokamax.ragged_dot_general(
-        lhs, rhs, group_sizes, _TRANS_RHS_DIM_NUMS, implementation=IMPLEMENTATION
+    # Tokamax's v2 Pallas TPU grouped matmul, with its VMEM-aware tiling
+    # heuristic (v1 only has tuned tiles for TPU7x). Called the way Tokamax's
+    # `ragged_dot_general(..., implementation="mosaic_tpu_v2")` calls it.
+    # HF experts store weights as [num_experts, out_features, in_features]:
+    # `transpose_rhs` uses them as stored, without a transposed copy.
+    return tokamax.gmm_v2.gmm_v2(
+        lhs,
+        rhs,
+        group_sizes,
+        preferred_element_type=lhs.dtype,
+        maybe_quantize_lhs=False,
+        zero_initialize=False,
+        transpose_rhs=True,
     )
 
 

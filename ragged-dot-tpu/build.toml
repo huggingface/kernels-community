@@ -4,6 +4,9 @@ version = 1
 edition = 6
 license = "Apache-2.0"
 backends = ["tpu"]
+kernel-depends = [
+    { repo-id = "kernels-community/tokamax", version = 1 },
+]
 
 [general.hub]
 repo-id = "kernels-community/ragged-dot-tpu"

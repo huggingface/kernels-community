@@ -8,11 +8,13 @@ tags:
 
 MoE experts forward for [torch_tpu](https://github.com/google-pytorch/torch_tpu),
 built on [tokamax](https://github.com/openxla/tokamax)'s Pallas grouped matmul
-(`tokamax.ragged_dot_general`, `implementation="mosaic_tpu_v2"`) and wrapped
-with torch_tpu's `jax_op`. Packaged as a
+(GMM v2, what `tokamax.ragged_dot_general` runs for
+`implementation="mosaic_tpu_v2"`) and wrapped with torch_tpu's `jax_op`. Packaged as a
 [`kernels`](https://github.com/huggingface/kernels) Hub kernel.
 
-Written for this repo; the grouped matmul itself comes from tokamax.
+Written for this repo; the grouped matmul itself comes from the
+[`kernels-community/tokamax`](https://huggingface.co/kernels-community/tokamax)
+kernel, a kernel dependency declared in `build.toml`.
 
 ## What it does
 
@@ -45,9 +47,10 @@ rhs[G, N, K].mT -> [M, N]`, with the rows of `lhs` sorted by group and
 
 ## Requirements
 
-torch_tpu, jax and tokamax must be installed. They are not in the `kernels`
-library's list of allowed Python dependencies, so `build.toml` does not
-declare them.
+torch_tpu and jax must be installed. They are not in the `kernels` library's
+list of allowed Python dependencies, so `build.toml` does not declare them.
+Tokamax does not need to be installed: `kernels` loads the
+`kernels-community/tokamax` kernel along with this one.
 
 ## Benchmarks
 
