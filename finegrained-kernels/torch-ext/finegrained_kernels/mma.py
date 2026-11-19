@@ -75,7 +75,14 @@ def mx_dot_rescale(
     SWAP_AB: tl.constexpr = False,
     BLOCK_SIZE_K: tl.constexpr = 0,
 ):
-    """MX 'dot' step (BK == one scale group): fp8 ``tl.dot`` on E4M3-decoded operands + per-group
+    """MX 'dot' step: single-group tiles use fp8 dot followed by rescaling;
+    multi-group tiles dequantize each K group before a bf16 dot. E2M1 times an
+    E4M3 scale is exactly representable in bf16 (including subnormal E4M3
+    scales), so the NVFP4 fallback adds no operand rounding.
+    Multi-group tiles only arise for NVFP4 (group 16) under the MX-pinned BK=32; on sm_10x the
+    dot arm is pruned (``dot_arm_ok`` in ``mx_config_pruner``), so this branch never compiles
+    there for typical shapes. Packed E2M1 decodes straight to fp32 here (no E4M3 hop).
+    Single-group path: fp8 ``tl.dot`` on E4M3-decoded operands + per-group
     software rescale (both UE8M0 scales decoded here), accumulating into ``acc``. Plain: ``a``
     [BM, BK] x ``w`` [BK, BN] with the weight's per-column scale transposed onto the product (the
     batched gate_up kernel passes the INTERLEAVED gate|up 2*BN tile — per-column independence keeps
@@ -84,15 +91,30 @@ def mx_dot_rescale(
     well-shaped fp8 MMA at M=1 (M quantizes to 64/128, N only to 8, so weight rows fill the big
     atom); the weight's per-output-row scale broadcasts down the acc columns and the token's single
     group scale is a scalar; ``acc`` is the persistent ``[ROWS, MMA_N_ATOM]`` accumulator."""
-    aq = e2m1_cols_to_e4m3(a) if a.dtype == tl.uint8 else a
     a_s = decode_group_scale(a_scale)
     w_s = decode_group_scale(w_scale)
-    if SWAP_AB:
-        wq = e2m1_cols_to_e4m3(w) if w.dtype == tl.uint8 else w
-        acc = tl.fma(tl.dot(wq, swap_pad_rhs(aq, BLOCK_SIZE_K)) * w_s, a_s, acc)
+    NG: tl.constexpr = w_scale.shape[1]
+    if NG > 1:
+        GK: tl.constexpr = BLOCK_SIZE_K // NG
+        af = e2m1_cols_to_f32(a) if a.dtype == tl.uint8 else a.to(tl.float32)
+        if SWAP_AB:
+            wf = e2m1_cols_to_f32(w) if w.dtype == tl.uint8 else w.to(tl.float32)
+            wd = (wf.reshape(w.shape[0], NG, GK) * w_s[:, :, None]).reshape(w.shape[0], BLOCK_SIZE_K).to(tl.bfloat16)
+            ad = (af.reshape(NG, GK) * a_s[:, None]).reshape(BLOCK_SIZE_K).to(tl.bfloat16)
+            acc = tl.dot(wd, swap_pad_rhs(ad, BLOCK_SIZE_K), acc)
+        else:
+            wf = e2m1_to_f32(w) if w.dtype == tl.uint8 else w.to(tl.float32)
+            wd = (wf.reshape(NG, GK, w.shape[1]) * tl.trans(w_s)[:, None, :]).reshape(BLOCK_SIZE_K, w.shape[1]).to(tl.bfloat16)
+            ad = (af.reshape(af.shape[0], NG, GK) * a_s[:, :, None]).reshape(af.shape[0], BLOCK_SIZE_K).to(tl.bfloat16)
+            acc = tl.dot(ad, wd, acc)
     else:
-        wq = e2m1_to_e4m3(w) if w.dtype == tl.uint8 else w
-        acc = tl.fma(tl.dot(aq, wq) * a_s, tl.trans(w_s), acc)
+        aq = e2m1_cols_to_e4m3(a) if a.dtype == tl.uint8 else a
+        if SWAP_AB:
+            wq = e2m1_cols_to_e4m3(w) if w.dtype == tl.uint8 else w
+            acc = tl.fma(tl.dot(wq, swap_pad_rhs(aq, BLOCK_SIZE_K)) * w_s, a_s, acc)
+        else:
+            wq = e2m1_to_e4m3(w) if w.dtype == tl.uint8 else w
+            acc = tl.fma(tl.dot(aq, wq) * a_s, tl.trans(w_s), acc)
     return acc
 
 
