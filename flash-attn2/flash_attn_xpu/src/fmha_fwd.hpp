@@ -164,7 +164,8 @@ void cutlass_fmha_fwd_varlen_impl(
     void* rng_state = nullptr,
     void* s_dmask = nullptr,
     int seqlen_q_rounded = 0,
-    int seqlen_k_rounded = 0);
+    int seqlen_k_rounded = 0,
+    int min_seqlen_q = 0);
 
 void cutlass_fmha_fwd_fix_impl(
     sycl::queue& queue,

@@ -81,6 +81,24 @@ def round_multiple(x, m):
     return (x + m - 1) // m * m
 
 
+def _xpu_inference_fast_path(q, k, v, dropout_p, return_attn_probs):
+    """Call the XPU op directly when nothing needs autograd or torch.compile.
+
+    The autograd.Function and torch.library.custom_op layers cost ~20 us of host time per call,
+    longer than a short decode kernel on XPU (vllm-xpu-kernels calls its op directly).
+    """
+    return (
+        q.device.type == "xpu"
+        and dropout_p == 0.0
+        and not return_attn_probs
+        and not torch.compiler.is_compiling()
+        and not (
+            torch.is_grad_enabled()
+            and (q.requires_grad or k.requires_grad or v.requires_grad)
+        )
+    )
+
+
 def _philox_generator(
     q: torch.Tensor, dropout_p: float, generator: Optional[torch.Generator] = None
 ) -> Optional[torch.Generator]:
@@ -1295,6 +1313,20 @@ def flash_attn_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    if _xpu_inference_fast_path(q, k, v, dropout_p, return_attn_probs):
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        head_size_og = q.size(3)
+        if head_size_og % 8 != 0:
+            q, k, v = [
+                torch.nn.functional.pad(x, [0, 8 - head_size_og % 8]) for x in (q, k, v)
+            ]
+        q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+        out = flash_attn.fwd(
+            q, k, v, None, alibi_slopes, 0.0, softmax_scale, causal,
+            window_size[0], window_size[1], softcap, False, None,
+        )[0]
+        return out if out.size(-1) == head_size_og else out[..., :head_size_og]
     return FlashAttnFunc.apply(
         q,
         k,
@@ -1542,6 +1574,21 @@ def flash_attn_varlen_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    if _xpu_inference_fast_path(q, k, v, dropout_p, return_attn_probs):
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        head_size_og = q.size(2)
+        if head_size_og % 8 != 0:
+            q, k, v = [
+                torch.nn.functional.pad(x, [0, 8 - head_size_og % 8]) for x in (q, k, v)
+            ]
+        q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+        out = flash_attn.varlen_fwd(
+            q, k, v, None, cu_seqlens_q, cu_seqlens_k, None, None, block_table,
+            alibi_slopes, max_seqlen_q, max_seqlen_k, 0.0, softmax_scale, False,
+            causal, window_size[0], window_size[1], softcap, False, None,
+        )[0]
+        return out if out.size(-1) == head_size_og else out[..., :head_size_og]
     return FlashAttnVarlenFunc.apply(
         q,
         k,
