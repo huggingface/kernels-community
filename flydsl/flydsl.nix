@@ -58,6 +58,8 @@ manylinux_2_28.stdenv.mkDerivation {
     # Ensure unique nanobind domain.
     substituteInPlace python/mlir_flydsl/CMakeLists.txt \
       --replace-fail 'MLIR_BINDINGS_PYTHON_NB_DOMAIN "mlir"' 'MLIR_BINDINGS_PYTHON_NB_DOMAIN "${sdkId}"'
+    substituteInPlace python/mlir_flydsl/CMakeLists.txt \
+      --replace-fail 'MLIR_PYTHON_PACKAGE_PREFIX=flydsl.' 'MLIR_PYTHON_PACKAGE_PREFIX=${sdkId}.'
   '';
 
   buildInputs = [ clr ];

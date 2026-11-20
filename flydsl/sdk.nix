@@ -90,10 +90,17 @@ stdenv.mkDerivation {
     flydsl = importlib.import_module(\"..\", __package__)
 
     contents = []"
+
+    # Hub snapshots are symlinks into `blobs/`, resolving them loses the SDK
+    # directory structure. Use absolute paths instead.
     substituteInPlace $variantDir/runtime/_libraries.py \
       --replace-fail "    import flydsl
 
-    root = Path(flydsl.__file__).resolve().parent" "    root = Path(__file__).resolve().parent.parent"
+    root = Path(flydsl.__file__).resolve().parent" "    root = Path(__file__).absolute().parent.parent" \
+      --replace-fail "[d.resolve() for d in candidates if d.is_dir()]" "[d.absolute() for d in candidates if d.is_dir()]" \
+      --replace-fail "return path.resolve()" "return path.absolute()"
+    substituteInPlace $variantDir/compiler/jit_executor.py \
+      --replace-fail "Path(__file__).resolve().parent.parent" "Path(__file__).absolute().parent.parent"
 
     # When used as an SDK, we need to load modules eagerly, so that they are
     # accessible through `get_kernel(...)`.
