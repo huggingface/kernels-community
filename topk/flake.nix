@@ -1,5 +1,5 @@
 {
-  description = "Fused sequence-mixing kernels from ggml: the gated delta rule, as one kernel";
+  description = "Flake for topk (Metal top-k for MoE routing) kernels";
   inputs = {
     kernel-builder.url = "github:huggingface/kernels";
   };
