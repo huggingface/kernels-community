@@ -29,10 +29,10 @@ from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, co
 from .bench import gemm_cold_banks
 from .descriptors import build_grouped_operand_descriptors, rebind_grouped_descriptors, rebind_grouped_mx_descriptors
 from .formats import WEIGHT_ONLY_STAGE_MIN_ROWS, block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, row_scale_stride, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, validate_int_operands, INT_WEIGHT_DTYPES
-from .quant import dequantize_int_weight, fp8_act_quant_block_dynamic, MX_ACT_QUANT, mx_act_quant_grouped, mx_act_quant_routed_rows, quantize_routed_rows_per_expert, static_expert_act_operands, swizzle_grouped_mx_scales, tensor_wide_act_operands, prepare_fp8_mx_inputs, permute_routed_rows
+from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, mx_act_quant_grouped, mx_act_quant_routed_rows, quantize_routed_rows_per_expert, static_expert_act_operands, swizzle_grouped_mx_scales, tensor_wide_act_operands, prepare_fp8_mx_inputs, permute_routed_rows
 from .swizzle import swizzled_scale_descriptor
 from .loading.scales import apply_row_scale, weight_scale_rows, dequant_block_fp8_weight, dequant_mx_weight, csf_weight_scales, load_swizzled_rows_scale
-from .mma import block_dynamic_dot, block_fp8_weight_only_dot, fp8_dot, mx_compute, mx_dot_scaled_tokens, mx_weight_only_compute, static_dot, int_weight_only_compute
+from .mma import block_dynamic_dot, block_fp8_weight_only_dot, dequantize_int_weight, fp8_dot, mx_compute, mx_dot_scaled_tokens, mx_weight_only_compute, static_dot, int_weight_only_compute
 from .scheduling import build_tile_layout, expand_gather_below_parity, expand_regime, load_packed_schedule, grouped_tile_order, prefetch_packed_entry, resolve_grouped_tile, resolve_grouped_tile_packed, fill_packed_schedule, packed_schedule_buffer
 from .loading.tiles import (
     load_act_block_dynamic,

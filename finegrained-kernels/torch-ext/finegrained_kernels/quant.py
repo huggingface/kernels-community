@@ -19,7 +19,7 @@ from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
 from .bayesian_autotuner import bayesian_autotune
 from .path_autotuner import path_autotune
-from .formats import global_scale_stride, int_weight_bits, is_per_expert_global, normalize_global_scale
+from .formats import global_scale_stride, is_per_expert_global, normalize_global_scale
 from ._ops import add_op_namespace_prefix
 from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, is_blackwell, is_sm10x, pdl_launch_kwargs, sm_count, FP8_MAX
 from .ptx import e2m1x2_to_bf16x2, e2m1x2_to_e4m3x2, f32x2_to_e2m1x2
@@ -1657,76 +1657,6 @@ def interleave_int_words(words: torch.Tensor, bits: int) -> torch.Tensor:
     values = (words.unsqueeze(-1) >> (bits * j)) & mask  # (..., words, vpw), natural slot j
     slot = j // 2 + (j % 2) * (vpw // 2)
     return (values << (bits * slot)).sum(-1, dtype=torch.int32).view(torch.uint32)
-
-
-@triton.jit
-def _dequantize_int_kernel(
-    W,  # (rows, K // VPW) uint32 words, interleaved (interleave_int_words)
-    Ws,  # (rows, K // SCALE_GROUP_K) float group scales
-    Wz,  # (rows, K // SCALE_GROUP_K) integer zero points; None for the symmetric 2 ** (BITS - 1)
-    WsGlobal,  # fp32 W4A8 second-level weight scale (the E4M3 rounding of ``int_dequant``); None otherwise
-    Out,  # (rows, K)
-    rows,
-    K_WORDS,
-    BITS: tl.constexpr,
-    SCALE_GROUP_K: tl.constexpr,
-    BLOCK_SIZE_R: tl.constexpr,
-    BLOCK_SIZE_W: tl.constexpr,
-):
-    """One ``[BLOCK_SIZE_R, BLOCK_SIZE_W]`` word tile back to its ``[BLOCK_SIZE_R, BLOCK_SIZE_W * VPW]`` values:
-    ``((q - zero) * scale)`` rounded in the scale dtype, then cast to ``Out``'s."""
-    VPW: tl.constexpr = 32 // BITS
-    HALF: tl.constexpr = VPW // 2
-    MASK: tl.constexpr = (1 << BITS) - 1
-    offs_r = tl.program_id(0) * BLOCK_SIZE_R + tl.arange(0, BLOCK_SIZE_R)
-    offs_w = tl.program_id(1) * BLOCK_SIZE_W + tl.arange(0, BLOCK_SIZE_W)
-    r_mask = (offs_r < rows)[:, None]
-    w = tl.load(W + offs_r[:, None].to(tl.int64) * K_WORDS + offs_w[None, :], mask=r_mask & (offs_w < K_WORDS)[None, :])
-    shifts = (tl.arange(0, HALF) * BITS)[None, None, :]
-    # slot s < HALF holds K offset 2s, slot s + HALF offset 2s + 1
-    lo = (w[:, :, None] >> shifts) & MASK
-    hi = (w[:, :, None] >> (shifts + HALF * BITS)) & MASK
-    q = tl.join(lo, hi).reshape(BLOCK_SIZE_R, BLOCK_SIZE_W * VPW).to(tl.int32)
-    offs_k = tl.program_id(1) * BLOCK_SIZE_W * VPW + tl.arange(0, BLOCK_SIZE_W * VPW)
-    mask = r_mask & (offs_k < K_WORDS * VPW)[None, :]
-    groups = K_WORDS * VPW // SCALE_GROUP_K
-    g_ptrs = offs_r[:, None].to(tl.int64) * groups + (offs_k // SCALE_GROUP_K)[None, :]
-    scale = tl.load(Ws + g_ptrs, mask=mask)
-    zero = (1 << (BITS - 1)) if Wz is None else tl.load(Wz + g_ptrs, mask=mask).to(tl.int32)
-    v = (q - zero).to(scale.dtype) * scale
-    if WsGlobal is not None:
-        v = tl.clamp(v.to(tl.float32) / tl.load(WsGlobal), -448.0, 448.0)
-    out_ptrs = Out + offs_r[:, None].to(tl.int64) * (K_WORDS * VPW) + offs_k[None, :]
-    tl.store(out_ptrs, v.to(Out.dtype.element_ty), mask=mask)
-
-
-def dequantize_int_weight(
-    words: torch.Tensor, scales: torch.Tensor, K: int, zeros: torch.Tensor | None = None,
-    dtype: torch.dtype | None = None, global_scale: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """An integer weight in the GEMMs' interleaved layout (``(..., N, K // VPW)`` uint32, ``interleave_int_words``)
-    back to ``(..., N, K)`` the way the GEMMs dequantize it: ``(q - zero)`` in the scale dtype times the per-group
-    scale, rounded once, then cast to ``dtype`` (``None``: the scale dtype). The width follows from ``K`` and the
-    word count; ``zeros`` ``None`` is the symmetric zero point ``2 ** (bits - 1)``. ``global_scale`` (W4A8) divides
-    that value as ModelOpt's second quantizer does before its E4M3 rounding (``dtype`` FP8). One fused launch, used by
-    the large-prefill paths that dequantize once and run the cuBLAS GEMM."""
-    bits = int_weight_bits(K, words)
-    k_words = words.shape[-1]
-    group = K // scales.shape[-1]
-    rows = words.numel() // k_words
-    assert group * scales.shape[-1] == K and group % (32 // bits) == 0, f"{scales.shape[-1]} groups cannot split K={K}"
-    assert zeros is None or zeros.shape == scales.shape, "zero points are shaped like the scales"
-    out = torch.empty(*words.shape[:-1], K, device=words.device, dtype=dtype or scales.dtype)
-
-    # 16 rows x 32 words, 4 warps: 4.0 TB/s vs 3.6 for 32 x 16 (B200 INT4 Qwen3-30B down/gate_up stacks, bit-identical);
-    # writing the bf16 output alone runs at ~4 TB/s here, so this is near the store roofline
-    grid = (triton.cdiv(rows, 16), triton.cdiv(k_words, 32))
-    with device_context(words.device):
-        compile_time_only_triton_wrap(_dequantize_int_kernel)[grid](
-            words.contiguous(), scales.contiguous(), None if zeros is None else zeros.contiguous(), global_scale, out,
-            rows, k_words, BITS=bits, SCALE_GROUP_K=group, BLOCK_SIZE_R=16, BLOCK_SIZE_W=32, num_warps=4,
-        )
-    return out
 
 
 def repack_gptq_int4(

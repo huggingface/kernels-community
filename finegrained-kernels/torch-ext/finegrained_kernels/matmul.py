@@ -32,9 +32,9 @@ from .descriptors import can_back_descriptor, maybe_descriptor, rebind_bd_descri
 from .formats import block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, normalize_global_scale, e2m1_as_uint8, is_mx, is_rowwise, mx_scale_family, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_2d_operands, weight_format, validate_int_operands, validate_svdquant_operands, INT_WEIGHT_DTYPES
 from .bench import gemm_cold_banks
 from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
-from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, maybe_act_quant, mxfp8_act_quant, nvfp4_act_quant, quantize_calibrated_act, quantize_rows_static, tensor_wide_act_operands, prepare_fp8_mx_inputs, dequantize_int_weight, permute_act_cols, svdquant_act_quant
+from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, maybe_act_quant, mxfp8_act_quant, nvfp4_act_quant, quantize_calibrated_act, quantize_rows_static, tensor_wide_act_operands, prepare_fp8_mx_inputs, permute_act_cols, svdquant_act_quant
 from .loading.scales import apply_row_scale, dequant_block_fp8_weight, mx_2d_scale_ptrs, weight_scale_rows, csf_weight_scales
-from .mma import SM10X, block_dynamic_dot, block_fp8_weight_only_dot, fp8_dot, k_slices_sum, mx_compute, mx_weight_only_compute, plain_dot, static_dot, int_weight_only_compute
+from .mma import SM10X, block_dynamic_dot, block_fp8_weight_only_dot, dequantize_int_weight, fp8_dot, k_slices_sum, mx_compute, mx_weight_only_compute, plain_dot, static_dot, int_weight_only_compute
 from .loading.tiles import (
     advance_ptrs,
     output_tile_range,

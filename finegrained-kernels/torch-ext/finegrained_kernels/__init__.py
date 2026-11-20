@@ -29,11 +29,11 @@ from .formats import get_supported_act_fns
 from .norm import get_supported_norms, rms_norm_rows
 from .swizzle import swizzle_mx_scales, unswizzle_mx_scales
 from .loading.scales import prepare_nvfp4_csf_scales, decompress_nvfp4_csf_scales
+from .mma import dequantize_int_weight
 from .quant import (
     mxfp8_act_quant,
     mxfp4_act_quant,
     nvfp4_act_quant,
-    dequantize_int_weight,
     interleave_int_words,
     fold_act_order_into_gate_up,
     repack_gptq_int4,

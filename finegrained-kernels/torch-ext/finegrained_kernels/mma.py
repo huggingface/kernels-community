@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import torch
 import triton
 import triton.language as tl
 
 from .quant import e2m1_cols_to_bf16, e2m1_cols_to_e4m3, e2m1_cols_to_f32, e2m1_to_bf16, e2m1_to_e4m3, e2m1_to_f32
 from .loading.scales import block_fp8_scaled_act, block_fp8_weight_scale_cols, decode_group_scale
 from .loading.tiles import load_weight_block_fp8, load_weight_plain
-from .compat import is_nvidia, is_sm10x
+from .compat import compile_time_only_triton_wrap, device_context, is_nvidia, is_sm10x
+from .formats import int_weight_bits
 from .ptx import (
     add_mul_x2, add_x2, dp4a, e2m1x8_to_f16x2, e4m3x4_to_f16x2, f16x2_dot4_f32, int4_nibbles_to_16bit_lanes, int8_bytes_to_f16_lanes, int_words_fma_rows,
     nibbles_to_table_bytes, offset_int8_to_bf16_lanes, round_f32_to_bf16_f32,
@@ -620,6 +622,87 @@ def int_offset_dequant_tile(
                 v = int_dequant(q, ZERO, _group_scale(w_scale, True), OUT_DTYPE, divisor)
         out = v.reshape(BK, N)
     return out
+
+
+@triton.jit
+def _dequantize_int_kernel(
+    W,  # (rows, K // VPW) uint32 words, interleaved (interleave_int_words)
+    Ws,  # (rows, K // SCALE_GROUP_K) float group scales
+    Wz,  # (rows, K // SCALE_GROUP_K) integer zero points; None for the symmetric 2 ** (BITS - 1)
+    WsGlobal,  # fp32 W4A8 second-level weight scale (the E4M3 rounding of ``int_dequant``); None otherwise
+    Out,  # (rows, K)
+    rows,
+    K_WORDS,
+    BITS: tl.constexpr,
+    SCALE_GROUP_K: tl.constexpr,
+    BLOCK_SIZE_R: tl.constexpr,
+    BLOCK_SIZE_W: tl.constexpr,
+):
+    """One ``[BLOCK_SIZE_R, BLOCK_SIZE_W]`` word tile back to its ``[BLOCK_SIZE_R, BLOCK_SIZE_W * VPW]`` values through the
+    GEMMs' own decode (``int_dequant_tile``): ``((q - zero) * scale)`` rounded in the scale dtype, then cast to ``Out``'s.
+    The tile spans whole scale groups, or sits inside one, so its scales load once per group, not per value."""
+    VPW: tl.constexpr = 32 // BITS
+    BK: tl.constexpr = BLOCK_SIZE_W * VPW
+    TILE_GROUP: tl.constexpr = min(SCALE_GROUP_K, BK)
+    offs_r = tl.program_id(0) * BLOCK_SIZE_R + tl.arange(0, BLOCK_SIZE_R)
+    offs_w = tl.program_id(1) * BLOCK_SIZE_W + tl.arange(0, BLOCK_SIZE_W)
+    r_mask = (offs_r < rows)[:, None]
+    w = tl.load(W + offs_r[:, None].to(tl.int64) * K_WORDS + offs_w[None, :], mask=r_mask & (offs_w < K_WORDS)[None, :],
+                other=0)
+    groups = K_WORDS * VPW // SCALE_GROUP_K
+    offs_g = (tl.program_id(1) * BK + tl.arange(0, BK // TILE_GROUP) * TILE_GROUP) // SCALE_GROUP_K
+    g_mask = r_mask & (offs_g < groups)[None, :]
+    g_ptrs = offs_r[:, None].to(tl.int64) * groups + offs_g[None, :]
+    scale = tl.load(Ws + g_ptrs, mask=g_mask, other=1)
+    zero = None if Wz is None else tl.load(Wz + g_ptrs, mask=g_mask, other=0)
+    divisor = None if WsGlobal is None else tl.load(WsGlobal)
+    offs_k = tl.program_id(1) * BK + tl.arange(0, BK)
+    if Wz is not None and Ws.dtype.element_ty == tl.float32:
+        # the packed zero-point add lifts into a 16-bit float, so fp32 scales with zero points subtract per value
+        HALF: tl.constexpr = VPW // 2
+        shifts = (tl.arange(0, HALF) * BITS)[None, None, :]
+        q = tl.join((w[:, :, None] >> shifts) & ((1 << BITS) - 1), (w[:, :, None] >> (shifts + HALF * BITS)) & ((1 << BITS) - 1))
+        q = q.reshape(BLOCK_SIZE_R, BK).to(tl.int32)
+        v = int_dequant(q.reshape(BLOCK_SIZE_R, BK // TILE_GROUP, TILE_GROUP), zero.to(tl.int32)[:, :, None],
+                        scale[:, :, None], Out.dtype.element_ty, divisor).reshape(BLOCK_SIZE_R, BK)
+    else:
+        v = tl.trans(int_dequant_tile(w, scale, zero, True, TILE_GROUP, BITS, Out.dtype.element_ty, divisor=divisor))
+    tl.store(Out + offs_r[:, None].to(tl.int64) * (K_WORDS * VPW) + offs_k[None, :], v,
+             mask=r_mask & (offs_k < K_WORDS * VPW)[None, :])
+
+
+def dequantize_int_weight(
+    words: torch.Tensor, scales: torch.Tensor, K: int, zeros: torch.Tensor | None = None,
+    dtype: torch.dtype | None = None, global_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """An integer weight in the GEMMs' interleaved layout (``(..., N, K // VPW)`` uint32, ``interleave_int_words``)
+    back to ``(..., N, K)`` the way the GEMMs dequantize it: ``(q - zero)`` in the scale dtype times the per-group
+    scale, rounded once, then cast to ``dtype`` (``None``: the scale dtype). The width follows from ``K`` and the
+    word count; ``zeros`` ``None`` is the symmetric zero point ``2 ** (bits - 1)``. ``global_scale`` (W4A8) divides
+    that value as ModelOpt's second quantizer does before its E4M3 rounding (``dtype`` FP8). One fused launch, used by
+    the large-prefill paths that dequantize once and run the cuBLAS GEMM."""
+    bits = int_weight_bits(K, words)
+    k_words = words.shape[-1]
+    group = K // scales.shape[-1]
+    rows = words.numel() // k_words
+    assert group * scales.shape[-1] == K and group % (32 // bits) == 0, f"{scales.shape[-1]} groups cannot split K={K}"
+    assert zeros is None or zeros.shape == scales.shape, "zero points are shaped like the scales"
+    out = torch.empty(*words.shape[:-1], K, device=words.device, dtype=dtype or scales.dtype)
+
+    # 8 rows x 128 words at 4 warps, clipped so the tile spans whole scale groups or sits inside one: 6.6 TB/s on the
+    # Qwen3-30B INT4 gate|up stack (258 -> 154 us symmetric, 293 -> 155 us with zero points), bit-identical
+    block_w = 128
+    while block_w > 1 and (block_w * (32 // bits)) % group and group % (block_w * (32 // bits)):
+        block_w //= 2
+    grid = (triton.cdiv(rows, 8), triton.cdiv(k_words, block_w))
+    with device_context(words.device):
+        compile_time_only_triton_wrap(_dequantize_int_kernel)[grid](
+            words.contiguous(), scales.contiguous(), None if zeros is None else zeros.contiguous(), global_scale, out,
+            rows, k_words, BITS=bits, SCALE_GROUP_K=group, BLOCK_SIZE_R=8, BLOCK_SIZE_W=block_w, num_warps=4,
+        )
+    return out
+
+
 
 
 @triton.jit
