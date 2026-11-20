@@ -144,10 +144,10 @@ def test_collect_skips_pr_creation_when_configs_are_unchanged(autotune_run):
     assert [result["status"] for result in results] == ["no_changes", "no_changes"]
 
 
-@pytest.fixture
-def autotuner_pr():
+@pytest.fixture(params=["github-actions[bot]", "kernel-pr[bot]"])
+def autotuner_pr(request):
     return {
-        "user": {"login": "github-actions[bot]"},
+        "user": {"login": request.param, "type": "Bot"},
         "head": {
             "repo": {"full_name": "example/repo"},
             "ref": "autotune/example/abc123",
@@ -167,7 +167,19 @@ def test_pr_without_autotune_marker_is_not_recognized(autotuner_pr):
 
 
 def test_human_pr_with_autotune_marker_is_not_recognized(autotuner_pr):
-    autotuner_pr["user"]["login"] = "maintainer"
+    autotuner_pr["user"] = {"login": "maintainer", "type": "User"}
+
+    assert not autotune.is_autotune_pr(autotuner_pr, "example/repo")
+
+
+def test_bot_pr_from_a_fork_is_not_recognized(autotuner_pr):
+    autotuner_pr["head"]["repo"]["full_name"] = "other/repo"
+
+    assert not autotune.is_autotune_pr(autotuner_pr, "example/repo")
+
+
+def test_bot_pr_without_autotune_branch_is_not_recognized(autotuner_pr):
+    autotuner_pr["head"]["ref"] = "unrelated-update"
 
     assert not autotune.is_autotune_pr(autotuner_pr, "example/repo")
 
