@@ -12,16 +12,6 @@
 #include "../../decode/splitkv_decode.hpp"
 #include "chunk_prefill_args.hpp"
 
-#if !FLASH_XPU_HAS_XE3_KERNELS
-// No 512-GRF Xe35 build: report "not handled" so the caller falls back.
-namespace flash_xpu_prefill::xe3 {
-template <int HD, bool Bf16, bool Paged>
-bool chunk_prefill_impl(sycl::queue&, const chunk_prefill_args_t&) {
-  return false;
-}
-}  // namespace flash_xpu_prefill::xe3
-#else
-
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "../../collective/fmha_fusion.hpp"
@@ -310,8 +300,8 @@ struct KernelLauncher {
         syclex::work_group_scratch_size(smem_size),
     };
     compat::experimental::kernel_properties kernel_props{
-        syclex::sub_group_size<cute::intel::sg_size>,
-        FLASH_XPU_GRF_PROP(FLASH_XPU_GRF_SIZE)};
+        flash_xpu_grf::with_grf<FLASH_XPU_GRF_SIZE>(
+            syclex::sub_group_size<cute::intel::sg_size>)};
     compat::experimental::launch_policy policy{
         sycl_grid, sycl_block, launch_props, kernel_props};
     compat::experimental::launch<cutlass::device_kernel<FMHAKernel>>(
@@ -554,5 +544,3 @@ bool chunk_prefill_impl(sycl::queue& queue, const chunk_prefill_args_t& args) {
 }
 
 }  // namespace flash_xpu_prefill::xe3
-
-#endif  // FLASH_XPU_HAS_XE3_KERNELS

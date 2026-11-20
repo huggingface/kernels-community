@@ -12,6 +12,12 @@ backends = [
 [general.hub]
 repo-id = "kernels-community/flash-attn2"
 
+# The Xe35 (CRI) paged-decode and chunk-prefill kernels run with 512 GRF
+# (flash_attn_xpu/src/decode/grf_mode.hpp). scripts/check_xpu_build.py checks
+# the GRF sizes in the built library.
+[general.xpu]
+cri-grf-size = 512
+
 [torch]
 src = [
     "torch-ext/torch_binding.cpp",
@@ -287,6 +293,7 @@ src = [
     "flash_attn_xpu/src/flash_bwd_hdim512_fix_fp16.cpp",
     "flash_attn_xpu/src/flash_bwd_hdim512_fix_bf16.cpp",
     "flash_attn_xpu/src/fmha_utils.hpp",
+    "flash_attn_xpu/src/lse_pad.hpp",
     "flash_attn_xpu/src/xe_barrier_compat.hpp",
     "flash_attn_xpu/src/collective/fmha_fusion.hpp",
     "flash_attn_xpu/src/collective/copy_block_slm.hpp",
@@ -409,6 +416,7 @@ src = [
     "flash_attn_xpu/src/decode/splitkv_epilogue.hpp",
     "flash_attn_xpu/src/decode/splitkv_kernel.hpp",
     "flash_attn_xpu/src/decode/splitkv_launch.hpp",
+    "flash_attn_xpu/src/lse_pad.hpp",
     "flash_attn_xpu/src/xe_barrier_compat.hpp",
     "flash_attn_xpu/src/collective/copy_block_slm.hpp",
 ]

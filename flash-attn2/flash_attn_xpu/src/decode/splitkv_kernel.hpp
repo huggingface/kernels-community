@@ -16,6 +16,7 @@
 #include "cute/tensor.hpp"
 
 #include "splitkv_decode.hpp"
+#include "../lse_pad.hpp"
 #include "splitkv_mainloop.hpp"
 #include "splitkv_epilogue.hpp"
 
@@ -202,6 +203,11 @@ struct SplitKVDecodeKernel {
     constexpr int tile_q = get<0>(TileShapeO{});
     constexpr int tile_v = get<1>(TileShapeO{});
     constexpr int kThreads = SGPerWG::value * intel::sg_size;
+    if (a.lse_rows > 0 && flat == 0 && blk_q == 0 && blk_v == 0) {
+      flash_xpu::zero_padded_lse(
+          a.softmax_lse, a.lse_head_stride, a.lse_row_stride, a.num_heads_q,
+          a.cu_seqlens_q, a.batch, a.lse_rows, thr_id, kThreads);
+    }
     int row0 = blk_q * tile_q;
     int row1 = row0 + tile_q < s.q_len * group ? row0 + tile_q : s.q_len * group;
     if (!s.valid) {

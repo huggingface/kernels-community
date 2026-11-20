@@ -331,8 +331,8 @@ struct DecodeKernelLauncher {
         syclex::work_group_scratch_size(smem_size),
     };
     compat::experimental::kernel_properties kernel_props{
-        syclex::sub_group_size<cute::intel::sg_size>,
-        FLASH_XPU_GRF_PROP(FLASH_XPU_GRF_SIZE)};
+        flash_xpu_grf::with_grf<FLASH_XPU_GRF_SIZE>(
+            syclex::sub_group_size<cute::intel::sg_size>)};
     compat::experimental::launch_policy policy{
         sycl_grid, sycl_block, launch_props, kernel_props};
     compat::experimental::launch<cutlass::device_kernel<FMHAKernel>>(

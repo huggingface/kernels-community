@@ -28,19 +28,6 @@
 
 #include "splitkv_decode.hpp"
 
-#if !FLASH_XPU_HAS_XE3_KERNELS
-// No 512-GRF Xe35 build: flash_api.cpp's paged_decode_supported() is false,
-// so these are never called; they only satisfy the link.
-#define FLASH_XPU_PAGED_DECODE_INSTANTIATE(HD, NAME, ELEMENT)                \
-  namespace flash_xpu_splitkv {                                              \
-  template <>                                                                \
-  void paged_decode_##NAME<FLASH_XPU_SPLITKV_TARGET_ARCH, HD>(               \
-      sycl::queue&, const paged_decode_args_t&) {                            \
-    TORCH_CHECK(false, "paged decode needs DPC++ >= 2026.2");                \
-  }                                                                          \
-  }
-#else
-
 #include "../prefill/xe3/chunk_prefill_scheduler.hpp"
 #include "../prefill/xe3/chunk_prefill_epilogue.hpp"
 #include "paged_decode_kernel.hpp"
@@ -412,8 +399,8 @@ struct DecodeKernelLauncher {
         syclex::work_group_scratch_size(smem_size),
     };
     compat::experimental::kernel_properties kernel_props{
-        syclex::sub_group_size<cute::intel::sg_size>,
-        FLASH_XPU_GRF_PROP(FLASH_XPU_GRF_SIZE)};
+        flash_xpu_grf::with_grf<FLASH_XPU_GRF_SIZE>(
+            syclex::sub_group_size<cute::intel::sg_size>)};
     compat::experimental::launch_policy policy{
         sycl_grid, sycl_block, launch_props, kernel_props};
     compat::experimental::launch<cutlass::device_kernel<FMHAKernel>>(
@@ -664,5 +651,3 @@ void paged_decode(sycl::queue& queue, const paged_decode_args_t& args) {
     paged::paged_decode<ELEMENT, HD>(q, a);                                  \
   }                                                                          \
   }
-
-#endif  // FLASH_XPU_HAS_XE3_KERNELS

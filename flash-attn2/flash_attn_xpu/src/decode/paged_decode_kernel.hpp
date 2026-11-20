@@ -438,24 +438,13 @@ class XeFMHAFwdSplitKVKernel {
       }
 
       if (num_effective_kv_blocks <= 0) {
-        // flash-attn2: a sequence without keys gets O = 0 and LSE = -inf.
-        // With several splits ReduceSplitK writes them; with one split the
-        // output is O itself, written here.
-        if (seq_len <= 0 && num_kv_splits <= 1) {
-          const int q0 = blk_q * get<0>(TileShapeO{});
-          const int v0 = blk_v * get<1>(TileShapeO{});
-          const int rows = cute::min(int(get<0>(TileShapeO{})), head_group_q - q0);
-          const int cols = cute::min(int(get<1>(TileShapeO{})), s.head_size_vo - v0);
-          ElementO* o_tile = p.Oaccum + offset_o +
-              (head_q_start + q0) * s.head_size_vo + v0;
-          for (int i = thr_id; i < rows * cols; i += SGPerWG::value * intel::sg_size)
-            o_tile[(i / cols) * s.head_size_vo + i % cols] = ElementO(0);
-          if (p.softmax_lse != nullptr && blk_v == 0) {
-            for (int r = thr_id; r < rows; r += SGPerWG::value * intel::sg_size)
-              p.softmax_lse[(head_q_start + q0 + r) * p.lse_stride + offset_lse] =
-                  -cutlass::platform::numeric_limits<float>::infinity();
-          }
-        }
+        // Sequence without keys (seqused_k == 0). Skipped as in
+        // vllm-xpu-kernels: with several splits ReduceSplitK still writes
+        // O = 0 / LSE = -inf, with one split the rows of O and LSE are left
+        // undefined. Writing them here makes ocloc 26.22 miscompile the
+        // fp16 hd256 page-32 variant (DEVICE_LOST), and the host-side fill
+        // cost ~14 us per decode call. See run_paged_decode in flash_api.cpp.
+        // TODO(ocloc>=26.40): write O = 0 / LSE = -inf here again.
         continue;
       }
 

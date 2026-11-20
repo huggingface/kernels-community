@@ -44,6 +44,7 @@
 #include "../../collective/fmha_fusion.hpp"
 #include "chunk_prefill_mainloop.hpp"
 #include "chunk_prefill_epilogue.hpp"
+#include "../../lse_pad.hpp"
 
 namespace cutlass::fmha::kernel {
 // Arch-tagged inline namespace: gives these definitions a mangled name
@@ -259,6 +260,17 @@ class XeFMHAFwdKernel {
     int thr_id = int(ThreadIdxX());
     int sub_group_id = thr_id / intel::sg_size;
     int q_sg_tile = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})));
+
+    // flash-attn2: padded queries after the last batch get LSE 0.
+    if constexpr (is_var_len) {
+      if (p.softmax_lse != nullptr && BlockIdxX() == 0 && BlockIdxY() == 0 &&
+          BlockIdxZ() == 0) {
+        flash_xpu::zero_padded_lse(
+            p.softmax_lse, p.lse_stride, 1, s.num_heads_q,
+            s.seq_len_qo.cumulative_length, s.batch, p.lse_stride, thr_id,
+            SGPerWG::value * intel::sg_size);
+      }
+    }
 
     auto cS = make_identity_tensor(take<0, 2>(TiledMMAQK{}.tile_mnk()));
     auto tScS = TiledMMAQK{}.get_slice(thr_id).partition_C(cS);

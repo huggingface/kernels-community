@@ -391,7 +391,7 @@ inline bool paged_decode_supported(const at::Tensor& q, const at::Tensor& k) {
         case 64: case 96: case 128: case 192: case 256: case 512: break;
         default: return false;
     }
-    if (is_xe35(q)) return FLASH_XPU_HAS_XE3_KERNELS;
+    if (is_xe35(q)) return true;
     return small_page(k);
 }
 
@@ -520,6 +520,18 @@ inline bool run_paged_decode(sycl::queue& queue, const at::Tensor& q, int tokens
             TORCH_CHECK(false, "paged decode: unsupported head size ", head_size);
     }
 #undef PAGED_DECODE_CASE
+    // Known gap, same as vllm-xpu-kernels: on Xe35 with one KV split, rows of
+    // a sequence without keys (seqused_k == 0) keep whatever O / softmax_lse
+    // held, instead of flash-attn2's O = 0 / LSE = -inf. Callers (vllm,
+    // transformers continuous batching) drop those rows. Xe2 and the
+    // multi-split path still write O = 0 / LSE = -inf.
+    // - In-kernel write: ocloc 26.22 miscompiles the fp16 hd256 page-32
+    //   variant (DEVICE_LOST even when the branch is not taken).
+    // - Host-side fill here: correct, but ~11-14 small kernels, ~14 us per
+    //   call (B8 decode 18.6 -> 33 us), so it was dropped.
+    // TODO(ocloc>=26.40): write O = 0 / LSE = -inf for these rows in the
+    // kernel again (26.40 compiles it fine). Needs only a newer ocloc in the
+    // kernel-builder toolchain, no torch / DPC++ upgrade.
     return true;
 }
 
@@ -1100,6 +1112,7 @@ mha_varlen_fwd(
         }
         a.lse_head_stride = total_q;
         a.lse_row_stride = 1;
+        a.lse_rows = total_q;
         a.softmax_scale = softmax_scale;
         a.window_size_left =
             (window_size_left >= 0 && window_size_left < max_seqlen_k) ? window_size_left : -1;
@@ -1133,6 +1146,21 @@ mha_varlen_fwd(
                     ? window_size_left : -1,
                 -1, /*forced_splits=*/0, softmax_lse,
                 /*lse_stride=*/total_q, /*lse_row_stride=*/1);
+            if (done) {
+                // Padded queries (rows >= cu_seqlens_q[batch]) get LSE 0. Done
+                // here, as vllm-xpu-kernels masks padding outside the kernel:
+                // the same zeroing inside the paged decode kernel makes ocloc
+                // 26.22 miscompile the Xe35 hd256 page-32 variant (hangs /
+                // DEVICE_LOST even when not executed; fine with ocloc 26.40).
+                // Costs two small extra kernels per call (compare +
+                // masked_fill, ~1.5-2 us; B1 varlen decode 6.9 -> 8.4 us).
+                // TODO(ocloc>=26.40): zero these rows in the kernel again
+                // and drop this mask (see run_paged_decode).
+                at::Tensor pad = splitkv::arange_int(cu_q, total_q)
+                                     .narrow(0, 0, total_q)
+                                     .ge(cu_q.narrow(0, batch_size, 1));
+                softmax_lse.masked_fill_(pad, 0.f);
+            }
         }
         // Small pages: the generic kernel below when the paged decode kernel
         // cannot run.

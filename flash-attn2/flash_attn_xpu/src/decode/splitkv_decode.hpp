@@ -22,7 +22,8 @@
 #define FLASH_XPU_SPLITKV_TARGET_ARCH 35
 #define FLASH_XPU_XE3_NS xe3_xe35
 // The Xe35 paged-decode and chunk-prefill kernels run with 512 GRF, as
-// vllm-xpu-kernels builds its XE3 kernels (add_xe3_kernel_library).
+// vllm-xpu-kernels builds its XE3 kernels (add_xe3_kernel_library); see
+// grf_mode.hpp.
 #ifndef FLASH_XPU_GRF_SIZE
 #define FLASH_XPU_GRF_SIZE 512
 #endif
@@ -30,15 +31,6 @@
 #define FLASH_XPU_SPLITKV_TARGET_NS xe20
 #define FLASH_XPU_SPLITKV_TARGET_ARCH 20
 #define FLASH_XPU_XE3_NS xe3_xe20
-#endif
-
-// The Xe35 paged decode and chunk prefill kernels run with 512 GRF, which
-// needs maximum_registers (DPC++ 2026.2+); grf_size only takes 128/256. With
-// an older compiler CRI keeps the split-KV and generic kernels.
-#if defined(__INTEL_LLVM_COMPILER) && __INTEL_LLVM_COMPILER >= 20260200
-#define FLASH_XPU_HAS_XE3_KERNELS 1
-#else
-#define FLASH_XPU_HAS_XE3_KERNELS 0
 #endif
 
 namespace flash_xpu_splitkv {
@@ -103,6 +95,9 @@ struct decode_args_t {
   // softmax_lse[b * lse_batch_stride + hq * lse_head_stride
   //             + row * lse_row_stride]
   int64_t lse_batch_stride = 0, lse_head_stride = 0, lse_row_stride = 0;
+  // > 0 (with cu_seqlens_q): softmax_lse has lse_rows rows; those after
+  // cu_seqlens_q[batch] (padded queries) get LSE 0.
+  int lse_rows = 0;
 
   float softmax_scale = 1.f;
   float empty_lse = 0.f;      // LSE of a row without a visible key
