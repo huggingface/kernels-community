@@ -7,7 +7,7 @@ upstream = "https://github.com/ROCm/FlyDSL"
 backends = ["rocm"]
 
 [general.hub]
-repo-id = "kernels-community/flydsl"
+repo-id = "kernels-sdk/flydsl"
 
 [torch]
 src = []
