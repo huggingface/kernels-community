@@ -38,8 +38,10 @@ from utils import (  # type: ignore
     make_weights,
     quant_dequant_a,
     SUPPORTS_FP8,
+    sweep_configs,
     TEST_DEVICE,
     WEIGHTS,
+    INT_BITS,
 )
 
 fg = finegrained_kernels
@@ -47,6 +49,7 @@ dgrad_matmul_2d = internals.backward.dgrad_matmul_2d
 dgrad_matmul_batched = internals.backward.dgrad_matmul_batched
 dgrad_matmul_grouped = internals.backward.dgrad_matmul_grouped
 glu_backward = internals.backward.glu_backward
+dgrad_matmul_grouped_kernel = internals.backward.dgrad_matmul_grouped_kernel
 
 
 pytestmark = pytest.mark.skipif(not SUPPORTS_FP8, reason="FP8 kernels require SM89+")
@@ -259,7 +262,8 @@ def test_inference_path_is_untouched():
     assert not out.requires_grad and torch.isfinite(out.float()).all()
 
 
-QUANT_WEIGHTS = [r for r in WEIGHTS if r not in ("bf16", "fp16")]
+# Row-wise FP8 and integer formats leave gradients to the separate dgrad stream.
+QUANT_WEIGHTS = [r for r in WEIGHTS if r not in ("bf16", "fp16", "fp8_rowwise") and r not in INT_BITS]
 
 
 @pytest.mark.parametrize("weights", QUANT_WEIGHTS)
@@ -365,7 +369,6 @@ def test_dgrad_grouped_every_admitted_config_accumulates():
     benches configs by speed, so an arm that is wrong ONLY under these launch semantics gets
     crowned whenever it wins a near-tied tune — the descriptor-anchor bug this guards against
     read the wrong dY rows on exactly this launch while passing every identity-gather test."""
-    backward_module = internals.backward
     dgrad_matmul_grouped = internals.backward.dgrad_matmul_grouped
 
     torch.manual_seed(0)
@@ -394,14 +397,14 @@ def test_dgrad_grouped_every_admitted_config_accumulates():
             num_input_rows=T,
         )
 
-    tuner = backward_module.dgrad_matmul_grouped_kernel
+    tuner = dgrad_matmul_grouped_kernel
     admitted = {}
     original_prune, original_configs = tuner.early_config_prune, tuner.configs
 
     def spy(configs, named_args, **kwargs):
         kept = original_prune(configs, named_args, **kwargs) if original_prune else configs
-        admitted["configs"] = list(kept)
-        return kept
+        admitted["configs"] = sweep_configs(kept)
+        return kept[:1]  # this launch only captures the list; every config runs below, so skip the tune
 
     tuner.early_config_prune = spy
     tuner.cache.clear()  # an earlier test's crown takes the fast path and prune (the spy) never runs
@@ -410,7 +413,7 @@ def test_dgrad_grouped_every_admitted_config_accumulates():
     finally:
         tuner.early_config_prune = original_prune
 
-    wrong = []
+    wrong, failed = [], []
     try:
         for config in admitted["configs"]:
             tuner.configs = [config]
@@ -418,8 +421,12 @@ def test_dgrad_grouped_every_admitted_config_accumulates():
             try:
                 dX = launch()
                 torch.accelerator.synchronize()
-            except Exception:
-                continue  # the tuner's forgiven-inf path: a config may decline, never lie
+            except Exception as e:
+                # a compiled shared/tensor memory overflow is the compiler's per-shape choice (see the forward
+                # sweep in test_ops), not a pruner gap; strict fails on anything else
+                if "out of resource: shared memory" not in str(e) and "out of resource: tensor memory" not in str(e):
+                    failed.append((config.all_kwargs(), f"{type(e).__name__}: {str(e)[:120]}"))
+                continue
             rel = _rel(dX, floor)
             if rel > 5e-3:
                 wrong.append((rel, config.all_kwargs()))
@@ -427,3 +434,5 @@ def test_dgrad_grouped_every_admitted_config_accumulates():
         tuner.configs = original_configs
         tuner.cache.clear()
     assert not wrong, f"{len(wrong)} config(s) break top-k accumulation, e.g. {wrong[0]}"
+    # strict (the test default, see conftest): the pruners admitted a config that cannot run
+    assert not failed or tuner.max_failures != 0, f"{len(failed)} admitted config(s) failed to run, e.g. {failed[0]}"

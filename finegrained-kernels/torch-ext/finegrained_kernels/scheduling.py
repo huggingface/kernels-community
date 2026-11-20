@@ -64,10 +64,8 @@ def resolve_tile_inline(
     sorted_indices = tl.max_contiguous(m_start + offs, BLOCK_SIZE_M)
     return expert_id, sorted_indices, row_mask
 
-# Flat-slot tile per program for the O(S) routing kernels (count + scatter). These are small
-# latency-bound atomic kernels that want many programs: a sweep over {256..4096} x prefill shapes
-# put 256 best (or within ~1%) for both, with 1024 up to ~1.5x slower. The grid derives from it
-# so the two can't drift. Power of 2.
+# Scatter tiles and the per-slot atomic fallback favor many small programs. Aggregated
+# counting uses larger tiles to reduce global atomic traffic further.
 _ROUTING_BLOCK_SIZE = 256
 
 
@@ -109,10 +107,11 @@ def _scatter_kernel(
     NUM_TOP_K: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    AGGREGATE: tl.constexpr = False,
 ):
-    """Counting-sort scatter: each flat slot atomically claims the next slot of its expert
-    (``expert_start[e] + counter[e]++``). O(S), replaces an O(S·logS) argsort. Within-expert
-    order is arbitrary (atomic race) — fine, the per-token reduce is order-invariant. Slots whose
+    """Counting-sort scatter: reserve per-expert slots, aggregating reservations within a
+    block for large routes. O(S), replaces an O(S·logS) argsort. Within-expert
+    order is arbitrary — the per-token reduce is order-invariant. Slots whose
     expert is non-local (an ``is_off_rank`` EP sentinel) fill the tail past
     ``expert_start[E]``, one atomic per block, so every entry of both maps is a real slot / token
     and a consumer that runs over all ``S`` rows reads in bounds; the tiles never reach them."""
@@ -121,39 +120,77 @@ def _scatter_kernel(
     expert_id = tl.load(ExpertIds + offs, mask=in_range, other=NUM_EXPERTS)
     sentinel = in_range & is_off_rank(expert_id, NUM_EXPERTS)
     valid = in_range & ~sentinel
-    local = tl.load(ExpertStart + expert_id, mask=valid, other=0) + tl.atomic_add(
-        Counters + expert_id, 1, mask=valid, sem="relaxed"
-    )
-    dest = local
-    n_sentinel = tl.sum(sentinel.to(tl.int32), 0)
-    if n_sentinel > 0:  # without EP no block takes this branch
-        rank = tl.cumsum(sentinel.to(tl.int32), 0) - sentinel.to(tl.int32)
-        tail = tl.load(ExpertStart + NUM_EXPERTS) + tl.atomic_add(Counters + NUM_EXPERTS, n_sentinel, sem="relaxed")
-        dest = tl.where(valid, local, tail + rank)
-    stored = valid | sentinel
+    if AGGREGATE:
+        # Contiguous local expert runs reserve one range each, including the off-rank tail.
+        expert_id = tl.where(valid, expert_id, NUM_EXPERTS)
+        packed = tl.sort((expert_id.to(tl.uint64) << 32) | offs.to(tl.uint64), descending=False)
+        expert_id, offs = (packed >> 32).to(tl.int32), packed.to(tl.uint32)
+        counts = tl.histogram(expert_id, 2 * NUM_EXPERTS, mask=offs < S)
+        bins = tl.arange(0, 2 * NUM_EXPERTS)
+        base = tl.atomic_add(Counters + bins, counts, mask=(bins <= NUM_EXPERTS) & (counts > 0), sem="relaxed")
+        base += tl.load(ExpertStart + bins, mask=bins <= NUM_EXPERTS, other=0)
+        base -= tl.cumsum(counts, 0) - counts
+        dest = tl.gather(base, expert_id, axis=0) + tl.arange(0, BLOCK_SIZE)
+        stored = offs < S
+    else:
+        local = tl.load(ExpertStart + expert_id, mask=valid, other=0) + tl.atomic_add(
+            Counters + expert_id, 1, mask=valid, sem="relaxed"
+        )
+        dest = local
+        n_sentinel = tl.sum(sentinel.to(tl.int32), 0)
+        if n_sentinel > 0:  # without EP no block takes this branch
+            rank = tl.cumsum(sentinel.to(tl.int32), 0) - sentinel.to(tl.int32)
+            tail = tl.load(ExpertStart + NUM_EXPERTS) + tl.atomic_add(Counters + NUM_EXPERTS, n_sentinel, sem="relaxed")
+            dest = tl.where(valid, local, tail + rank)
+        stored = valid | sentinel
     tl.store(Perm + dest, offs, mask=stored)
     tl.store(PermToken + dest, offs // NUM_TOP_K, mask=stored)
 
 
 @triton.jit
-def _count_kernel(
-    ExpertIds, ExpertFreq, S, NUM_EXPERTS: tl.constexpr, BLOCK_SIZE: tl.constexpr
+def _route_one_block_kernel(
+    ExpertIds, Perm, PermToken, ExpertStart, S,
+    NUM_TOP_K: tl.constexpr, NUM_EXPERTS: tl.constexpr, BLOCK_SIZE: tl.constexpr,
 ):
-    """Per-expert token count via atomics — replaces ``torch.histc`` (no float cast), fixed
-    ``(NUM_EXPERTS,)`` output stays CUDA-graph friendly. ``ExpertFreq`` is pre-zeroed."""
+    """The whole decode-sized routing in one program: count, exclusive offsets and the expert sort that
+    ``_count_kernel`` + ``_exclusive_offsets_kernel`` + ``_scatter_kernel`` (and the counters' memset) build
+    over four launches. One ``tl.sort`` on ``(expert << 32) | position`` orders the slots by expert; EP
+    sentinels take key ``NUM_EXPERTS`` and so fill the tail past ``expert_start[E]``, as the scatter places
+    them, and the padding sorts after them."""
+    offs = tl.arange(0, BLOCK_SIZE)
+    in_range = offs < S
+    expert_id = tl.load(ExpertIds + offs, mask=in_range, other=0)
+    key = tl.where(in_range, tl.where(is_off_rank(expert_id, NUM_EXPERTS), NUM_EXPERTS, expert_id), NUM_EXPERTS + 1)
+    counts = tl.histogram(key, NUM_EXPERTS, mask=key < NUM_EXPERTS)
+    tl.store(ExpertStart, 0)
+    tl.store(ExpertStart + 1 + tl.arange(0, NUM_EXPERTS), tl.cumsum(counts, 0))
+    src = tl.sort((key.to(tl.uint64) << 32) | offs.to(tl.uint64)).to(tl.uint32).to(tl.int32)
+    tl.store(Perm + offs, src, mask=in_range)
+    tl.store(PermToken + offs, src // NUM_TOP_K, mask=in_range)
+
+
+@triton.jit
+def _count_kernel(
+    ExpertIds, ExpertFreq, S, NUM_EXPERTS: tl.constexpr, BLOCK_SIZE: tl.constexpr, AGGREGATE: tl.constexpr = False,
+):
+    """Per-expert counts, aggregated locally before global atomics on large routes.
+    Fixed ``(NUM_EXPERTS,)`` output stays graph friendly; ``ExpertFreq`` is pre-zeroed."""
     offs = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < S
     expert_id = tl.load(ExpertIds + offs, mask=mask, other=NUM_EXPERTS)
-    tl.atomic_add(
-        ExpertFreq + expert_id, 1, mask=mask & ~is_off_rank(expert_id, NUM_EXPERTS), sem="relaxed"
-    )
+    valid = mask & ~is_off_rank(expert_id, NUM_EXPERTS)
+    if AGGREGATE:
+        counts = tl.histogram(expert_id, NUM_EXPERTS, mask=valid)
+        tl.atomic_add(ExpertFreq + tl.arange(0, NUM_EXPERTS), counts, mask=counts > 0, sem="relaxed")
+    else:
+        tl.atomic_add(ExpertFreq + expert_id, 1, mask=valid, sem="relaxed")
 
 
 def compute_grouped_scheduling(
     expert_ids: torch.Tensor, num_experts: int, num_top_k: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """On-device routing: expert-sorted index (no copy of the activations) via two Triton
-    launches — exclusive offsets + an atomic counting-sort scatter (replaces host ``argsort``).
+    """On-device routing: count, exclusive offsets and counting-sort scatter build an
+    expert-sorted index without copying the activations (replaces host ``argsort``).
     Run it once per layer and pass the results to every grouped GEMM of that layer. Returns
     ``(expert_start, gather_idx, scatter_idx)``:
 
@@ -192,6 +229,14 @@ def routed_expert_start(expert_ids: torch.Tensor, num_experts: int) -> torch.Ten
     return _compute_expert_start(expert_ids, num_experts)
 
 
+# Routes up to this many slots are sorted by one program (``_route_one_block_kernel``).
+_ONE_BLOCK_ROUTING_MAX_ROWS = 1024
+
+
+def _aggregate_routing(num_routed_tokens: int, num_experts: int) -> bool:
+    return num_routed_tokens >= 4096 and num_experts <= 2 * _ROUTING_BLOCK_SIZE
+
+
 def _launch_expert_start(
     expert_ids: torch.Tensor, num_experts: int, counters: torch.Tensor | None = None
 ) -> torch.Tensor:
@@ -201,15 +246,19 @@ def _launch_expert_start(
     num_routed_tokens = expert_ids.numel()  # S = num_tokens * num_top_k
     expert_freq = torch.zeros(num_experts, dtype=torch.int32, device=device)
     expert_start = torch.empty(num_experts + 1, dtype=torch.int32, device=device)
+    # Bound local histogram storage; small routes and larger expert sets keep per-slot atomics.
+    aggregate = _aggregate_routing(num_routed_tokens, num_experts)
+    count_block = 1024 if aggregate else _ROUTING_BLOCK_SIZE
     with device_context(device):
         compile_time_only_triton_wrap(_count_kernel)[
-            (triton.cdiv(num_routed_tokens, _ROUTING_BLOCK_SIZE),)
+            (triton.cdiv(num_routed_tokens, count_block),)
         ](
             expert_ids,
             expert_freq,
             num_routed_tokens,
             NUM_EXPERTS=num_experts,
-            BLOCK_SIZE=_ROUTING_BLOCK_SIZE,
+            BLOCK_SIZE=count_block,
+            AGGREGATE=aggregate,
         )
         compile_time_only_triton_wrap(_exclusive_offsets_kernel)[(1,)](
             expert_freq,
@@ -236,10 +285,23 @@ def _compute_grouped_scheduling(
     device = expert_ids.device
     expert_ids = expert_ids.int().contiguous()  # routing kernels index with unit stride
     num_routed_tokens = expert_ids.numel()  # S = num_tokens * num_top_k
+    if num_routed_tokens <= _ONE_BLOCK_ROUTING_MAX_ROWS:
+        # decode: one launch instead of a memset and three (Qwen3-30B-A3B T=1 on B200: 5.5 -> ~1.5 us of routing)
+        expert_start = torch.empty(num_experts + 1, dtype=torch.int32, device=device)
+        perm = torch.empty(num_routed_tokens, dtype=torch.int32, device=device)
+        perm_token = torch.empty(num_routed_tokens, dtype=torch.int32, device=device)
+        with device_context(device):
+            compile_time_only_triton_wrap(_route_one_block_kernel)[(1,)](
+                expert_ids, perm, perm_token, expert_start, num_routed_tokens,
+                NUM_TOP_K=num_top_k, NUM_EXPERTS=num_experts,
+                BLOCK_SIZE=max(triton.next_power_of_2(num_routed_tokens), 16),
+            )
+        return perm_token, perm, expert_start
     counters = torch.empty(num_experts + 1, dtype=torch.int32, device=device)
     expert_start = _launch_expert_start(expert_ids, num_experts, counters)
     perm = torch.empty(num_routed_tokens, dtype=torch.int32, device=device)
     perm_token = torch.empty(num_routed_tokens, dtype=torch.int32, device=device)
+    aggregate = _aggregate_routing(num_routed_tokens, num_experts)
     with device_context(device):
         compile_time_only_triton_wrap(_scatter_kernel)[
             (triton.cdiv(num_routed_tokens, _ROUTING_BLOCK_SIZE),)
@@ -253,6 +315,7 @@ def _compute_grouped_scheduling(
             NUM_TOP_K=num_top_k,
             NUM_EXPERTS=num_experts,
             BLOCK_SIZE=_ROUTING_BLOCK_SIZE,
+            AGGREGATE=aggregate,
         )
     return perm_token, perm, expert_start
 
@@ -269,20 +332,23 @@ def packed_schedule_capacity(num_routed_tokens: int, num_experts: int) -> int:
     return (num_routed_tokens + PACKED_SCHEDULE_BM - 1) // PACKED_SCHEDULE_BM + num_experts
 
 
-def build_packed_schedule(
-    expert_start: torch.Tensor, num_routed_tokens: int, num_experts: int
-) -> torch.Tensor:
-    """Allocate + fill the packed tile schedule (one launch, fixed shape — graph-safe)."""
-    schedule = torch.empty(
-        1 + 3 * packed_schedule_capacity(num_routed_tokens, num_experts),
-        dtype=torch.int32, device=expert_start.device,
-    )
-    pow2 = triton.next_power_of_2(num_experts)
+def packed_schedule_buffer(num_routed_tokens: int, num_experts: int, device: torch.device) -> torch.Tensor:
+    """The packed tile schedule's buffer: fixed shape (graph-safe), shared by every config of a launch so the tuned
+    configs see identical args; ``fill_packed_schedule`` writes it for the configs that read it."""
+    return torch.empty(1 + 3 * packed_schedule_capacity(num_routed_tokens, num_experts), dtype=torch.int32, device=device)
+
+
+def fill_packed_schedule(nargs):
+    """Per-config pre_hook: build ``Schedule`` from ``ExpertStart`` (one launch) for a ``PACKED_SCHEDULE`` config.
+    The other configs never read it, so their launches (every decode crown) carry no schedule kernel."""
+    if not nargs.get("PACKED_SCHEDULE"):
+        return
+    expert_start = nargs["ExpertStart"]
+    pow2 = triton.next_power_of_2(expert_start.shape[0] - 1)
     with device_context(expert_start.device):
         compile_time_only_triton_wrap(_packed_schedule_kernel)[(pow2,)](
-            expert_start, schedule, NUM_EXPERTS=pow2
+            expert_start, nargs["Schedule"], NUM_EXPERTS=pow2
         )
-    return schedule
 
 
 @triton.jit
@@ -318,6 +384,26 @@ def load_packed_schedule(Schedule, BLOCK_SIZE_M: tl.constexpr):
     ``packed_schedule_scope_pruner``); the static_assert is the self-fence."""
     tl.static_assert(BLOCK_SIZE_M == 128, "the packed schedule is built for BM=128")
     return tl.load(Schedule)
+
+
+@triton.jit
+def grouped_tile_order(tile_id, num_m_tiles, num_n_tiles, GROUP_SIZE_M: tl.constexpr = 8):
+    """Reuse each weight tile across up to ``GROUP_SIZE_M`` adjacent M-tiles before advancing N. ``GROUP_SIZE_M=1`` is
+    the row-major tile id, returned as is (chosen per config by ``tile_order_pruner``)."""
+    if GROUP_SIZE_M == 1:
+        return tile_id
+    group_first_m = tile_id // (GROUP_SIZE_M * num_n_tiles) * GROUP_SIZE_M
+    # Keep a trailing prefetch past the M-grid well-defined.
+    group_size_m = tl.maximum(1, tl.minimum(GROUP_SIZE_M, num_m_tiles - group_first_m))
+    group_offset = tile_id - group_first_m * num_n_tiles
+    # Every group but the last is full: dividing by the constexpr size compiles to shifts, not a second runtime division.
+    if group_size_m == GROUP_SIZE_M:
+        pid_m = group_first_m + group_offset % GROUP_SIZE_M
+        pid_n = group_offset // GROUP_SIZE_M
+    else:
+        pid_m = group_first_m + group_offset % group_size_m
+        pid_n = group_offset // group_size_m
+    return pid_m * num_n_tiles + pid_n
 
 
 @triton.jit
@@ -435,7 +521,7 @@ def _gather_local_rows_kernel(Src, Dst, GatherIdx, ExpertStart, row_words, NUM_E
         cols = c + tl.arange(0, BLOCK_C)
         mask = row_mask[:, None] & (cols < row_words)[None, :]
         vals = tl.load(Src + src[:, None] * row_words + cols[None, :], mask=mask)
-        tl.store(Dst + rows.to(tl.int64)[:, None] * row_words + cols[None, :], vals, mask=mask)
+        tl.store(Dst + rows.to(tl.int64)[:, None] * row_words + cols[None, :], vals, mask=mask, cache_modifier=".cs")
 
 
 def _gather_local_rows(x, gather_idx, expert_start, num_experts):
@@ -481,12 +567,11 @@ def expand_regime(S_rows: int, num_experts: int) -> bool:
     tokens/expert — gather4's 1-row box is MONOTONIC in tokens/expert; every other arch has
     no gather TMA at all, so any large-S gather expands).
 
-    Raw bf16 activations (the full-precision grouped path) were A/B'd against keeping the
-    in-kernel gather, 200-trial tunes each side, 2026-08-28: DeepSeek-V4 3455 -> 3344us (-3.2%),
-    DeepSeek-V3 7267 -> 7290 (wash), GLM-5.2 6039 -> 6439 (+6.6%). The copy (150-370us) is
-    offset by what the gather costs the GEMM, and which side wins is shape-specific within the
-    tune's roll variance — so the law is NOT split on ``act_itemsize``; it stays as measured.
-    ``FINEGRAINED_FORCE_GATHER=1`` is the A/B knob (never expand)."""
+    The copy wins on every arm (B200, T=8192, full fused MoE, one process, graphs interleaved,
+    bit-identical; Triton 3.9): DeepSeek-V3 FP8 block-dynamic 6533 -> 5713us, GLM-5.2 bf16
+    7474 -> 6170, DeepSeek-V4 bf16 3854 -> 3644. The swizzled MX arm takes the routed-rows quant
+    instead of a copy (``mx_dynamic_matmul_grouped``): DeepSeek-V4 W4A8 gate|up T=2048 605 -> 538us,
+    T=8192 1085 -> 967. ``FINEGRAINED_FORCE_GATHER=1`` is the A/B knob (never expand)."""
     if os.environ.get("FINEGRAINED_FORCE_GATHER"):
         return False
     return S_rows >= 4096 and (not is_sm10x() or S_rows < 1024 * num_experts)

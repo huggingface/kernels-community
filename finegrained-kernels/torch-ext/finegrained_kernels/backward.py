@@ -74,7 +74,7 @@ from .compat import (
     get_accelerator_autotuning_configs,
     sm_count,
 )
-from .descriptors import maybe_descriptor, rebind_dgrad_descriptors, rebind_dgrad_grouped_descriptors
+from .descriptors import maybe_descriptor, rebind_dgrad_descriptors, rebind_dgrad_grouped_descriptors, weight_descriptor
 from .matmul import matmul_2d
 from .pruners import (
     PATH_ANCHOR_AXES,
@@ -273,7 +273,7 @@ def dgrad_matmul_2d_kernel(
         accumulator = accumulator * tl.load(BsGlobal)
 
     tl.store(
-        C + offs_m[:, None] * stride_c_m + offs_k[None, :] * stride_c_k,
+        C + offs_m.to(tl.int64)[:, None] * stride_c_m + offs_k[None, :] * stride_c_k,
         accumulator.to(C.dtype.element_ty),
         mask=m_mask[:, None] & k_mask[None, :],
     )
@@ -316,7 +316,7 @@ def dgrad_matmul_2d(
         # caller's device is not the active one. Boxes are placeholders; the pre_hook rebinds
         # them to the tuned tile per config.
         a_descriptor = maybe_descriptor(dY, [1, 128])
-        b_descriptor = maybe_descriptor(W, [1, 128])
+        b_descriptor = weight_descriptor(W, [1, 128])
         compile_time_only_triton_wrap(dgrad_matmul_2d_kernel)[grid](
             dY,
             a_descriptor,
@@ -537,13 +537,13 @@ def dgrad_matmul_grouped_kernel(
             # top_k=8 (3003 vs 4215us), 1.13x at GPT-OSS top_k=4, break-even at decode. top_k-way
             # atomic contention is the difference; the reduce itself is nearly free.
             tl.store(
-                C + out_row[:, None] * stride_c_m + offs_k[None, :] * stride_c_k,
+                C + out_row.to(tl.int64)[:, None] * stride_c_m + offs_k[None, :] * stride_c_k,
                 accumulator,
                 mask=row_mask[:, None] & (offs_k[None, :] < K),
             )
         else:
             tl.atomic_add(
-                C + in_row[:, None] * stride_c_m + offs_k[None, :] * stride_c_k,
+                C + in_row.to(tl.int64)[:, None] * stride_c_m + offs_k[None, :] * stride_c_k,
                 accumulator,
                 mask=row_mask[:, None] & (offs_k[None, :] < K),
             )
@@ -592,7 +592,7 @@ def dgrad_matmul_grouped(
     with device_context(dY.device):
         # inside the context — see dgrad_matmul_2d; placeholder boxes, rebound by the pre_hook
         a_descriptor = maybe_descriptor(dY, [1, 128])
-        b_descriptor = maybe_descriptor(W, [1, 1, 128])
+        b_descriptor = weight_descriptor(W, [1, 1, 128])
         compile_time_only_triton_wrap(dgrad_matmul_grouped_kernel)[(num_sms,)](
             dY,
             a_descriptor,
