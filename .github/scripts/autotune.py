@@ -91,7 +91,8 @@ def github_api(path):
 def is_autotune_pr(pr, repository):
     """Recognize our own config PRs, including after squash merging."""
     return (
-        pr["user"]["login"] == "github-actions[bot]"
+        # GitHub App tokens create PRs as the app's bot, not github-actions[bot].
+        pr["user"].get("type") == "Bot"
         and pr["head"]["repo"] is not None
         and pr["head"]["repo"]["full_name"] == repository
         and pr["head"]["ref"].startswith("autotune/")
