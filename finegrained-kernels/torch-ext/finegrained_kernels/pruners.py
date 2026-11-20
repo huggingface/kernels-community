@@ -1447,6 +1447,10 @@ def swizzled_scale_config_pruner(allow_gate_subblock=False):
         if config_dim(c, args, "BLOCK_SIZE_K") % band != 0:
             return False
         bn = config_dim(c, args, "BLOCK_SIZE_N")
+        # A sub-128 BN gathers its scale slice with async copies; under WARP_SPEC, a slice of under one byte per
+        # thread trips Triton's 4/8/16-byte cp.async assert (MXFP8 2D BN=32 BK=128 at 8 warps; 4 warps or BK=256 fit).
+        if c.kwargs.get("WARP_SPEC") and bn < 128 and bn * (config_dim(c, args, "BLOCK_SIZE_K") // args["SCALE_GROUP_K"]) < 32 * c.num_warps:
+            return False
         if args.get("GATE"):
             return bn == 128 or (allow_gate_subblock and bn in (32, 64))
         if bn > 128:
