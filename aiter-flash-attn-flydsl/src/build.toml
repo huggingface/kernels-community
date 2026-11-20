@@ -1,0 +1,19 @@
+[general]
+name = "aiter-flash-attn-flydsl"
+version = 1
+edition = 6
+license = "MIT"
+upstream = "https://github.com/ROCm/aiter.git"
+source = "https://github.com/huggingface/kernels-community/tree/main/aiter-flash-attn-flydsl"
+backends = ["rocm"]
+kernel-depends = [
+    { repo-id = "kernels-staging/flydsl", revision = "pr-1323" },
+]
+
+[general.hub]
+repo-id = "kernels-community/aiter-flash-attn-flydsl"
+
+[torch-noarch]
+rocm_archs = ["gfx1201"]
+
+[kernel]

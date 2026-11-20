@@ -1,0 +1,12 @@
+[
+  {
+    "dependency": {
+      "repo-id": "kernels-staging/flydsl",
+      "revision": "pr-1323"
+    },
+    "lock": {
+      "commit": "b379dc18fcc01f7879a98ae4a86f6bd161d5f93e",
+      "hash": "sha256-yXHJiY7bv0eT4jqLyytjZKEFlgkGhgRVmcy/aHRU1+w="
+    }
+  }
+]
