@@ -1,0 +1,12 @@
+[
+  {
+    "dependency": {
+      "repo-id": "kernels-community/tokamax",
+      "version": 1
+    },
+    "lock": {
+      "commit": "5c66e49673ae61ead0a56353d9eb3be23b2e9a75",
+      "hash": "sha256-q5b9kj5ae/ZeFZRsrNm8t+ZSaQxeQYkt9VQycVjV890="
+    }
+  }
+]
