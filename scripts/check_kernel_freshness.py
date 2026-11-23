@@ -42,6 +42,7 @@ KERNEL_SOURCE_MAPPING = {
     "quantization-bitsandbytes": "https://github.com/bitsandbytes-foundation/bitsandbytes",
     "quantization-eetq": "https://github.com/NetEase-FuXi/EETQ",
     "quantization-gptq": "",
+    "ragged-dot-tpu": "",
     "rmsnorm": "https://github.com/intel/intel-extension-for-pytorch",
     "rotary": "https://github.com/Dao-AILab/flash-attention",
     "rwkv": "https://github.com/BlinkDL/RWKV-LM",
@@ -76,6 +77,7 @@ KERNEL_SOURCE_MAPPING = {
     "esmfold2-trimul": "",
     # Written for this repo, so there is no upstream to track.
     "weathernext2-banded-attention": "",
+    "tokamax": "https://github.com/openxla/tokamax",
 }
 
 def parse_args() -> argparse.Namespace:

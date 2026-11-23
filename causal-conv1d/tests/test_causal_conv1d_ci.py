@@ -13,11 +13,12 @@ pytestmark = pytest.mark.kernels_ci
 # (channel last only), bias and SiLU.
 @pytest.mark.parametrize("itype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("channel_last", [False, True])
-def test_causal_conv1d_ci(itype, channel_last):
+@pytest.mark.parametrize("width", [4, 7])
+def test_causal_conv1d_ci(itype, channel_last, width):
     upstream.test_causal_conv1d(
         dim=64,
         seqlen=130,
-        width=4,
+        width=width,
         has_bias=True,
         silu_activation=True,
         itype=itype,

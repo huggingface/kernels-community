@@ -76,34 +76,4 @@ jobs:
         if: steps.kernel.outputs.skip != 'true'
         env:
           KERNEL: ${{ steps.kernel.outputs.kernel }}
-        run: kernels benchmark "kernels-community/$KERNEL" --branch main --visual benches
-      - name: Ensure README has performance section
-        if: steps.kernel.outputs.skip != 'true'
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          KERNEL: ${{ steps.kernel.outputs.kernel }}
-        run: |
-          REPO="kernels-community/$KERNEL"
-          hf download "$REPO" README.md --local-dir /tmp/kernel-readme --revision main
-          if ! grep -q '### Performance' /tmp/kernel-readme/README.md; then
-          cat >> /tmp/kernel-readme/README.md << 'EOF'
-
-          ### Performance
-
-          <img class="dark:hidden border border-gray-200 dark:border-gray-700 rounded-lg" src="media/benches_light_animation.svg" />
-          <img class="hidden dark:block border border-gray-200 dark:border-gray-700 rounded-lg" src="media/benches_dark_animation.svg" />
-
-          <img class="dark:hidden border border-gray-200 dark:border-gray-700 rounded-lg" src="media/benches_light_latency.svg" />
-          <img class="hidden dark:block border border-gray-200 dark:border-gray-700 rounded-lg" src="media/benches_dark_latency.svg" />
-
-          <img class="dark:hidden border border-gray-200 dark:border-gray-700 rounded-lg" src="media/benches_light_throughput.svg" />
-          <img class="hidden dark:block border border-gray-200 dark:border-gray-700 rounded-lg" src="media/benches_dark_throughput.svg" />
-          EOF
-          hf upload "$REPO" /tmp/kernel-readme/README.md README.md --revision main
-          fi
-      - name: Upload benchmark visuals
-        if: steps.kernel.outputs.skip != 'true'
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          KERNEL: ${{ steps.kernel.outputs.kernel }}
-        run: hf upload "kernels-community/$KERNEL" media media --revision main
+        run: kernels benchmark "kernels-community/$KERNEL" --branch main

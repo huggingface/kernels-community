@@ -18,6 +18,7 @@ DATASET_REPO = os.getenv("KERNEL_STATUS_REPO") or "kernels-community/kernel-stat
 WORKFLOW_PLATFORM = {"build.yaml": "linux", "build-mac.yaml": "mac", "build-windows.yaml": "windows"}
 TORCH_RE = re.compile(r"^torch(\d)(\d+)-")
 STABLE_ABI_RE = re.compile(r"^torch-stable-abi(\d)(\d+)-")
+CARD = Path(__file__).with_name("kernel_status_card.md")
 EVENT_MONTHS = 6
 BUILDER_DAYS = 14
 SEVERITIES = ("error", "warn", "info")
@@ -266,6 +267,11 @@ def add_health(k: dict, name: str, torch_versions: list[str], history: list[dict
 # Snapshot
 
 
+def render_card(generated_at: str) -> str:
+    """The dataset card, stamped with the time of the snapshot."""
+    return CARD.read_text().replace("{generated_at}", generated_at)
+
+
 def build_snapshot(root: Path, abi_results: dict, history: list[dict], token: str | None) -> dict:
     from huggingface_hub import HfApi
 
@@ -310,8 +316,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Build the kernel-status snapshot.")
     parser.add_argument("--root", default=".", help="Root of the kernels-community checkout.")
     parser.add_argument("--abi-results", help="JSON from `report_kernel_failures.py --results-json`.")
-    parser.add_argument("--out", help="Also write latest.json and history.jsonl to this directory.")
-    parser.add_argument("--upload", action="store_true", help=f"Upload latest.json and history.jsonl to {DATASET_REPO}.")
+    parser.add_argument("--out", help="Also write latest.json, history.jsonl and README.md to this directory.")
+    parser.add_argument("--upload", action="store_true", help=f"Upload latest.json, history.jsonl and README.md to {DATASET_REPO}.")
     parser.add_argument("--github-token", default=os.getenv("GITHUB_TOKEN"))
     args = parser.parse_args()
 
@@ -326,6 +332,7 @@ def main() -> int:
     files = {
         "latest.json": json.dumps(snapshot, indent=2),
         "history.jsonl": "".join(json.dumps(r) + "\n" for r in history),
+        "README.md": render_card(snapshot["generated_at"]),
     }
 
     if args.out:

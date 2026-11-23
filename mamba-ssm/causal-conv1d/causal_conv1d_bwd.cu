@@ -281,6 +281,23 @@ void causal_conv1d_bwd_cuda(ConvParamsBwd &params, cudaStream_t stream) {
         causal_conv1d_bwd_launch<128, 3, input_t, weight_t>(params, stream);
     } else if (params.width == 4) {
         causal_conv1d_bwd_launch<128, 4, input_t, weight_t>(params, stream);
+    } else if (params.width == 5) {
+        // widths 5-8 need 8 elements per thread, which only the 16-bit types load
+        if constexpr (sizeof(input_t) <= 2) {
+            causal_conv1d_bwd_launch<128, 5, input_t, weight_t>(params, stream);
+        }
+    } else if (params.width == 6) {
+        if constexpr (sizeof(input_t) <= 2) {
+            causal_conv1d_bwd_launch<128, 6, input_t, weight_t>(params, stream);
+        }
+    } else if (params.width == 7) {
+        if constexpr (sizeof(input_t) <= 2) {
+            causal_conv1d_bwd_launch<128, 7, input_t, weight_t>(params, stream);
+        }
+    } else if (params.width == 8) {
+        if constexpr (sizeof(input_t) <= 2) {
+            causal_conv1d_bwd_launch<128, 8, input_t, weight_t>(params, stream);
+        }
     }
 }
 
@@ -603,6 +620,22 @@ void causal_conv1d_channellast_bwd_cuda(ConvParamsBwd &params, cudaStream_t stre
         causal_conv1d_channellast_bwd_launch<128, 3, input_t, weight_t>(params, stream);
     } else if (params.width == 4) {
         causal_conv1d_channellast_bwd_launch<128, 4, input_t, weight_t>(params, stream);
+    } else if (params.width == 5) {
+        if constexpr (sizeof(input_t) <= 2) {
+            causal_conv1d_channellast_bwd_launch<128, 5, input_t, weight_t>(params, stream);
+        }
+    } else if (params.width == 6) {
+        if constexpr (sizeof(input_t) <= 2) {
+            causal_conv1d_channellast_bwd_launch<128, 6, input_t, weight_t>(params, stream);
+        }
+    } else if (params.width == 7) {
+        if constexpr (sizeof(input_t) <= 2) {
+            causal_conv1d_channellast_bwd_launch<128, 7, input_t, weight_t>(params, stream);
+        }
+    } else if (params.width == 8) {
+        if constexpr (sizeof(input_t) <= 2) {
+            causal_conv1d_channellast_bwd_launch<128, 8, input_t, weight_t>(params, stream);
+        }
     }
 }
 

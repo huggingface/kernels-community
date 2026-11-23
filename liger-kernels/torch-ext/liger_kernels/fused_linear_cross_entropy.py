@@ -31,6 +31,9 @@ def fused_linear_cross_entropy_forward(
     use_token_scaling=False,
     return_token_accuracy=False,
     return_predicted_tokens=False,
+    token_grad_output=None,
+    compute_gradients=None,
+    weight_requires_grad=None,
 ):
     assert isinstance(return_z_loss, bool), f"return_z_loss must be True or False. Got: {return_z_loss}"
     assert isinstance(return_token_accuracy, bool), (
@@ -41,7 +44,10 @@ def fused_linear_cross_entropy_forward(
     )
     device = _input.device
 
-    input_requires_grad = _input.requires_grad
+    # Backward recomputation uses detached tensors, so preserve the original
+    # gradient requirements. Per-token weights must be applied before projection.
+    input_requires_grad = _input.requires_grad if compute_gradients is None else compute_gradients
+    weight_needs_grad = weight.requires_grad if weight_requires_grad is None else weight_requires_grad
 
     # inputs have shape: BT x H
     # materialized activations will have shape: BT x V
@@ -63,10 +69,10 @@ def fused_linear_cross_entropy_forward(
     # we use fp32 for loss and gradients accumulator
     if input_requires_grad:
         if accum_dtype is None:
-            grad_weight = torch.zeros_like(weight, device=device) if weight.requires_grad else None
+            grad_weight = torch.zeros_like(weight, device=device) if weight_needs_grad else None
             grad_bias = torch.zeros_like(bias, device=device) if bias is not None else None
         else:
-            grad_weight = torch.zeros_like(weight, dtype=accum_dtype, device=device) if weight.requires_grad else None
+            grad_weight = torch.zeros_like(weight, dtype=accum_dtype, device=device) if weight_needs_grad else None
             grad_bias = torch.zeros_like(bias, dtype=accum_dtype, device=device) if bias is not None else None
     else:
         grad_weight = None
@@ -207,6 +213,13 @@ def fused_linear_cross_entropy_forward(
             scaling_factors_expanded = scaling_factors.unsqueeze(-1)  # chunk_size x 1
             grad_logits_chunk = grad_logits_chunk * scaling_factors_expanded
 
+        # The token dimension disappears when computing weight/bias gradients.
+        # Apply each token's upstream gradient before those reductions.
+        if token_grad_output is not None:
+            grad_logits_chunk = grad_logits_chunk * token_grad_output[start_idx:end_idx].unsqueeze(-1).to(
+                grad_logits_chunk.dtype
+            )
+
         if input_requires_grad:
             grad_input[start_idx:end_idx] = grad_logits_chunk @ weight
 
@@ -220,11 +233,6 @@ def fused_linear_cross_entropy_forward(
                 out=grad_bias,
                 alpha=1.0,
             )
-
-    # Need extra calculations for backward if reduction=='none'. Not supporting reduction='none' now.
-    # if reduction == "none":
-    #     loss = loss_1d
-    #     z_loss = z_loss_1d if return_z_loss else None
 
     if reduction == "none":
         # Return per-token losses
@@ -262,6 +270,7 @@ def fused_linear_cross_entropy_backward(grad_output, grad_input, grad_weight, gr
                 grad_output,
                 H,
                 BLOCK_SIZE=BLOCK_SIZE,
+                X_col_stride=grad_input.stride(-1),
                 num_warps=32 if not is_hip() else 16,
             )
 
@@ -276,6 +285,7 @@ def fused_linear_cross_entropy_backward(grad_output, grad_input, grad_weight, gr
                     grad_output,
                     H,
                     BLOCK_SIZE=BLOCK_SIZE,
+                    X_col_stride=grad_weight.stride(-1),
                     num_warps=32 if not is_hip() else 16,
                 )
 
@@ -341,6 +351,15 @@ class LigerFusedLinearCrossEntropyFunction(torch.autograd.Function):
         return_predicted_tokens (bool): When `return_predicted_tokens` is `True`, returns per-token predicted class indices (argmax) without materializing logits. Default: `False`
         """
 
+        # With reduction="none" the loss is per-token, so backward receives a
+        # per-token grad_output that must be folded into the logits gradient BEFORE
+        # it is summed into grad_weight/grad_bias. That weight is not known yet here,
+        # so defer the gradient computation to backward (recomputing the chunked
+        # logits there) instead of producing an unscaled gradient we could never
+        # correctly rescale. mean/sum keep the original compute-in-forward fast path.
+        needs_grad = _input.requires_grad or weight.requires_grad or (bias is not None and bias.requires_grad)
+        ctx.defer_grads = reduction == "none" and needs_grad
+
         loss, z_loss, token_accuracy, predicted_tokens, grad_input, grad_weight, grad_bias = (
             fused_linear_cross_entropy_forward(
                 _input=_input,
@@ -358,14 +377,30 @@ class LigerFusedLinearCrossEntropyFunction(torch.autograd.Function):
                 use_token_scaling=use_token_scaling,
                 return_token_accuracy=return_token_accuracy,
                 return_predicted_tokens=return_predicted_tokens,
+                compute_gradients=False if ctx.defer_grads else None,
             )
         )
-        # downcast to dtype and store for backward
-        ctx.save_for_backward(
-            grad_input.detach(),
-            grad_weight.detach() if grad_weight is not None else None,
-            grad_bias.detach() if grad_bias is not None else None,
-        )
+
+        if ctx.defer_grads:
+            ctx.save_for_backward(_input.detach(), weight.detach(), target, bias.detach() if bias is not None else None)
+            ctx.fwd_kwargs = dict(
+                ce_weight=ce_weight,
+                ignore_index=ignore_index,
+                lse_square_scale=lse_square_scale,
+                label_smoothing=label_smoothing,
+                reduction=reduction,
+                softcap=softcap,
+                accum_dtype=accum_dtype,
+                use_token_scaling=use_token_scaling,
+            )
+            ctx.weight_requires_grad = weight.requires_grad
+        else:
+            # downcast to dtype and store for backward
+            ctx.save_for_backward(
+                grad_input.detach(),
+                grad_weight.detach() if grad_weight is not None else None,
+                grad_bias.detach() if grad_bias is not None else None,
+            )
         ctx.return_z_loss = return_z_loss
         ctx.return_token_accuracy = return_token_accuracy
         ctx.return_predicted_tokens = return_predicted_tokens
@@ -380,10 +415,27 @@ class LigerFusedLinearCrossEntropyFunction(torch.autograd.Function):
             del grad_output3  # token_accuracy is only for metrics
         if ctx.return_predicted_tokens:
             del grad_output4  # predicted_tokens is only for metrics
-        (grad_input, grad_weight, grad_bias) = ctx.saved_tensors
-        grad_input, grad_weight, grad_bias = fused_linear_cross_entropy_backward(
-            grad_output, grad_input, grad_weight, grad_bias
-        )
+
+        if ctx.defer_grads:
+            # reduction="none": grad_output is per-token. Recompute the chunked
+            # logits gradient and fold grad_output into each row before projecting,
+            # which is the only point at which the per-token weights can be applied.
+            _input, weight, target, bias = ctx.saved_tensors
+            _, _, _, _, grad_input, grad_weight, grad_bias = fused_linear_cross_entropy_forward(
+                _input=_input,
+                weight=weight,
+                target=target,
+                bias=bias,
+                token_grad_output=grad_output,
+                compute_gradients=True,
+                weight_requires_grad=ctx.weight_requires_grad,
+                **ctx.fwd_kwargs,
+            )
+        else:
+            (grad_input, grad_weight, grad_bias) = ctx.saved_tensors
+            grad_input, grad_weight, grad_bias = fused_linear_cross_entropy_backward(
+                grad_output, grad_input, grad_weight, grad_bias
+            )
         return (
             grad_input,
             grad_weight,

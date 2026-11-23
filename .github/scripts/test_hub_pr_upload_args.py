@@ -55,6 +55,14 @@ def test_community_opens_a_pull_request_against_an_external_repo(tmp_path, monke
     assert hub.upload_args("msa", COMMUNITY) == "--create-pr"
 
 
+def test_community_uploads_directly_to_kernels_sdk(tmp_path, monkeypatch):
+    write_kernel(tmp_path, "sdkkernel", b'[general.hub]\nrepo-id = "kernels-sdk/sdkkernel"\n')
+    monkeypatch.chdir(tmp_path)
+    assert hub.external_repo_id("sdkkernel", COMMUNITY) == ""
+    assert hub.repo_id("sdkkernel", COMMUNITY) == "kernels-sdk/sdkkernel"
+    assert hub.upload_args("sdkkernel", COMMUNITY) == "--repo-id kernels-sdk/sdkkernel"
+
+
 def test_community_uploads_its_own_kernels_by_repo_id(tmp_path, monkeypatch):
     write_kernel(tmp_path, "mykernel", COMMUNITY_TOML)
     monkeypatch.chdir(tmp_path)

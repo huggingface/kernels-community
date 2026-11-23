@@ -163,6 +163,9 @@ __global__ void act_and_mul_kernel_with_param(
   int64_t num_tokens = input.numel() / input.size(-1);                       \
   dim3 grid(num_tokens);                                                      \
   dim3 block(std::min(d, 1024));                                              \
+  if (num_tokens == 0) {                                                      \
+    return;                                                                   \
+  }                                                                           \
   const torch::stable::accelerator::DeviceGuard device_guard(                 \
       input.get_device_index());                                             \
   void* stream_ptr = nullptr;                                                 \
@@ -207,6 +210,9 @@ __global__ void activation_kernel(
   int64_t num_tokens = input.numel() / d;                                    \
   dim3 grid(num_tokens);                                                     \
   dim3 block(std::min(d, 1024));                                             \
+  if (num_tokens == 0) {                                                     \
+    return;                                                                  \
+  }                                                                          \
   const torch::stable::accelerator::DeviceGuard device_guard(               \
       input.get_device_index());                                            \
   void* stream_ptr = nullptr;                                                \
@@ -233,10 +239,12 @@ __device__ __forceinline__ T gelu_new_kernel(const T& x) {
 
 template <typename T>
 __device__ __forceinline__ T gelu_fast_kernel(const T& x) {
+  // Compute in fp32 and round once. Rounding the intermediates to T gave
+  // results that depended on how the compiler contracted them (hipcc and
+  // nvcc differed), and lost up to several ulps at small |x|.
   const float f = (float)x;
-  const T t =
-      (T)tanhf(((T)(f * 0.79788456f)) * (((T)1.0) + (T)(0.044715f * f) * x));
-  return ((T)0.5) * x * (((T)1.0) + t);
+  const float t = tanhf(f * 0.79788456f * (1.0f + 0.044715f * f * f));
+  return (T)(0.5f * f * (1.0f + t));
 }
 
 template <typename T>

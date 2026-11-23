@@ -1,0 +1,14 @@
+[general]
+name = "tokamax"
+version = 1
+edition = 6
+license = "Apache-2.0"
+upstream = "https://github.com/openxla/tokamax.git"
+backends = ["tpu"]
+
+[general.hub]
+repo-id = "kernels-community/tokamax"
+
+[torch-noarch]
+
+[kernel]

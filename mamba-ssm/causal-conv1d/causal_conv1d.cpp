@@ -176,7 +176,8 @@ causal_conv1d_fwd(const at::Tensor &x,
         TORCH_CHECK(dim % 8 == 0, "causal_conv1d only supports channel dimension divisible by 8 for now");
         TORCH_CHECK(x.stride(2) % 8 == 0 and x.stride(0) % 8 == 0, "causal_conv1d with channel last layout requires strides (x.stride(0) and x.stride(2)) to be multiples of 8");
     }
-    TORCH_CHECK(width >= 2 && width <= 4, "causal_conv1d only supports width between 2 and 4");
+    TORCH_CHECK(width >= 2 && width <= (input_type == at::ScalarType::Float ? 4 : 8),
+                "causal_conv1d only supports width between 2 and 4 (2 and 8 for half/bfloat16 input)");
 
     if (bias_.has_value()) {
         auto bias = bias_.value();
@@ -283,7 +284,8 @@ causal_conv1d_bwd(const at::Tensor &x,
     const int seqlen = sizes[2];
     const int width = weight.size(-1);
 
-    TORCH_CHECK(width >= 2 && width <= 4, "causal_conv1d only supports width between 2 and 4");
+    TORCH_CHECK(width >= 2 && width <= (input_type == at::ScalarType::Float ? 4 : 8),
+                "causal_conv1d only supports width between 2 and 4 (2 and 8 for half/bfloat16 input)");
 
     CHECK_SHAPE(x, batch_size, dim, seqlen);
     CHECK_SHAPE(weight, dim, width);
@@ -425,7 +427,8 @@ causal_conv1d_update(const at::Tensor &x,
     CHECK_SHAPE(x, batch_size, dim, seqlen);
     CHECK_SHAPE(weight, dim, width);
 
-    TORCH_CHECK(width >= 2 && width <= 4, "causal_conv1d only supports width between 2 and 4");
+    TORCH_CHECK(width >= 2 && width <= (input_type == at::ScalarType::Float ? 4 : 8),
+                "causal_conv1d only supports width between 2 and 4 (2 and 8 for half/bfloat16 input)");
 
     if (bias_.has_value()) {
         auto bias = bias_.value();

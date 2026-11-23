@@ -11,7 +11,7 @@ import pytest
 from einops import rearrange, repeat
 
 
-mamba_ssm = kernels.get_kernel("kernels-community/mamba-ssm", version=4)
+mamba_ssm = kernels.get_kernel("kernels-community/mamba-ssm", version=5)
 selective_state_update = mamba_ssm.ops.triton.selective_state_update
 
 
@@ -69,8 +69,9 @@ def selective_state_update_ref(state, x, dt, A, B, C, D=None, z=None, dt_bias=No
     B = repeat(B, "b g n -> b (g h) n", h=nheads // ngroups)  # (batch, nheads, dstate)
     C = repeat(C, "b g n -> b (g h) n", h=nheads // ngroups)  # (batch, nheads, dstate)
     dB = rearrange(dt, "b h d -> b h d 1") * rearrange(B, "b h n -> b h 1 n")  # (batch, nheads, dim, dstate)
-    state.copy_(state * dA + dB * rearrange(x, "b h d -> b h d 1"))  # (batch, dim, dstate
-    out = torch.einsum("bhdn,bhn->bhd", state.to(C.dtype), C)
+    new_state = state * dA + dB * rearrange(x, "b h d -> b h d 1")  # (batch, dim, dstate
+    state.copy_(new_state)
+    out = torch.einsum("bhdn,bhn->bhd", new_state.to(C.dtype), C)
     if D is not None:
         out += (x * D).to(out.dtype)
     out = (out if z is None else out * F.silu(z)).to(x.dtype)

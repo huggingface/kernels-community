@@ -8,7 +8,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 @pytest.fixture(scope="module")
 def layers():
-    return kernels.get_kernel("kernels-community/mamba-ssm", version=4).layers
+    return kernels.get_kernel("kernels-community/mamba-ssm", version=5).layers
 
 
 def rand(*shape, dtype, requires_grad=True, scale=1.0):

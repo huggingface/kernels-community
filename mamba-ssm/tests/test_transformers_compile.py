@@ -6,7 +6,16 @@ import pytest
 import torch
 
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+transformers = pytest.importorskip("transformers")
+
+# transformers turns its hub kernel integration off for kernels versions it does not support.
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+    pytest.mark.skipif(
+        not transformers.utils.is_kernels_available(),
+        reason="transformers disables hub kernels for this kernels version",
+    ),
+]
 
 
 @dataclass(frozen=True)
@@ -16,7 +25,7 @@ class LoadedLayer:
     layer_name: str
 
     def load(self):
-        kernel = kernels.get_kernel("kernels-community/mamba-ssm", version=4)
+        kernel = kernels.get_kernel("kernels-community/mamba-ssm", version=5)
         return getattr(kernel.layers, self.layer_name)
 
 
@@ -42,7 +51,7 @@ def model(request):
 
 
 def kernelize(model):
-    kernel = kernels.get_kernel("kernels-community/mamba-ssm", version=4)
+    kernel = kernels.get_kernel("kernels-community/mamba-ssm", version=5)
     device = "rocm" if torch.version.hip else "cuda"
     mapping = {
         name: {device: LoadedLayer(name)}
