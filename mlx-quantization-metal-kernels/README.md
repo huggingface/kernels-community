@@ -49,10 +49,12 @@ which upstream writes against its own `array` and device types; `mlx_dispatch.mm
 `mlx_quantization.cpp` transcribe it function by function, keeping upstream's names, and helpers
 marked verbatim are upstream's text.
 
-Two build details: kernel-builder compiles every `.metal` it is given with its own flags and has no
-way to pass MLX's `-fno-fast-math`, so each wrapper sets the equivalent `#pragma METAL fp
+Three build details: kernel-builder compiles every `.metal` it is given with its own flags and has
+no way to pass MLX's `-fno-fast-math`, so each wrapper sets the equivalent `#pragma METAL fp
 math_mode(safe)` and includes the upstream file, which `vendor.py` stores as `.metal.h` so it is not
 compiled a second time. On M5-class GPUs MLX's dispatch picks the NAX kernels, as upstream does.
+kernel-builder builds Metal for macOS 26.0 but MLX builds its NAX kernels for 26.2+, where the
+matmul differs. The NAX wrappers raise the target the headers see (`nax_deployment_target.h`).
 
 ## Updating MLX
 
