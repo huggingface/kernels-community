@@ -125,7 +125,10 @@ def _topk_forward(X, stride_xm,  # inputs
 
     # normalize selected values
     if APPLY_SOFTMAX:
-        y_values = tl.softmax(y_values.to(tl.float32), dim=1, keep_dims=True).to(x_dtype)
+        # Inline `tl.softmax`, which needs `keep_dims=True` before Triton 3.9 and deprecates it from 3.9
+        y_values = y_values.to(tl.float32)
+        y_values = tl.exp(y_values - tl.max(y_values, axis=1, keep_dims=True))
+        y_values = tl.fdiv(y_values, tl.sum(y_values, axis=1, keep_dims=True)).to(x_dtype)
 
     # write back
     Yv_ptrs = Yv + offs_m[:, None] * stride_ym + offs_y_n[None, :]
