@@ -578,6 +578,11 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None, block_within_k: bool 
         # token in N.
         if c.kwargs.get("COMPUTE_MODE") != "dot_scaled":
             return True
+        if get_active_device_type() == "xpu":
+            # NVFP4 dot_scaled silently returns incorrect results at K=32 on XPU:
+            # https://github.com/intel/intel-xpu-backend-for-triton/issues/8881
+            # Remove this workaround once the supported Triton-XPU versions include the fix.
+            return False
         if not acts_are_scaled(args) or not 4 <= c.num_warps <= 8:
             return False
         if c.kwargs.get("SWAP_AB"):
