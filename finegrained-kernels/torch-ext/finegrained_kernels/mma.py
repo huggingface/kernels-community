@@ -77,7 +77,7 @@ def mx_dot_rescale(
 ):
     """MX 'dot' step. If the tile spans one scale group, run an fp8 ``tl.dot`` on E4M3-decoded
     operands and rescale the product. If it spans several (NVFP4, group 16), dequantize each
-    group to bf16 (exact) before a bf16 ``tl.dot``. Plain: ``a``
+    group to bf16 (exact: E2M1 x E4M3 needs <= 6 significant bits) before a bf16 ``tl.dot``. Plain: ``a``
     [BM, BK] x ``w`` [BK, BN] with the weight's per-column scale transposed onto the product (the
     batched gate_up kernel passes the INTERLEAVED gate|up 2*BN tile — per-column independence keeps
     that bit-exact). ``SWAP_AB`` (decode): the weight ``w`` [ROWS, BK] is the lhs (E2M1 column-unpacked,
