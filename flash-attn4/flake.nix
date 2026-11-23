@@ -2,7 +2,7 @@
   description = "Flake for Flash Attention 4 kernels";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/torch-2.15.0-final";
+    kernel-builder.url = "github:huggingface/kernels/build-layout-zip";
   };
 
   outputs =
