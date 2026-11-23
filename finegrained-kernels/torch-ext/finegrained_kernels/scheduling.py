@@ -159,7 +159,7 @@ def _route_one_block_kernel(
     them, and the padding sorts after them."""
     offs = tl.arange(0, BLOCK_SIZE)
     in_range = offs < S
-    expert_id = tl.load(ExpertIds + offs, mask=in_range, other=0)
+    expert_id = tl.load(ExpertIds + offs, mask=in_range, other=0).to(tl.int32)  # top-k's int64 ids, read in place
     key = tl.where(in_range, tl.where(is_off_rank(expert_id, NUM_EXPERTS), NUM_EXPERTS, expert_id), NUM_EXPERTS + 1)
     counts = tl.histogram(key, NUM_EXPERTS, mask=key < NUM_EXPERTS)
     tl.store(ExpertStart, 0)
@@ -283,9 +283,10 @@ def _compute_grouped_scheduling(
     expert_ids: torch.Tensor, num_experts: int, num_top_k: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     device = expert_ids.device
-    expert_ids = expert_ids.int().contiguous()  # routing kernels index with unit stride
     num_routed_tokens = expert_ids.numel()  # S = num_tokens * num_top_k
     if num_routed_tokens <= _ONE_BLOCK_ROUTING_MAX_ROWS:
+        # the one-block kernel casts in registers: no int32 copy launch (Qwen3-30B-A3B T=64 on B200: 2.1 us)
+        expert_ids = expert_ids.contiguous()  # routing kernels index with unit stride
         # decode: one launch instead of a memset and three (Qwen3-30B-A3B T=1 on B200: 5.5 -> ~1.5 us of routing)
         expert_start = torch.empty(num_experts + 1, dtype=torch.int32, device=device)
         perm = torch.empty(num_routed_tokens, dtype=torch.int32, device=device)
@@ -297,6 +298,7 @@ def _compute_grouped_scheduling(
                 BLOCK_SIZE=max(triton.next_power_of_2(num_routed_tokens), 16),
             )
         return perm_token, perm, expert_start
+    expert_ids = expert_ids.int().contiguous()  # routing kernels index with unit stride
     counters = torch.empty(num_experts + 1, dtype=torch.int32, device=device)
     expert_start = _launch_expert_start(expert_ids, num_experts, counters)
     perm = torch.empty(num_routed_tokens, dtype=torch.int32, device=device)

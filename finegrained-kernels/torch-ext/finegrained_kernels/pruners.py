@@ -1174,9 +1174,13 @@ def warp_spec_memory_mode_pruner(weight_only: bool = False, gather_only: bool = 
             )
             # FP8-activation dot loops pipelined across output tiles lower at w8 too (tensor-wide grouped
             # gate|up, Mistral-4: BM128 BN128 BK128 tile_loop w8 s4 runs, 0.85x the k_loop crown)
+            # the K-loop form lowers too when A is not gathered (expanded prefill rows: DeepSeek-V3 FP8 block-dynamic
+            # gate|up T=8192 5.7 -> 5.3 ms, bit-identical, against the flattened w8 crown); with a descriptor gather it
+            # fails every cell
             fp8_pipeline_tile = (
                 not weight_only and getattr(args.get("A"), "dtype", None) == FP8_DTYPE
-                and c.kwargs.get("PIPELINE", "k_loop") != "k_loop" and a == b == "host_descriptor"
+                and (c.kwargs.get("PIPELINE", "k_loop") != "k_loop" or args.get("GatherIdx") is None)
+                and a == b == "host_descriptor"
             )
             return not descriptor or (
                 config_dim(c, args, "BLOCK_SIZE_M") == 128

@@ -599,6 +599,7 @@ def _tensor_grouped_configs():
     configs = _grouped_dot_configs()
     for config in configs:
         config.kwargs["PIPELINE"] = "k_loop"
+        config.kwargs["SWAP_AB"] = False
     if is_sm10x():
         seeds = [
             c for c in configs
@@ -607,6 +608,19 @@ def _tensor_grouped_configs():
             and (c.kwargs["BLOCK_SIZE_N"], c.num_warps) in ((128, 8), (256, 4))
         ]
         configs.extend(pipeline_autotuning_configs(seeds, ("tile_loop", "flattened")))
+        # Swapped small-token tiles put the weight rows on the MMA M side, for experts averaging a few routed rows
+        # (grouped_swap_scope_pruner), as in the INT grid. Mistral-4 FP8 static MoE: T=512 737 -> 616 us, T=256
+        # 585 -> 561 us; the gate|up tile wants BK=256 (BN=128, 3 stages: a further 482 -> 473 us at T=64).
+        for bm in (16, 32):
+            for bn in (64, 128):
+                for bk, stages in ((128, 3), (128, 4), (256, 2), (256, 3)):
+                    for a_mode in ("pointer", "host_descriptor"):
+                        configs.append(triton.Config(
+                            dict(BLOCK_SIZE_M=bm, BLOCK_SIZE_N=bn, BLOCK_SIZE_K=bk, WARP_SPEC=False, GROUP_SIZE_M=1,
+                                 A_MEMORY_MODE=a_mode, B_MEMORY_MODE="host_descriptor", PACKED_SCHEDULE=False,
+                                 PIPELINE="k_loop", SWAP_AB=True),
+                            num_warps=4, num_stages=stages, pre_hook=grouped_pre_hook,
+                        ))
     return configs
 
 
@@ -635,6 +649,7 @@ def _tensor_grouped_configs():
             descriptor_box_pruner(),
             exact_memory_pruner(fp8_dot_smem, fallback=smem_pruner(ws_full_stages=True, raw_a_staged=True)),
             raw_activation_pointer_pruner(),
+            grouped_swap_scope_pruner(),
         )
     },
 )
@@ -700,6 +715,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
     GROUP_SIZE_M: tl.constexpr = 8,
+    SWAP_AB: tl.constexpr = False,
 ):
     """Tensor-scale / row-wise grouped FP8 expert matmul kernel — persistent grid-stride over tiles.
 
@@ -761,7 +777,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
             offs_k,
             stride_b_n,
             stride_b_k,
-            False,
+            SWAP_AB,
         )
         # per token, or the tile's own expert under a calibrated scale (stride_as_m 0); 1.0 on
         # the masked rows so the static arm's in-register divide never sees a zero
@@ -769,7 +785,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
             As + in_row * stride_as_m + expert_id64.to(tl.int32) * stride_as_e, mask=row_mask, other=1.0
         )
 
-        acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
+        acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, SWAP_AB)
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC and PIPELINE == "k_loop"):
             a, _as = load_act_static(
                 a_ptrs, ADescriptor, m_start, k * BLOCK_SIZE_K, row_mask, in_row, a_s[:, None],
@@ -777,13 +793,18 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
             )
             w, _ws = load_weight_plain(
                 b_ptrs, BDescriptor, row0, n_off, k * BLOCK_SIZE_K,
-                GATE, True, B_MEMORY_MODE, False, BLOCK_SIZE_N, BLOCK_SIZE_K,
+                GATE, True, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
             )
-            acc = acc + fp8_dot(a, w, False, BLOCK_SIZE_K)
+            if SWAP_AB:  # weight rows on the MMA M side, the token tile on N
+                acc = tl.dot(w, tl.trans(a), acc)
+            else:
+                acc = acc + fp8_dot(a, w, False, BLOCK_SIZE_K)
             a_ptrs += BLOCK_SIZE_K * stride_a_k
             b_ptrs += BLOCK_SIZE_K * stride_b_k
         # per-token activation scale and the expert's weight scale, applied once post-loop
-        acc = apply_row_scale(acc * a_s[:, None], Bs + expert_id64 * stride_bs_e, offs_bn, stride_bs_n)
+        acc = apply_row_scale(
+            acc * (a_s[None, :] if SWAP_AB else a_s[:, None]), Bs + expert_id64 * stride_bs_e, offs_bn, stride_bs_n, SWAP_AB
+        )
 
         gemm_epilogue(
             C,
@@ -811,6 +832,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
             stride_bias_e=stride_bias_e,
             stride_bias_n=stride_bias_n,
             global_row=expert_id64,
+            SWAP_AB=SWAP_AB,
         )
 
 
