@@ -1111,8 +1111,8 @@ def warp_spec_memory_mode_pruner(weight_only: bool = False, gather_only: bool = 
 
     Weight-only dot prefill additionally supports the measured w8 128x128x128 tile at
     stages 2/3 with both host descriptors, inline scheduling and an already expert-sorted A. Both original
-    and swapped operand orientations lower, except the swapped MXFP8 down K loop; descriptor gather is
-    outside this exception.
+    and swapped operand orientations lower, except the swapped MXFP8 down K loop (and, below Triton 3.9,
+    the swapped MXFP4 one); descriptor gather is outside this exception.
     Integer outer pipelines also support eight warps for the 128x64x256 gate tile and
     the packed, flattened 128x128x256 down tile at stage 2; MX outer pipelines support the
     swapped 128x128x128 down tile at stage 2 (its gate|up tile fails to lower).
@@ -1144,8 +1144,11 @@ def warp_spec_memory_mode_pruner(weight_only: bool = False, gather_only: bool = 
                 and not c.kwargs.get("PACKED_SCHEDULE")
                 and c.kwargs.get("PIPELINE", "k_loop") == "k_loop"
                 and not (
-                    c.kwargs.get("SWAP_AB") and args.get("WEIGHT_VALUES_PER_BYTE") == 1
-                    and not args.get("GATE", False)
+                    c.kwargs.get("SWAP_AB") and not args.get("GATE", False) and (
+                        args.get("WEIGHT_VALUES_PER_BYTE") == 1
+                        # the swapped MXFP4 down tile fails to lower on Triton 3.8 too (GPT-OSS T=64, s2 and s3)
+                        or "WEIGHT_VALUES_PER_BYTE" in args and not is_triton_greater_or_equal("3.9")
+                    )
                 )
                 and config_dim(c, args, "BLOCK_SIZE_N") == 128
                 and config_dim(c, args, "BLOCK_SIZE_K") == 128
