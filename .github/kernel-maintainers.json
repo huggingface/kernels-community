@@ -20,6 +20,7 @@
   "flash-attn3": [],
   "flash-attn4": [],
   "flash-mla": [],
+  "flydsl": [],
   "fp8-fbgemm": [],
   "ggml-gated-delta-net": ["U0586KAH2E9"],
   "ggml-attn": ["U0586KAH2E9"],

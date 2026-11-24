@@ -18,6 +18,7 @@ KERNEL_SOURCE_MAPPING = {
     "deformable-detr": "",
     "einops": "https://github.com/arogozhnikov/einops",
     "finegrained-fp8": "",
+    "flydsl": "https://github.com/ROCm/FlyDSL",
     "finegrained-kernels": "",
     "flash-attn-ops": "https://github.com/Dao-AILab/flash-attention",
     "topk": "",
