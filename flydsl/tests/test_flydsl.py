@@ -11,7 +11,7 @@ import importlib
 import kernels
 import pytest
 
-flydsl = kernels.get_kernel("kernels-community/flydsl", version=1)
+flydsl = kernels.get_kernel("kernels-sdk/flydsl", version=1)
 
 pytestmark = pytest.mark.kernels_ci
 

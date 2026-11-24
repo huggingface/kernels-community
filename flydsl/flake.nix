@@ -90,7 +90,7 @@
       inherit self torchVersions mkVariant;
 
       name = "flydsl";
-      repoId = "kernels-community/flydsl";
+      repoId = "kernels-sdk/flydsl";
 
       # Upstream ships an abi3 wheel for Python 3.12.
       python = {
