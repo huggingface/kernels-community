@@ -128,3 +128,71 @@ def test_rotary_equivalence(batch_size, nheads, seqlen, headdim, rotary_dim, qk_
         assert torch.equal(
             k_kernel[..., 2 * rotary_dim:], k_orig[..., 2 * rotary_dim:]
         ), "Non-rotated part of K should be unchanged"
+
+
+def rotate_half(x):
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb_torch(q, k, cos, sin, unsqueeze_dim=1):
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    return q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("entry_point", ["function", "layer"])
+@pytest.mark.parametrize("contiguous", [True, False])
+@pytest.mark.parametrize("unsqueeze_dim", [1, 2])
+@pytest.mark.parametrize(
+    "dtype, atol, rtol",
+    [
+        (torch.float32, 1e-5, 1e-5),
+        pytest.param(
+            torch.bfloat16,
+            3e-2,
+            1e-2,
+            marks=pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU"),
+        ),
+    ],
+)
+def test_apply_rotary_transformers_backward(entry_point, contiguous, unsqueeze_dim, dtype, atol, rtol):
+    device = infer_device()
+    if device is None:
+        pytest.skip("No suitable device found for testing")
+
+    batch_size, nheads, nkv_heads, seqlen, headdim = 2, 8, 2, 128, 64
+    if unsqueeze_dim == 1:
+        q_shape, k_shape = (batch_size, nheads, seqlen, headdim), (batch_size, nkv_heads, seqlen, headdim)
+    else:
+        q_shape, k_shape = (batch_size, seqlen, nheads, headdim), (batch_size, seqlen, nkv_heads, headdim)
+
+    freqs = torch.rand(batch_size, seqlen, headdim // 2, device=device) * 100
+    emb = torch.cat((freqs, freqs), dim=-1)
+    cos, sin = emb.cos().to(dtype), emb.sin().to(dtype)
+
+    def randn(shape):
+        if contiguous:
+            return torch.randn(shape, device=device, dtype=dtype)
+        b, x, y, d = shape
+        return torch.randn(b, y, x, d, device=device, dtype=dtype).transpose(1, 2)
+
+    q, k = randn(q_shape), randn(k_shape)
+    grad_q, grad_k = torch.randn_like(q), torch.randn_like(k)
+
+    if entry_point == "function":
+        rotary_fn = rotary.apply_rotary_transformers
+    else:
+        rotary_fn = rotary.layers.apply_rotary_transformers()
+
+    outputs = []
+    for fn in (apply_rotary_pos_emb_torch, rotary_fn):
+        q_in, k_in = q.clone().requires_grad_(), k.clone().requires_grad_()
+        q_out, k_out = fn(q_in, k_in, cos, sin, unsqueeze_dim=unsqueeze_dim)
+        torch.autograd.backward((q_out, k_out), (grad_q, grad_k))
+        assert torch.equal(q_in.detach(), q) and torch.equal(k_in.detach(), k), "Inputs must not be modified"
+        outputs.append((q_out.detach(), k_out.detach(), q_in.grad, k_in.grad))
+
+    for name, expected, actual in zip(("q", "k", "grad_q", "grad_k"), *outputs):
+        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol, msg=f"{name} mismatch")
