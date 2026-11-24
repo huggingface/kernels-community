@@ -4,7 +4,6 @@ from .modules.fused_norm_gate import rms_norm_gated
 from .ops.gated_delta_rule import chunk_gated_delta_rule as chunk_gdn
 from .ops.gated_delta_rule import fused_recurrent_gated_delta_rule as fused_recurrent_gdn
 from .ops.kda import chunk_kda, fused_recurrent_kda
-from .utils import IS_NVIDIA_HOPPER, TRITON_ABOVE_3_4_0, TRITON_ABOVE_3_7_1
 
 
 class FusedRMSNormGated(nn.Module):
@@ -83,8 +82,6 @@ class recurrent_kimi_delta_attention(nn.Module):
 
 class chunk_gated_delta_rule(nn.Module):
     can_torch_compile = True
-    # Triton >= 3.4.0 and < 3.7.1 miscompiles the gated backward on Hopper GPUs, see `chunk_bwd_dqkwg`
-    has_backward = not (IS_NVIDIA_HOPPER and TRITON_ABOVE_3_4_0 and not TRITON_ABOVE_3_7_1)
 
     def forward(
         self,

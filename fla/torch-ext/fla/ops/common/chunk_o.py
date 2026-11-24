@@ -728,13 +728,6 @@ def chunk_bwd_dqkwg(
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if g is not None and IS_NVIDIA_HOPPER and TRITON_ABOVE_3_4_0 and not TRITON_ABOVE_3_7_1:
-        raise RuntimeError(
-            "Triton >= 3.4.0 and < 3.7.1 on Hopper GPUs produces incorrect results for "
-            "gated chunk_bwd_dqkwg (see #640). Please upgrade Triton to >= 3.7.1 or "
-            "install tilelang: `pip install tilelang`"
-        )
-
     B, T, H, K, V, HV = *k.shape, v.shape[-1], v.shape[2]
     BT = chunk_size
     if chunk_indices is None and cu_seqlens is not None:
@@ -753,6 +746,12 @@ def chunk_bwd_dqkwg(
         CONST_TILING = 32
     BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
     BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
+    # On Hopper, Triton >= 3.4.0 and < 3.7.1 miscompiles the gated backward with BK=64 only (#640)
+    if g is not None and BK == 64 and IS_NVIDIA_HOPPER and TRITON_ABOVE_3_4_0 and not TRITON_ABOVE_3_7_1:
+        raise RuntimeError(
+            "Triton >= 3.4.0 and < 3.7.1 on Hopper GPUs produces incorrect results for "
+            "gated chunk_bwd_dqkwg with BK=64 (see #640). Please upgrade Triton to >= 3.7.1"
+        )
     NK = triton.cdiv(K, BK)
     dq = q.new_empty(B, T, HV, K)
     dk = k.new_empty(B, T, HV, K)
