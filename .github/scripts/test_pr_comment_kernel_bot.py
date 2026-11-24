@@ -87,6 +87,13 @@ def test_community_upload_does_not_need_branch_preflight(tmp_path, monkeypatch):
     )
 
 
+def test_kernels_sdk_upload_is_not_external(tmp_path, monkeypatch):
+    write_build_toml(tmp_path, "example", repo_id="kernels-sdk/example", version=3)
+    monkeypatch.chdir(tmp_path)
+
+    assert bot.external_upload_target("example") is None
+
+
 def test_external_upload_preflight_accepts_existing_branch(tmp_path, monkeypatch):
     write_build_toml(tmp_path, "example", repo_id="vendor/example", version=3)
     monkeypatch.chdir(tmp_path)

@@ -72,6 +72,10 @@ class DispatchResult:
     action_url: str | None = None
 
 
+# Hub namespaces that are not considered external.
+INTERNAL_REPO_PREFIXES = ("kernels-community/", "kernels-sdk/")
+
+
 @dataclass(frozen=True)
 class ExternalUploadTarget:
     kernel: str
@@ -108,7 +112,7 @@ def external_upload_target(
     repo_id = hub.get("repo-id")
     if not isinstance(repo_id, str) or not repo_id:
         raise ValueError(f"`{kernel}` has no [general.hub].repo-id")
-    if repo_id.startswith("kernels-community/"):
+    if repo_id.startswith(INTERNAL_REPO_PREFIXES):
         return None
 
     branch = requested_branch or hub.get("branch")
