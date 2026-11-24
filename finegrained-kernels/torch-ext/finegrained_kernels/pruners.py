@@ -719,7 +719,9 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None, block_within_k: bool 
         # mxf4nvf4 (E4M3 scales) has NO fallback below the native staging — the decompose
         # path materializes the scale through an integer-only DenseElementsAttr and
         # PassManager fails outright (charted BM {16,32,64} x BK {128,256}, 2026-07-15;
-        # warps/operand law 2026-08-12). Native staging needs the M operand >= 128 AND
+        # warps/operand law 2026-08-12). Triton 3.9 compiles some of these (the BM=16 grouped
+        # NVFP4 down) and returns wrong output (0.95 relative error), so this is a correctness
+        # fence, not just a compile guard. Native staging needs the M operand >= 128 AND
         # num_warps in {4, 8} (2 and 16 both fail across every BN/BK/stages cell) AND
         # both operands microscaled — the weight-only kernels (no ``As``: raw bf16 acts,
         # in-register inline quant) never stage it, so their E4M3-scale dot_scaled fails
