@@ -220,6 +220,8 @@ jobs:
           PROMPT
             cat /tmp/changes.diff
           } | claude -p \
+                --setting-sources user \
+                --strict-mcp-config \
                 --model claude-opus-4-8 \
                 --permission-mode plan \
                 --allowedTools "Read,Grep,Glob,LS" \
