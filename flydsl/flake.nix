@@ -44,9 +44,9 @@
               builtins.compareVersions a.rocmVersion b.rocmVersion < 0
           ) candidates;
         in
-        map (
-          rocmVersion: lib.findFirst (version: version.rocmVersion == rocmVersion) null preferred
-        ) (lib.unique (map (version: version.rocmVersion) preferred));
+        map (rocmVersion: lib.findFirst (version: version.rocmVersion == rocmVersion) null preferred) (
+          lib.unique (map (version: version.rocmVersion) preferred)
+        );
 
       # The same LLVM/MLIR is used for all variants, it does not depend on ROCm.
       mkShared =
