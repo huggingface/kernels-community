@@ -2,7 +2,7 @@
   description = "Flake for the FlyDSL SDK (built from source)";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/gen-sdk-outputs";
+    kernel-builder.url = "github:huggingface/kernels";
   };
 
   outputs =
