@@ -7,7 +7,7 @@ upstream = "https://github.com/ROCm/aiter.git"
 source = "https://github.com/huggingface/kernels-community/tree/main/aiter-flash-attn-flydsl"
 backends = ["rocm"]
 kernel-depends = [
-    { repo-id = "kernels-staging/flydsl", revision = "pr-1323" },
+    { repo-id = "kernels-sdk/flydsl", version = 1 },
 ]
 
 [general.hub]

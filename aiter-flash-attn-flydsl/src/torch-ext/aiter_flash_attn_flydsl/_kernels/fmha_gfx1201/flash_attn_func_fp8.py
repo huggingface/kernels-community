@@ -27,7 +27,7 @@ conversion is localized because the pinned compiler cannot lower vector FP8 cast
 import math as host_math
 
 import kernels
-flydsl = kernels.get_kernel_dep("kernels-staging/flydsl")
+flydsl = kernels.get_kernel_dep("kernels-sdk/flydsl")
 flyc = flydsl.compiler
 fx = flydsl.expr
 const_expr = flydsl.expr.const_expr

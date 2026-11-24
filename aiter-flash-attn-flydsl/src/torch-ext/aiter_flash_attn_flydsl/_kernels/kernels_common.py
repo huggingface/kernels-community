@@ -9,7 +9,7 @@ from threading import Lock
 from typing import Any
 
 import kernels
-flydsl = kernels.get_kernel_dep("kernels-staging/flydsl")
+flydsl = kernels.get_kernel_dep("kernels-sdk/flydsl")
 fx = flydsl.expr
 ir = flydsl._mlir.ir
 builtin = flydsl._mlir.dialects.builtin

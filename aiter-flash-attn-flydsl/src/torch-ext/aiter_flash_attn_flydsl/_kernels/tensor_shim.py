@@ -8,7 +8,7 @@ from functools import lru_cache
 from itertools import product
 
 import kernels
-flydsl = kernels.get_kernel_dep("kernels-staging/flydsl")
+flydsl = kernels.get_kernel_dep("kernels-sdk/flydsl")
 flyc = flydsl.compiler
 fx = flydsl.expr
 import numpy as np

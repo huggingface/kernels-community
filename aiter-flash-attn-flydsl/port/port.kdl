@@ -85,7 +85,7 @@ overlay from="overlay"
 kernelize_imports \
     in="torch-ext/aiter_flash_attn_flydsl/**" \
     package="flydsl" \
-    kernel="kernels-staging/flydsl" \
+    kernel="kernels-sdk/flydsl" \
     dependency=#true \
     changes=46
 
@@ -97,7 +97,7 @@ manifest \
     upstream="https://github.com/ROCm/aiter.git" \
     source="https://github.com/huggingface/kernels-community/tree/main/aiter-flash-attn-flydsl" \
     backends="rocm" \
-    kernel_depends="kernels-staging/flydsl@pr-1323" \
+    kernel_depends="kernels-sdk/flydsl@1" \
     repo_id="kernels-community/aiter-flash-attn-flydsl" \
     noarch=#true \
     rocm_archs="gfx1201"

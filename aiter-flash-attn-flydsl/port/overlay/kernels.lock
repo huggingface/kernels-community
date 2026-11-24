@@ -1,8 +1,8 @@
 [
   {
     "dependency": {
-      "repo-id": "kernels-staging/flydsl",
-      "revision": "pr-1323"
+      "repo-id": "kernels-sdk/flydsl",
+      "version": 1
     },
     "lock": {
       "commit": "e04bcbcef038065153120141d351328601467011",

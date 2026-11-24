@@ -34,7 +34,7 @@ from __future__ import annotations
 import inspect
 
 import kernels
-flydsl = kernels.get_kernel_dep("kernels-staging/flydsl")
+flydsl = kernels.get_kernel_dep("kernels-sdk/flydsl")
 fx = flydsl.expr
 ir = flydsl._mlir.ir
 llvm = flydsl._mlir.dialects.llvm

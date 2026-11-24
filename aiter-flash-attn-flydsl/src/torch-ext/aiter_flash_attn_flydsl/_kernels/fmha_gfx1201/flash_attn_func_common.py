@@ -4,7 +4,7 @@
 """Shared representation-independent helpers for gfx1201 flash attention."""
 
 import kernels
-flydsl = kernels.get_kernel_dep("kernels-staging/flydsl")
+flydsl = kernels.get_kernel_dep("kernels-sdk/flydsl")
 fx = flydsl.expr
 const_expr = flydsl.expr.const_expr
 range_constexpr = flydsl.expr.range_constexpr

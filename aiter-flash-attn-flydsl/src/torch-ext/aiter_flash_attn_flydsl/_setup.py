@@ -7,7 +7,7 @@ from functools import lru_cache
 from pathlib import Path
 
 import kernels
-flydsl = kernels.get_kernel_dep("kernels-staging/flydsl")
+flydsl = kernels.get_kernel_dep("kernels-sdk/flydsl")
 RocmBackend = flydsl.compiler.backends.rocm.RocmBackend
 get_rocm_arch = flydsl.runtime.device.get_rocm_arch
 

@@ -12,7 +12,7 @@ import builtins as _builtins
 import re
 
 import kernels
-flydsl = kernels.get_kernel_dep("kernels-staging/flydsl")
+flydsl = kernels.get_kernel_dep("kernels-sdk/flydsl")
 fx = flydsl.expr
 ir = flydsl._mlir.ir
 

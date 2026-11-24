@@ -12,7 +12,7 @@ does not depend on an installed AITER package.
 
 Sources are pinned to AITER commit
 [`c1096fa40a907cf83cf95d6d87c4fad5823e7054`](https://github.com/ROCm/aiter/tree/c1096fa40a907cf83cf95d6d87c4fad5823e7054).
-FlyDSL is a kernel dependency (`kernels-staging/flydsl`, revision `pr-1323`), so it does not
+FlyDSL is a kernel dependency (`kernels-sdk/flydsl`, version 1), so it does not
 need to be installed separately. The vendored kernel sources were written against
 FlyDSL 0.4.2 (the upstream AITER requirement); the dependency currently provides 0.5.0. Kernel sources retain their upstream MIT or
 Apache-2.0 notices; the Apache-2.0 license is included in `LICENSE-FlyDSL`.
@@ -93,7 +93,7 @@ The raw public functions preserve upstream `flydsl_flash_attn_func` and
 
 This kernel is generated from upstream AITER by `port/port.kdl` (see the
 `kernel-port` tool) into `src/`; edit the recipe or the files in `port/overlay`, not
-`src/`. It depends on the `kernels-staging/flydsl` kernel (`kernel-depends` in
+`src/`. It depends on the `kernels-sdk/flydsl` kernel (`kernel-depends` in
 `build.toml`), which is resolved when the kernel is loaded. Build with Nix from this
 directory; evaluate with `nix eval` before building, as required by the builder
 repository. Nix Git flakes omit untracked files, so add new files to Git first.

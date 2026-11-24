@@ -205,7 +205,7 @@ def main():
             if args.timing == "profiler"
             else "median CUDA event duration",
             "input_rotation_slots": 1,
-            "flydsl": "kernels-staging/flydsl (kernel dependency)",
+            "flydsl": "kernels-sdk/flydsl (kernel dependency)",
             "kernels": importlib.metadata.version("kernels"),
             "triton": __import__("triton").__version__,
             "baseline_revision": baseline_revision,

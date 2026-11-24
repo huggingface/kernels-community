@@ -9,7 +9,7 @@ This is the repository card of {{ repo_id }} that has been pushed on the Hub. It
 
 Use Linux x86_64 with a gfx1201 GPU, ROCm-enabled PyTorch, and a release of
 `kernels` that supports kernel dependencies. FlyDSL is provided by the
-`kernels-staging/flydsl` kernel dependency, which `kernels` fetches automatically.
+`kernels-sdk/flydsl` kernel dependency, which `kernels` fetches automatically.
 FlyDSL compiles kernels at runtime and also requires the ROCm development SDK
 and linker: set `ROCM_PATH` to the SDK root and add its LLVM tool directory to
 `PATH`. Installing the Python packages alone does not provide these tools.
@@ -80,7 +80,7 @@ The kernel-builder formatted source for this kernel is available at {{ source }}
 ## Hardware and precision
 
 This package targets gfx1201 on Linux x86_64 and requires ROCm PyTorch and
-the `kernels-staging/flydsl` kernel dependency. It provides BF16/FP16 and prequantized E4M3FN FP8 forward attention
+the `kernels-sdk/flydsl` kernel dependency. It provides BF16/FP16 and prequantized E4M3FN FP8 forward attention
 in BSHD layout, plus BF16-to-FP8 Q/K/V quantization. It does not provide
 backward, LSE, GQA, arbitrary masks, dropout, or packed variable-length inputs.
 
