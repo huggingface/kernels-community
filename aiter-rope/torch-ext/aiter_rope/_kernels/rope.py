@@ -621,7 +621,13 @@ def _rope_kernel_sbhd_cached_fwd(
             x, x_rotated_mask, BLOCK_S, BLOCK_D, BLOCK_D_HALF
         )
 
-    out_x = x * cos + x_rotated * sin
+    if x.dtype == tl.bfloat16 and cos.dtype == tl.bfloat16 and sin.dtype == tl.bfloat16:
+        # Match eager PyTorch's BF16 rounding before adding the two products.
+        x_cos = (x.to(tl.float32) * cos.to(tl.float32)).to(tl.bfloat16)
+        rotated_sin = (x_rotated.to(tl.float32) * sin.to(tl.float32)).to(tl.bfloat16)
+        out_x = x_cos.to(tl.float32) + rotated_sin.to(tl.float32)
+    else:
+        out_x = x * cos + x_rotated * sin
     out_x = out_x.to(x_ptr.dtype.element_ty)
     x_out_offs = (
         b * stride_out_b
