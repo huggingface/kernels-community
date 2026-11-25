@@ -75,10 +75,11 @@ from .compat import (
     device_context,
     get_accelerator_autotuning_configs,
     sm_count,
+    split_k_autotuning_configs,
 )
 from .descriptors import maybe_descriptor, rebind_dgrad_descriptors, rebind_dgrad_grouped_descriptors, weight_descriptor
 from . import batched, grouped, matmul
-from .matmul import matmul_2d
+from .matmul import SPLIT_K_VALUES, matmul_2d, split_k_reduce, split_k_workspace
 from .pruners import (
     PATH_ANCHOR_AXES,
     block_within_dim_pruner,
@@ -86,6 +87,7 @@ from .pruners import (
     descriptor_support_pruner,
     dgrad_grouped_warps_pruner,
     compose_pruners,
+    int_split_k_pruner,
     smem_pruner,
     warp_spec_compile_guard_pruner,
 )
@@ -185,21 +187,36 @@ def _dgrad_int_tile(w, w_scale, w_zero, divisor, BLOCK_SIZE_K: tl.constexpr, SCA
     return out
 
 
-@bayesian_autotune(
-    # Plain-dot loop over the N reduction — same physics as the full-precision 2D kernel (tile +
-    # WS), no memory-mode axis: the dequantize is in-tile so both operands read through pointers,
-    # and no COMPUTE_MODE axis because the scaled MMA cannot reduce over an unscaled axis.
-    get_accelerator_autotuning_configs(
+# Decode band of the 2D dgrad's N split: the launch sizes its partials for these tiles.
+DGRAD_SPLIT_MAX_M = 256
+DGRAD_SPLIT_MAX_BLOCK_M = 64
+DGRAD_SPLIT_MIN_BLOCK = 16
+DGRAD_SPLIT_MAX_BLOCK_K = 512
+
+
+def _dgrad_2d_configs():
+    """The plain-dot grid, plus decode tiles splitting the N reduction: the output is only ``M x K``, so at decode a
+    ``K=2048`` dgrad runs 16 programs that each stream all of N (7168x2048 block FP8, M=1, B200: 48us unsplit)."""
+    configs = get_accelerator_autotuning_configs(
         tune_block_nk=True,
         tune_block_m=True,
         warp_spec=True,
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
         pre_hook=rebind_dgrad_descriptors,
-    ),
+    )
+    decode = [c for c in configs if c.kwargs["BLOCK_SIZE_M"] <= DGRAD_SPLIT_MAX_BLOCK_M and not c.kwargs["WARP_SPEC"]]
+    return configs + split_k_autotuning_configs(SPLIT_K_VALUES, decode)
+
+
+@bayesian_autotune(
+    # Plain-dot loop over the N reduction — same physics as the full-precision 2D kernel (tile +
+    # WS), no memory-mode axis: the dequantize is in-tile so both operands read through pointers,
+    # and no COMPUTE_MODE axis because the scaled MMA cannot reduce over an unscaled axis.
+    _dgrad_2d_configs(),
     ["N", "K", "m_bit_length"],
     n_trials=100,
-    path_anchor_axes=PATH_ANCHOR_AXES,
+    path_anchor_axes=(*PATH_ANCHOR_AXES, "SPLIT_K"),
     finite_check_args=("C",),
     prune_configs_by={
         "early_config_prune": compose_pruners(
@@ -211,6 +228,7 @@ def _dgrad_int_tile(w, w_scale, w_zero, divisor, BLOCK_SIZE_K: tl.constexpr, SCA
                 lambda c, a: c.kwargs["BLOCK_SIZE_K"] % a.get("SCALE_GROUP_K", 1) == 0
                 or a.get("SCALE_GROUP_K", 1) % c.kwargs["BLOCK_SIZE_K"] == 0
             ),
+            int_split_k_pruner("M", DGRAD_SPLIT_MAX_M, dim="N", tile="BLOCK_SIZE_N"),
             warp_spec_compile_guard_pruner(),
             descriptor_support_pruner(),
             smem_pruner("BLOCK_SIZE_K"),
@@ -228,6 +246,8 @@ def dgrad_matmul_2d_kernel(
     BsGlobal,  # fp32 NVFP4 / W4A8 second-level weight scale; folded on the accumulator, None folds out
     C,  # (M, K) output gradient
     Perm,  # (K,) act-order K order: column j of the product is stored at Perm[j]; None = natural
+    Partials,  # (SPLIT_K_MAX, tiles, BM, BK) fp32 split partial sums; read iff SPLIT_K > 1
+    TileCounters,  # (tiles,) int32 split arrival counters, zero between launches; read iff SPLIT_K > 1
     # Shape
     M,
     N,
@@ -255,6 +275,7 @@ def dgrad_matmul_2d_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     WARP_SPEC: tl.constexpr,
+    SPLIT_K: tl.constexpr = 1,  # decode: the N reduction split across SPLIT_K programs (grid axis 2), reduced in-kernel
     INT_BITS: tl.constexpr = 0,  # integer weight width; 0: E2M1 / E4M3 / full-precision weight
 ):
     pid_m = tl.program_id(0)
@@ -274,7 +295,8 @@ def dgrad_matmul_2d_kernel(
     # BLOCK_SIZE_N divides N (block_within_dim_pruner), so the reduction loop is EXACT: no tail
     # mask on the activation, no clamp on the weight rows, and the addresses advance by a constant
     # stride instead of being rebuilt from offsets each step — the forward's loop shape.
-    offs_n0 = tl.arange(0, BLOCK_SIZE_N)
+    split = tl.program_id(2) if SPLIT_K > 1 else 0
+    offs_n0 = split * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     # SWAP_AB is the WEIGHT's viewpoint, inverted for activations: True = rows-major [BM, BN]
     dy_ptrs = operand_tile_ptrs(A, offs_m, offs_n0, stride_a_m, stride_a_n, A_MEMORY_MODE, True)
     b_ptrs = operand_tile_ptrs(B, offs_n0, offs_kb, stride_b_n, stride_b_k, B_MEMORY_MODE, True)
@@ -284,7 +306,7 @@ def dgrad_matmul_2d_kernel(
         bz_ptrs = Bz + offs_n0[:, None] * stride_bz_n + offs_kg[None, :] * stride_bz_k
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_K), dtype=tl.float32)
-    for n in tl.range(0, tl.cdiv(N, BLOCK_SIZE_N), warp_specialize=WARP_SPEC):
+    for n in tl.range(split, tl.cdiv(N, BLOCK_SIZE_N), SPLIT_K, warp_specialize=WARP_SPEC):
         n_off = n * BLOCK_SIZE_N
         dy = load_grouped_act_tile(
             dy_ptrs, ADescriptor, pid_m * BLOCK_SIZE_M, n_off, m_mask, 0, A_MEMORY_MODE
@@ -305,22 +327,29 @@ def dgrad_matmul_2d_kernel(
                 dy.to(tl.bfloat16),
                 _dgrad_weight_tile(w, w_scale, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, tl.bfloat16),
             )
-        dy_ptrs += BLOCK_SIZE_N * stride_a_n
-        b_ptrs += BLOCK_SIZE_N * stride_b_n
+        dy_ptrs += SPLIT_K * BLOCK_SIZE_N * stride_a_n
+        b_ptrs += SPLIT_K * BLOCK_SIZE_N * stride_b_n
         if Bs is not None:
-            bs_ptrs += (BLOCK_SIZE_N // SCALE_ROW_DIV) * stride_bs_n
+            bs_ptrs += SPLIT_K * (BLOCK_SIZE_N // SCALE_ROW_DIV) * stride_bs_n
         if Bz is not None:
-            bz_ptrs += BLOCK_SIZE_N * stride_bz_n
+            bz_ptrs += SPLIT_K * BLOCK_SIZE_N * stride_bz_n
 
-    if BsGlobal is not None:  # the second-level scale: one matrix, so one value
-        accumulator = accumulator * tl.load(BsGlobal)
-
-    cols = tl.load(Perm + offs_k, mask=k_mask, other=0) if Perm is not None else offs_k
-    tl.store(
-        C + offs_m.to(tl.int64)[:, None] * stride_c_m + cols[None, :] * stride_c_k,
-        accumulator.to(C.dtype.element_ty),
-        mask=m_mask[:, None] & k_mask[None, :],
-    )
+    if SPLIT_K > 1:
+        accumulator, last = split_k_reduce(
+            accumulator, Partials, TileCounters, pid_m * tl.num_programs(1) + pid_k,
+            tl.num_programs(0) * tl.num_programs(1), BLOCK_SIZE_M, BLOCK_SIZE_K, SPLIT_K,
+        )
+    else:
+        last = True
+    if last:
+        if BsGlobal is not None:  # the second-level scale: one matrix, so one value
+            accumulator = accumulator * tl.load(BsGlobal)
+        cols = tl.load(Perm + offs_k, mask=k_mask, other=0) if Perm is not None else offs_k
+        tl.store(
+            C + offs_m.to(tl.int64)[:, None] * stride_c_m + cols[None, :] * stride_c_k,
+            accumulator.to(C.dtype.element_ty),
+            mask=m_mask[:, None] & k_mask[None, :],
+        )
 
 
 @compile_time_only_triton_op(add_op_namespace_prefix("dgrad_matmul_2d"), mutates_args=())
@@ -357,7 +386,18 @@ def dgrad_matmul_2d(
     grid = lambda META: (  # noqa: E731
         triton.cdiv(M, META["BLOCK_SIZE_M"]),
         triton.cdiv(K, META["BLOCK_SIZE_K"]),
+        META.get("SPLIT_K", 1),
     )
+    # split scratch (int_split_k_pruner): partials for the widest split over the split tiles' padded grid, counters
+    # for the narrowest tile's grid
+    partials = counters = None
+    if M <= DGRAD_SPLIT_MAX_M:
+        partials, counters = split_k_workspace(
+            dY.device,
+            SPLIT_K_VALUES[-1] * triton.cdiv(M, DGRAD_SPLIT_MAX_BLOCK_M) * DGRAD_SPLIT_MAX_BLOCK_M
+            * triton.cdiv(K, DGRAD_SPLIT_MAX_BLOCK_K) * DGRAD_SPLIT_MAX_BLOCK_K,
+            triton.cdiv(M, DGRAD_SPLIT_MIN_BLOCK) * triton.cdiv(K, DGRAD_SPLIT_MIN_BLOCK),
+        )
     with device_context(dY.device):
         # built INSIDE the device context: the tensormap is created against the CURRENT context,
         # so constructing it before the switch fails as "invalid device context" whenever the
@@ -375,6 +415,8 @@ def dgrad_matmul_2d(
             w_global_scale,
             dX,
             perm,
+            partials,
+            counters,
             M,
             N,
             K,
