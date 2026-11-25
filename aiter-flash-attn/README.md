@@ -67,6 +67,8 @@ imports (including the `flash_attn_triton_amd` / `dao_ai` backend), vendored at
 [`ROCm/aiter@8a9186d`](https://github.com/ROCm/aiter/commit/8a9186d983ed34ece2f68fe039e07f1b0abe147b).
 All `from aiter.*` absolute imports have been rewritten to package-relative form
 per the [Hub kernel requirements](https://huggingface.co/docs/kernels/kernel-requirements).
+The `triton.autotune` decorators no longer pass `use_cuda_graph=True`, which
+Triton deprecates, as in [ROCm/aiter#5381](https://github.com/ROCm/aiter/pull/5381).
 
 Two intentional local deviations from upstream:
 
