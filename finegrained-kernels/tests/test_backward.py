@@ -36,13 +36,13 @@ from utils import (  # type: ignore
     finegrained_kernels,
     internals,
     is_memory_overflow,
+    make_gptq_act_order,
     make_weights,
     quant_dequant_a,
     SUPPORTS_FP8,
     sweep_configs,
     TEST_DEVICE,
     WEIGHTS,
-    INT_BITS,
 )
 
 fg = finegrained_kernels
@@ -263,8 +263,7 @@ def test_inference_path_is_untouched():
     assert not out.requires_grad and torch.isfinite(out.float()).all()
 
 
-# integer formats: not differentiable yet
-QUANT_WEIGHTS = [r for r in WEIGHTS if r not in ("bf16", "fp16") and r not in INT_BITS]
+QUANT_WEIGHTS = [r for r in WEIGHTS if r not in ("bf16", "fp16")]
 
 
 @pytest.mark.parametrize("weights", QUANT_WEIGHTS)
@@ -293,6 +292,38 @@ def test_dgrad_every_quant_format(weights):
     W = dequantize_weight(B, Bs, global_scale=g).reshape(N, K)
     ref = grad_out.float() @ W
     assert _rel(A.grad, ref) < 2e-1, f"{weights}: dA vs dequantized reference {_rel(A.grad, ref):.2e}"
+
+
+@pytest.mark.parametrize("route", ["2d", "grouped", "batched"])
+def test_dgrad_int_act_order_zero_points(route):
+    """GPTQ act-order INT4 weights with zero points: the dgrad decodes the words with their zero points and stores
+    each column back through its expert's ``b_perm``, landing on ``dY @ W`` in A's natural K order."""
+    torch.manual_seed(0)
+    T, top_k, E = 64, 2, 4
+    W, Ws, Wz, perm, ref_W = make_gptq_act_order(N, K, 1 if route == "2d" else E)
+    A = torch.randn(T, K, device=TEST_DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    if route == "2d":
+        grad_out = torch.randn(T, N, device=TEST_DEVICE, dtype=torch.bfloat16)
+        out = fg.matmul_2d(A, W[0], Bs=Ws[0], b_zero=Wz[0], b_perm=perm[0], output_dtype=torch.bfloat16)
+        ref = grad_out.float() @ ref_W[0]
+    else:
+        expert_ids = torch.stack([torch.randperm(E)[:top_k] for _ in range(T)]).flatten().to(TEST_DEVICE, torch.int32)
+        grad_out = torch.randn(T * top_k, N, device=TEST_DEVICE, dtype=torch.bfloat16)
+        if route == "grouped":
+            expert_start, gather_idx, scatter_idx = internals.scheduling.compute_grouped_scheduling(expert_ids, E, top_k)
+            out = fg.matmul_grouped(A, W, Bs=Ws, b_zero=Wz, b_perm=perm, expert_start=expert_start,
+                                    gather_idx=gather_idx, routed_idx=scatter_idx, output_dtype=torch.bfloat16)
+            tokens = gather_idx.long()
+            experts = torch.repeat_interleave(torch.arange(E, device=TEST_DEVICE), expert_start.diff().long())
+        else:
+            out = fg.matmul_batched(A, W, Bs=Ws, b_zero=Wz, b_perm=perm, expert_ids=expert_ids,
+                                    output_dtype=torch.bfloat16)
+            tokens = torch.arange(T * top_k, device=TEST_DEVICE) // top_k
+            experts = expert_ids.long()
+        ref = torch.zeros(T, K, device=TEST_DEVICE).index_add_(
+            0, tokens, torch.einsum("sn,snk->sk", grad_out.float(), ref_W[experts]))
+    out.backward(grad_out)
+    assert _rel(A.grad, ref) < 1e-2, f"{route}: dA vs act-order reference {_rel(A.grad, ref):.2e}"
 
 
 def test_dgrad_pre_quant_scale():

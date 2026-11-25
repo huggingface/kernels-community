@@ -93,6 +93,7 @@ from .formats import global_scale_stride, normalize_global_scale, ue8m0_as_uint8
 from .swizzle import unswizzle_mx_scales
 from .quant import e2m1_cols_to_bf16, e2m1_cols_to_f32
 from .loading.scales import decode_group_scale
+from .mma import int_dequant_tile
 from .loading.tiles import load_grouped_act_tile, operand_tile_ptrs
 from .scheduling import build_tile_layout, resolve_grouped_tile
 
@@ -145,7 +146,8 @@ def _dgrad_weight_tile(
     bf16, and the multiply is a cheap exponent shift), fp32 for the scalar reduce, which widens
     anyway and for which the bf16/E4M3 hop is pure cost. Single return; only the taken arm
     compiles."""
-    NG: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
+    TILE_GROUP: tl.constexpr = SCALE_GROUP_K if SCALE_GROUP_K < BLOCK_SIZE_K else BLOCK_SIZE_K  # a group wider than the tile
+    NG: tl.constexpr = BLOCK_SIZE_K // TILE_GROUP
     if w_scale is None:  # full-precision weight
         out = w.to(OUT_DTYPE)
     elif OUT_DTYPE == tl.float32:  # scalar-reduce arm: unpack straight to fp32, no narrow hop
@@ -155,7 +157,31 @@ def _dgrad_weight_tile(
         vals = e2m1_cols_to_bf16(w) if w.dtype == tl.uint8 else w.to(tl.bfloat16)
         sc = decode_group_scale(w_scale).to(tl.bfloat16)[:, :, None]
     if w_scale is not None:
-        out = (vals.reshape(BLOCK_SIZE_N, NG, SCALE_GROUP_K) * sc).reshape(BLOCK_SIZE_N, BLOCK_SIZE_K).to(OUT_DTYPE)
+        out = (vals.reshape(BLOCK_SIZE_N, NG, TILE_GROUP) * sc).reshape(BLOCK_SIZE_N, BLOCK_SIZE_K).to(OUT_DTYPE)
+    return out
+
+
+@triton.jit
+def _dgrad_scale_cols(pid_k, K, BLOCK_SIZE_K: tl.constexpr, SCALE_GROUP_K: tl.constexpr):
+    """The scale columns of K tile ``pid_k``, one per ``min(SCALE_GROUP_K, BLOCK_SIZE_K)`` sub-group: the tile's own
+    groups, or the one group it lies inside (repeated) when groups are wider than the tile."""
+    TILE_GROUP: tl.constexpr = SCALE_GROUP_K if SCALE_GROUP_K < BLOCK_SIZE_K else BLOCK_SIZE_K
+    starts = pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K // TILE_GROUP) * TILE_GROUP
+    return tl.minimum(starts // SCALE_GROUP_K, K // SCALE_GROUP_K - 1)
+
+
+@triton.jit
+def _dgrad_int_tile(w, w_scale, w_zero, divisor, BLOCK_SIZE_K: tl.constexpr, SCALE_GROUP_K: tl.constexpr,
+                    INT_BITS: tl.constexpr, OUT_DTYPE: tl.constexpr):
+    """One forward-oriented ``[BN, BK]`` integer weight tile from its ``[BN, BK // VPW]`` interleaved words, the value
+    the forward multiplies by: ``int_dequant_tile`` rounded in the scale dtype into ``OUT_DTYPE`` (the activation
+    dtype), or, under ModelOpt W4A8 (``divisor``: the second-level scale), into E4M3 against it."""
+    TILE_GROUP: tl.constexpr = SCALE_GROUP_K if SCALE_GROUP_K < BLOCK_SIZE_K else BLOCK_SIZE_K
+    if divisor is None:
+        out = tl.trans(int_dequant_tile(w, w_scale, w_zero, True, TILE_GROUP, INT_BITS, OUT_DTYPE))
+    else:
+        out = tl.trans(int_dequant_tile(w, w_scale, w_zero, True, TILE_GROUP, INT_BITS, tl.float8e4nv, divisor=divisor))
+        out = out.to(OUT_DTYPE)
     return out
 
 
@@ -181,8 +207,9 @@ def _dgrad_weight_tile(
             config_filter(  # the scale row advances by BN // SCALE_ROW_DIV — must be whole
                 lambda c, a: c.kwargs["BLOCK_SIZE_N"] % max(a.get("SCALE_ROW_DIV", 1), 1) == 0
             ),
-            config_filter(  # BK below one scale group gives NG=0 -> tl.arange(0, 0)
-                lambda c, a: c.kwargs["BLOCK_SIZE_K"] % max(a.get("SCALE_GROUP_K", 1), 1) == 0
+            config_filter(  # a K tile holds whole scale groups, or lies inside one (per-channel INT, wide groups)
+                lambda c, a: c.kwargs["BLOCK_SIZE_K"] % a.get("SCALE_GROUP_K", 1) == 0
+                or a.get("SCALE_GROUP_K", 1) % c.kwargs["BLOCK_SIZE_K"] == 0
             ),
             warp_spec_compile_guard_pruner(),
             descriptor_support_pruner(),
@@ -197,8 +224,10 @@ def dgrad_matmul_2d_kernel(
     B,  # (N, K) quantized weight, K-contiguous — read in its FORWARD orientation
     BDescriptor,  # host TMA descriptor over B, box (BN, BK_bytes); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (N // SCALE_ROW_DIV, K // SCALE_GROUP_K) weight scales
-    BsGlobal,  # fp32 NVFP4 second-level weight global; folded on the accumulator, None folds out
+    Bz,  # (N, K // SCALE_GROUP_K) integer zero points; None for a symmetric or non-integer weight
+    BsGlobal,  # fp32 NVFP4 / W4A8 second-level weight scale; folded on the accumulator, None folds out
     C,  # (M, K) output gradient
+    Perm,  # (K,) act-order K order: column j of the product is stored at Perm[j]; None = natural
     # Shape
     M,
     N,
@@ -211,6 +240,8 @@ def dgrad_matmul_2d_kernel(
     stride_b_k,
     stride_bs_n,
     stride_bs_k,
+    stride_bz_n,
+    stride_bz_k,
     stride_c_m,
     stride_c_k,
     # Format
@@ -224,6 +255,7 @@ def dgrad_matmul_2d_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     WARP_SPEC: tl.constexpr,
+    INT_BITS: tl.constexpr = 0,  # integer weight width; 0: E2M1 / E4M3 / full-precision weight
 ):
     pid_m = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -235,10 +267,7 @@ def dgrad_matmul_2d_kernel(
         + tl.arange(0, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE),
         K // WEIGHT_VALUES_PER_BYTE - 1,
     )
-    offs_kg = tl.minimum(
-        (pid_k * BLOCK_SIZE_K) // SCALE_GROUP_K + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K),
-        K // SCALE_GROUP_K - 1,
-    )
+    offs_kg = _dgrad_scale_cols(pid_k, K, BLOCK_SIZE_K, SCALE_GROUP_K)
     m_mask = offs_m < M
     k_mask = offs_k < K
 
@@ -251,6 +280,8 @@ def dgrad_matmul_2d_kernel(
     b_ptrs = operand_tile_ptrs(B, offs_n0, offs_kb, stride_b_n, stride_b_k, B_MEMORY_MODE, True)
     if Bs is not None:
         bs_ptrs = Bs + (offs_n0[:, None] // SCALE_ROW_DIV) * stride_bs_n + offs_kg[None, :] * stride_bs_k
+    if Bz is not None:
+        bz_ptrs = Bz + offs_n0[:, None] * stride_bz_n + offs_kg[None, :] * stride_bz_k
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_K), dtype=tl.float32)
     for n in tl.range(0, tl.cdiv(N, BLOCK_SIZE_N), warp_specialize=WARP_SPEC):
@@ -265,22 +296,28 @@ def dgrad_matmul_2d_kernel(
             BLOCK_SIZE_N, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE, B_MEMORY_MODE,
         )
         w_scale = tl.load(bs_ptrs) if Bs is not None else None
-        accumulator += tl.dot(
-            dy.to(tl.bfloat16),
-            _dgrad_weight_tile(
-                w, w_scale, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, tl.bfloat16
-            ),
-        )
+        if INT_BITS:
+            w_zero = tl.load(bz_ptrs) if Bz is not None else None
+            divisor = tl.load(BsGlobal) if BsGlobal is not None else None
+            accumulator += tl.dot(dy, _dgrad_int_tile(w, w_scale, w_zero, divisor, BLOCK_SIZE_K, SCALE_GROUP_K, INT_BITS, dy.dtype))
+        else:
+            accumulator += tl.dot(
+                dy.to(tl.bfloat16),
+                _dgrad_weight_tile(w, w_scale, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, tl.bfloat16),
+            )
         dy_ptrs += BLOCK_SIZE_N * stride_a_n
         b_ptrs += BLOCK_SIZE_N * stride_b_n
         if Bs is not None:
             bs_ptrs += (BLOCK_SIZE_N // SCALE_ROW_DIV) * stride_bs_n
+        if Bz is not None:
+            bz_ptrs += BLOCK_SIZE_N * stride_bz_n
 
-    if BsGlobal is not None:  # NVFP4's second level — one matrix, so one value
+    if BsGlobal is not None:  # the second-level scale: one matrix, so one value
         accumulator = accumulator * tl.load(BsGlobal)
 
+    cols = tl.load(Perm + offs_k, mask=k_mask, other=0) if Perm is not None else offs_k
     tl.store(
-        C + offs_m.to(tl.int64)[:, None] * stride_c_m + offs_k[None, :] * stride_c_k,
+        C + offs_m.to(tl.int64)[:, None] * stride_c_m + cols[None, :] * stride_c_k,
         accumulator.to(C.dtype.element_ty),
         mask=m_mask[:, None] & k_mask[None, :],
     )
@@ -295,6 +332,9 @@ def dgrad_matmul_2d(
     scale_row_div: int,
     output_dtype: torch.dtype | None = None,
     w_global_scale: torch.Tensor | None = None,
+    w_zero: torch.Tensor | None = None,
+    perm: torch.Tensor | None = None,
+    int_bits: int = 0,
 ) -> torch.Tensor:
     """``dX = dY @ W`` against the FORWARD-oriented quantized weight — the gradient a frozen
     quantized base weight passes to whatever trains in front of it (LoRA adapters, earlier
@@ -302,10 +342,11 @@ def dgrad_matmul_2d(
 
     ``W`` is ``(N, K)`` exactly as the forward holds it; nothing is transposed or re-quantized.
     ``scale_group_k``/``scale_row_div`` describe the scale grid (MX: ``32, 1``; block-FP8:
-    ``128, 128``), which is the only thing that differs between formats."""
+    ``128, 128``), which is the only thing that differs between formats. An integer weight (``int_bits``) is its
+    interleaved uint32 words, with ``w_zero`` its zero points and ``perm`` its act-order K order."""
     assert dY.ndim == 2 and W.ndim == 2, f"expected 2D operands, got {dY.ndim}D and {W.ndim}D"
     M, N = dY.shape
-    values_per_byte = 2 if W.dtype == torch.uint8 else 1
+    values_per_byte = 32 // int_bits if int_bits else 2 if W.dtype == torch.uint8 else 1
     K = W.shape[1] * values_per_byte
     assert W.shape[0] == N, f"weight rows {W.shape[0]} != dY's N {N}"
     assert K % scale_group_k == 0, (
@@ -330,8 +371,10 @@ def dgrad_matmul_2d(
             W,
             b_descriptor,
             Ws,
+            w_zero,
             w_global_scale,
             dX,
+            perm,
             M,
             N,
             K,
@@ -341,11 +384,13 @@ def dgrad_matmul_2d(
             W.stride(0),
             W.stride(1),
             *_scale_strides(Ws, 2),
+            *_scale_strides(w_zero, 2),
             dX.stride(0),
             dX.stride(1),
             SCALE_GROUP_K=scale_group_k,
             SCALE_ROW_DIV=scale_row_div,
             WEIGHT_VALUES_PER_BYTE=values_per_byte,
+            INT_BITS=int_bits,
         )
     return dX
 
@@ -373,8 +418,9 @@ def dgrad_matmul_2d(
             config_filter(  # the scale row advances by BN // SCALE_ROW_DIV — must be whole
                 lambda c, a: c.kwargs["BLOCK_SIZE_N"] % max(a.get("SCALE_ROW_DIV", 1), 1) == 0
             ),
-            config_filter(  # BK below one scale group gives NG=0 -> tl.arange(0, 0)
-                lambda c, a: c.kwargs["BLOCK_SIZE_K"] % max(a.get("SCALE_GROUP_K", 1), 1) == 0
+            config_filter(  # a K tile holds whole scale groups, or lies inside one (per-channel INT, wide groups)
+                lambda c, a: c.kwargs["BLOCK_SIZE_K"] % a.get("SCALE_GROUP_K", 1) == 0
+                or a.get("SCALE_GROUP_K", 1) % c.kwargs["BLOCK_SIZE_K"] == 0
             ),
             warp_spec_compile_guard_pruner(),
             descriptor_support_pruner(),
@@ -389,9 +435,11 @@ def dgrad_matmul_grouped_kernel(
     B,  # (E, N, K) quantized weights, K-contiguous — the forward orientation
     BDescriptor,  # host TMA descriptor over B, box (1, BN, BK_bytes)
     Bs,  # (E, N // SCALE_ROW_DIV, K // SCALE_GROUP_K) weight scales
-    BsGlobal,  # fp32 NVFP4 weight global, per tensor or per expert; folded on the accumulator
+    Bz,  # (E, N, K // SCALE_GROUP_K) integer zero points; None for a symmetric or non-integer weight
+    BsGlobal,  # fp32 NVFP4 / W4A8 second-level weight scale, per tensor or per expert; folded on the accumulator
     stride_bs_global,  # expert stride of BsGlobal (0 broadcasts a scalar)
     C,  # (S, K) output gradient, written in the forward's INPUT row order
+    Perm,  # (E, K) act-order K orders: column j of an expert's product is stored at Perm[e, j]; None = natural
     GatherIdx,  # (S,) sorted position -> source row of the forward's A
     ScatterIdx,  # (S,) sorted position -> destination row of the forward's C
     RoutedIdx,  # (S,) sorted position -> its token-major routed row, for a gather-only launch; else None
@@ -410,6 +458,10 @@ def dgrad_matmul_grouped_kernel(
     stride_bs_e,
     stride_bs_n,
     stride_bs_k,
+    stride_bz_e,
+    stride_bz_n,
+    stride_bz_k,
+    stride_perm_e,
     stride_c_m,
     stride_c_k,
     # Format
@@ -426,6 +478,7 @@ def dgrad_matmul_grouped_kernel(
     WARP_SPEC: tl.constexpr,
     B_MEMORY_MODE: tl.constexpr,
     STORE: tl.constexpr = "position",
+    INT_BITS: tl.constexpr = 0,  # integer weight width; 0: E2M1 / E4M3 / full-precision weight
 ):
     """Grouped dgrad. The tile resolver is reused verbatim with K-tiles in its N-tile slot —
     it is generic in that second axis, so ``offs_bn`` comes back as this kernel's K offsets and
@@ -462,10 +515,7 @@ def dgrad_matmul_grouped_kernel(
             + tl.arange(0, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE),
             K // WEIGHT_VALUES_PER_BYTE - 1,
         )
-        offs_kg = tl.minimum(
-            (pid_k * BLOCK_SIZE_K) // SCALE_GROUP_K + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K),
-            K // SCALE_GROUP_K - 1,
-        )
+        offs_kg = _dgrad_scale_cols(pid_k, K, BLOCK_SIZE_K, SCALE_GROUP_K)
         b_base = B + expert_id64 * stride_b_e
 
         # exact N-loop (BLOCK_SIZE_N divides N): maskless weight, constant-stride advance
@@ -486,6 +536,9 @@ def dgrad_matmul_grouped_kernel(
                 + (offs_n0[:, None] // SCALE_ROW_DIV) * stride_bs_n
                 + offs_kg[None, :] * stride_bs_k
             )
+        if Bz is not None:
+            bz_ptrs = Bz + expert_id64 * stride_bz_e + offs_n0[:, None] * stride_bz_n + offs_kg[None, :] * stride_bz_k
+        divisor = tl.load(BsGlobal + expert_id64 * stride_bs_global) if INT_BITS and BsGlobal is not None else None
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_K), dtype=tl.float32)
         for n in tl.range(0, tl.cdiv(N, BLOCK_SIZE_N), warp_specialize=WARP_SPEC):
@@ -505,25 +558,31 @@ def dgrad_matmul_grouped_kernel(
                 BLOCK_SIZE_N, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE, B_MEMORY_MODE, True,
             )
             w_scale = tl.load(bs_ptrs) if Bs is not None else None
-            accumulator += tl.dot(
-                dy.to(tl.bfloat16),
-                _dgrad_weight_tile(
-                    w, w_scale, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, tl.bfloat16
-                ),
-            )
+            if INT_BITS:
+                w_zero = tl.load(bz_ptrs) if Bz is not None else None
+                accumulator += tl.dot(dy, _dgrad_int_tile(w, w_scale, w_zero, divisor, BLOCK_SIZE_K, SCALE_GROUP_K, INT_BITS, dy.dtype))
+            else:
+                accumulator += tl.dot(
+                    dy.to(tl.bfloat16),
+                    _dgrad_weight_tile(w, w_scale, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, tl.bfloat16),
+                )
             dy_ptrs += BLOCK_SIZE_N * stride_a_n
             b_ptrs += BLOCK_SIZE_N * stride_b_n
             if Bs is not None:
                 bs_ptrs += (BLOCK_SIZE_N // SCALE_ROW_DIV) * stride_bs_n
+            if Bz is not None:
+                bz_ptrs += BLOCK_SIZE_N * stride_bz_n
 
-        if BsGlobal is not None:  # NVFP4's second level, this tile's expert
+        if BsGlobal is not None:  # the second-level scale, this tile's expert
             accumulator = accumulator * tl.load(BsGlobal + expert_id64 * stride_bs_global)
 
-        _store_dgrad_rows(C, accumulator, in_row, out_row, row_mask, offs_k, K, stride_c_m, stride_c_k, RoutedIdx, STORE)
+        k_mask = offs_k < K
+        cols = tl.load(Perm + expert_id64 * stride_perm_e + offs_k, mask=k_mask, other=0) if Perm is not None else offs_k
+        _store_dgrad_rows(C, accumulator, in_row, out_row, row_mask, cols, k_mask, stride_c_m, stride_c_k, RoutedIdx, STORE)
 
 
 @triton.jit
-def _store_dgrad_rows(C, accumulator, in_row, out_row, row_mask, offs_k, K, stride_c_m, stride_c_k,
+def _store_dgrad_rows(C, accumulator, in_row, out_row, row_mask, cols, col_mask, stride_c_m, stride_c_k,
                       RoutedIdx, STORE: tl.constexpr):
     """Store a dgrad tile where its rows' gradients belong, each row exactly once, no atomics:
     - ``"routed"``: each position's TOKEN-MAJOR routed row (``out_row`` with a scatter map, ``RoutedIdx`` of a
@@ -538,9 +597,9 @@ def _store_dgrad_rows(C, accumulator, in_row, out_row, row_mask, offs_k, K, stri
     else:
         row = out_row
     tl.store(
-        C + row.to(tl.int64)[:, None] * stride_c_m + offs_k[None, :] * stride_c_k,
+        C + row.to(tl.int64)[:, None] * stride_c_m + cols[None, :] * stride_c_k,
         accumulator,
-        mask=row_mask[:, None] & (offs_k[None, :] < K),
+        mask=row_mask[:, None] & col_mask[None, :],
     )
 
 
@@ -558,6 +617,9 @@ def dgrad_matmul_grouped(
     num_input_rows: int | None = None,
     w_global_scale: torch.Tensor | None = None,
     routed_idx: torch.Tensor | None = None,
+    w_zero: torch.Tensor | None = None,
+    perm: torch.Tensor | None = None,
+    int_bits: int = 0,
 ) -> torch.Tensor:
     """Routed ``dX = dY @ W[expert]`` over expert-sorted positions — the MoE counterpart of
     ``dgrad_matmul_2d``.
@@ -566,10 +628,11 @@ def dgrad_matmul_grouped(
     their roles itself (reads ``dY`` at the forward's scatter destination, writes ``dX`` at its
     gather source), so callers hand over the same two tensors the forward got. A gathered launch sums each
     token's top_k rows, so it needs them token-major: its scatter map, or ``routed_idx`` (each position's
-    token-major routed row, the chain's scatter map) when it has none."""
+    token-major routed row, the chain's scatter map) when it has none. An integer weight (``int_bits``) is its
+    interleaved uint32 words, with ``w_zero`` its zero points and ``perm`` its per-expert act-order K orders."""
     assert dY.ndim == 2 and W.ndim == 3, f"expected (S,N) and (E,N,K), got {dY.shape}, {W.shape}"
     S, N = dY.shape
-    values_per_byte = 2 if W.dtype == torch.uint8 else 1
+    values_per_byte = 32 // int_bits if int_bits else 2 if W.dtype == torch.uint8 else 1
     K = W.shape[2] * values_per_byte
     assert W.shape[1] == N, f"weight N {W.shape[1]} != dY's N {N}"
     assert K % scale_group_k == 0, (
@@ -598,9 +661,11 @@ def dgrad_matmul_grouped(
             W,
             b_descriptor,
             Ws,
+            w_zero,
             w_global_scale,
             global_scale_stride(w_global_scale),
             dX,
+            perm,
             gather_idx,
             scatter_idx,
             routed_idx if store == "routed" and scatter_idx is None else None,
@@ -615,6 +680,8 @@ def dgrad_matmul_grouped(
             W.stride(1),
             W.stride(2),
             *_scale_strides(Ws, 3),
+            *_scale_strides(w_zero, 3),
+            perm.stride(0) if perm is not None else 0,
             dX.stride(0),
             dX.stride(1),
             SCALE_GROUP_K=scale_group_k,
@@ -623,6 +690,7 @@ def dgrad_matmul_grouped(
             NUM_EXPERTS_POW2=triton.next_power_of_2(num_experts),
             NUM_SMS=num_sms,
             STORE=store,
+            INT_BITS=int_bits,
         )
     if store == "routed":
         dX = dX.view(rows, S // rows, K).sum(1)
@@ -750,9 +818,11 @@ def dgrad_matmul_batched_kernel(
     A,  # (S, N) upstream gradient
     B,  # (E, N, K) quantized weights, K-contiguous — the forward orientation
     Bs,  # (E, N // SCALE_ROW_DIV, K // SCALE_GROUP_K) weight scales
-    BsGlobal,  # fp32 NVFP4 weight global, per tensor or per expert; folded on the accumulator
+    Bz,  # (E, N, K // SCALE_GROUP_K) integer zero points; None for a symmetric or non-integer weight
+    BsGlobal,  # fp32 NVFP4 / W4A8 second-level weight scale, per tensor or per expert; folded on the accumulator
     stride_bs_global,  # expert stride of BsGlobal (0 broadcasts a scalar)
     C,  # (S, K) output gradient
+    Perm,  # (E, K) act-order K orders: column j of an expert's product is stored at Perm[e, j]; None = natural
     ExpertIds,  # (S,) which expert each row routed to
     # Shape
     S,
@@ -767,6 +837,10 @@ def dgrad_matmul_batched_kernel(
     stride_bs_e,
     stride_bs_n,
     stride_bs_k,
+    stride_bz_e,
+    stride_bz_n,
+    stride_bz_k,
+    stride_perm_e,
     stride_c_m,
     stride_c_k,
     # Format
@@ -776,6 +850,7 @@ def dgrad_matmul_batched_kernel(
     # Meta-parameters
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    INT_BITS: tl.constexpr = 0,  # integer weight width; 0: E2M1 / E4M3 / full-precision weight
 ):
     """Batched dgrad: ``dX[s] = dY[s] @ B[ExpertIds[s]]``.
 
@@ -793,10 +868,7 @@ def dgrad_matmul_batched_kernel(
         + tl.arange(0, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE),
         K // WEIGHT_VALUES_PER_BYTE - 1,
     )
-    offs_kg = tl.minimum(
-        (pid_k * BLOCK_SIZE_K) // SCALE_GROUP_K + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K),
-        K // SCALE_GROUP_K - 1,
-    )
+    offs_kg = _dgrad_scale_cols(pid_k, K, BLOCK_SIZE_K, SCALE_GROUP_K)
     b_base = B + expert_id * stride_b_e
 
     # CUDA-core FMA reduce, NOT tl.dot: one row per program is an M=1 GEVM, and feeding the MMA a
@@ -816,19 +888,22 @@ def dgrad_matmul_batched_kernel(
         w_scale = tl.load(
             Bs + expert_id * stride_bs_e + (offs_nc[:, None] // SCALE_ROW_DIV) * stride_bs_n + offs_kg[None, :] * stride_bs_k
         ) if Bs is not None else None
-        wdeq = _dgrad_weight_tile(
-            w, w_scale, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, tl.float32
-        )
+        if INT_BITS:
+            w_zero = tl.load(
+                Bz + expert_id * stride_bz_e + offs_nc[:, None] * stride_bz_n + offs_kg[None, :] * stride_bz_k
+            ) if Bz is not None else None
+            divisor = tl.load(BsGlobal + expert_id * stride_bs_global) if BsGlobal is not None else None
+            wdeq = _dgrad_int_tile(
+                w, w_scale, w_zero, divisor, BLOCK_SIZE_K, SCALE_GROUP_K, INT_BITS, A.dtype.element_ty
+            ).to(tl.float32)
+        else:
+            wdeq = _dgrad_weight_tile(w, w_scale, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, tl.float32)
         accumulator += tl.sum(dy[:, None] * wdeq, axis=0)
-
-    if BsGlobal is not None:  # NVFP4's second level, this row's expert
+    if BsGlobal is not None:  # the second-level scale, this row's expert
         accumulator = accumulator * tl.load(BsGlobal + expert_id * stride_bs_global)
-
-    tl.store(
-        C + pid_m * stride_c_m + offs_k * stride_c_k,
-        accumulator.to(C.dtype.element_ty),
-        mask=row_ok & (offs_k < K),
-    )
+    k_mask = row_ok & (offs_k < K)
+    cols = tl.load(Perm + expert_id * stride_perm_e + offs_k, mask=k_mask, other=0) if Perm is not None else offs_k
+    tl.store(C + pid_m * stride_c_m + cols * stride_c_k, accumulator.to(C.dtype.element_ty), mask=k_mask)
 
 
 @compile_time_only_triton_op(add_op_namespace_prefix("dgrad_matmul_batched"), mutates_args=())
@@ -841,6 +916,9 @@ def dgrad_matmul_batched(
     scale_row_div: int,
     output_dtype: torch.dtype | None = None,
     w_global_scale: torch.Tensor | None = None,
+    w_zero: torch.Tensor | None = None,
+    perm: torch.Tensor | None = None,
+    int_bits: int = 0,
 ) -> torch.Tensor:
     """``dX[s] = dY[s] @ W[expert_ids[s]]`` — the batched (per-row expert) counterpart of
     ``dgrad_matmul_grouped``. Registered because the batched experts forward is a SELECTABLE
@@ -848,7 +926,7 @@ def dgrad_matmul_batched(
     silently produces no gradient."""
     assert dY.ndim == 2 and W.ndim == 3, f"expected (S,N) and (E,N,K), got {dY.shape}, {W.shape}"
     S, N = dY.shape
-    values_per_byte = 2 if W.dtype == torch.uint8 else 1
+    values_per_byte = 32 // int_bits if int_bits else 2 if W.dtype == torch.uint8 else 1
     K = W.shape[2] * values_per_byte
     assert W.shape[1] == N, f"weight N {W.shape[1]} != dY's N {N}"
 
@@ -856,14 +934,17 @@ def dgrad_matmul_batched(
     grid = lambda META: (S, triton.cdiv(K, META["BLOCK_SIZE_K"]))  # noqa: E731
     with device_context(dY.device):
         compile_time_only_triton_wrap(dgrad_matmul_batched_kernel)[grid](
-            dY, W, Ws, w_global_scale, global_scale_stride(w_global_scale), dX, expert_ids, S, N, K,
+            dY, W, Ws, w_zero, w_global_scale, global_scale_stride(w_global_scale), dX, perm, expert_ids, S, N, K,
             dY.stride(0), dY.stride(1),
             W.stride(0), W.stride(1), W.stride(2),
             *_scale_strides(Ws, 3),
+            *_scale_strides(w_zero, 3),
+            perm.stride(0) if perm is not None else 0,
             dX.stride(0), dX.stride(1),
             SCALE_GROUP_K=scale_group_k,
             SCALE_ROW_DIV=scale_row_div,
             WEIGHT_VALUES_PER_BYTE=values_per_byte,
+            INT_BITS=int_bits,
         )
     return dX
 
@@ -909,6 +990,48 @@ def _token_sum(routed_rows, ctx):
     """Each token's gradient from its token-major routed rows ``(T * top_k, K)``: a contiguous fp32 top_k sum, no
     atomics."""
     return routed_rows.view(ctx.a_rows, -1, routed_rows.shape[1]).sum(1, dtype=torch.float32).to(ctx.a_dtype)
+
+
+def _int_dgrad_2d(ctx, dY, B, Bs, b_zero=None, b_perm=None, b_scale2=None):
+    """Integer dA on the dgrad kernel: the interleaved words decoded in registers to the value the forward multiplies
+    by (zero points, group or per-channel scales, ModelOpt W4A8's E4M3 rounding against ``b_scale2``), the act-order
+    columns stored back through ``b_perm``."""
+    return dgrad_matmul_2d(
+        dY.contiguous(), B, Bs, ctx.a_cols // Bs.shape[-1], 1, output_dtype=ctx.a_dtype,
+        **_int_operands(ctx, B, Bs, b_zero, b_perm, b_scale2, 1),
+    )
+
+
+def _int_operands(ctx, B, Bs, b_zero, b_perm, b_scale2, num_experts):
+    """The dgrad kernels' integer kwargs: zero points, act-order, the W4A8 second level and the bit width (read off
+    the word count against the input's K)."""
+    return dict(
+        w_zero=b_zero, perm=b_perm, w_global_scale=normalize_global_scale(b_scale2, num_experts),
+        int_bits=32 // (ctx.a_cols // B.shape[-1]),
+    )
+
+
+def _int_grouped_dgrad(ctx, dY, B, expert_start, Bs, gather_idx=None, scatter_idx=None, routed_idx=None,
+                       b_zero=None, b_perm=None, b_scale2=None):
+    """Integer routed dA on the grouped dgrad kernel (``_int_dgrad_2d``'s decode, per expert)."""
+    return dgrad_matmul_grouped(
+        dY.contiguous(), B, Bs, expert_start, ctx.a_cols // Bs.shape[-1], 1, gather_idx=gather_idx,
+        scatter_idx=scatter_idx, output_dtype=ctx.a_dtype, num_input_rows=ctx.a_rows, routed_idx=routed_idx,
+        **_int_operands(ctx, B, Bs, b_zero, b_perm, b_scale2, B.shape[0]),
+    )
+
+
+def _int_batched_dgrad(ctx, dY, B, expert_ids, Bs, scatter_idx=None, b_zero=None, b_perm=None, b_scale2=None):
+    """Integer per-row-expert dA on the batched dgrad kernel, a gate|up launch's top_k rows summed per token."""
+    summed = expert_ids.shape[0] != ctx.a_rows
+    if scatter_idx is not None:
+        dY = dY.index_select(0, scatter_idx)
+    rows = dgrad_matmul_batched(
+        dY.contiguous(), B, Bs, expert_ids, ctx.a_cols // Bs.shape[-1], 1,
+        output_dtype=torch.float32 if summed else ctx.a_dtype,
+        **_int_operands(ctx, B, Bs, b_zero, b_perm, b_scale2, B.shape[0]),
+    )
+    return _token_sum(rows, ctx) if summed else rows
 
 
 def _dgrad_2d(ctx, dY, B, Bs, b_global_scale=None):
@@ -996,7 +1119,7 @@ def _register(op, reads, dgrad):
         ctx.save_for_backward(*(values[name] for name in ctx.tensor_names))
         ctx.config = {name: value for name, value in values.items() if name not in ctx.tensor_names}
         # a gathered launch's rows sum back to its source rows, a different count from the routed rows it consumed
-        ctx.a_dtype, ctx.a_rows = inputs[0].dtype, inputs[0].shape[0]
+        ctx.a_dtype, ctx.a_rows, ctx.a_cols = inputs[0].dtype, inputs[0].shape[0], inputs[0].shape[-1]
 
     def backward(ctx, *grads):
         # `needs_input_grad` is sized to the args as invoked plus torch's trailing metadata slot
@@ -1025,6 +1148,8 @@ _register(matmul.mx_dynamic_matmul, ("B", "Bs", "b_global_scale", "a_pre_quant_s
           _with_input_transform(_dgrad_2d))
 _register(matmul.mx_weight_only_matmul_2d, ("B", "Bs", "b_global_scale"), _dgrad_2d)
 _register(matmul.block_fp8_weight_only_matmul_2d, ("B", "Bs"), _dgrad_2d)
+_register(matmul.int_weight_only_matmul_2d, ("B", "Bs", "b_zero", "b_perm", "b_scale2", "a_pre_quant_scale"),
+          _with_input_transform(_int_dgrad_2d))
 _register(matmul.full_precision_matmul_2d, ("B",), _dgrad_full_precision_2d)
 # grouped: every format on the grouped dgrad kernel
 for _op in (grouped.w8a8_block_dynamic_fp8_matmul_grouped, grouped.w8a8_block_static_fp8_matmul_grouped,
@@ -1034,6 +1159,8 @@ _register(grouped.mx_dynamic_matmul_grouped, (*_GROUPED, "b_global_scale", "a_pr
           _with_input_transform(_grouped_dgrad))
 _register(grouped.mx_weight_only_matmul_grouped, (*_GROUPED, "b_global_scale"), _grouped_dgrad)
 _register(grouped.block_fp8_weight_only_matmul_grouped, _GROUPED, _grouped_dgrad)
+_INT = ("b_zero", "b_perm", "b_scale2", "a_pre_quant_scale")
+_register(grouped.int_weight_only_matmul_grouped, (*_GROUPED, *_INT), _with_input_transform(_int_grouped_dgrad))
 # batched: the batched experts forward is a selectable dispatch in transformers, not a decode-only path
 _BATCHED = ("B", "Bs", "expert_ids", "scatter_idx", "b_global_scale")
 for _op in (batched.w8a8_block_dynamic_fp8_matmul_batched, batched.w8a8_block_static_fp8_matmul_batched,
@@ -1041,3 +1168,5 @@ for _op in (batched.w8a8_block_dynamic_fp8_matmul_batched, batched.w8a8_block_st
             batched.block_fp8_weight_only_matmul_batched, batched.full_precision_matmul_batched):
     _register(_op, _BATCHED, _batched_dgrad)
 _register(batched.mx_dynamic_matmul_batched, (*_BATCHED, "a_pre_quant_scale"), _with_input_transform(_batched_dgrad))
+_register(batched.int_weight_only_matmul_batched, ("B", "Bs", "expert_ids", "scatter_idx", *_INT),
+          _with_input_transform(_int_batched_dgrad))
