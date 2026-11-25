@@ -1,9 +1,8 @@
 import argparse
 import torch
 import torch.multiprocessing as mp
-import kernels
 
-deep_gemm = kernels.get_kernel("kernels-community/deep-gemm", version=2)
+from generators import deep_gemm  # noqa: F401 (loading it before the processes start is the test)
 
 
 def main(local_rank: int):

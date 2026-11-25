@@ -1,10 +1,87 @@
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import autotune
+
+
+@pytest.mark.parametrize("source", ["merged", "off_main", "before_merge"])
+def test_build_run_refreshes_main_and_checks_ancestry(tmp_path, monkeypatch, source):
+    remote, checkout = tmp_path / "remote", tmp_path / "checkout"
+
+    def git(directory, *args):
+        return subprocess.check_output(
+            ["git", "-C", str(directory), *args], text=True, stderr=subprocess.PIPE
+        ).strip()
+
+    remote.mkdir()
+    git(remote, "init", "-b", "main")
+    git(remote, "config", "user.name", "Test")
+    git(remote, "config", "user.email", "test@example.com")
+    git(remote, "commit", "--allow-empty", "-m", "comment event")
+    before_merge = git(remote, "rev-parse", "HEAD")
+    git(tmp_path, "clone", str(remote), str(checkout))
+    git(remote, "commit", "--allow-empty", "-m", "merged PR")
+    merged = git(remote, "rev-parse", "HEAD")
+    git(remote, "checkout", "-b", "unmerged")
+    git(remote, "commit", "--allow-empty", "-m", "not on main")
+    off_main = git(remote, "rev-parse", "HEAD")
+    # Reproduce checkout fetching all history, then resetting origin/main to
+    # the issue_comment event SHA even though the release built the merged PR.
+    git(checkout, "fetch", "origin")
+    git(checkout, "update-ref", "refs/remotes/origin/main", before_merge)
+    sha = {"merged": merged, "off_main": off_main, "before_merge": before_merge}[source]
+    pr = {
+        "merged": True,
+        "base": {"ref": "main"},
+        "merge_commit_sha": merged,
+        "user": {"login": "maintainer"},
+    }
+    run = {
+        "id": 42,
+        "path": ".github/workflows/build.yaml",
+        "event": "workflow_dispatch",
+        "status": "completed",
+        "conclusion": "success",
+        "head_branch": "main",
+        "head_repository": {"full_name": "example/repo"},
+        "display_title": "Build / mode=release / request=test",
+        "head_sha": sha,
+    }
+    request = {
+        "pr_number": 1,
+        "builds": [{"workflow": "build.yaml", "dispatch_key": "test", "run_id": 42}],
+    }
+    monkeypatch.chdir(checkout)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "example/repo")
+    monkeypatch.setattr(
+        autotune, "github_api", lambda path: pr if "/pulls/" in path else run
+    )
+    real_run = subprocess.run
+    downloads = []
+
+    def execute(command, **kwargs):
+        if command[:3] == ["gh", "run", "download"]:
+            downloads.append(command)
+            return subprocess.CompletedProcess(command, 0)
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(autotune.subprocess, "run", execute)
+    if source == "merged":
+        assert autotune.build_run(request, tmp_path / "uploads") == {
+            "source_sha": merged,
+            "skip": "false",
+        }
+        assert len(downloads) == 1
+    else:
+        with pytest.raises(subprocess.CalledProcessError, match="merge-base"):
+            autotune.build_run(request, tmp_path / "uploads")
+        assert not downloads
+    assert git(checkout, "rev-parse", "origin/main") == merged
+    assert git(checkout, "rev-parse", "HEAD") == before_merge
 
 
 @pytest.fixture
@@ -67,10 +144,10 @@ def test_collect_skips_pr_creation_when_configs_are_unchanged(autotune_run):
     assert [result["status"] for result in results] == ["no_changes", "no_changes"]
 
 
-@pytest.fixture
-def autotuner_pr():
+@pytest.fixture(params=["github-actions[bot]", "kernel-pr[bot]"])
+def autotuner_pr(request):
     return {
-        "user": {"login": "github-actions[bot]"},
+        "user": {"login": request.param, "type": "Bot"},
         "head": {
             "repo": {"full_name": "example/repo"},
             "ref": "autotune/example/abc123",
@@ -90,7 +167,19 @@ def test_pr_without_autotune_marker_is_not_recognized(autotuner_pr):
 
 
 def test_human_pr_with_autotune_marker_is_not_recognized(autotuner_pr):
-    autotuner_pr["user"]["login"] = "maintainer"
+    autotuner_pr["user"] = {"login": "maintainer", "type": "User"}
+
+    assert not autotune.is_autotune_pr(autotuner_pr, "example/repo")
+
+
+def test_bot_pr_from_a_fork_is_not_recognized(autotuner_pr):
+    autotuner_pr["head"]["repo"]["full_name"] = "other/repo"
+
+    assert not autotune.is_autotune_pr(autotuner_pr, "example/repo")
+
+
+def test_bot_pr_without_autotune_branch_is_not_recognized(autotuner_pr):
+    autotuner_pr["head"]["ref"] = "unrelated-update"
 
     assert not autotune.is_autotune_pr(autotuner_pr, "example/repo")
 

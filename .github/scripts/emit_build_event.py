@@ -122,6 +122,7 @@ def load_uploads(directory: Path) -> list[dict]:
 
 def build_event(platform: str, env: dict, jobs: list[dict], sources: dict, uploads: list[dict]) -> dict:
     needs = json.loads(env.get("NEEDS_JSON") or "{}")
+    gpu_test_job = "test-kernel-metal" if platform == "mac" else "test-kernel-gpu"
     jobs = [j for j in jobs if not j["name"].startswith(OWN_JOB)]
     started = min((j["started_at"] for j in jobs if j.get("started_at")), default=None)
     repository, run_id = env["GITHUB_REPOSITORY"], env["GITHUB_RUN_ID"]
@@ -147,7 +148,7 @@ def build_event(platform: str, env: dict, jobs: list[dict], sources: dict, uploa
         "result": {
             "overall": overall_result(needs),
             "needs": {name: n["result"] for name, n in needs.items()},
-            "gpu_tests": needs.get("test-kernel-gpu", {}).get("result"),
+            "gpu_tests": needs.get(gpu_test_job, {}).get("result"),
             "jobs": [summarize_job(j, platform) for j in jobs],
         },
         "uploads": uploads,

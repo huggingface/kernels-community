@@ -20,13 +20,10 @@
 #   - the operator/fake-tensor registration of the Hopper-only GEMMs, which is
 #     checked under `FakeTensorMode` and so needs no kernel launch.
 
-import kernels
 import pytest
 import torch
 
-# `kernels-community/deep-gemm` is `[general.hub] repo-id` and 2 is
-# `[general] version` in `build.toml`.
-deep_gemm = kernels.get_kernel("kernels-community/deep-gemm", version=2)
+from generators import deep_gemm
 
 pytestmark = [
     pytest.mark.kernels_ci,
@@ -209,3 +206,51 @@ def test_gemm_ops_registered() -> None:
         grouped_d = torch.empty((num_groups * M, N), device='cuda', dtype=torch.bfloat16)
         layout = torch.zeros((num_groups * M,), device='cuda', dtype=torch.int32)
         deep_gemm.m_grouped_bf16_gemm_nt_contiguous(grouped_a, grouped_b, grouped_d, layout)
+
+
+# ── fused per-token FP8 cast ────────────────────────────────────────────────
+# A local addition (`deep_gemm/fused_cast.py`, a Triton kernel), checked bit for
+# bit against upstream's PyTorch reference.
+
+def _cast_input(m: int, n: int, dtype: torch.dtype) -> torch.Tensor:
+    torch.manual_seed(m * n)
+    x = torch.randn((m, n), device='cuda', dtype=torch.float32)
+    x *= torch.logspace(-6, 4, m, device='cuda')[:, None]  # rows from tiny to large values
+    x[0, :32] = 0  # a group of zeros: the clamped amax
+    x[-1, -16:] = 3e4  # a large tail
+    return x.to(dtype)
+
+
+def _bits(t: torch.Tensor) -> torch.Tensor:
+    return t.view(torch.uint8) if t.element_size() == 1 else t.view(torch.int32)
+
+
+@pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize('gran_k,use_ue8m0,use_packed_ue8m0', [
+    (32, True, True), (32, True, False), (128, True, True), (128, True, False), (128, False, False), (32, False, False),
+])
+@pytest.mark.parametrize('m,n', [(1, 512), (7, 4096), (129, 7168), (64, 1000)])
+def test_fused_per_token_cast_matches_reference(dtype, gran_k, use_ue8m0, use_packed_ue8m0, m, n) -> None:
+    num_groups = -(-n // gran_k)
+    if use_packed_ue8m0 and num_groups % 4:
+        pytest.skip('packed UE8M0 scales need a multiple of 4 groups per row')
+    x = _cast_input(m, n, dtype)
+    expected_x, expected_sf = deep_gemm.utils.per_token_cast_to_fp8(
+        x, use_ue8m0=use_ue8m0, gran_k=gran_k, use_packed_ue8m0=use_packed_ue8m0)
+    out_x, out_sf = deep_gemm.fused_per_token_cast_to_fp8(
+        x, use_ue8m0=use_ue8m0, gran_k=gran_k, use_packed_ue8m0=use_packed_ue8m0)
+    assert torch.equal(_bits(out_x), _bits(expected_x))
+    assert out_sf.dtype == expected_sf.dtype and torch.equal(_bits(out_sf), _bits(expected_sf))
+
+
+def test_fused_per_token_cast_into_buffer_views() -> None:
+    # the outputs can be rows of larger buffers (as the Mega MoE symmetric buffer's `x` and `x_sf` are)
+    m, n = 37, 4096
+    x = _cast_input(m, n, torch.bfloat16)
+    buffer_x = torch.zeros((64, n), device='cuda', dtype=torch.float8_e4m3fn)
+    buffer_sf = torch.zeros((64, n // 128), device='cuda', dtype=torch.int32)
+    deep_gemm.fused_per_token_cast_to_fp8(
+        x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True, out=buffer_x[:m], out_sf=buffer_sf[:m])
+    expected_x, expected_sf = deep_gemm.utils.per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+    assert torch.equal(_bits(buffer_x[:m]), _bits(expected_x)) and torch.equal(buffer_sf[:m], expected_sf)
+    assert not buffer_x[m:].view(torch.uint8).any() and not buffer_sf[m:].any()

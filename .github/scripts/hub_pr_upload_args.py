@@ -3,7 +3,8 @@
 #   <repo-id|upload-args> <kernel> <repo-prefix>
 #
 # Output:
-#   The effective Hub repo-id, or upload args using --create-pr for external repos.
+#   The effective Hub repo-id, or upload args using --create-pr for external repos
+#   (except kernels-sdk, which is uploaded to directly).
 #
 # The kernel is resolved against the working directory, not this file's location:
 # workflows run the helpers from a copy of the default branch while the kernel
@@ -22,6 +23,7 @@ import tomllib
 from pathlib import Path
 
 COMMUNITY = "kernels-community"
+SDK = "kernels-sdk"
 
 
 # Ported kernels keep their generated tree in <kernel>/src, with flake.nix
@@ -31,7 +33,8 @@ def build_toml_path(kernel):
     return nested if nested.is_file() else Path(kernel) / "build.toml"
 
 
-def external_repo_id(kernel, repo_prefix):
+def declared_repo_id(kernel, repo_prefix):
+    # The repo-id from build.toml, honoured only for the community org.
     if repo_prefix != COMMUNITY:
         return ""
     build_toml = build_toml_path(kernel)
@@ -39,17 +42,26 @@ def external_repo_id(kernel, repo_prefix):
         return ""
     with open(build_toml, "rb") as f:
         repo_id = tomllib.load(f).get("general", {}).get("hub", {}).get("repo-id")
-    return repo_id if isinstance(repo_id, str) and repo_id and not repo_id.startswith(f"{COMMUNITY}/") else ""
+    return repo_id if isinstance(repo_id, str) else ""
+
+
+def external_repo_id(kernel, repo_prefix):
+    # Repos outside our own orgs, which can only be reached through a pull request.
+    declared = declared_repo_id(kernel, repo_prefix)
+    own = (f"{COMMUNITY}/", f"{SDK}/")
+    return declared if declared and not declared.startswith(own) else ""
 
 
 def repo_id(kernel, repo_prefix):
-    return external_repo_id(kernel, repo_prefix) or f"{repo_prefix}/{kernel}"
+    return declared_repo_id(kernel, repo_prefix) or f"{repo_prefix}/{kernel}"
 
 
 def upload_args(kernel, repo_prefix):
     # --create-pr carries no --repo-id: the uploader falls back to build.toml's
     # repo-id, so it is only ever correct when that repo-id is the target.
-    return "--create-pr" if external_repo_id(kernel, repo_prefix) else f"--repo-id {repo_prefix}/{kernel}"
+    if external_repo_id(kernel, repo_prefix):
+        return "--create-pr"
+    return f"--repo-id {repo_id(kernel, repo_prefix)}"
 
 
 if __name__ == "__main__":

@@ -736,6 +736,11 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None, block_within_k: bool 
         if args.get("SCALE_GROUP_K") == 32:
             # Mixed tensor-FP8 / group-32 E4M3 FP4 is not the group-16 FP4xFP4 MMA.
             return False
+        if get_active_device_type() == "xpu":
+            # NVFP4 dot_scaled silently returns incorrect results at K=32 on XPU:
+            # https://github.com/intel/intel-xpu-backend-for-triton/issues/8881
+            # Remove this workaround once the supported Triton-XPU versions include the fix.
+            return False
         if not acts_are_scaled(args):
             return False
         if not 4 <= c.num_warps <= 8 and not is_triton_greater_or_equal("3.9"):

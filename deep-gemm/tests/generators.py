@@ -5,7 +5,9 @@ from typing import Generator, List, Optional, Tuple
 
 import kernels
 
-deep_gemm = kernels.get_kernel("kernels-community/deep-gemm", version=2)
+# The kernel every test uses, loaded as users load it. `kernels-community/deep-gemm` is `[general.hub] repo-id`
+# and 3 is `[general] version` in `build.toml`: bump it here only.
+deep_gemm = kernels.get_kernel("kernels-community/deep-gemm", version=3)
 
 get_arch_major = deep_gemm.testing.get_arch_major
 

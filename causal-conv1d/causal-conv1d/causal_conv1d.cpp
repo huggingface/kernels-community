@@ -16,7 +16,14 @@
 extern "C" AOTITorchError aoti_torch_get_current_cuda_stream(
     int32_t device_index, void** ret_stream);
 
+// This .cpp is not hipified (only .cu sources are), so pick the runtime explicitly.
+// On ROCm the hipified kernels take hipStream_t; alias it so declarations below match.
+#ifdef USE_ROCM
+#include <hip/hip_runtime.h>
+using cudaStream_t = hipStream_t;
+#else
 #include <cuda_runtime.h>
+#endif
 
 #include <cstring>
 #include <optional>

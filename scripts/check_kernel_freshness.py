@@ -18,6 +18,7 @@ KERNEL_SOURCE_MAPPING = {
     "deformable-detr": "",
     "einops": "https://github.com/arogozhnikov/einops",
     "finegrained-fp8": "",
+    "flydsl": "https://github.com/ROCm/FlyDSL",
     "finegrained-kernels": "",
     "flash-attn-ops": "https://github.com/Dao-AILab/flash-attention",
     "topk": "",
@@ -42,6 +43,7 @@ KERNEL_SOURCE_MAPPING = {
     "quantization-bitsandbytes": "https://github.com/bitsandbytes-foundation/bitsandbytes",
     "quantization-eetq": "https://github.com/NetEase-FuXi/EETQ",
     "quantization-gptq": "",
+    "ragged-dot-tpu": "",
     "rmsnorm": "https://github.com/intel/intel-extension-for-pytorch",
     "rotary": "https://github.com/Dao-AILab/flash-attention",
     "rwkv": "https://github.com/BlinkDL/RWKV-LM",
@@ -76,6 +78,7 @@ KERNEL_SOURCE_MAPPING = {
     "esmfold2-trimul": "",
     # Written for this repo, so there is no upstream to track.
     "weathernext2-banded-attention": "",
+    "tokamax": "https://github.com/openxla/tokamax",
 }
 
 def parse_args() -> argparse.Namespace:

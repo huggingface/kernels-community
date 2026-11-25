@@ -25,7 +25,7 @@ STABLE_TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
         "    Tensor? conv_state_indices) -> ()");
 }
 
-#if defined(CUDA_KERNEL)
+#if defined(CUDA_KERNEL) || defined(ROCM_KERNEL)
 STABLE_TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, CUDA, ops) {
     ops.impl("causal_conv1d_fwd", TORCH_BOX(&causal_conv1d_fwd));
     ops.impl("causal_conv1d_bwd", TORCH_BOX(&causal_conv1d_bwd));

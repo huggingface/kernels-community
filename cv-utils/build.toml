@@ -3,7 +3,10 @@ name = "cv-utils"
 version = 2
 edition = 6
 license = "Apache-2.0"
-backends = ["cuda"]
+backends = [
+    "cuda",
+    "rocm",
+]
 
 [general.hub]
 repo-id = "kernels-community/cv-utils"
@@ -16,6 +19,7 @@ src = [
 
 [torch.stable-abi]
 cuda = "2.10"
+rocm = "2.10"
 
 [kernel.cv_utils]
 language = "cpp-cuda"
@@ -26,6 +30,33 @@ cuda-flags = [
     "-D__CUDA_NO_HALF2_OPERATORS__",
 ]
 depends = ["torch", "torch-stable-abi-shim"]
+src = [
+    "cv_utils/connected_components.cu",
+    "cv_utils/generic_nms.cu",
+    "cv_utils/stable_utils.h",
+]
+
+[kernel.cv_utils_rocm]
+language = "cpp-rocm"
+depends = ["torch", "torch-stable-abi-shim"]
+rocm-archs = [
+    "gfx906",
+    "gfx908",
+    "gfx90a",
+    "gfx940",
+    "gfx941",
+    "gfx942",
+    "gfx950",
+    "gfx1030",
+    "gfx1100",
+    "gfx1101",
+    "gfx1102",
+    "gfx1103",
+    "gfx1150",
+    "gfx1151",
+    "gfx1200",
+    "gfx1201",
+]
 src = [
     "cv_utils/connected_components.cu",
     "cv_utils/generic_nms.cu",

@@ -22,6 +22,8 @@ on:
       - "scripts/kernel_status_card.md"
       - "scripts/test_kernel_status_snapshot.py"
       - "scripts/kernel-status/**"
+      - "build-concurrency.json"
+      - ".github/workflows/generate-build-matrix.py"
       # test_dispatch.py sweeps every kernel's build.toml (parses it, checks the
       # declared backends map to a known build workflow), so a kernel manifest
       # change can break this suite too.
@@ -44,6 +46,8 @@ on:
       - "scripts/kernel_status_card.md"
       - "scripts/test_kernel_status_snapshot.py"
       - "scripts/kernel-status/**"
+      - "build-concurrency.json"
+      - ".github/workflows/generate-build-matrix.py"
       - "**/build.toml"
       - ".github/workflows/build*.yaml"
       - ".github/workflows/pr-autolabel.yml"

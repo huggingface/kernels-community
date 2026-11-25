@@ -6,7 +6,16 @@ import pytest
 import torch
 
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+transformers = pytest.importorskip("transformers")
+
+# transformers turns its hub kernel integration off for kernels versions it does not support.
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+    pytest.mark.skipif(
+        not transformers.utils.is_kernels_available(),
+        reason="transformers disables hub kernels for this kernels version",
+    ),
+]
 
 
 @dataclass(frozen=True)

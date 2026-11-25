@@ -579,10 +579,11 @@ jobs:
     timeout-minutes: 120
     steps:
       # The Nix installer and cachix need these; the base image is minimal.
+      # Triton needs a C compiler to build its launcher at test time.
       - name: Install base packages
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends ca-certificates curl xz-utils sudo
+          apt-get install -y --no-install-recommends ca-certificates curl xz-utils sudo gcc libc6-dev
 
       # Containers have no systemd, so install Nix without an init system.
       # The action's cached nix-installer is saved by non-root runners (uid
