@@ -1,0 +1,18 @@
+recipe version=1
+
+// The input is the upstream tree. It is pinned by the hash of the fetch, there
+// is no git checkout that `source` could verify.
+
+prune keep="einops/**"
+delete in="einops/tests/**"
+
+relativize_imports in="einops/**" package_root="einops" changes=12
+
+// Load the submodules eagerly, so that they are accessible through `get_kernel`.
+ensure_import in="einops/__init__.py" from="." name="array_api"
+ensure_import in="einops/__init__.py" from="." name="experimental"
+ensure_import in="einops/__init__.py" from="." name="layers"
+ensure_import in="einops/__init__.py" from="." name="packing"
+ensure_import in="einops/__init__.py" from="." name="parsing"
+
+move from="einops" to="."
