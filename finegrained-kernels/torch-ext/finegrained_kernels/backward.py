@@ -279,7 +279,7 @@ def dgrad_matmul_2d_kernel(
     )
 
 
-@compile_time_only_triton_op("finegrained::dgrad_matmul_2d", mutates_args=())
+@compile_time_only_triton_op(add_op_namespace_prefix("dgrad_matmul_2d"), mutates_args=())
 def dgrad_matmul_2d(
     dY: torch.Tensor,
     W: torch.Tensor,
@@ -549,7 +549,7 @@ def dgrad_matmul_grouped_kernel(
             )
 
 
-@compile_time_only_triton_op("finegrained::dgrad_matmul_grouped", mutates_args=())
+@compile_time_only_triton_op(add_op_namespace_prefix("dgrad_matmul_grouped"), mutates_args=())
 def dgrad_matmul_grouped(
     dY: torch.Tensor,
     W: torch.Tensor,
@@ -836,7 +836,7 @@ def dgrad_matmul_batched_kernel(
     )
 
 
-@compile_time_only_triton_op("finegrained::dgrad_matmul_batched", mutates_args=())
+@compile_time_only_triton_op(add_op_namespace_prefix("dgrad_matmul_batched"), mutates_args=())
 def dgrad_matmul_batched(
     dY: torch.Tensor,
     W: torch.Tensor,
