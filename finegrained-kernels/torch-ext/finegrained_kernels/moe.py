@@ -386,6 +386,13 @@ def _fused_post_expert_norm(down_out, post_expert_norm, weight, eps):
     return _post_expert_norm(down_out, post_expert_norm, weight, eps), {}
 
 
+def _trains(hidden_states: torch.Tensor) -> bool:
+    """Whether the chain differentiates into the hidden states. Every GEMM then takes a full-precision input it
+    quantizes itself: a gradient cannot cross a quantized tensor (autograd would cast it to FP8 / FP4). The routing
+    weights' gradient needs no such change, since the reduce reads the rows in full precision either way."""
+    return torch.is_grad_enabled() and hidden_states.requires_grad
+
+
 def _gate_up_activations(hidden, fmt, gate_up_scale, global_scale, activation_scale, scatter_idx, expert_start, pre_quant_scale=None):
     """``(A, As)`` for the grouped gate_up. Under a shared global on swizzled MX weights, ``hidden``
     is quantized once with its scales stored straight into each routed row's expert tile, which
@@ -509,7 +516,8 @@ def moe_fused_grouped(
     # a per-token (tensor-wide / row-wise) intermediate scale spans the whole row, which the
     # gate_up epilogue's tiles never see: the down quantizes the bf16 intermediate instead
     per_token = per_token_activations(gate_up_proj, gate_up_proj_scale_inv)
-    gate_up_in, gate_up_in_scale = _gate_up_activations(
+    trains = _trains(hidden_states)
+    gate_up_in, gate_up_in_scale = (hidden_states, gate_up_proj_activation_scale) if trains else _gate_up_activations(
         hidden_states, fmt, gate_up_proj_scale_inv, gate_up_proj_input_global_scale,
         gate_up_proj_activation_scale, scatter_idx, expert_start, gate_up_proj_pre_quant_scale,
     )
@@ -525,7 +533,7 @@ def moe_fused_grouped(
         a_pre_quant_scale=gate_up_proj_pre_quant_scale,
         # the intermediate requant normalizes against the DOWN's calibrated input global,
         # which the down then consumes as its activation global — the two-level handoff
-        output_global_scale=down_proj_input_global_scale if down_proj_pre_quant_scale is None else None,
+        output_global_scale=down_proj_input_global_scale if down_proj_pre_quant_scale is None and not trains else None,
         expert_start=expert_start,
         **glu,
         bias=gate_up_proj_bias,
@@ -533,7 +541,10 @@ def moe_fused_grouped(
         # no requant. So does static, whose epilogue has no calibrated scale to requant against.
         activation_format=fmt,
         activation_scale_ub=activation_scale_ub,
-        quantize_output=fused and fmt != "bf16" and not static_act and not per_token and down_proj_pre_quant_scale is None,
+        quantize_output=(
+            fused and fmt != "bf16" and not static_act and not per_token and down_proj_pre_quant_scale is None
+            and not trains
+        ),
         output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,
         # the dgrad of this gather-only launch stores each routed row token-major through it
@@ -660,6 +671,7 @@ def moe_fused_batched(
     static_act = gate_up_proj_activation_scale is not None or down_proj_activation_scale is not None
     # A per-token scale spans the whole intermediate row, so the down projection quantizes it.
     per_token = per_token_activations(gate_up_proj, gate_up_proj_scale_inv)
+    trains = _trains(hidden_states)
     gate_up_out = matmul_batched(
         hidden_states,
         gate_up_proj,
@@ -671,7 +683,7 @@ def moe_fused_batched(
         b_perm=gate_up_proj_weight_perm,
         a_pre_quant_scale=gate_up_proj_pre_quant_scale,
         # the two-level handoff, as in the grouped sibling
-        output_global_scale=down_proj_input_global_scale if down_proj_pre_quant_scale is None else None,
+        output_global_scale=down_proj_input_global_scale if down_proj_pre_quant_scale is None and not trains else None,
         expert_ids=expert_ids,
         **glu,
         bias=gate_up_proj_bias,
@@ -691,6 +703,7 @@ def moe_fused_batched(
             and not static_act
             and not per_token
             and down_proj_pre_quant_scale is None
+            and not trains
         ),
         output_dtype=hidden_states.dtype,
     )

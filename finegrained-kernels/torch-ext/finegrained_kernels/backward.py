@@ -78,7 +78,7 @@ from .compat import (
     split_k_autotuning_configs,
 )
 from .descriptors import maybe_descriptor, rebind_dgrad_descriptors, rebind_dgrad_grouped_descriptors, weight_descriptor
-from . import batched, grouped, matmul
+from . import batched, grouped, matmul, moe
 from .matmul import SPLIT_K_VALUES, matmul_2d, split_k_reduce, split_k_workspace
 from .pruners import (
     PATH_ANCHOR_AXES,
@@ -97,7 +97,8 @@ from .quant import e2m1_cols_to_bf16, e2m1_cols_to_f32
 from .loading.scales import decode_group_scale
 from .mma import int_dequant_tile
 from .loading.tiles import load_grouped_act_tile, operand_tile_ptrs
-from .scheduling import build_tile_layout, resolve_grouped_tile
+from .norm import norm_column_factor
+from .scheduling import build_tile_layout, is_off_rank, resolve_grouped_tile
 
 
 # Internal: these are the gradient PRODUCTS, not API. Backward hangs off the forward ops via
@@ -840,6 +841,82 @@ def glu_backward(
     return dZ
 
 
+@triton.jit
+def _weighted_reduce_backward_kernel(
+    DY,  # (num_groups, H) upstream gradient of the reduced rows
+    Rows,  # (num_groups * NUM_TOP_K, H) the forward's rows, group-major
+    Ids,  # (num_groups * NUM_TOP_K,) per-row id; an ``is_off_rank`` row is skipped
+    Weights,  # (num_groups * NUM_TOP_K,) per-row routing weight
+    NormWeight,  # (H,) fused norm weight; None folds the arm out
+    NormInv,  # (num_groups * NUM_TOP_K,) the forward's per-row rsqrt
+    DRows,  # (num_groups * NUM_TOP_K, H) out: gradient of the rows
+    DWeights,  # (num_groups * NUM_TOP_K,) out: gradient of the routing weights
+    H,
+    stride_dy_m,
+    stride_rows_m,
+    stride_drows_m,
+    NUM_TOP_K: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    NORM: tl.constexpr = None,
+):
+    """``weighted_reduce``'s backward, one program per row ``r`` of group ``g = r // NUM_TOP_K``. Both gradients share
+    one reduction, ``R = sum_h dY[g] * x * factor`` (factor 1 without a norm):
+    - ``dWeights[r] = inv * R``;
+    - ``DRows[r] = w * dY[g] * factor * inv``, plus under a norm the term through ``inv``,
+      ``-w * R * inv**3 / H * x`` (times ``factor**2`` in the input-scaled form, whose rsqrt is over ``x * factor``).
+    A sentinel row's values and rsqrt are masked at the load: they were never written."""
+    r = tl.program_id(0).to(tl.int64)
+    kept = ~is_off_rank(tl.load(Ids + r), NUM_EXPERTS)
+    weight = tl.where(kept, tl.load(Weights + r).to(tl.float32), 0.0)
+    inv = 1.0
+    if NORM is not None:
+        inv = tl.load(NormInv + r, mask=kept, other=0.0).to(tl.float32)
+    dy_row = DY + (r // NUM_TOP_K) * stride_dy_m
+    acc = tl.zeros((BLOCK_H,), tl.float32)
+    for h in range(0, H, BLOCK_H):
+        offs_h = h + tl.arange(0, BLOCK_H)
+        mask = offs_h < H
+        dy = tl.load(dy_row + offs_h, mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(Rows + r * stride_rows_m + offs_h, mask=mask & kept, other=0.0).to(tl.float32)
+        if NORM is not None:
+            x = x * norm_column_factor(NormWeight, offs_h, mask, NORM)
+        acc += dy * x
+    reduced = tl.sum(acc, axis=0)
+    tl.store(DWeights + r, (inv * reduced).to(DWeights.dtype.element_ty))
+    through_inv = -weight * reduced * inv * inv * inv / H
+    for h in range(0, H, BLOCK_H):
+        offs_h = h + tl.arange(0, BLOCK_H)
+        mask = offs_h < H
+        d_row = weight * tl.load(dy_row + offs_h, mask=mask, other=0.0).to(tl.float32)
+        if NORM is not None:
+            x = tl.load(Rows + r * stride_rows_m + offs_h, mask=mask & kept, other=0.0).to(tl.float32)
+            factor = norm_column_factor(NormWeight, offs_h, mask, NORM)
+            if NORM == "input_scaled_rms_norm":
+                d_row = d_row * factor * inv + through_inv * x * factor * factor
+            else:
+                d_row = d_row * factor * inv + through_inv * x
+        tl.store(DRows + r * stride_drows_m + offs_h, d_row.to(DRows.dtype.element_ty), mask=mask)
+
+
+def _weighted_reduce_dgrad(ctx, dY, rows, top_k_index, top_k_weights, num_experts, norm, norm_inv, norm_weight):
+    """Row ``t*K + k`` is token ``t``'s ``k``-th route, so each row's upstream gradient is its token's: the rows' and
+    the routing weights' gradients in one pass per row (``_weighted_reduce_backward_kernel``)."""
+    rows, dY = rows.contiguous(), dY.contiguous()  # the kernel walks H at unit stride
+    num_rows = rows.shape[0]
+    d_rows = torch.empty_like(rows)
+    d_weights = torch.empty(num_rows, device=rows.device, dtype=top_k_weights.dtype)
+    with device_context(rows.device):
+        compile_time_only_triton_wrap(_weighted_reduce_backward_kernel)[(num_rows,)](
+            dY, rows, top_k_index.reshape(-1).contiguous(), top_k_weights.reshape(-1).contiguous(),
+            norm_weight, None if norm_inv is None else norm_inv.reshape(-1), d_rows, d_weights,
+            rows.shape[1], dY.stride(0), rows.stride(0), d_rows.stride(0),
+            NUM_TOP_K=top_k_index.shape[1], NUM_EXPERTS=num_experts,
+            BLOCK_H=min(triton.next_power_of_2(rows.shape[1]), 1024), NORM=norm, num_warps=4,
+        )
+    return {"rows": d_rows, "top_k_weights": d_weights.view_as(top_k_weights)}
+
+
 @bayesian_autotune(
     # Neither a BLOCK_SIZE_M nor a WARP_SPEC axis. One row per program (the rows are not
     # expert-sorted, so a tile cannot span them) and the reduce is FMA rather than MMA, so there is
@@ -865,11 +942,12 @@ def dgrad_matmul_batched_kernel(
     stride_bs_global,  # expert stride of BsGlobal (0 broadcasts a scalar)
     C,  # (S, K) output gradient
     Perm,  # (E, K) act-order K orders: column j of an expert's product is stored at Perm[e, j]; None = natural
-    ExpertIds,  # (S,) which expert each row routed to
+    ExpertIds,  # (S,) which expert each row routed to; an ``is_off_rank`` row (EP sentinel) gets a zero gradient
     # Shape
     S,
     N,
     K,
+    num_experts,
     # Strides
     stride_a_m,
     stride_a_n,
@@ -903,6 +981,8 @@ def dgrad_matmul_batched_kernel(
     pid_k = tl.program_id(1)
     row_ok = pid_m < S
     expert_id = tl.load(ExpertIds + pid_m, mask=row_ok, other=0).to(tl.int64)
+    kept = ~is_off_rank(expert_id, num_experts)  # a sentinel names no local weight: no loop, a zero row
+    expert_id = tl.where(kept, expert_id, 0)
 
     offs_k = pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
     offs_kb = tl.minimum(
@@ -918,7 +998,7 @@ def dgrad_matmul_batched_kernel(
     # conclusion for its decode path (``mx_weight_only_scalar_swapped``) — the scalar arm wins at
     # M=1 and the tuner picks it there. Same reduction, no MMA, no padded M dimension.
     accumulator = tl.zeros((BLOCK_SIZE_K,), dtype=tl.float32)
-    for n in tl.range(0, tl.cdiv(N, BLOCK_SIZE_N)):
+    for n in tl.range(0, tl.where(kept, tl.cdiv(N, BLOCK_SIZE_N), 0)):
         offs_n = n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         dy = tl.load(
             A + pid_m * stride_a_m + offs_n * stride_a_n,
@@ -976,7 +1056,7 @@ def dgrad_matmul_batched(
     grid = lambda META: (S, triton.cdiv(K, META["BLOCK_SIZE_K"]))  # noqa: E731
     with device_context(dY.device):
         compile_time_only_triton_wrap(dgrad_matmul_batched_kernel)[grid](
-            dY, W, Ws, w_zero, w_global_scale, global_scale_stride(w_global_scale), dX, perm, expert_ids, S, N, K,
+            dY, W, Ws, w_zero, w_global_scale, global_scale_stride(w_global_scale), dX, perm, expert_ids, S, N, K, W.shape[0],
             dY.stride(0), dY.stride(1),
             W.stride(0), W.stride(1), W.stride(2),
             *_scale_strides(Ws, 3),
@@ -1164,7 +1244,9 @@ __all__: list[str] = []
 
 def _register(op, reads, dgrad):
     """Attach ``dgrad`` to ``op``. It receives ``ctx``, the output gradient and the ``reads`` parameters by name, and
-    returns the activation's gradient; weights and scales take none (a quantized tensor cannot be an autograd leaf).
+    returns the first input's gradient, or ``{name: gradient}`` for several inputs. Every other input stays frozen,
+    and asking it for a gradient raises: weights and scales take none (a quantized tensor cannot be an autograd leaf),
+    and neither do biases or norm weights.
     A fused GLU (``gate`` with an ``act_fn``) differentiates through ``glu_backward`` at its saved pre-activation (the
     op's last output under ``save_pre_activation``, set by the dispatchers whenever the input takes a gradient), the
     resulting ``(rows, 2N)`` gradient then an ungated product over the 2N-row gate|up weight."""
@@ -1187,12 +1269,10 @@ def _register(op, reads, dgrad):
     def backward(ctx, *grads):
         # `needs_input_grad` is sized to the args as invoked plus torch's trailing metadata slot
         n_grads = len(ctx.needs_input_grad)
-        if not ctx.needs_input_grad[0]:
-            return (None,) * n_grads
         dY = grads[0]
         while isinstance(dY, (list, tuple)):  # the ops return list[Tensor]
             dY = dY[0]
-        if dY is None:
+        if dY is None or not any(ctx.needs_input_grad):
             return (None,) * n_grads
         saved = dict(zip(ctx.tensor_names, ctx.saved_tensors))
         pre_activation = saved.pop("pre_activation", None)
@@ -1202,7 +1282,14 @@ def _register(op, reads, dgrad):
             dY = glu_backward(dY.reshape(pre_activation.shape[0], -1).contiguous(), pre_activation, *ctx.glu)
             if "Bs" in saved:
                 saved["Bs"] = _ungated_scale_rows(saved["Bs"], pre_activation.shape[1])
-        return (dgrad(ctx, dY, **saved, **ctx.config),) + (None,) * (n_grads - 1)
+        computed = dgrad(ctx, dY, **saved, **ctx.config)
+        if not isinstance(computed, dict):
+            computed = {names[0]: computed}
+        out = [computed.get(name) if needed else None for name, needed in zip(names, ctx.needs_input_grad)]
+        for name, needed, grad in zip(names, ctx.needs_input_grad, out):
+            if needed and grad is None:
+                raise NotImplementedError(f"{op.__name__}: no gradient for {name!r}, which the backward keeps frozen")
+        return (*out, *(None,) * (n_grads - len(out)))
 
     torch.library.register_autograd(add_op_namespace_prefix(op.__name__), backward, setup_context=setup_context)
 
@@ -1240,3 +1327,7 @@ for _op in (batched.w8a8_block_dynamic_fp8_matmul_batched, batched.w8a8_block_st
 _register(batched.mx_dynamic_matmul_batched, (*_BATCHED, "a_pre_quant_scale"), _with_input_transform(_batched_dgrad))
 _register(batched.int_weight_only_matmul_batched, ("B", "Bs", "expert_ids", "scatter_idx", *_INT),
           _with_input_transform(_int_batched_dgrad))
+
+# routing-weighted top-k reduce: the rows' and the routing weights' gradients
+_register(moe.weighted_reduce, ("rows", "top_k_index", "top_k_weights", "num_experts", "norm", "norm_inv",
+                                "norm_weight"), _weighted_reduce_dgrad)

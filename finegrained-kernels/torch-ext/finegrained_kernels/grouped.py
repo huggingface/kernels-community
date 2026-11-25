@@ -3235,11 +3235,13 @@ def matmul_grouped(
         b_zero, b_perm, a_pre_quant_scale, activation_format, quantize_output, activation_scale_ub,
     )
     assert act_fn is not None or not quantize_output, "the raw gate|up output (act_fn=None) is not requantized"
-    if gather_idx is not None and activation_format == "bf16" and As is None and a_pre_quant_scale is None:
+    if (gather_idx is not None and activation_format == "bf16" and As is None and a_pre_quant_scale is None
+            and not (torch.is_grad_enabled() and A.requires_grad)):
         # weight-only: raw bf16 rows are what the kernel consumes, so the trade is decided
         # here; the QUANTIZED formats decide it in their family wrappers AFTER the act quant
         # (expanding packed rows + scales — see ``expand_gather_below_parity``). An AWQ input
         # transform combines the sorted copy and column scaling in its preparation pass below.
+        # A training input keeps the gather: the copy happens outside the op, out of autograd's sight.
         A, _, gather_idx = expand_gather_below_parity(A, None, gather_idx, B.shape[0], expert_start)
     if B.dtype == FP8_DTYPE and Bs is not None and not is_mx(B, Bs) and activation_format == "bf16":
         assert As is None and not quantize_output, "weight-only takes raw activations without requantization"

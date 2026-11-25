@@ -605,3 +605,214 @@ def test_dgrad_grouped_every_admitted_config_accumulates():
     assert not wrong, f"{len(wrong)} config(s) break top-k accumulation, e.g. {wrong[0]}"
     # strict (the test default, see conftest): the pruners admitted a config that cannot run
     assert not failed or tuner.max_failures != 0, f"{len(failed)} admitted config(s) failed to run, e.g. {failed[0]}"
+
+
+# ── fused MoE, end to end ────────────────────────────────────────────────────────
+# `moe_fused_*` chain the gate_up (fused GLU), the down and the routing-weighted reduce. These pin the gradients a
+# fine-tune takes out of the experts, into the hidden states and through the routing weights into the router's,
+# against autograd over an fp32 reference on the dequantized weights.
+
+MOE_T, MOE_TOP_K, MOE_E, MOE_H, MOE_I = 16, 2, 4, 256, 256
+MOE_FORMATS = [  # (weights, activation_format): None follows the weights
+    ("fp8_128x128", None),
+    ("mxfp8", None),
+    ("nvfp4", None),
+    ("mxfp4", None),  # W4A4
+    ("mxfp4", "bf16"),  # W4A16, the QLoRA base
+    ("int4", None),
+    ("bf16", None),
+]
+MOE_FORWARDS = ["moe_fused_grouped", "moe_fused_batched"]
+
+
+def _moe_glu(z, alpha=None, limit=None):
+    """The fused epilogue's SwiGLU over interleaved gate|up columns, written independently."""
+    g, u = z[..., 0::2], z[..., 1::2]
+    if limit is not None:
+        g, u = g.clamp(max=limit), u.clamp(-limit, limit)
+    if alpha is not None:
+        return (u + 1) * g * torch.sigmoid(alpha * g)
+    return u * torch.nn.functional.silu(g)
+
+
+def _moe_norm(y, norm, weight, eps=1e-6):
+    if norm is None:
+        return y
+    factor = weight.float() if norm == "rms_norm" else 1.0 + weight.float()
+    scaled = y * factor if norm == "input_scaled_rms_norm" else y
+    return y * factor * torch.rsqrt(scaled.pow(2).mean(-1, keepdim=True) + eps)
+
+
+def _moe_reference(x, top_k_index, top_k_weights, gate_up, down, alpha=None, limit=None, gate_up_bias=None,
+                   down_bias=None, norm=None, norm_weight=None):
+    """fp32 MoE over dequantized weights: the gradient target the quantized chain approximates."""
+    kept = (top_k_index >= 0) & (top_k_index < gate_up.shape[0])  # EP sentinels (E, or -1) route nowhere
+    idx = top_k_index.long().clamp(0, gate_up.shape[0] - 1)
+    z = torch.einsum("th,tknh->tkn", x.float(), gate_up[idx])
+    if gate_up_bias is not None:
+        z = z + gate_up_bias.float()[idx]
+    y = torch.einsum("tki,tkhi->tkh", _moe_glu(z, alpha, limit), down[idx])
+    if down_bias is not None:
+        y = y + down_bias.float()[idx]
+    y = _moe_norm(y, norm, norm_weight)
+    return (y * (top_k_weights.float() * kept)[..., None]).sum(1)
+
+
+def _moe_problem(weights, activation_format, sentinels=0, sentinel_id=MOE_E, scale=1.0):
+    torch.manual_seed(0)
+    row = WEIGHTS[weights]
+    gate_up, gate_up_s, gate_up_g = row["make"](2 * MOE_I, MOE_H, MOE_E)
+    down, down_s, down_g = row["make"](MOE_H, MOE_I, MOE_E)
+    x = scale * torch.randn(MOE_T, MOE_H, device=TEST_DEVICE, dtype=torch.bfloat16)
+    top_k_index = torch.randn(MOE_T, MOE_E, device=TEST_DEVICE).topk(MOE_TOP_K, dim=-1).indices.to(torch.int32)
+    if sentinels:
+        top_k_index.view(-1)[torch.randperm(top_k_index.numel(), device=TEST_DEVICE)[:sentinels]] = sentinel_id
+    top_k_weights = torch.rand(MOE_T, MOE_TOP_K, device=TEST_DEVICE, dtype=torch.bfloat16)
+    kwargs = dict(
+        gate_up_proj=gate_up, down_proj=down, gate_up_proj_scale_inv=gate_up_s, down_proj_scale_inv=down_s,
+        gate_up_proj_weight_global_scale=gate_up_g, down_proj_weight_global_scale=down_g,
+        activation_format=activation_format,
+    )
+    dequant = (dequant_gate_up(row, gate_up, gate_up_s, gate_up_g), row["dequant"](down, down_s, down_g))
+    if weights == "nvfp4" and activation_format is None:
+        # the calibrated activation globals an NVFP4 checkpoint ships (`input_scale`): without them the test
+        # weights saturate every NVFP4 activation and the comparison says nothing
+        idx = top_k_index.long().clamp(0, MOE_E - 1)
+        inter = _moe_glu(torch.einsum("th,tknh->tkn", x.float(), dequant[0][idx]))
+        kwargs["gate_up_proj_input_global_scale"] = (x.float().abs().amax() / (6.0 * 448.0)).reshape(1)
+        kwargs["down_proj_input_global_scale"] = (inter.abs().amax() / (6.0 * 448.0)).reshape(1)
+    return x, top_k_index, top_k_weights, kwargs, dequant
+
+
+def _moe_grads(forward, x, top_k_index, top_k_weights, grad_out, train_hidden=True, **kwargs):
+    x = x.detach().clone().requires_grad_(train_hidden)
+    w = top_k_weights.detach().clone().requires_grad_(True)
+    out = getattr(fg, forward)(x, top_k_index, w, **kwargs)
+    out.backward(grad_out)
+    return out, x.grad, w.grad
+
+
+def _reference_grads(x, top_k_index, top_k_weights, grad_out, dequant, **kwargs):
+    x = x.detach().float().requires_grad_(True)
+    w = top_k_weights.detach().float().requires_grad_(True)
+    out = _moe_reference(x, top_k_index, w, *dequant, **kwargs)
+    out.backward(grad_out.float())
+    return out, x.grad, w.grad
+
+
+def _assert_moe_grads(out, dx, dw, ref_out, ref_dx, ref_dw):
+    """The forward's own quantization error bounds what the backward can reach."""
+    floor = _rel(out, ref_out)
+    bound = max(2 * floor, 5e-2)
+    assert dw is not None and torch.isfinite(dw.float()).all()
+    assert _rel(dw, ref_dw) < bound, f"dw {_rel(dw, ref_dw):.2e} (forward {floor:.2e})"
+    if ref_dx is not None:
+        assert dx is not None and dx.dtype == torch.bfloat16 and torch.isfinite(dx.float()).all()
+        assert _rel(dx, ref_dx) < bound, f"dx {_rel(dx, ref_dx):.2e} (forward {floor:.2e})"
+
+
+@pytest.mark.parametrize("forward", MOE_FORWARDS)
+@pytest.mark.parametrize("weights,activation_format", MOE_FORMATS)
+def test_moe_backward_matches_reference(weights, activation_format, forward):
+    """Hidden-state and routing-weight gradients through the whole chain, EP sentinels included."""
+    x, top_k_index, top_k_weights, kwargs, dequant = _moe_problem(weights, activation_format, sentinels=4)
+    grad_out = torch.randn(MOE_T, MOE_H, device=TEST_DEVICE, dtype=torch.bfloat16)
+    _assert_moe_grads(
+        *_moe_grads(forward, x, top_k_index, top_k_weights, grad_out, **kwargs),
+        *_reference_grads(x, top_k_index, top_k_weights, grad_out, dequant),
+    )
+
+
+@pytest.mark.kernels_ci
+def test_moe_fused_grouped_backward_fp8():
+    """The cheap CI subset: block FP8 through the grouped (prefill) forward."""
+    test_moe_backward_matches_reference("fp8_128x128", None, "moe_fused_grouped")
+
+
+@pytest.mark.parametrize("sentinel_id", [MOE_E, -1])  # any id outside [0, E) is another rank's
+@pytest.mark.parametrize("forward", MOE_FORWARDS)
+def test_moe_backward_skips_ep_sentinels(forward, sentinel_id):
+    """A sentinel slot routes to no local expert: its routing weight takes exactly zero gradient."""
+    x, top_k_index, top_k_weights, kwargs, dequant = _moe_problem("mxfp8", None, sentinels=6, sentinel_id=sentinel_id)
+    grad_out = torch.randn(MOE_T, MOE_H, device=TEST_DEVICE, dtype=torch.bfloat16)
+    out, dx, dw = _moe_grads(forward, x, top_k_index, top_k_weights, grad_out, **kwargs)
+    sentinel = top_k_index == sentinel_id
+    assert sentinel.any() and (dw[sentinel] == 0).all(), "a sentinel slot received a gradient"
+    _assert_moe_grads(out, dx, dw, *_reference_grads(x, top_k_index, top_k_weights, grad_out, dequant))
+
+
+@pytest.mark.parametrize("forward", MOE_FORWARDS)
+def test_moe_backward_clamped_swiglu_with_bias(forward):
+    """The GPT-OSS arm: alpha-scaled, limit-clamped SwiGLU, both projections biased (frozen). The hidden states are
+    scaled so a few percent of the gates saturate, as in a trained model, so the clamp's zero gradient is exercised
+    without the MXFP8 error deciding which ones saturate."""
+    x, top_k_index, top_k_weights, kwargs, dequant = _moe_problem("mxfp8", None, scale=0.2)
+    gate_up_bias = torch.randn(MOE_E, 2 * MOE_I, device=TEST_DEVICE, dtype=torch.bfloat16)
+    down_bias = 0.1 * torch.randn(MOE_E, MOE_H, device=TEST_DEVICE, dtype=torch.bfloat16)
+    idx = top_k_index.long()
+    z = torch.einsum("th,tknh->tkn", x.float(), dequant[0][idx]) + gate_up_bias.float()[idx]
+    saturated = (z[..., 0::2] >= 7.0).float().mean()
+    assert 0 < saturated < 0.1, f"{saturated:.1%} of the gates saturate: the clamp is untested or dominant"
+    grad_out = torch.randn(MOE_T, MOE_H, device=TEST_DEVICE, dtype=torch.bfloat16)
+    _assert_moe_grads(
+        *_moe_grads(forward, x, top_k_index, top_k_weights, grad_out, gate_up_proj_bias=gate_up_bias,
+                    down_proj_bias=down_bias, swiglu_alpha=1.702, swiglu_limit=7.0, **kwargs),
+        *_reference_grads(x, top_k_index, top_k_weights, grad_out, dequant, alpha=1.702, limit=7.0,
+                          gate_up_bias=gate_up_bias, down_bias=down_bias),
+    )
+
+
+@pytest.mark.parametrize("norm", ["rms_norm", "centered_rms_norm", "input_scaled_rms_norm"])
+@pytest.mark.parametrize("forward", MOE_FORWARDS)
+def test_moe_backward_through_post_expert_norm(forward, norm):
+    """A named post-expert norm rides inside the forward's reduce, its rows never materialized; the reduce's
+    backward differentiates it, the per-row rsqrt included."""
+    x, top_k_index, top_k_weights, kwargs, dequant = _moe_problem("mxfp8", None)
+    norm_weight = 0.5 * torch.rand(MOE_H, device=TEST_DEVICE, dtype=torch.bfloat16)
+    grad_out = torch.randn(MOE_T, MOE_H, device=TEST_DEVICE, dtype=torch.bfloat16)
+    _assert_moe_grads(
+        *_moe_grads(forward, x, top_k_index, top_k_weights, grad_out, post_expert_norm=norm,
+                    post_expert_norm_weight=norm_weight, **kwargs),
+        *_reference_grads(x, top_k_index, top_k_weights, grad_out, dequant, norm=norm, norm_weight=norm_weight),
+    )
+
+
+def test_moe_backward_router_only():
+    """Only the router trains: the hidden states take no gradient, so the chain keeps its quantized intermediate
+    handoff and the routing weights' gradient still comes out of the reduce."""
+    x, top_k_index, top_k_weights, kwargs, dequant = _moe_problem("fp8_128x128", None)
+    grad_out = torch.randn(MOE_T, MOE_H, device=TEST_DEVICE, dtype=torch.bfloat16)
+    out, dx, dw = _moe_grads("moe_fused_grouped", x, top_k_index, top_k_weights, grad_out, train_hidden=False,
+                             **kwargs)
+    assert dx is None
+    ref_out, _, ref_dw = _reference_grads(x, top_k_index, top_k_weights, grad_out, dequant)
+    _assert_moe_grads(out, None, dw, ref_out, None, ref_dw)
+
+
+def test_moe_backward_through_expanded_gather():
+    """Prefill row counts trade the gate_up's in-kernel gather for one contiguous copy (``expand_regime``), laid out
+    by sorted position: its gradient must sum back per token. The shared problem is too small to reach it."""
+    num_tokens, top_k, num_experts = 2048, 2, 8
+    assert internals.scheduling.expand_regime(num_tokens * top_k, num_experts)
+    torch.manual_seed(0)
+    gate_up = (0.05 * torch.randn(num_experts, 2 * MOE_I, MOE_H, device=TEST_DEVICE)).to(torch.bfloat16)
+    down = (0.05 * torch.randn(num_experts, MOE_H, MOE_I, device=TEST_DEVICE)).to(torch.bfloat16)
+    x = torch.randn(num_tokens, MOE_H, device=TEST_DEVICE, dtype=torch.bfloat16)
+    top_k_index = torch.randn(num_tokens, num_experts, device=TEST_DEVICE).topk(top_k, dim=-1).indices.to(torch.int32)
+    top_k_weights = torch.rand(num_tokens, top_k, device=TEST_DEVICE, dtype=torch.bfloat16)
+    grad_out = torch.randn(num_tokens, MOE_H, device=TEST_DEVICE, dtype=torch.bfloat16)
+    out, dx, dw = _moe_grads("moe_fused_grouped", x, top_k_index, top_k_weights, grad_out, gate_up_proj=gate_up,
+                             down_proj=down, gate_up_proj_scale_inv=None, down_proj_scale_inv=None)
+    ref_out, ref_dx, ref_dw = _reference_grads(x, top_k_index, top_k_weights, grad_out, (gate_up.float(), down.float()))
+    assert _rel(out, ref_out) < 2e-2
+    assert _rel(dx, ref_dx) < 2e-2, f"dx {_rel(dx, ref_dx):.2e}"
+    assert _rel(dw, ref_dw) < 2e-2, f"dw {_rel(dw, ref_dw):.2e}"
+
+
+def test_moe_backward_refuses_a_trained_bias():
+    """Biases stay frozen with the quantized base: one asking for a gradient raises instead of getting none."""
+    x, top_k_index, top_k_weights, kwargs, _ = _moe_problem("mxfp8", None)
+    bias = torch.zeros(MOE_E, MOE_H, device=TEST_DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    out = fg.moe_fused_grouped(x.requires_grad_(), top_k_index, top_k_weights, down_proj_bias=bias, **kwargs)
+    with pytest.raises(NotImplementedError, match="bias"):
+        out.sum().backward()
