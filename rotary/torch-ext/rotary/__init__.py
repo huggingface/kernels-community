@@ -34,8 +34,9 @@ def apply_rotary_transformers(
     return _ApplyRotary.apply(q, cos, sin), _ApplyRotary.apply(k, cos, sin)
 
 
-# Add torch compile support for functions
+# Add torch compile and backward support for functions
 apply_rotary_transformers.can_torch_compile = True
+apply_rotary_transformers.has_backward = True
 
 
 # Keeping `apply_rotary` and `apply_rotary_transformers` for BC

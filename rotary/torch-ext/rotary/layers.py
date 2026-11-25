@@ -27,6 +27,7 @@ class _ApplyRotary(torch.autograd.Function):
 
 class apply_rotary_transformers(nn.Module):
     can_torch_compile = True
+    has_backward = True
 
     def forward(
         self,
