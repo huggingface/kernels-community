@@ -209,16 +209,16 @@ def naive_chunk_kda(
 
 
 @pytest.mark.kernels_ci
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_gated_delta_rule_dg_strong_decay():
-    # Gated DeltaNet layers decay strongly (g = -exp(A_log) * softplus(...)), where TF32 dots used to break dg in fp32
-    if not torch.cuda.is_available():
-         pytest.skip("only sanity checking cuda for now")
-
+    # TF32 dots used to break dg in fp32 under strong decay (fla-org/flash-linear-attention#1802)
     torch.manual_seed(42)
 
     B, T, H, D = 2, 128, 4, 64
     q, k = (F.normalize(torch.randn(B, T, H, D, device="cuda"), dim=-1) for _ in range(2))
     v, do = (torch.randn(B, T, H, D, device="cuda") for _ in range(2))
+    # As strong as in Gated DeltaNet layers, where exp(A_log) goes up to 16. With the logsigmoid decay of the
+    # other tests, the dg error was only 3e-3 before the fix.
     g = -16 * F.softplus(torch.randn(B, T, H, device="cuda"))
     beta = torch.rand(B, T, H, device="cuda")
 
