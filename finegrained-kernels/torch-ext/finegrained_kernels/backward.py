@@ -1034,6 +1034,18 @@ def _int_batched_dgrad(ctx, dY, B, expert_ids, Bs, scatter_idx=None, b_zero=None
     return _token_sum(rows, ctx) if summed else rows
 
 
+def _ungated_scale_rows(Bs, rows):
+    """A gate|up weight's block-scale grid as the ungated ``rows``-row product over it reads it, one scale row per
+    weight row. Checkpoints quantize gate and up apart and interleave their rows and scale blocks, so the forward maps
+    row ``r`` to scale row ``2 * ((r // 2) // block) + r % 2`` (``weight_scale_rows``), not ``r // block``. A grid
+    already per row (MX, NVFP4, INT, row-wise), per tensor or swizzled is returned as is."""
+    if Bs is None or Bs.ndim not in (2, 3) or Bs.shape[-2] in (1, rows):
+        return Bs
+    block = rows // Bs.shape[-2]
+    r = torch.arange(rows, device=Bs.device)
+    return Bs.index_select(-2, 2 * ((r // 2) // block) + r % 2)
+
+
 def _dgrad_2d(ctx, dY, B, Bs, b_global_scale=None):
     """dA on the dgrad kernel (``dgrad_matmul_2d``): contract N against the forward-oriented tile decoded in registers,
     the NVFP4 second-level global folded on the accumulator."""
@@ -1047,7 +1059,10 @@ def _dgrad_2d(ctx, dY, B, Bs, b_global_scale=None):
 def _dgrad_transposed_weight(ctx, dY, B, Bs):
     """dA on the quantized weight reoriented by transposition: a per-tensor scalar is orientation-free and a block
     grid subdivides both axes, so transposing the grid is the tile's own reindexing. The grid is made contiguous
-    (strided, every tile's re-read cost 79 us of a 4096x8192x6144 dgrad for a ~3 KB copy); the weight stays a view."""
+    (strided, every tile's re-read cost 79 us of a 4096x8192x6144 dgrad for a ~3 KB copy); the weight stays a view.
+    A gate|up weight's grid is per row by then (``_ungated_scale_rows``), which only the dgrad kernel reads."""
+    if ctx.fused_glu:
+        return _dgrad_2d(ctx, dY, B, Bs)
     return matmul_2d(dY.contiguous(), B.t(), None, Bs if Bs.numel() == 1 else Bs.t().contiguous(), output_dtype=ctx.a_dtype)
 
 
@@ -1108,13 +1123,19 @@ __all__: list[str] = []
 def _register(op, reads, dgrad):
     """Attach ``dgrad`` to ``op``. It receives ``ctx``, the output gradient and the ``reads`` parameters by name, and
     returns the activation's gradient; weights and scales take none (a quantized tensor cannot be an autograd leaf).
-    A fused GLU (``gate`` with an ``act_fn``) is refused: its gradient needs the pre-activation."""
+    A fused GLU (``gate`` with an ``act_fn``) differentiates through ``glu_backward`` at its saved pre-activation (the
+    op's last output under ``save_pre_activation``, set by the dispatchers whenever the input takes a gradient), the
+    resulting ``(rows, 2N)`` gradient then an ungated product over the 2N-row gate|up weight."""
     names = list(inspect.signature(op).parameters)
 
     def setup_context(ctx, inputs, output):
         bound = dict(zip(names, inputs))
         ctx.fused_glu = bool(bound.get("gate")) and bound.get("act_fn") is not None
+        ctx.glu = (bound.get("act_fn"), bound.get("swiglu_alpha"), bound.get("swiglu_limit"))
         values = {name: bound.get(name) for name in reads}
+        if ctx.fused_glu and bound.get("save_pre_activation"):
+            values["pre_activation"] = output[-1]
+        ctx.set_materialize_grads(False)  # only the primary output's gradient is read
         ctx.tensor_names = [name for name, value in values.items() if isinstance(value, torch.Tensor)]
         ctx.save_for_backward(*(values[name] for name in ctx.tensor_names))
         ctx.config = {name: value for name, value in values.items() if name not in ctx.tensor_names}
@@ -1126,12 +1147,19 @@ def _register(op, reads, dgrad):
         n_grads = len(ctx.needs_input_grad)
         if not ctx.needs_input_grad[0]:
             return (None,) * n_grads
-        if ctx.fused_glu:
-            raise NotImplementedError(f"{op.__name__}: no backward through a fused GLU; call with act_fn=None")
         dY = grads[0]
         while isinstance(dY, (list, tuple)):  # the ops return list[Tensor]
             dY = dY[0]
+        if dY is None:
+            return (None,) * n_grads
         saved = dict(zip(ctx.tensor_names, ctx.saved_tensors))
+        pre_activation = saved.pop("pre_activation", None)
+        if ctx.fused_glu:
+            if pre_activation is None:
+                raise NotImplementedError(f"{op.__name__}: a fused GLU's gradient needs save_pre_activation=True")
+            dY = glu_backward(dY.reshape(pre_activation.shape[0], -1).contiguous(), pre_activation, *ctx.glu)
+            if "Bs" in saved:
+                saved["Bs"] = _ungated_scale_rows(saved["Bs"], pre_activation.shape[1])
         return (dgrad(ctx, dY, **saved, **ctx.config),) + (None,) * (n_grads - 1)
 
     torch.library.register_autograd(add_op_namespace_prefix(op.__name__), backward, setup_context=setup_context)

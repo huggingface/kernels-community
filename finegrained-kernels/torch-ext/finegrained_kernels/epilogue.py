@@ -140,6 +140,37 @@ def acc_finalize(
     return acc
 
 
+def pre_activation_buffer(rows: int, N: int, C: torch.Tensor, save: bool) -> torch.Tensor | None:
+    """A gated epilogue's ``(rows, 2N)`` pre-activation, the GLU backward's input, which the epilogue writes only when
+    given one; ``None`` unless saved. On ``C``'s device in its dtype, or bf16 behind an FP8 / FP4 requantized ``C``."""
+    if not save:
+        return None
+    dtype = C.dtype if C.dtype.is_floating_point and C.dtype.itemsize >= 2 else torch.bfloat16
+    return torch.empty(rows, 2 * N, device=C.device, dtype=dtype)
+
+
+def pre_activation_strides(pre_act: torch.Tensor | None) -> tuple[int, int]:
+    """``(row, column)`` strides of a pre-activation buffer, ``(0, 0)`` without one (the epilogue store folds out)."""
+    return (0, 0) if pre_act is None else (pre_act.stride(0), pre_act.stride(1))
+
+
+def with_pre_activation(outputs: list, pre_act: torch.Tensor | None) -> list:
+    """An op's outputs, the saved pre-activation last, where its backward reads it."""
+    return outputs if pre_act is None else [*outputs, pre_act]
+
+
+def needs_pre_activation(A: torch.Tensor, gate: bool, act_fn: str | None) -> bool:
+    """Whether a dispatcher's op saves its fused GLU's pre-activation: only when the input will take a gradient."""
+    return bool(gate) and act_fn is not None and torch.is_grad_enabled() and A.requires_grad
+
+
+def dispatcher_outputs(out: list, saved_pre_activation: bool):
+    """A dispatcher's return from its op's list (torch custom ops can't return a Tensor-or-tuple union): ``C``, or
+    ``(C, Cs)`` under ``quantize_output``, the saved pre-activation dropped."""
+    out = out[:-1] if saved_pre_activation else out
+    return out[0] if len(out) == 1 else tuple(out)
+
+
 def bias_strides(bias: torch.Tensor | None) -> tuple[int, int]:
     """(expert, column) strides for a per-expert output bias, for ``add_bias``. A 1-D bias is the
     single-expert 2D case, so its expert stride is 0. ``None`` gives (0, 0) — the kernel arm folds
@@ -680,7 +711,7 @@ def gemm_epilogue(
         # ordinary store serves it — no separate path, no gated store arm.
         if PreAct is not None:
             _store_out(
-                PreAct, flat,
+                PreAct + out_row.to(tl.int64) * stride_pa_m if FAKE_BATCH else PreAct, flat,  # pre-advanced like C
                 out_row, pid_n, row_mask, stride_pa_m, stride_pa_n,
                 BLOCK_SIZE_M, 2 * BLOCK_SIZE_N, FAKE_BATCH,
                 2 * N_COLS if N_COLS > 0 else 0,

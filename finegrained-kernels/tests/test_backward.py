@@ -32,6 +32,7 @@ quantized weight takes no gradient, because an fp8/fp4 tensor cannot be an autog
 import pytest
 import torch
 from utils import (  # type: ignore
+    dequant_gate_up,
     dequantize_weight,
     finegrained_kernels,
     internals,
@@ -50,6 +51,7 @@ dgrad_matmul_2d = internals.backward.dgrad_matmul_2d
 dgrad_matmul_batched = internals.backward.dgrad_matmul_batched
 dgrad_matmul_grouped = internals.backward.dgrad_matmul_grouped
 glu_backward = internals.backward.glu_backward
+apply_glu = internals.epilogue.apply_glu
 dgrad_matmul_grouped_kernel = internals.backward.dgrad_matmul_grouped_kernel
 
 
@@ -405,6 +407,53 @@ def test_dgrad_fp8_weight_only(route):
             0, tokens, torch.einsum("sn,snk->sk", grad_out.float(), W[experts]))
     out.backward(grad_out)
     assert _rel(A.grad, ref) < 1e-2, f"{route}: dA vs dequantized reference {_rel(A.grad, ref):.2e}"
+
+
+GATED_WEIGHTS = ["fp8_128x128", "mxfp8", "int4", "bf16"]
+
+
+@pytest.mark.parametrize("route", ["2d", "grouped", "batched"])
+@pytest.mark.parametrize("weights", GATED_WEIGHTS)
+def test_gated_dgrad(weights, route):
+    """A fused gate|up GLU differentiates through its saved pre-activation (the dispatchers save it whenever the
+    input takes a gradient): near torch autograd through ``apply_glu`` on the dequantized gate|up weight, gate rows
+    at ``0::2`` and up rows at ``1::2``."""
+    torch.manual_seed(0)
+    T, top_k, E = 64, 2, 4
+    B, Bs, g = WEIGHTS[weights]["make"](2 * N, K, 1 if route == "2d" else E)
+    W = dequant_gate_up(WEIGHTS[weights], B, Bs, g).reshape(-1, 2 * N, K)
+    if route == "2d":
+        B, Bs = B[0], None if Bs is None else Bs[0]
+        g = None if g is None else g.reshape(-1)[:1]
+    A = torch.randn(T, K, device=TEST_DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    glu = dict(gate=True, act_fn="silu", output_dtype=torch.bfloat16)
+    if route == "2d":
+        out = fg.matmul_2d(A, B, Bs=Bs, b_global_scale=g, **glu)
+        tokens = torch.arange(T, device=TEST_DEVICE)
+        experts = torch.zeros(T, device=TEST_DEVICE, dtype=torch.long)
+    else:
+        expert_ids = torch.stack([torch.randperm(E)[:top_k] for _ in range(T)]).flatten().to(TEST_DEVICE, torch.int32)
+        if route == "grouped":
+            expert_start, gather_idx, scatter_idx = internals.scheduling.compute_grouped_scheduling(expert_ids, E, top_k)
+            out = fg.matmul_grouped(A, B, Bs=Bs, b_global_scale=g, expert_start=expert_start, gather_idx=gather_idx,
+                                    routed_idx=scatter_idx, **glu)
+            tokens = gather_idx.long()
+            experts = torch.repeat_interleave(torch.arange(E, device=TEST_DEVICE), expert_start.diff().long())
+        else:
+            out = fg.matmul_batched(A, B, Bs=Bs, b_global_scale=g, expert_ids=expert_ids, **glu)
+            tokens = torch.arange(T * top_k, device=TEST_DEVICE) // top_k
+            experts = expert_ids.long()
+    grad_out = torch.randn_like(out)
+    out.backward(grad_out)
+    A_ref = A.detach().float().requires_grad_(True)
+    # the forward's activation round-trip (W8A8), straight through: Z sees what the kernel saw, the gradient is dA's
+    quant, row = WEIGHTS[weights]["act_quant"][None], WEIGHTS[weights]
+    A_seen = A_ref if quant is None else A_ref + (row["dq_act"](*quant(A.detach())) - A_ref).detach()
+    Z = torch.einsum("sk,snk->sn", A_seen[tokens], W[experts])
+    H = apply_glu(Z[:, 0::2], Z[:, 1::2], "silu", None, None)
+    (H * grad_out.float()).sum().backward()
+    assert A.grad is not None and torch.isfinite(A.grad.float()).all()
+    assert _rel(A.grad, A_ref.grad) < 5e-2, f"{weights} {route}: gated dA vs autograd {_rel(A.grad, A_ref.grad):.2e}"
 
 
 def test_dgrad_batched_per_row_expert():
