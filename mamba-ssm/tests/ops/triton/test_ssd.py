@@ -17,6 +17,8 @@ _chunk_cumsum_fwd = mamba_ssm.ops.triton.ssd_chunk_state._chunk_cumsum_fwd
 _chunk_state_fwd = mamba_ssm.ops.triton.ssd_chunk_state._chunk_state_fwd
 chunk_state_varlen = mamba_ssm.ops.triton.ssd_chunk_state.chunk_state_varlen
 _state_passing_fwd = mamba_ssm.ops.triton.ssd_state_passing._state_passing_fwd
+mamba_chunk_scan_combined = mamba_ssm.ops.triton.ssd_combined.mamba_chunk_scan_combined
+_chunk_scan_chunk_state_bwd_dx_kernel = mamba_ssm.ops.triton.ssd_combined._chunk_scan_chunk_state_bwd_dx_kernel
 
 
 def detach_clone(*args):
@@ -79,3 +81,25 @@ def test_chunk_state_varlen(chunk_size, ngroups, dtype):
     out_ref = torch.cat(out_ref, dim=0)
     print(f"Max diff = {(out - out_ref).abs().max().item()}")
     assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("block_size_n", [32, 64, 128])
+def test_dD_head_split_across_blocks(block_size_n, monkeypatch):
+    # Without z, out = y + D * x, so the grad of a per-head D is sum(dout * x) over everything but the head.
+    # With headdim 128, BLOCK_SIZE_N < 128 splits each head across several blocks.
+    configs = [c for c in _chunk_scan_chunk_state_bwd_dx_kernel.configs if c.kwargs["BLOCK_SIZE_N"] == block_size_n]
+    monkeypatch.setattr(_chunk_scan_chunk_state_bwd_dx_kernel, "configs", configs[:1])
+    monkeypatch.setattr(_chunk_scan_chunk_state_bwd_dx_kernel, "cache", {})
+    device = "cuda"
+    torch.random.manual_seed(0)
+    batch, seqlen, nheads, headdim, dstate, chunk_size = 2, 256, 4, 128, 64, 64
+    x = torch.randn(batch, seqlen, nheads, headdim, device=device)
+    dt = F.softplus(torch.randn(batch, seqlen, nheads, device=device) - 4)
+    A = -torch.rand(nheads, device=device)
+    B = torch.randn(batch, seqlen, 1, dstate, device=device)
+    C = torch.randn(batch, seqlen, 1, dstate, device=device)
+    D = torch.randn(nheads, device=device, requires_grad=True)
+    out = mamba_chunk_scan_combined(x, dt, A, B, C, chunk_size, D=D)
+    dout = torch.randn_like(out)
+    out.backward(dout)
+    torch.testing.assert_close(D.grad, (dout * x).sum(dim=(0, 1, 3)), rtol=1e-4, atol=1e-3)
