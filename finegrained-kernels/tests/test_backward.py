@@ -342,6 +342,40 @@ def test_routed_dgrad_every_format(weights, route):
     assert _rel(A.grad, ref) < 2e-1, f"{weights} {route}: dA vs dequantized reference {_rel(A.grad, ref):.2e}"
 
 
+@pytest.mark.parametrize("route", ["2d", "grouped", "batched"])
+def test_dgrad_fp8_weight_only(route):
+    """Block-FP8 weight-only (raw BF16 activations, ``activation_format="bf16"``) on every route: the dgrad kernel
+    decodes the FP8 tile against its block grid with a BF16 ``dY``, no requantization."""
+    torch.manual_seed(0)
+    T, top_k, E = 64, 2, 4
+    B, Bs, _ = WEIGHTS["fp8_128x128"]["make"](N, K, None if route == "2d" else E)
+    W = WEIGHTS["fp8_128x128"]["dequant"](B, Bs)
+    rows = T if route == "2d" else T * top_k
+    A = torch.randn(T, K, device=TEST_DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    grad_out = torch.randn(rows, N, device=TEST_DEVICE, dtype=torch.bfloat16)
+    if route == "2d":
+        out = fg.matmul_2d(A, B, Bs=Bs, activation_format="bf16", output_dtype=torch.bfloat16)
+        ref = grad_out.float() @ W.reshape(N, K)
+    else:
+        expert_ids = torch.stack([torch.randperm(E)[:top_k] for _ in range(T)]).flatten().to(TEST_DEVICE, torch.int32)
+        W = W.reshape(E, N, K)
+        if route == "grouped":
+            expert_start, gather_idx, scatter_idx = internals.scheduling.compute_grouped_scheduling(expert_ids, E, top_k)
+            out = fg.matmul_grouped(A, B, Bs=Bs, expert_start=expert_start, gather_idx=gather_idx, routed_idx=scatter_idx,
+                                    activation_format="bf16", output_dtype=torch.bfloat16)
+            tokens = gather_idx.long()
+            experts = torch.repeat_interleave(torch.arange(E, device=TEST_DEVICE), expert_start.diff().long())
+        else:
+            out = fg.matmul_batched(A, B, Bs=Bs, expert_ids=expert_ids, activation_format="bf16",
+                                    output_dtype=torch.bfloat16)
+            tokens = torch.arange(rows, device=TEST_DEVICE) // top_k
+            experts = expert_ids.long()
+        ref = torch.zeros(T, K, device=TEST_DEVICE).index_add_(
+            0, tokens, torch.einsum("sn,snk->sk", grad_out.float(), W[experts]))
+    out.backward(grad_out)
+    assert _rel(A.grad, ref) < 1e-2, f"{route}: dA vs dequantized reference {_rel(A.grad, ref):.2e}"
+
+
 def test_dgrad_batched_per_row_expert():
     """Batched dgrad: ``dX[s] = dY[s] @ W[expert_ids[s]]``. Rows are NOT expert-sorted here — each
     names its own expert — so this cannot reuse the grouped kernel. Registered because the batched

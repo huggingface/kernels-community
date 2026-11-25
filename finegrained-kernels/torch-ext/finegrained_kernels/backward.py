@@ -1024,6 +1024,7 @@ _register(matmul.w8a8_tensor_dynamic_fp8_matmul, ("B", "Bs"), _dgrad_2d)
 _register(matmul.mx_dynamic_matmul, ("B", "Bs", "b_global_scale", "a_pre_quant_scale", "svdquant_lora_a"),
           _with_input_transform(_dgrad_2d))
 _register(matmul.mx_weight_only_matmul_2d, ("B", "Bs", "b_global_scale"), _dgrad_2d)
+_register(matmul.block_fp8_weight_only_matmul_2d, ("B", "Bs"), _dgrad_2d)
 _register(matmul.full_precision_matmul_2d, ("B",), _dgrad_full_precision_2d)
 # grouped: every format on the grouped dgrad kernel
 for _op in (grouped.w8a8_block_dynamic_fp8_matmul_grouped, grouped.w8a8_block_static_fp8_matmul_grouped,
@@ -1032,10 +1033,11 @@ for _op in (grouped.w8a8_block_dynamic_fp8_matmul_grouped, grouped.w8a8_block_st
 _register(grouped.mx_dynamic_matmul_grouped, (*_GROUPED, "b_global_scale", "a_pre_quant_scale"),
           _with_input_transform(_grouped_dgrad))
 _register(grouped.mx_weight_only_matmul_grouped, (*_GROUPED, "b_global_scale"), _grouped_dgrad)
+_register(grouped.block_fp8_weight_only_matmul_grouped, _GROUPED, _grouped_dgrad)
 # batched: the batched experts forward is a selectable dispatch in transformers, not a decode-only path
 _BATCHED = ("B", "Bs", "expert_ids", "scatter_idx", "b_global_scale")
 for _op in (batched.w8a8_block_dynamic_fp8_matmul_batched, batched.w8a8_block_static_fp8_matmul_batched,
             batched.w8a8_tensor_dynamic_fp8_matmul_batched, batched.mx_weight_only_matmul_batched,
-            batched.full_precision_matmul_batched):
+            batched.block_fp8_weight_only_matmul_batched, batched.full_precision_matmul_batched):
     _register(_op, _BATCHED, _batched_dgrad)
 _register(batched.mx_dynamic_matmul_batched, (*_BATCHED, "a_pre_quant_scale"), _with_input_transform(_batched_dgrad))
