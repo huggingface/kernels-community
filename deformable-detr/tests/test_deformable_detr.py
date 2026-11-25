@@ -180,15 +180,7 @@ def check_against_ref(deformable_detr, dtype, im2col_step=64, **kwargs):
             rtol=TOLERANCES[dtype]["rtol"],
             atol=TOLERANCES[dtype]["atol"] * max(scale, 1.0),
         )
-        if name == "sampling_loc" and dtype in (torch.float16, torch.bfloat16):
-            # The kernel computes sampling coordinates in the input precision.
-            # A point close to a pixel boundary can then be rounded into a
-            # neighbouring bilinear cell, where the (piecewise) gradient with
-            # respect to the location differs. Allow a few such outliers.
-            close = torch.isclose(actual.grad.to(ref_dtype), expected.grad, **tol)
-            assert close.float().mean().item() >= 0.99, f"{(~close).sum()} mismatches"
-        else:
-            torch.testing.assert_close(actual.grad.to(ref_dtype), expected.grad, **tol)
+        torch.testing.assert_close(actual.grad.to(ref_dtype), expected.grad, **tol)
 
 
 @pytest.mark.kernels_ci

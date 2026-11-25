@@ -46,6 +46,13 @@ class MultiScaleDeformableAttentionFunction(Function):
         im2col_step: int,
     ):
         context.im2col_step = im2col_step
+        dtype = value.dtype
+        # The kernel computes the sampling coordinates in the input precision: in half
+        # precision, a location on a 100 pixel wide map only lands on half pixels.
+        if dtype in (torch.float16, torch.bfloat16):
+            value, sampling_locations, attention_weights = (
+                t.float() for t in (value, sampling_locations, attention_weights)
+            )
         output = ops.ms_deform_attn_forward(
             value,
             value_spatial_shapes,
@@ -61,7 +68,7 @@ class MultiScaleDeformableAttentionFunction(Function):
             sampling_locations,
             attention_weights,
         )
-        return output
+        return output.to(dtype)
 
     @staticmethod
     @once_differentiable
@@ -82,7 +89,7 @@ class MultiScaleDeformableAttentionFunction(Function):
             attention_weights,
             # The kernel requires a contiguous gradient, which autograd does not
             # guarantee (e.g. the expanded gradient of `.sum()`).
-            grad_output.contiguous(),
+            grad_output.to(value.dtype).contiguous(),
             context.im2col_step,
         )
 
