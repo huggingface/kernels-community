@@ -1,20 +1,10 @@
+import kernels
 import pytest
 import torch
 
 from tests.utils import infer_device, supports_bfloat16
-from pathlib import Path
 
-# import rotary
-# from transformers.trainer_utils import set_seed
-# set_seed(42)
-
-# Set the local repo path, relative path
-try:
-    import rotary
-except ImportError:
-    from kernels import get_local_kernel
-    repo_path = Path(__file__).parent.parent
-    rotary = get_local_kernel(repo_path=repo_path, package_name="rotary")
+rotary = kernels.get_kernel("kernels-community/rotary", version=2)
 
 def apply_rotary_torch(x1: torch.Tensor, x2: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, conj: bool = False):
     assert x1.shape == x2.shape, "x1 and x2 must have the same shape"
@@ -128,3 +118,52 @@ def test_rotary_equivalence(batch_size, nheads, seqlen, headdim, rotary_dim, qk_
         assert torch.equal(
             k_kernel[..., 2 * rotary_dim:], k_orig[..., 2 * rotary_dim:]
         ), "Non-rotated part of K should be unchanged"
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("entry_point", ["function", "layer"])
+@pytest.mark.parametrize(
+    "dtype, atol, rtol",
+    [
+        (torch.float32, 1e-5, 1e-5),
+        pytest.param(
+            torch.bfloat16,
+            1e-1,
+            1e-5,
+            marks=pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU"),
+        ),
+    ],
+)
+def test_apply_rotary_transformers_backward(entry_point, dtype, atol, rtol):
+    device = infer_device()
+    if device is None:
+        pytest.skip("No suitable device found for testing")
+
+    batch_size, nheads, seqlen, headdim = 2, 8, 128, 64
+    rotary_dim = headdim // 2
+
+    q_orig = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+    k_orig = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+    cos = torch.randn(seqlen, headdim, device=device, dtype=dtype)
+    sin = torch.randn(seqlen, headdim, device=device, dtype=dtype)
+    grad_q, grad_k = torch.randn_like(q_orig), torch.randn_like(k_orig)
+
+    if entry_point == "function":
+        apply_rotary_kernel = rotary.apply_rotary_transformers
+    else:
+        apply_rotary_kernel = rotary.layers.apply_rotary_transformers()
+
+    q_torch, k_torch = q_orig.clone().requires_grad_(), k_orig.clone().requires_grad_()
+    q_torch_out, k_torch_out = apply_rotary_torch_wrapper(
+        q_torch, k_torch, cos[:, None, :rotary_dim], sin[:, None, :rotary_dim]
+    )
+    torch.autograd.backward((q_torch_out, k_torch_out), (grad_q, grad_k))
+
+    q_kernel, k_kernel = q_orig.clone().requires_grad_(), k_orig.clone().requires_grad_()
+    q_kernel_out, k_kernel_out = apply_rotary_kernel(q_kernel, k_kernel, cos, sin, unsqueeze_dim=1)
+    torch.autograd.backward((q_kernel_out, k_kernel_out), (grad_q, grad_k))
+
+    torch.testing.assert_close(q_kernel_out, q_torch_out, atol=atol, rtol=rtol)
+    torch.testing.assert_close(k_kernel_out, k_torch_out, atol=atol, rtol=rtol)
+    torch.testing.assert_close(q_kernel.grad, q_torch.grad, atol=atol, rtol=rtol)
+    torch.testing.assert_close(k_kernel.grad, k_torch.grad, atol=atol, rtol=rtol)

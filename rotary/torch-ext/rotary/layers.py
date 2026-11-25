@@ -4,8 +4,30 @@ import torch.nn as nn
 from ._ops import ops
 
 
+class _ApplyRotary(torch.autograd.Function):
+    @staticmethod
+    def rotate_half(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, conj: bool) -> torch.Tensor:
+        out = torch.empty_like(x)
+        half_dim = x.shape[-1] // 2
+        ops.apply_rotary(
+            x[..., :half_dim], x[..., half_dim:], cos, sin, out[..., :half_dim], out[..., half_dim:], conj
+        )
+        return out
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(cos, sin)
+        return _ApplyRotary.rotate_half(x, cos, sin, conj=False)
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor):
+        cos, sin = ctx.saved_tensors
+        return _ApplyRotary.rotate_half(grad, cos, sin, conj=True), None, None
+
+
 class apply_rotary_transformers(nn.Module):
     can_torch_compile = True
+    has_backward = True
 
     def forward(
         self,
@@ -19,23 +41,7 @@ class apply_rotary_transformers(nn.Module):
         Rotary kernel implementation wrapper
         Adapts rotary kernel implementation to match transformers apply_rotary_pos_emb signature
         """
-        cos = cos.unsqueeze(unsqueeze_dim)
-        sin = sin.unsqueeze(unsqueeze_dim)
-
-        q_rotated = q.clone()
-        k_rotated = k.clone()
-
-        # Get half dimension for rotation
         half_dim = q.shape[-1] // 2
-        q1 = q_rotated[..., :half_dim]
-        q2 = q_rotated[..., half_dim:]
-        k1 = k_rotated[..., :half_dim]
-        k2 = k_rotated[..., half_dim:]
-        if cos.shape[-1] != half_dim:
-            # Trim cos/sin to match half_dim
-            cos = cos[..., :half_dim]
-            sin = sin[..., :half_dim]
-
-        ops.apply_rotary(q1, q2, cos, sin, q1, q2, False)
-        ops.apply_rotary(k1, k2, cos, sin, k1, k2, False)
-        return q_rotated, k_rotated
+        cos = cos.unsqueeze(unsqueeze_dim)[..., :half_dim]
+        sin = sin.unsqueeze(unsqueeze_dim)[..., :half_dim]
+        return _ApplyRotary.apply(q, cos, sin), _ApplyRotary.apply(k, cos, sin)

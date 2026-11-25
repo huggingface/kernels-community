@@ -2,6 +2,7 @@ import torch
 
 from . import layers
 from ._ops import ops
+from .layers import _ApplyRotary
 
 
 def apply_rotary(
@@ -27,30 +28,15 @@ def apply_rotary_transformers(
     Rotary kernel implementation wrapper
     Adapts rotary kernel implementation to match transformers apply_rotary_pos_emb signature
     """
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-
-    q_rotated = q.clone()
-    k_rotated = k.clone()
-
-    # Get half dimension for rotation
     half_dim = q.shape[-1] // 2
-    q1 = q_rotated[..., :half_dim]
-    q2 = q_rotated[..., half_dim:]
-    k1 = k_rotated[..., :half_dim]
-    k2 = k_rotated[..., half_dim:]
-    if cos.shape[-1] != half_dim:
-        # Trim cos/sin to match half_dim
-        cos = cos[..., :half_dim]
-        sin = sin[..., :half_dim]
-
-    apply_rotary(q1, q2, cos, sin, q1, q2, False)
-    apply_rotary(k1, k2, cos, sin, k1, k2, False)
-    return q_rotated, k_rotated
+    cos = cos.unsqueeze(unsqueeze_dim)[..., :half_dim]
+    sin = sin.unsqueeze(unsqueeze_dim)[..., :half_dim]
+    return _ApplyRotary.apply(q, cos, sin), _ApplyRotary.apply(k, cos, sin)
 
 
-# Add torch compile support for functions
+# Add torch compile and backward support for functions
 apply_rotary_transformers.can_torch_compile = True
+apply_rotary_transformers.has_backward = True
 
 
 # Keeping `apply_rotary` and `apply_rotary_transformers` for BC
