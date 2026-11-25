@@ -1,0 +1,12 @@
+[
+  {
+    "dependency": {
+      "repo-id": "kernels-community/einops",
+      "version": 1
+    },
+    "lock": {
+      "commit": "6e7a7a8cef4c5838c0048ed1e6d68159ffc21f62",
+      "hash": "sha256-BPpKx+qpmwoWSODx105yz2tDUzmLMxLaIhcJ2MkiDHA="
+    }
+  }
+]
