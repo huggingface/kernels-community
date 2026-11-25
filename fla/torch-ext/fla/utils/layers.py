@@ -10,7 +10,7 @@
 # NOTE: This is a copy of `fla.layers.utils` but we do not sync the FLA layers in hf-kernels
 
 import torch
-from einops import rearrange, repeat
+from .._deps import rearrange, repeat
 
 from ..ops.utils.index import (
     prepare_cu_seqlens_from_lens,

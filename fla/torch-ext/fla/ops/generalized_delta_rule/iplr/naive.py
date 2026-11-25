@@ -6,7 +6,7 @@
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 import torch
-from einops import rearrange
+from ...._deps import rearrange
 
 
 # S_t = S_t @ (I + alpha_t beta_t^T) + v_t k_t^T

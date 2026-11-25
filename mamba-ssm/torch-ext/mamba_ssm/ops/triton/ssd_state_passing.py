@@ -10,7 +10,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from einops import rearrange, repeat
+from ..._deps import rearrange, repeat
 
 from ...utils.device import device_guard
 

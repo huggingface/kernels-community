@@ -6,7 +6,7 @@
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 import torch
-from einops import rearrange
+from ..._deps import rearrange
 
 from ...ops.utils.index import (
     prepare_chunk_indices,

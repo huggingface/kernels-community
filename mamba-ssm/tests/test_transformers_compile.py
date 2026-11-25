@@ -25,7 +25,7 @@ class LoadedLayer:
     layer_name: str
 
     def load(self):
-        kernel = kernels.get_kernel("kernels-community/mamba-ssm", version=5)
+        kernel = kernels.get_kernel("kernels-community/mamba-ssm", version=6)
         return getattr(kernel.layers, self.layer_name)
 
 
@@ -51,7 +51,7 @@ def model(request):
 
 
 def kernelize(model):
-    kernel = kernels.get_kernel("kernels-community/mamba-ssm", version=5)
+    kernel = kernels.get_kernel("kernels-community/mamba-ssm", version=6)
     device = "rocm" if torch.version.hip else "cuda"
     mapping = {
         name: {device: LoadedLayer(name)}

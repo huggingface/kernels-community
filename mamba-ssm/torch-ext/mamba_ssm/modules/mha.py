@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
+from .._deps import rearrange
 
 try:
     from flash_attn import flash_attn_with_kvcache

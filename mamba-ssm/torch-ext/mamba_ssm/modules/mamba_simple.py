@@ -6,7 +6,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange, repeat
+from .._deps import rearrange, repeat
 from torch import Tensor
 
 from .._causal_conv1d import causal_conv1d_fn, causal_conv1d_update

@@ -12,7 +12,7 @@ import pytest
 from einops import rearrange
 
 
-mamba_ssm = kernels.get_kernel("kernels-community/mamba-ssm", version=5)
+mamba_ssm = kernels.get_kernel("kernels-community/mamba-ssm", version=6)
 causal_conv1d = mamba_ssm._causal_conv1d
 
 causal_conv1d_fn = causal_conv1d.causal_conv1d_fn

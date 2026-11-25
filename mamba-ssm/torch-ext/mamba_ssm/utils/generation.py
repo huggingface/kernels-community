@@ -8,7 +8,7 @@ from typing import Callable, Optional, Sequence, Union
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange, repeat
+from .._deps import rearrange, repeat
 from torch import Tensor
 from torch.profiler import ProfilerActivity, profile, record_function
 from transformers.generation import GenerateDecoderOnlyOutput, TextStreamer

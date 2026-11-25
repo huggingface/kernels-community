@@ -1,6 +1,6 @@
 [general]
 name = "mamba-ssm"
-version = 5
+version = 6
 edition = 6
 license = "Apache-2.0"
 backends = [
@@ -8,7 +8,9 @@ backends = [
     "rocm",
     "xpu",
 ]
-python-depends = ["einops"]
+kernel-depends = [
+    { repo-id = "kernels-community/einops", version = 1 },
+]
 
 [general.hub]
 repo-id = "kernels-community/mamba-ssm"

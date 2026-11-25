@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
-from einops import rearrange, repeat
+from ..._deps import rearrange, repeat
 
 from ...backends import dispatch
 from ...ops.utils import prepare_chunk_indices

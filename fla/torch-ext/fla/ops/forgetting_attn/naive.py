@@ -7,7 +7,7 @@
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange, repeat
+from ..._deps import rearrange, repeat
 
 
 def naive_forgetting_attn(

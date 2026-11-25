@@ -5,7 +5,7 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange, repeat
+from ._deps import rearrange, repeat
 from torch._guards import active_fake_mode
 from torch._subclasses.fake_tensor import FakeTensorMode
 

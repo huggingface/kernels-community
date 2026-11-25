@@ -8,7 +8,7 @@
 """CUDA and mixed Triton/CUDA implementations of causal convolution."""
 
 import torch
-from einops import rearrange
+from ....._deps import rearrange
 
 from .....modules.causal_conv1d import causal_conv1d_update_states
 from .....ops.utils import prepare_sequence_ids

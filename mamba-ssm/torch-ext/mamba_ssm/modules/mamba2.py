@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange, repeat
+from .._deps import rearrange, repeat
 
 from .._causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .._causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states

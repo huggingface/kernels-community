@@ -9,7 +9,7 @@ import warnings
 
 import torch
 import torch.nn.functional as F
-from einops import repeat
+from ..._deps import repeat
 
 
 def naive_dsa_indexer(

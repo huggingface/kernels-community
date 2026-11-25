@@ -1,6 +1,6 @@
 [general]
 name = "fla"
-version = 2
+version = 3
 edition = 6
 license = "MIT"
 backends = [
@@ -8,7 +8,9 @@ backends = [
     "rocm",
     "xpu",
 ]
-python-depends = ["einops"]
+kernel-depends = [
+    { repo-id = "kernels-community/einops", version = 1 },
+]
 
 [general.hub]
 repo-id = "kernels-community/fla"

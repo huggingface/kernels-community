@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from einops import rearrange
+from .._deps import rearrange
 
 from .linear import linear_act_func, act_linear_func
 from .linear import linear_gated_func, gated_linear_func

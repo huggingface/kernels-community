@@ -6,7 +6,7 @@
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 import torch
-from einops import rearrange
+from ..._deps import rearrange
 
 from ...ops.delta_rule import chunk_delta_rule
 from ...ops.gated_delta_rule import chunk_gated_delta_rule
