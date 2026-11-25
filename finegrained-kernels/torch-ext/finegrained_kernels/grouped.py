@@ -2075,6 +2075,7 @@ def w8a8_block_static_fp8_matmul_grouped(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
+    routed_idx: torch.Tensor | None = None,  # read by the backward only (dgrad's token-major store)
 ) -> List[torch.Tensor]:
     """Block-scale grouped FP8 matmul with a static (per-tensor calibrated) activation scale —
     the block-dynamic sibling with the 2D ``block_static`` format. ``A`` is raw here: the op
@@ -2204,6 +2205,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
     activation_scale_ub: float | None = None,
+    routed_idx: torch.Tensor | None = None,  # read by the backward only (dgrad's token-major store)
 ) -> List[torch.Tensor]:
     """Tensor-scale / row-wise grouped FP8 matmul over expert-sorted positions (per-tile
     gather/scatter, the sort is virtual — see ``compute_grouped_scheduling`` for the maps).
@@ -2338,6 +2340,7 @@ def mx_dynamic_matmul_grouped(
     output_global_scale: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
     a_pre_quant_scale: torch.Tensor | None = None,
+    routed_idx: torch.Tensor | None = None,  # read by the backward only (dgrad's token-major store)
 ) -> List[torch.Tensor]:
     """Grouped MX matmul over expert-sorted positions (per-tile gather/scatter, the
     sort is virtual — see ``compute_grouped_scheduling`` for the maps). Activations arrive
@@ -2667,6 +2670,7 @@ def full_precision_matmul_grouped(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
+    routed_idx: torch.Tensor | None = None,  # read by the backward only (dgrad's token-major store)
 ) -> List[torch.Tensor]:
     """Full-precision (BF16/FP16) grouped matmul over expert-sorted positions (per-tile
     gather/scatter, the sort is virtual — see ``compute_grouped_scheduling`` for the maps).
@@ -2770,6 +2774,7 @@ def block_fp8_weight_only_matmul_grouped(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
+    routed_idx: torch.Tensor | None = None,  # read by the backward only (dgrad's token-major store)
 ) -> List[torch.Tensor]:
     """FP8 W8A16 grouped GEMM; stage weights only when routed reuse amortizes conversion."""
     validate_dense_operands(A, B)
@@ -2995,6 +3000,7 @@ def int_weight_only_matmul_grouped(
     a_pre_quant_scale: torch.Tensor | None = None,
     a_scale: torch.Tensor | None = None,
     b_scale2: torch.Tensor | None = None,
+    routed_idx: torch.Tensor | None = None,  # read by the backward only (dgrad's token-major store)
 ) -> List[torch.Tensor]:
     """Integer weight-only grouped matmul: raw bf16/fp16 activations against 2/4/8-bit integer weights, ``B``
     ``(E, N, K // VPW)`` interleaved uint32 words, ``Bs`` ``(E, N, K // group)`` float group scales, ``b_zero`` the
@@ -3179,6 +3185,7 @@ def matmul_grouped(
         out = block_fp8_weight_only_matmul_grouped(
             A, B, Bs, expert_start, gate, act_fn, swiglu_alpha, swiglu_limit,
             simulate_unfused, output_dtype, gather_idx, scatter_idx, bias=bias,
+            routed_idx=routed_idx,
         )
         return out[0]
     # a calibrated (static) scale on a raw A (see `tensor_wide_act_operands`): block-scale weights
@@ -3205,6 +3212,7 @@ def matmul_grouped(
             gather_idx,
             scatter_idx,
             bias=bias,
+            routed_idx=routed_idx,
         )
         return out[0] if len(out) == 1 else tuple(out)
 
@@ -3227,11 +3235,13 @@ def matmul_grouped(
             gather_idx,
             scatter_idx,
             bias=bias,
+            routed_idx=routed_idx,
         )
     elif B.dtype in INT_WEIGHT_DTYPES:  # packed integer weights
         out = int_weight_only_matmul_grouped(
             A, B, Bs, expert_start, gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, output_dtype,
             gather_idx, scatter_idx, b_zero=b_zero, bias=bias, b_perm=b_perm, a_pre_quant_scale=a_pre_quant_scale, a_scale=As, b_scale2=b_global_scale,
+            routed_idx=routed_idx,
         )
     elif is_mx(B, Bs) and activation_format == "bf16":  # weight-only: raw bf16 acts, MX weight upcast in-MMA
         assert As is None and a_global_scale is None and not quantize_output, (
@@ -3278,6 +3288,7 @@ def matmul_grouped(
             b_global_scale,
             output_global_scale,
             bias=bias, a_pre_quant_scale=a_pre_quant_scale,
+            routed_idx=routed_idx,
         )
     elif (block_size := weight_block_size(B, Bs)) is None:
         out = w8a8_tensor_dynamic_fp8_matmul_grouped(
@@ -3298,6 +3309,7 @@ def matmul_grouped(
             scatter_idx,
             bias=bias,
             activation_scale_ub=activation_scale_ub,
+            routed_idx=routed_idx,
         )
     else:
         out = w8a8_block_dynamic_fp8_matmul_grouped(

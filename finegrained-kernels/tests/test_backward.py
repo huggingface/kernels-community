@@ -263,8 +263,8 @@ def test_inference_path_is_untouched():
     assert not out.requires_grad and torch.isfinite(out.float()).all()
 
 
-# Row-wise FP8 and integer formats leave gradients to the separate dgrad stream.
-QUANT_WEIGHTS = [r for r in WEIGHTS if r not in ("bf16", "fp16", "fp8_rowwise") and r not in INT_BITS]
+# integer formats: not differentiable yet
+QUANT_WEIGHTS = [r for r in WEIGHTS if r not in ("bf16", "fp16") and r not in INT_BITS]
 
 
 @pytest.mark.parametrize("weights", QUANT_WEIGHTS)
@@ -293,6 +293,53 @@ def test_dgrad_every_quant_format(weights):
     W = dequantize_weight(B, Bs, global_scale=g).reshape(N, K)
     ref = grad_out.float() @ W
     assert _rel(A.grad, ref) < 2e-1, f"{weights}: dA vs dequantized reference {_rel(A.grad, ref):.2e}"
+
+
+def test_dgrad_pre_quant_scale():
+    """An input smoothed before quantization (``a_pre_quant_scale``: the GEMM reads ``A * s``) takes
+    ``dA = (dY @ W) * s``."""
+    torch.manual_seed(0)
+    B, Bs, g = WEIGHTS["mxfp8"]["make"](N, K, None)
+    s = torch.rand(K, device=TEST_DEVICE, dtype=torch.bfloat16) + 0.5
+    A = torch.randn(M, K, device=TEST_DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    grad_out = torch.randn(M, N, device=TEST_DEVICE, dtype=torch.bfloat16)
+    fg.matmul_2d(A, B, Bs=Bs, a_pre_quant_scale=s, output_dtype=torch.bfloat16).backward(grad_out)
+    ref = (grad_out.float() @ dequantize_weight(B, Bs).reshape(N, K)) * s.float()
+    assert _rel(A.grad, ref) < 2e-2, f"dA vs (dY @ W) * s: {_rel(A.grad, ref):.2e}"
+
+
+ROUTED_WEIGHTS = [*QUANT_WEIGHTS, "bf16"]
+
+
+@pytest.mark.parametrize("route", ["grouped", "batched"])
+@pytest.mark.parametrize("weights", ROUTED_WEIGHTS)
+def test_routed_dgrad_every_format(weights, route):
+    """Every routed GEMM format differentiates through ``matmul_grouped`` / ``matmul_batched`` on a gathered top_k
+    launch (one input row per token, the gate|up's shape), so each token's top_k rows sum back: near the product
+    against the dequantized weight."""
+    torch.manual_seed(0)
+    T, top_k, E = 64, 2, 4
+    B, Bs, g = WEIGHTS[weights]["make"](N, K, E)
+    W = WEIGHTS[weights]["dequant"](B, Bs, g).reshape(E, N, K)
+    A = torch.randn(T, K, device=TEST_DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    expert_ids = torch.stack([torch.randperm(E)[:top_k] for _ in range(T)]).flatten().to(TEST_DEVICE, torch.int32)
+    grad_out = torch.randn(T * top_k, N, device=TEST_DEVICE, dtype=torch.bfloat16)
+    if route == "grouped":
+        expert_start, gather_idx, scatter_idx = internals.scheduling.compute_grouped_scheduling(expert_ids, E, top_k)
+        out = fg.matmul_grouped(A, B, Bs=Bs, expert_start=expert_start, gather_idx=gather_idx, routed_idx=scatter_idx,
+                                b_global_scale=g, output_dtype=torch.bfloat16)
+        tokens = gather_idx.long()
+        experts = torch.repeat_interleave(torch.arange(E, device=TEST_DEVICE), expert_start.diff().long())
+    else:
+        out = fg.matmul_batched(A, B, Bs=Bs, expert_ids=expert_ids, b_global_scale=g, output_dtype=torch.bfloat16)
+        tokens = torch.arange(T * top_k, device=TEST_DEVICE) // top_k
+        experts = expert_ids.long()
+    assert out.requires_grad, f"{weights} {route}: output not attached to the graph"
+    out.backward(grad_out)
+    ref = torch.zeros(T, K, device=TEST_DEVICE).index_add_(
+        0, tokens, torch.einsum("sn,snk->sk", grad_out.float(), W[experts]))
+    assert A.grad is not None and A.grad.shape == (T, K) and torch.isfinite(A.grad.float()).all()
+    assert _rel(A.grad, ref) < 2e-1, f"{weights} {route}: dA vs dequantized reference {_rel(A.grad, ref):.2e}"
 
 
 def test_dgrad_batched_per_row_expert():
