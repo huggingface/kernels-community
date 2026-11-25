@@ -360,10 +360,6 @@ def dgrad_matmul_2d(
     n_trials=100,
     path_anchor_axes=PATH_ANCHOR_AXES,
     finite_check_args=("C",),
-    # C is ACCUMULATED into (tl.atomic_add: several routed rows share a source token), so the
-    # kernel is not idempotent. Benchmarking calls each config many times against one buffer, and
-    # without this every repetition adds again — the tune reads a correct kernel as 1.7e5x wrong.
-    reset_to_zero=("C",),
     prune_configs_by={
         "early_config_prune": compose_pruners(
             dgrad_grouped_warps_pruner(),
@@ -392,6 +388,7 @@ def dgrad_matmul_grouped_kernel(
     C,  # (S, K) output gradient, written in the forward's INPUT row order
     GatherIdx,  # (S,) sorted position -> source row of the forward's A
     ScatterIdx,  # (S,) sorted position -> destination row of the forward's C
+    RoutedIdx,  # (S,) sorted position -> its token-major routed row, for a gather-only launch; else None
     ExpertStart,  # (NUM_EXPERTS_POW2 + 1,) cumulative row starts, S sentinel
     # Shape
     S,
@@ -422,7 +419,7 @@ def dgrad_matmul_grouped_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     WARP_SPEC: tl.constexpr,
     B_MEMORY_MODE: tl.constexpr,
-    ROUTED_OUT: tl.constexpr = False,
+    STORE: tl.constexpr = "position",
 ):
     """Grouped dgrad. The tile resolver is reused verbatim with K-tiles in its N-tile slot —
     it is generic in that second axis, so ``offs_bn`` comes back as this kernel's K offsets and
@@ -517,36 +514,32 @@ def dgrad_matmul_grouped_kernel(
         # one, so a store would keep whichever tile landed last and drop the rest — invisible to
         # any test whose gather map is the identity (S == M), which is how it survived one.
         #
-        # The FORWARD reduces without atomics (`weighted_reduce`: (S, H) -> (T, H)) — but its
-        # routed-space tensor already exists, because the down GEMM's natural output IS (S, H), and
-        # its reduce also applies routing weights and skips EP sentinels, which an atomic could not
-        # express. dgrad is the transpose: its natural output is SOURCE space, so mirroring the
-        # forward would mean materializing a (S, K) buffer purely to avoid atomics.
-        #
-        # Measured and rejected: store-into-(S, K) + index_add_ ran 4038 vs 4181us at DSV3 top_k=8
-        # (-3.4%), 1278 vs 1294 at GPT-OSS top_k=4, and SLOWER at decode (411 vs 404) — to buy that
-        # you pay a top_k x fp32 intermediate, ~940MB at DSV3 shapes. top_k-way contention is not
-        # the bottleneck here; the GEMM is.
         if BsGlobal is not None:  # NVFP4's second level, this tile's expert
             accumulator = accumulator * tl.load(BsGlobal + expert_id64 * stride_bs_global)
 
-        if ROUTED_OUT:
-            # Plain store at the TOKEN-MAJOR routed row (`out_row`), then the caller sums the
-            # top_k rows per token. This is the FORWARD's shape — it stores routed rows and
-            # reduces them with `weighted_reduce` — and it is 1.40x faster than atomics at DSV3
-            # top_k=8 (3003 vs 4215us), 1.13x at GPT-OSS top_k=4, break-even at decode. top_k-way
-            # atomic contention is the difference; the reduce itself is nearly free.
-            tl.store(
-                C + out_row.to(tl.int64)[:, None] * stride_c_m + offs_k[None, :] * stride_c_k,
-                accumulator,
-                mask=row_mask[:, None] & (offs_k[None, :] < K),
-            )
-        else:
-            tl.atomic_add(
-                C + in_row.to(tl.int64)[:, None] * stride_c_m + offs_k[None, :] * stride_c_k,
-                accumulator,
-                mask=row_mask[:, None] & (offs_k[None, :] < K),
-            )
+        _store_dgrad_rows(C, accumulator, in_row, out_row, row_mask, offs_k, K, stride_c_m, stride_c_k, RoutedIdx, STORE)
+
+
+@triton.jit
+def _store_dgrad_rows(C, accumulator, in_row, out_row, row_mask, offs_k, K, stride_c_m, stride_c_k,
+                      RoutedIdx, STORE: tl.constexpr):
+    """Store a dgrad tile where its rows' gradients belong, each row exactly once, no atomics:
+    - ``"routed"``: each position's TOKEN-MAJOR routed row (``out_row`` with a scatter map, ``RoutedIdx`` of a
+      gather-only launch), so the caller sums each token's top_k rows contiguously: the forward's own shape
+      (``weighted_reduce``), 1.40x faster than atomics at DeepSeek-V3 top_k=8 (3003 vs 4215 us).
+    - ``"position"``: ``in_row``, the sorted position of a scatter-only launch or the source row of a gather
+      that is a permutation (one position per input row)."""
+    if STORE == "position":
+        row = in_row
+    elif RoutedIdx is not None:
+        row = tl.load(RoutedIdx + out_row, mask=row_mask, other=0)
+    else:
+        row = out_row
+    tl.store(
+        C + row.to(tl.int64)[:, None] * stride_c_m + offs_k[None, :] * stride_c_k,
+        accumulator,
+        mask=row_mask[:, None] & (offs_k[None, :] < K),
+    )
 
 
 @compile_time_only_triton_op(add_op_namespace_prefix("dgrad_matmul_grouped"), mutates_args=())
@@ -562,13 +555,16 @@ def dgrad_matmul_grouped(
     output_dtype: torch.dtype | None = None,
     num_input_rows: int | None = None,
     w_global_scale: torch.Tensor | None = None,
+    routed_idx: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Routed ``dX = dY @ W[expert]`` over expert-sorted positions — the MoE counterpart of
     ``dgrad_matmul_2d``.
 
     ``gather_idx`` / ``scatter_idx`` are the FORWARD's maps, passed unchanged: the kernel swaps
     their roles itself (reads ``dY`` at the forward's scatter destination, writes ``dX`` at its
-    gather source), so callers hand over the same two tensors the forward got."""
+    gather source), so callers hand over the same two tensors the forward got. A gathered launch sums each
+    token's top_k rows, so it needs them token-major: its scatter map, or ``routed_idx`` (each position's
+    token-major routed row, the chain's scatter map) when it has none."""
     assert dY.ndim == 2 and W.ndim == 3, f"expected (S,N) and (E,N,K), got {dY.shape}, {W.shape}"
     S, N = dY.shape
     values_per_byte = 2 if W.dtype == torch.uint8 else 1
@@ -580,15 +576,16 @@ def dgrad_matmul_grouped(
 
     num_experts = W.shape[0]
     num_sms = sm_count(dY.device.index)
-    # (num_input_rows, K), ZERO-initialised: the kernel accumulates each routed row's gradient
-    # into its source token, so the buffer is indexed in SOURCE space and must start empty.
-    # fp32 because that is what tl.atomic_add takes.
     rows = S if num_input_rows is None else num_input_rows
-    # Token-major store + a top_k sum beats atomics whenever the scatter map makes the rows
-    # token-major (see the kernel). It costs a top_k x fp32 intermediate, which is why the atomic
-    # arm stays as the fallback for gather-only launches.
-    routed_out = scatter_idx is not None and rows > 0 and S % rows == 0
-    dX = torch.zeros(S if routed_out else rows, K, device=dY.device, dtype=torch.float32)
+    # a gather that is a permutation (one position per input row) has nothing to sum: each position stores at its
+    # gather source; otherwise every position stores token-major and the top_k rows are summed below
+    store = "position" if gather_idx is None or rows == S else "routed"
+    assert store == "position" or scatter_idx is not None or routed_idx is not None, (
+        "a gathered launch needs a token-major map: its scatter map or routed_idx"
+    )
+    assert store == "position" or S % rows == 0, f"{S} positions are not top_k rows of {rows} tokens"
+    # zero-initialised: the EP sentinel positions are never stored
+    dX = torch.zeros(S, K, device=dY.device, dtype=torch.float32)
     with device_context(dY.device):
         # inside the context — see dgrad_matmul_2d; placeholder boxes, rebound by the pre_hook
         a_descriptor = maybe_descriptor(dY, [1, 128])
@@ -604,6 +601,7 @@ def dgrad_matmul_grouped(
             dX,
             gather_idx,
             scatter_idx,
+            routed_idx if store == "routed" and scatter_idx is None else None,
             expert_start,
             S,
             N,
@@ -624,9 +622,9 @@ def dgrad_matmul_grouped(
             WEIGHT_VALUES_PER_BYTE=values_per_byte,
             NUM_EXPERTS_POW2=triton.next_power_of_2(num_experts),
             NUM_SMS=num_sms,
-            ROUTED_OUT=routed_out,
+            STORE=store,
         )
-    if routed_out:
+    if store == "routed":
         dX = dX.view(rows, S // rows, K).sum(1)
     return dX.to(output_dtype or dY.dtype)
 
@@ -919,7 +917,7 @@ def _dgrad_transposed_weight(dY, B, Bs, out_dtype):
     Bs_t = Bs if Bs.numel() == 1 else Bs.t().contiguous()
     return matmul_2d(dY.contiguous(), B.t(), None, Bs_t, output_dtype=out_dtype)
 
-def _dgrad_grouped(ctx, dY, B, Bs, expert_start, gather_idx, scatter_idx, b_global):
+def _dgrad_grouped(ctx, dY, B, Bs, expert_start, gather_idx, scatter_idx, b_global, routed_idx=None):
     """Routed dgrad. GATE is not a case to handle: the gradient of a gate|up GEMM is an UNGATED
     product at the doubled N extent, which is what a 2N-row weight already is. The forward's two
     row maps are passed through unchanged — the kernel swaps their roles itself. The NVFP4
@@ -934,7 +932,7 @@ def _dgrad_grouped(ctx, dY, B, Bs, expert_start, gather_idx, scatter_idx, b_glob
         K // Bs.shape[-1], max(B.shape[-2] // Bs.shape[-2], 1),
         gather_idx=gather_idx, scatter_idx=scatter_idx, output_dtype=torch.float32,
         num_input_rows=getattr(ctx, "a_rows", None),
-        w_global_scale=normalize_global_scale(b_global, B.shape[0]),
+        w_global_scale=normalize_global_scale(b_global, B.shape[0]), routed_idx=routed_idx,
     )
     return dX.to(ctx.a_dtype)
 
@@ -1026,9 +1024,9 @@ def _dgrad_batched(ctx, dY, B, Bs, expert_ids, b_global):
 
 
 # Routed MoE, weight-only — QLoRA on an MoE model. Positional slots: B=1, Bs=2, expert_start=3,
-# gather_idx=10, scatter_idx=11, b_global_scale=12.
+# gather_idx=10, scatter_idx=11, b_global_scale=12, routed_idx=15.
 _register(
-    "mx_weight_only_matmul_grouped", saved=(1, 2, 3, 10, 11, 12),
+    "mx_weight_only_matmul_grouped", saved=(1, 2, 3, 10, 11, 12, 15),
     dgrad=_dgrad_grouped,
 )
 
@@ -1036,10 +1034,10 @@ _register(
 # the per-row K-group layout at wider divisors, which `_dgrad_grouped` derives from `Bs.shape` —
 # but it is a DIFFERENT op, and only registering the weight-only one left the grouped block-FP8
 # path with no grad_fn at all. That is the path a PEFT LoRA on fp8 experts actually runs.
-# Positional slots: B=1, Bs=3, expert_start=4, gather_idx=14, scatter_idx=15; no global scale.
+# Positional slots: B=1, Bs=3, expert_start=4, gather_idx=14, scatter_idx=15, routed_idx=17; no global scale.
 _register(
-    "w8a8_block_dynamic_fp8_matmul_grouped", saved=(1, 3, 4, 14, 15),
-    dgrad=lambda ctx, dY, B, Bs, es, gi, si: _dgrad_grouped(ctx, dY, B, Bs, es, gi, si, None),
+    "w8a8_block_dynamic_fp8_matmul_grouped", saved=(1, 3, 4, 14, 15, 17),
+    dgrad=lambda ctx, dY, B, Bs, es, gi, si, ri: _dgrad_grouped(ctx, dY, B, Bs, es, gi, si, None, ri),
 )
 
 # The batched experts forward is a SELECTABLE dispatch in transformers, not a decode-only path, so

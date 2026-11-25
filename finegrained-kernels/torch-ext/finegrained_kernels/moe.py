@@ -536,6 +536,8 @@ def moe_fused_grouped(
         quantize_output=fused and fmt != "bf16" and not static_act and not per_token and down_proj_pre_quant_scale is None,
         output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,
+        # the dgrad of this gather-only launch stores each routed row token-major through it
+        routed_idx=scatter_idx,
     )
     inter, inter_scale = (
         gate_up_out if isinstance(gate_up_out, tuple) else (gate_up_out, None)
@@ -824,6 +826,8 @@ def moe_unfused_grouped(
         activation_scale_ub=activation_scale_ub,
         output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,
+        # the dgrad of this gather-only launch stores each routed row token-major through it
+        routed_idx=scatter_idx,
     )
     inter = _host_glu(gate_up_out, act_fn, swiglu_alpha, swiglu_limit, gate)
     # down over the expert-ordered intermediate (quantized in the same format), scattering

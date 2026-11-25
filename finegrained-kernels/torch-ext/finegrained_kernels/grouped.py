@@ -1924,6 +1924,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
+    routed_idx: torch.Tensor | None = None,  # read by the backward only (dgrad's token-major store)
 ) -> List[torch.Tensor]:
     """Block-scale grouped FP8 matmul over expert-sorted positions (per-tile
     gather/scatter, the sort is virtual — see ``compute_grouped_scheduling`` for the maps).
@@ -2868,6 +2869,7 @@ def mx_weight_only_matmul_grouped(
     b_global_scale: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
     a_global_scale: torch.Tensor | None = None,
+    routed_idx: torch.Tensor | None = None,  # read by the backward only (dgrad's token-major store)
 ) -> List[torch.Tensor]:
     """weight-only grouped matmul: raw bf16/fp16 activations against MXFP4/NVFP4/MXFP8 weights upcast
     to bf16 in-loop — the ``matmul_ogs`` format (fp4/fp8 weight bytes, bf16 acts, weight upcast in-MMA).
@@ -3110,6 +3112,7 @@ def matmul_grouped(
     b_zero: torch.Tensor | None = None,
     b_perm: torch.Tensor | None = None,
     a_pre_quant_scale: torch.Tensor | None = None,
+    routed_idx: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Grouped matmul dispatcher (W8A8 FP8, W4A8/W4A4 FP4, or full-precision).
     ``expert_start`` is the ``(E+1,)`` tiling schedule from one ``compute_grouped_scheduling``
@@ -3252,6 +3255,7 @@ def matmul_grouped(
             scatter_idx,
             b_global_scale=b_global_scale,
             bias=bias,
+            routed_idx=routed_idx,
         )
     elif is_mx(B, Bs):
         out = mx_dynamic_matmul_grouped(
@@ -3314,6 +3318,7 @@ def matmul_grouped(
             gather_idx,
             scatter_idx,
             bias=bias,
+            routed_idx=routed_idx,
         )
     # The ops return a list (torch custom ops can't return a Tensor-or-tuple union): [C] plain,
     # [C, Cs] under ``quantize_output``. Unwrap to the documented Tensor / (Tensor, Tensor) return.

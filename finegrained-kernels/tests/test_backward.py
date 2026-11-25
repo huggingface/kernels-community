@@ -338,6 +338,10 @@ def test_dgrad_grouped_accumulates_over_top_k():
     pairs = [(int(e), t) for t in range(T) for e in experts[t]]
     pairs.sort()
     gather_idx = torch.tensor([t for _, t in pairs], device=TEST_DEVICE, dtype=torch.int32)
+    # each position's token-major routed row, t * tk + (the expert's slot among the token's)
+    routed_idx = torch.tensor(
+        [t * tk + experts[t].tolist().index(e) for e, t in pairs], device=TEST_DEVICE, dtype=torch.int32
+    )
     counts = torch.bincount(torch.tensor([e for e, _ in pairs]), minlength=E)
     expert_start = torch.cat([torch.zeros(1, dtype=torch.long), counts.cumsum(0)]).to(
         TEST_DEVICE, torch.int32)
@@ -351,7 +355,7 @@ def test_dgrad_grouped_accumulates_over_top_k():
     dX = dgrad_matmul_grouped(
         dY, Wq, Ws, expert_start, 32, 1,
         gather_idx=gather_idx, scatter_idx=None, output_dtype=torch.float32,
-        num_input_rows=T,
+        num_input_rows=T, routed_idx=routed_idx,
     )
     assert dX.shape == (T, Ke), f"gradient must be in SOURCE space {(T, Ke)}, got {tuple(dX.shape)}"
 
@@ -378,6 +382,10 @@ def test_dgrad_grouped_every_admitted_config_accumulates():
     experts = torch.stack([torch.randperm(E)[:tk] for _ in range(T)])
     pairs = sorted((int(e), t) for t in range(T) for e in experts[t])
     gather_idx = torch.tensor([t for _, t in pairs], device=TEST_DEVICE, dtype=torch.int32)
+    # each position's token-major routed row, t * tk + (the expert's slot among the token's)
+    routed_idx = torch.tensor(
+        [t * tk + experts[t].tolist().index(e) for e, t in pairs], device=TEST_DEVICE, dtype=torch.int32
+    )
     counts = torch.bincount(torch.tensor([e for e, _ in pairs]), minlength=E)
     expert_start = torch.cat([torch.zeros(1, dtype=torch.long), counts.cumsum(0)]).to(
         TEST_DEVICE, torch.int32)
@@ -395,7 +403,7 @@ def test_dgrad_grouped_every_admitted_config_accumulates():
         return dgrad_matmul_grouped(
             dY, Wq, Ws, expert_start, 32, 1,
             gather_idx=gather_idx, scatter_idx=None, output_dtype=torch.float32,
-            num_input_rows=T,
+            num_input_rows=T, routed_idx=routed_idx,
         )
 
     tuner = dgrad_matmul_grouped_kernel
