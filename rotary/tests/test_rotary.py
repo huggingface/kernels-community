@@ -1,20 +1,10 @@
+import kernels
 import pytest
 import torch
 
 from tests.utils import infer_device, supports_bfloat16
-from pathlib import Path
 
-# import rotary
-# from transformers.trainer_utils import set_seed
-# set_seed(42)
-
-# Set the local repo path, relative path
-try:
-    import rotary
-except ImportError:
-    from kernels import get_local_kernel
-    repo_path = Path(__file__).parent.parent
-    rotary = get_local_kernel(repo_path=repo_path, package_name="rotary")
+rotary = kernels.get_kernel("kernels-community/rotary", version=2)
 
 def apply_rotary_torch(x1: torch.Tensor, x2: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, conj: bool = False):
     assert x1.shape == x2.shape, "x1 and x2 must have the same shape"
