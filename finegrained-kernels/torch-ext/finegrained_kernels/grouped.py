@@ -25,15 +25,15 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from .bayesian_autotuner import bayesian_autotune
 from .path_autotuner import path_autotune
 from ._ops import add_op_namespace_prefix
-from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, persistent_program_count, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, pipeline_autotuning_configs, persistent_programs_per_sm, is_sm10x, block_fp8_scale_mode_configs, int_scale_mode_configs, narrow_scalar_autotuning_configs, is_triton_greater_or_equal
+from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, clone_config, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, persistent_grid, persistent_program_count, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, pipeline_autotuning_configs, persistent_programs_per_sm, is_sm10x, block_fp8_scale_mode_configs, int_scale_mode_configs, narrow_scalar_autotuning_configs, is_triton_greater_or_equal
 from .bench import gemm_cold_banks
 from .descriptors import build_grouped_operand_descriptors, rebind_grouped_descriptors, rebind_grouped_mx_descriptors
-from .formats import WEIGHT_ONLY_STAGE_MIN_ROWS, block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, row_scale_stride, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, validate_int_operands, INT_WEIGHT_DTYPES
+from .formats import WEIGHT_ONLY_STAGE_MIN_ROWS, block_fp8_weight_scale_grid, validate_quantization_args, global_scale_stride, gate_out_cols, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, row_scale_stride, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, validate_int_operands, INT_WEIGHT_DTYPES
 from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, mx_act_quant_grouped, mx_act_quant_routed_rows, quantize_routed_rows_per_expert, static_expert_act_operands, swizzle_grouped_mx_scales, tensor_wide_act_operands, prepare_fp8_mx_inputs, permute_routed_rows
 from .swizzle import swizzled_scale_descriptor
 from .loading.scales import apply_row_scale, weight_scale_rows, dequant_block_fp8_weight, dequant_mx_weight, csf_weight_scales, load_swizzled_rows_scale
 from .mma import block_dynamic_dot, block_fp8_weight_only_dot, dequantize_int_weight, fp8_dot, mx_compute, mx_dot_scaled_tokens, mx_weight_only_compute, static_dot, int_weight_only_compute
-from .scheduling import build_tile_layout, expand_gather_below_parity, expand_regime, load_packed_schedule, grouped_tile_order, prefetch_packed_entry, resolve_grouped_tile, resolve_grouped_tile_packed, fill_packed_schedule, packed_schedule_buffer
+from .scheduling import expand_gather_below_parity, expand_regime, fill_packed_schedule, packed_schedule_buffer, grouped_tile_schedule, grouped_schedule_tile
 from .loading.tiles import (
     load_act_block_dynamic,
     load_act_mx,
@@ -50,7 +50,7 @@ from .loading.tiles import (
     weight_tile_ptrs,
 )
 from .epilogue import acc_init, bias_strides, gemm_epilogue
-from .pruners import PATH_ANCHOR_AXES, grouped_scalar_decode_pruner, block_fp8_scale_mode_pruner, int_scale_group_tile_pruner, fp8_dot_warp_pruner, raw_activation_pointer_pruner, warp_spec_memory_mode_pruner, packed_schedule_scope_pruner, tile_order_pruner, affine_scale_warp_spec_pruner, block_dynamic_grouped_matmul_pruner, block_static_grouped_matmul_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gate_stacked_tmem_trap_pruner, gated_pointer_weight_warp_spec_pruner, grouped_mx_swap_scope_pruner, grouped_swap_scope_pruner, mx_config_pruner, require_moe_dims_aligned, smem_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, swizzled_scales_bm_pruner, warp_spec_compile_guard_pruner, warp_spec_scatter_epilogue_pruner, weight_only_dot_scaled_warps_pruner, mxfp4_operand_warps_pruner, exact_memory_pruner, fp8_dot_smem, mx_grouped_smem, mx_weight_only_grouped_smem, mx_weight_only_grouped_tmem, weight_only_grouped_smem, weight_only_grouped_tmem
+from .pruners import PATH_ANCHOR_AXES, grouped_scalar_decode_pruner, block_fp8_scale_mode_pruner, int_scale_group_tile_pruner, fp8_dot_warp_pruner, raw_activation_pointer_pruner, warp_spec_memory_mode_pruner, packed_schedule_scope_pruner, tile_order_pruner, affine_scale_warp_spec_pruner, block_dynamic_grouped_matmul_pruner, block_static_grouped_matmul_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, descriptor_support_pruner, gate_stacked_tmem_trap_pruner, gated_pointer_weight_warp_spec_pruner, grouped_mx_swap_scope_pruner, grouped_swap_scope_pruner, mx_config_pruner, require_moe_dims_aligned, smem_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, swizzled_scales_bm_pruner, warp_spec_compile_guard_pruner, warp_spec_scatter_epilogue_pruner, weight_only_dot_scaled_warps_pruner, mxfp4_operand_warps_pruner, exact_memory_pruner, fp8_dot_smem, mx_grouped_smem, mx_weight_only_grouped_smem, mx_weight_only_grouped_tmem, weight_only_grouped_smem, weight_only_grouped_tmem
 
 
 def grouped_pre_hook(nargs):
@@ -154,8 +154,7 @@ def _block_dynamic_fp8_grouped_configs():
         config.kwargs["SWAP_AB"] = False
     if is_sm10x():
         configs.extend(
-            triton.Config(dict(c.kwargs, SWAP_AB=True), num_warps=c.num_warps, num_stages=c.num_stages,
-                          num_ctas=c.num_ctas, maxnreg=c.maxnreg, pre_hook=c.pre_hook)
+            clone_config(c, SWAP_AB=True)
             for c in list(configs)
             if c.kwargs["BLOCK_SIZE_M"] in (16, 32, 64) and not c.kwargs["WARP_SPEC"] and c.num_warps == 4
             and c.kwargs["PIPELINE"] == "k_loop"
@@ -185,7 +184,7 @@ def _block_dynamic_fp8_grouped_configs():
             warp_spec_compile_guard_pruner(),
             warp_spec_scatter_epilogue_pruner(),
             warp_spec_memory_mode_pruner(),
-            descriptor_box_pruner(),
+            descriptor_support_pruner(),
             smem_pruner(full_stages=True, pointer_ws_extra_stage=True),
         )
     },
@@ -232,16 +231,20 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     NUM_EXPERTS_POW2: tl.constexpr,
+    A_MEMORY_MODE: tl.constexpr = "pointer",
+    B_MEMORY_MODE: tl.constexpr = "pointer",
+    # weight rows on the MMA's M side, a 16-64 token tile on N: below tcgen05's 128-row M the
+    # unswapped tile falls back to mma.sync with most of its rows empty
+    SWAP_AB: tl.constexpr = False,
     WARP_SPEC: tl.constexpr = False,
+    # output-tile pipeline: "k_loop" WS on the K loop, "tile_loop" / "flattened" WS across output
+    # tiles so one tile's epilogue overlaps the next tile's MMA
+    PIPELINE: tl.constexpr = "k_loop",
     # tuner axis: resolve M-tiles from the packed schedule (3 scalar loads) instead of the
     # E-wide register-resident layout — register relief, bit-identical tiles; scope pruner
     # admits it at BM>=128 only (see packed_schedule_scope_pruner)
     PACKED_SCHEDULE: tl.constexpr = False,
-    # output-tile pipeline: "k_loop" WS on the K loop, "tile_loop" / "flattened" WS across output
-    # tiles so one tile's epilogue overlaps the next tile's MMA
-    PIPELINE: tl.constexpr = "k_loop",
-    A_MEMORY_MODE: tl.constexpr = "pointer",
-    B_MEMORY_MODE: tl.constexpr = "pointer",
+    GROUP_SIZE_M: tl.constexpr = 8,
     # Gate|up fusion epilogue (GATE=False -> plain grouped GEMM, every arm below folds out)
     GATE: tl.constexpr = False,
     ACT_FN: tl.constexpr = "silu",
@@ -251,10 +254,6 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     OUTPUT_FORMAT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
-    GROUP_SIZE_M: tl.constexpr = 8,
-    # weight rows on the MMA's M side, a 16-64 token tile on N: below tcgen05's 128-row M the
-    # unswapped tile falls back to mma.sync with most of its rows empty
-    SWAP_AB: tl.constexpr = False,
 ):
     """Block-scale grouped FP8 expert matmul kernel — persistent grid-stride over tiles.
 
@@ -280,17 +279,9 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     ) and not SWAP_AB
     NUM_PROGRAMS = tl.num_programs(axis=0)
     start_pid = tl.program_id(axis=0)
-    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
-    if PACKED_SCHEDULE:
-        total_m_tiles = load_packed_schedule(Schedule, BLOCK_SIZE_M)
-        if PIPELINE == "k_loop":
-            prefetched = prefetch_packed_entry(
-                Schedule, grouped_tile_order(start_pid, total_m_tiles, num_n_tiles, GROUP_SIZE_M=GROUP_SIZE_M) // num_n_tiles, total_m_tiles
-            )
-    else:
-        exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = build_tile_layout(
-            ExpertStart, NUM_EXPERTS_POW2, BLOCK_SIZE_M
-        )
+    num_n_tiles, total_m_tiles, layout, prefetched = grouped_tile_schedule(
+        Schedule, ExpertStart, start_pid, N, NUM_EXPERTS_POW2, BLOCK_SIZE_M, BLOCK_SIZE_N, PACKED_SCHEDULE, PIPELINE, GROUP_SIZE_M
+    )
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     # PIPELINE != "k_loop" warp-specializes the tile loop instead of the K loop, so the next tile's loads
@@ -301,31 +292,10 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
         flatten=PIPELINE == "flattened", warp_specialize=WARP_SPEC and PIPELINE != "k_loop",
         disallow_acc_multi_buffer=PIPELINE != "k_loop" and (2 if GATE else 1) * BLOCK_SIZE_N > 128,
     ):
-        tile_id = grouped_tile_order(logical_tile_id, total_m_tiles, num_n_tiles, GROUP_SIZE_M=GROUP_SIZE_M)
-        if PACKED_SCHEDULE and PIPELINE != "k_loop":
-            prefetched = prefetch_packed_entry(Schedule, tile_id // num_n_tiles, total_m_tiles)
-        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start = (
-            resolve_grouped_tile_packed(
-                tile_id, num_n_tiles, prefetched,
-                GatherIdx, ScatterIdx, BLOCK_SIZE_N, BLOCK_SIZE_M, GATE,
-            ) if PACKED_SCHEDULE else resolve_grouped_tile(
-                tile_id,
-                num_n_tiles,
-                exp_start,
-                freqs,
-                tile_start_excl,
-                e_offs,
-                GatherIdx,
-                ScatterIdx,
-                BLOCK_SIZE_N,
-                BLOCK_SIZE_M,
-                GATE,
-            )
+        pid_m, pid_n, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start, prefetched = grouped_schedule_tile(
+            logical_tile_id, prefetched, Schedule, layout, num_n_tiles, total_m_tiles, NUM_PROGRAMS, GatherIdx, ScatterIdx,
+            BLOCK_SIZE_N, BLOCK_SIZE_M, GATE, PACKED_SCHEDULE, PIPELINE, GROUP_SIZE_M,
         )
-        if PACKED_SCHEDULE and PIPELINE == "k_loop":
-            prefetched = prefetch_packed_entry(
-                Schedule, grouped_tile_order(logical_tile_id + NUM_PROGRAMS, total_m_tiles, num_n_tiles, GROUP_SIZE_M=GROUP_SIZE_M) // num_n_tiles, total_m_tiles
-            )
         a_ptrs = operand_tile_ptrs(A, in_row, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
         as_ptrs = As + in_row * stride_as_m
         # GATE stacks gate (rows [0, N)) and up (rows [N, 2N)) into one [BK, 2*BN] tile — the
@@ -366,7 +336,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
             acc,
             out_row,
             pid_n,
-            tile_id // num_n_tiles,
+            pid_m,
             row_mask,
             stride_c_m,
             stride_c_n,
@@ -411,7 +381,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
             warp_spec_compile_guard_pruner(),
             warp_spec_scatter_epilogue_pruner(),
             warp_spec_memory_mode_pruner(),
-            descriptor_box_pruner(),
+            descriptor_support_pruner(),
             raw_activation_pointer_pruner(),
             smem_pruner(full_stages=True),
         )
@@ -459,16 +429,17 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     NUM_EXPERTS_POW2: tl.constexpr,
+    A_MEMORY_MODE: tl.constexpr = "pointer",
+    B_MEMORY_MODE: tl.constexpr = "pointer",
     WARP_SPEC: tl.constexpr = False,
+    # output-tile pipeline: "k_loop" WS on the K loop, "tile_loop" / "flattened" WS across output
+    # tiles so one tile's epilogue overlaps the next tile's MMA
+    PIPELINE: tl.constexpr = "k_loop",
     # tuner axis: resolve M-tiles from the packed schedule (3 scalar loads) instead of the
     # E-wide register-resident layout — register relief, bit-identical tiles; scope pruner
     # admits it at BM>=128 only (see packed_schedule_scope_pruner)
     PACKED_SCHEDULE: tl.constexpr = False,
-    # output-tile pipeline: "k_loop" WS on the K loop, "tile_loop" / "flattened" WS across output
-    # tiles so one tile's epilogue overlaps the next tile's MMA
-    PIPELINE: tl.constexpr = "k_loop",
-    A_MEMORY_MODE: tl.constexpr = "pointer",
-    B_MEMORY_MODE: tl.constexpr = "pointer",
+    GROUP_SIZE_M: tl.constexpr = 8,
     # Gate|up fusion epilogue (GATE=False -> plain grouped GEMM, every arm below folds out)
     GATE: tl.constexpr = False,
     ACT_FN: tl.constexpr = "silu",
@@ -477,7 +448,6 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
     OUTPUT_FORMAT: tl.constexpr = None,  # None | "fp8" (per-(row, block) requant of the intermediate)
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
-    GROUP_SIZE_M: tl.constexpr = 8,
 ):
     """Block-scale grouped FP8 expert matmul with a static (per-tensor) activation scale —
     persistent grid-stride, the block-dynamic sibling's structure (virtual expert sort via
@@ -488,17 +458,9 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
     the plain grouped GEMM (down projection), bit-identical."""
     NUM_PROGRAMS = tl.num_programs(axis=0)
     start_pid = tl.program_id(axis=0)
-    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
-    if PACKED_SCHEDULE:
-        total_m_tiles = load_packed_schedule(Schedule, BLOCK_SIZE_M)
-        if PIPELINE == "k_loop":
-            prefetched = prefetch_packed_entry(
-                Schedule, grouped_tile_order(start_pid, total_m_tiles, num_n_tiles, GROUP_SIZE_M=GROUP_SIZE_M) // num_n_tiles, total_m_tiles
-            )
-    else:
-        exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = build_tile_layout(
-            ExpertStart, NUM_EXPERTS_POW2, BLOCK_SIZE_M
-        )
+    num_n_tiles, total_m_tiles, layout, prefetched = grouped_tile_schedule(
+        Schedule, ExpertStart, start_pid, N, NUM_EXPERTS_POW2, BLOCK_SIZE_M, BLOCK_SIZE_N, PACKED_SCHEDULE, PIPELINE, GROUP_SIZE_M
+    )
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     # PIPELINE != "k_loop": the output-tile pipeline (see the block-dynamic kernel)
@@ -507,31 +469,10 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
         flatten=PIPELINE == "flattened", warp_specialize=WARP_SPEC and PIPELINE != "k_loop",
         disallow_acc_multi_buffer=PIPELINE != "k_loop" and (2 if GATE else 1) * BLOCK_SIZE_N > 128,
     ):
-        tile_id = grouped_tile_order(logical_tile_id, total_m_tiles, num_n_tiles, GROUP_SIZE_M=GROUP_SIZE_M)
-        if PACKED_SCHEDULE and PIPELINE != "k_loop":
-            prefetched = prefetch_packed_entry(Schedule, tile_id // num_n_tiles, total_m_tiles)
-        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start = (
-            resolve_grouped_tile_packed(
-                tile_id, num_n_tiles, prefetched,
-                GatherIdx, ScatterIdx, BLOCK_SIZE_N, BLOCK_SIZE_M, GATE,
-            ) if PACKED_SCHEDULE else resolve_grouped_tile(
-                tile_id,
-                num_n_tiles,
-                exp_start,
-                freqs,
-                tile_start_excl,
-                e_offs,
-                GatherIdx,
-                ScatterIdx,
-                BLOCK_SIZE_N,
-                BLOCK_SIZE_M,
-                GATE,
-            )
+        pid_m, pid_n, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start, prefetched = grouped_schedule_tile(
+            logical_tile_id, prefetched, Schedule, layout, num_n_tiles, total_m_tiles, NUM_PROGRAMS, GatherIdx, ScatterIdx,
+            BLOCK_SIZE_N, BLOCK_SIZE_M, GATE, PACKED_SCHEDULE, PIPELINE, GROUP_SIZE_M,
         )
-        if PACKED_SCHEDULE and PIPELINE == "k_loop":
-            prefetched = prefetch_packed_entry(
-                Schedule, grouped_tile_order(logical_tile_id + NUM_PROGRAMS, total_m_tiles, num_n_tiles, GROUP_SIZE_M=GROUP_SIZE_M) // num_n_tiles, total_m_tiles
-            )
         a_ptrs = operand_tile_ptrs(A, in_row, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
         b_ptrs = weight_tile_ptrs(
             B + expert_id64 * stride_b_e,
@@ -549,7 +490,7 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
         a_s_static = tl.load(As + expert_id64.to(tl.int32) * stride_as_e)
         acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC and PIPELINE == "k_loop"):
-            a, a_dead = load_act_static(
+            a, _as = load_act_static(
                 a_ptrs, ADescriptor, m_start, k * BLOCK_SIZE_K, row_mask, in_row, a_s_static,
                 A_MEMORY_MODE, GatherIdx is not None,
             )
@@ -571,7 +512,7 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
             acc,
             out_row,
             pid_n,
-            tile_id // num_n_tiles,
+            pid_m,
             row_mask,
             stride_c_m,
             stride_c_n,
@@ -646,7 +587,7 @@ def _tensor_grouped_configs():
             warp_spec_compile_guard_pruner(),
             warp_spec_scatter_epilogue_pruner(),
             warp_spec_memory_mode_pruner(),
-            descriptor_box_pruner(),
+            descriptor_support_pruner(),
             exact_memory_pruner(fp8_dot_smem, fallback=smem_pruner(ws_full_stages=True, raw_a_staged=True)),
             raw_activation_pointer_pruner(),
             grouped_swap_scope_pruner(),
@@ -695,16 +636,18 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     NUM_EXPERTS_POW2: tl.constexpr,
+    A_MEMORY_MODE: tl.constexpr = "pointer",
+    B_MEMORY_MODE: tl.constexpr = "pointer",
+    SWAP_AB: tl.constexpr = False,
     WARP_SPEC: tl.constexpr = False,
+    # output-tile pipeline (the full-precision kernel's axis): "k_loop" WS on the K loop, "tile_loop" /
+    # "flattened" WS across output tiles so one tile's epilogue overlaps the next tile's MMA
+    PIPELINE: tl.constexpr = "k_loop",
     # tuner axis: resolve M-tiles from the packed schedule (3 scalar loads) instead of the
     # E-wide register-resident layout — register relief, bit-identical tiles; scope pruner
     # admits it at BM>=128 only (see packed_schedule_scope_pruner)
     PACKED_SCHEDULE: tl.constexpr = False,
-    # output-tile pipeline (the full-precision kernel's axis): "k_loop" WS on the K loop, "tile_loop" /
-    # "flattened" WS across output tiles so one tile's epilogue overlaps the next tile's MMA
-    PIPELINE: tl.constexpr = "k_loop",
-    A_MEMORY_MODE: tl.constexpr = "pointer",
-    B_MEMORY_MODE: tl.constexpr = "pointer",
+    GROUP_SIZE_M: tl.constexpr = 8,
     # Gate|up fusion epilogue (GATE=False -> plain grouped GEMM). No fused requant here
     # (tensor-wide down needs a per-token whole-row scale a per-tile epilogue can't form).
     GATE: tl.constexpr = False,
@@ -714,8 +657,6 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     OUTPUT_FORMAT: tl.constexpr = None,  # tensor-wide has no fused requant (kept None)
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
-    GROUP_SIZE_M: tl.constexpr = 8,
-    SWAP_AB: tl.constexpr = False,
 ):
     """Tensor-scale / row-wise grouped FP8 expert matmul kernel — persistent grid-stride over tiles.
 
@@ -726,48 +667,19 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     intermediate; ``GATE=False`` is the plain GEMM (bit-identical)."""
     NUM_PROGRAMS = tl.num_programs(axis=0)
     start_pid = tl.program_id(axis=0)
-    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
-    if PACKED_SCHEDULE:
-        total_m_tiles = load_packed_schedule(Schedule, BLOCK_SIZE_M)
-        if PIPELINE == "k_loop":
-            prefetched = prefetch_packed_entry(
-                Schedule, grouped_tile_order(start_pid, total_m_tiles, num_n_tiles, GROUP_SIZE_M=GROUP_SIZE_M) // num_n_tiles, total_m_tiles
-            )
-    else:
-        exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = build_tile_layout(
-            ExpertStart, NUM_EXPERTS_POW2, BLOCK_SIZE_M
-        )
+    num_n_tiles, total_m_tiles, layout, prefetched = grouped_tile_schedule(
+        Schedule, ExpertStart, start_pid, N, NUM_EXPERTS_POW2, BLOCK_SIZE_M, BLOCK_SIZE_N, PACKED_SCHEDULE, PIPELINE, GROUP_SIZE_M
+    )
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     for logical_tile_id in tl.range(
         start_pid, total_m_tiles * num_n_tiles, NUM_PROGRAMS,
         flatten=PIPELINE == "flattened", warp_specialize=WARP_SPEC and PIPELINE != "k_loop",
     ):
-        tile_id = grouped_tile_order(logical_tile_id, total_m_tiles, num_n_tiles, GROUP_SIZE_M=GROUP_SIZE_M)
-        if PACKED_SCHEDULE and PIPELINE != "k_loop":
-            prefetched = prefetch_packed_entry(Schedule, tile_id // num_n_tiles, total_m_tiles)
-        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start = (
-            resolve_grouped_tile_packed(
-                tile_id, num_n_tiles, prefetched,
-                GatherIdx, ScatterIdx, BLOCK_SIZE_N, BLOCK_SIZE_M, GATE,
-            ) if PACKED_SCHEDULE else resolve_grouped_tile(
-                tile_id,
-                num_n_tiles,
-                exp_start,
-                freqs,
-                tile_start_excl,
-                e_offs,
-                GatherIdx,
-                ScatterIdx,
-                BLOCK_SIZE_N,
-                BLOCK_SIZE_M,
-                GATE,
-            )
+        pid_m, pid_n, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start, prefetched = grouped_schedule_tile(
+            logical_tile_id, prefetched, Schedule, layout, num_n_tiles, total_m_tiles, NUM_PROGRAMS, GatherIdx, ScatterIdx,
+            BLOCK_SIZE_N, BLOCK_SIZE_M, GATE, PACKED_SCHEDULE, PIPELINE, GROUP_SIZE_M,
         )
-        if PACKED_SCHEDULE and PIPELINE == "k_loop":
-            prefetched = prefetch_packed_entry(
-                Schedule, grouped_tile_order(logical_tile_id + NUM_PROGRAMS, total_m_tiles, num_n_tiles, GROUP_SIZE_M=GROUP_SIZE_M) // num_n_tiles, total_m_tiles
-            )
         a_ptrs = operand_tile_ptrs(A, in_row, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
         # GATE stacks gate|up into one [BK, 2*BN] tile; rows are interleaved, so the tile is
         # one 2*BN span. GATE=False -> plain [BK, BN].
@@ -812,7 +724,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
             acc,
             out_row,
             pid_n,
-            tile_id // num_n_tiles,
+            pid_m,
             row_mask,
             stride_c_m,
             stride_c_n,
@@ -864,7 +776,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
             mx_config_pruner("K", "N"),
             swizzled_scales_bm_pruner(),
             swizzled_scale_config_pruner(),
-            descriptor_box_pruner(),
+            descriptor_support_pruner(),
             exact_memory_pruner(mx_grouped_smem, fallback=smem_pruner()),
             warp_spec_compile_guard_pruner(),
             warp_spec_scatter_epilogue_pruner(),
@@ -926,9 +838,20 @@ def mx_dynamic_matmul_grouped_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     NUM_EXPERTS_POW2: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
-    COMPUTE_MODE: tl.constexpr,
-    B_MEMORY_MODE: tl.constexpr = "pointer",
     A_MEMORY_MODE: tl.constexpr = "pointer",
+    B_MEMORY_MODE: tl.constexpr = "pointer",
+    COMPUTE_MODE: tl.constexpr = "dot_scaled",
+    # tuner axis: the 128 weight rows on the scaled MMA's M operand and the BM-token tile on N (a batch with a few
+    # rows per expert); scoped by grouped_mx_swap_scope_pruner
+    SWAP_AB: tl.constexpr = False,
+    SWIZZLED_SCALES: tl.constexpr = True,  # scales pre-swizzled (5D weight + matching acts); else affine
+    WARP_SPEC: tl.constexpr = False,  # tuner axis; dot_scaled+WS+TMA compiles+wins (num_warps%4, BM>=64)
+    PIPELINE: tl.constexpr = "k_loop",  # tuner axis: warp-specialize the K loop, or the tile loop ("tile_loop"/"flattened")
+    # tuner axis: resolve M-tiles from the packed schedule (3 scalar loads) instead of the
+    # E-wide register-resident layout — register relief, bit-identical tiles; scope pruner
+    # admits it at BM>=128 only (see packed_schedule_scope_pruner)
+    PACKED_SCHEDULE: tl.constexpr = False,
+    GROUP_SIZE_M: tl.constexpr = 1,
     # Gate|up fusion epilogue (GATE=False -> plain grouped GEMM, every arm below folds out)
     GATE: tl.constexpr = False,
     ACT_FN: tl.constexpr = "silu",
@@ -936,20 +859,9 @@ def mx_dynamic_matmul_grouped_kernel(
     SWIGLU_LIMIT: tl.constexpr = None,
     # the output format name (None | "mxfp8" | "mxfp4" | "nvfp4")
     OUTPUT_FORMAT: tl.constexpr = None,
+    SWIZZLED_OUT: tl.constexpr = False,  # requant emits Cs in SWIZZLE_32_4_4 (descriptor); single source: the wrapper
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
-    SWIZZLED_SCALES: tl.constexpr = True,  # scales pre-swizzled (5D weight + matching acts); else affine
-    SWIZZLED_OUT: tl.constexpr = False,  # requant emits Cs in SWIZZLE_32_4_4 (descriptor); single source: the wrapper
-    WARP_SPEC: tl.constexpr = False,  # tuner axis; dot_scaled+WS+TMA compiles+wins (num_warps%4, BM>=64)
-    # tuner axis: resolve M-tiles from the packed schedule (3 scalar loads) instead of the
-    # E-wide register-resident layout — register relief, bit-identical tiles; scope pruner
-    # admits it at BM>=128 only (see packed_schedule_scope_pruner)
-    PACKED_SCHEDULE: tl.constexpr = False,
-    PIPELINE: tl.constexpr = "k_loop",  # tuner axis: warp-specialize the K loop, or the tile loop ("tile_loop"/"flattened")
-    GROUP_SIZE_M: tl.constexpr = 1,
-    # tuner axis: the 128 weight rows on the scaled MMA's M operand and the BM-token tile on N (a batch with a few
-    # rows per expert); scoped by grouped_mx_swap_scope_pruner
-    SWAP_AB: tl.constexpr = False,
 ):
     """Unified grouped microscaled expert matmul (MXFP8/MXFP4/NVFP4; a ``uint8`` ``A``
     is caller-packed E2M1 — W4A4 on the native fp4 MMA) — persistent grid-stride.
@@ -964,16 +876,11 @@ def mx_dynamic_matmul_grouped_kernel(
     """
     NUM_PROGRAMS = tl.num_programs(axis=0)
     start_pid = tl.program_id(axis=0)
-    if PACKED_SCHEDULE:
-        total_m_tiles = load_packed_schedule(Schedule, BLOCK_SIZE_M)
-        if PIPELINE == "k_loop":
-            prefetched = prefetch_packed_entry(
-                Schedule, grouped_tile_order(start_pid, total_m_tiles, tl.cdiv(N, BLOCK_SIZE_N), GROUP_SIZE_M=GROUP_SIZE_M) // tl.cdiv(N, BLOCK_SIZE_N), total_m_tiles
-            )
-    else:
-        exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = build_tile_layout(
-            ExpertStart, NUM_EXPERTS_POW2, BLOCK_SIZE_M
-        )
+    num_n_tiles, total_m_tiles, layout, prefetched = grouped_tile_schedule(
+        Schedule, ExpertStart, start_pid, N, NUM_EXPERTS_POW2, BLOCK_SIZE_M, BLOCK_SIZE_N, PACKED_SCHEDULE, PIPELINE, GROUP_SIZE_M
+    )
+    if not PACKED_SCHEDULE:
+        _, freqs, tile_start_excl, e_offs = layout
         if SWAP_AB and (SWIZZLED_SCALES or SWIZZLED_OUT):
             # the swizzled act-scale slab pads each expert to whole 128-row blocks: a swapped token tile (BM < 128)
             # finds its rows at the expert's padded start plus its offset inside the expert
@@ -993,7 +900,6 @@ def mx_dynamic_matmul_grouped_kernel(
     # (weight_tile_ptrs' gate arm + the two-slab scale below); the dot is 2*BN wide and the epilogue
     # splits the accumulator into its gate/up halves for SiLU*up. Only the load (which two blocks) and
     # the epilogue (split) depend on GATE — the K-loop body is otherwise uniform.
-    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
     offs_ka = tl.arange(0, BLOCK_SIZE_K // ACT_VALUES_PER_BYTE)
     offs_kb = tl.arange(0, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE)
 
@@ -1005,31 +911,10 @@ def mx_dynamic_matmul_grouped_kernel(
         flatten=PIPELINE == "flattened", warp_specialize=WARP_SPEC and PIPELINE != "k_loop",
         disallow_acc_multi_buffer=PIPELINE != "k_loop" and (2 if GATE else 1) * BLOCK_SIZE_N > 128,
     ):
-        tile_id = grouped_tile_order(logical_tile_id, total_m_tiles, num_n_tiles, GROUP_SIZE_M=GROUP_SIZE_M)
-        if PACKED_SCHEDULE and PIPELINE != "k_loop":
-            prefetched = prefetch_packed_entry(Schedule, tile_id // num_n_tiles, total_m_tiles)
-        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start = (
-            resolve_grouped_tile_packed(
-                tile_id, num_n_tiles, prefetched,
-                GatherIdx, ScatterIdx, BLOCK_SIZE_N, BLOCK_SIZE_M, GATE,
-            ) if PACKED_SCHEDULE else resolve_grouped_tile(
-                tile_id,
-                num_n_tiles,
-                exp_start,
-                freqs,
-                tile_start_excl,
-                e_offs,
-                GatherIdx,
-                ScatterIdx,
-                BLOCK_SIZE_N,
-                BLOCK_SIZE_M,
-                GATE,
-            )
+        pid_m, pid_n, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start, prefetched = grouped_schedule_tile(
+            logical_tile_id, prefetched, Schedule, layout, num_n_tiles, total_m_tiles, NUM_PROGRAMS, GatherIdx, ScatterIdx,
+            BLOCK_SIZE_N, BLOCK_SIZE_M, GATE, PACKED_SCHEDULE, PIPELINE, GROUP_SIZE_M,
         )
-        if PACKED_SCHEDULE and PIPELINE == "k_loop":
-            prefetched = prefetch_packed_entry(
-                Schedule, grouped_tile_order(logical_tile_id + NUM_PROGRAMS, total_m_tiles, num_n_tiles, GROUP_SIZE_M=GROUP_SIZE_M) // num_n_tiles, total_m_tiles
-            )
         a_ptrs = operand_tile_ptrs(A, in_row, offs_ka, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
         # Non-128 N: the partial last N-tile's pointer-arm rows wrap into B (offs_bn % N) so the load
         # never reads past the expert's N rows; the wrapped columns' output is masked off (N_COLS) in
@@ -1056,7 +941,6 @@ def mx_dynamic_matmul_grouped_kernel(
         # tile's expert-sorted, 128-padded scale block is the flat tile index pid_m; the weight scale
         # block (descriptor bulk-load, BN=128) is expert*num_n_tiles + pid_n. Each expert's swizzled
         # slab is num_n_tiles REP-blocks (REP=2 under GATE, whose tile spans both).
-        pid_m = tile_id // num_n_tiles
         weight_blk = (expert_id64 * num_n_tiles + pid_n).to(tl.int32)
         if SWAP_AB and (SWIZZLED_SCALES or SWIZZLED_OUT):
             in_expert = e_offs == expert_id64.to(tl.int32)
@@ -1203,7 +1087,7 @@ def _mx_weight_only_grouped_configs():
             # veto belongs to the maskless-store kernels (see OPTIMIZATION_LOG: n-veto-lift)
             mx_config_pruner("K", "N", block_within_k=False),  # dot_scaled shape gates
             gate_stacked_tmem_trap_pruner(),
-            descriptor_box_pruner(),
+            descriptor_support_pruner(),
             exact_memory_pruner(mx_weight_only_grouped_smem, mx_weight_only_grouped_tmem, fallback=smem_pruner()),
             warp_spec_compile_guard_pruner(),
             warp_spec_scatter_epilogue_pruner(),
@@ -1233,7 +1117,7 @@ def mx_weight_only_matmul_grouped_kernel(
     K,
     stride_a_m,
     stride_a_k,
-    stride_as_global: tl.constexpr,
+    stride_as_global,  # expert stride of AsGlobal (0 broadcasts a shared scalar)
     stride_b_e,
     stride_b_k,
     stride_b_n,
@@ -1256,20 +1140,20 @@ def mx_weight_only_matmul_grouped_kernel(
     A_MEMORY_MODE: tl.constexpr = "pointer",
     B_MEMORY_MODE: tl.constexpr = "pointer",
     COMPUTE_MODE: tl.constexpr = "dot",
+    SWAP_AB: tl.constexpr = False,
     WARP_SPEC: tl.constexpr = False,
+    PIPELINE: tl.constexpr = "k_loop",
     # tuner axis: resolve M-tiles from the packed schedule (3 scalar loads) instead of the
     # E-wide register-resident layout — register relief, bit-identical tiles; scope pruner
     # admits it at BM>=128 only (see packed_schedule_scope_pruner)
     PACKED_SCHEDULE: tl.constexpr = False,
+    GROUP_SIZE_M: tl.constexpr = 1,
     GATE: tl.constexpr = False,
     ACT_FN: tl.constexpr = "silu",
     SWIGLU_ALPHA: tl.constexpr = None,
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
-    PIPELINE: tl.constexpr = "k_loop",
-    SWAP_AB: tl.constexpr = False,
-    GROUP_SIZE_M: tl.constexpr = 1,
 ):
     """weight-only grouped expert matmul: raw bf16 activations against MXFP4/MXFP8 weights upcast to bf16
     in-loop (unpack + per-group group-scale), plain ``tl.dot``. The ``matmul_ogs`` format. Persistent
@@ -1278,39 +1162,19 @@ def mx_weight_only_matmul_grouped_kernel(
     n_width: tl.constexpr = (2 if GATE else 1) * BLOCK_SIZE_N
     NUM_PROGRAMS = tl.num_programs(axis=0)
     start_pid = tl.program_id(axis=0)
-    if PACKED_SCHEDULE:
-        total_m_tiles = load_packed_schedule(Schedule, BLOCK_SIZE_M)
-        if PIPELINE == "k_loop":
-            prefetched = prefetch_packed_entry(
-                Schedule, grouped_tile_order(start_pid, total_m_tiles, tl.cdiv(N, BLOCK_SIZE_N), GROUP_SIZE_M=GROUP_SIZE_M) // tl.cdiv(N, BLOCK_SIZE_N), total_m_tiles
-            )
-    else:
-        exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = build_tile_layout(
-            ExpertStart, NUM_EXPERTS_POW2, BLOCK_SIZE_M
-        )
-    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
+    num_n_tiles, total_m_tiles, layout, prefetched = grouped_tile_schedule(
+        Schedule, ExpertStart, start_pid, N, NUM_EXPERTS_POW2, BLOCK_SIZE_M, BLOCK_SIZE_N, PACKED_SCHEDULE, PIPELINE, GROUP_SIZE_M
+    )
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     offs_kb = tl.arange(0, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE)
     for logical_tile_id in tl.range(
         start_pid, total_m_tiles * num_n_tiles, NUM_PROGRAMS,
         flatten=PIPELINE == "flattened", warp_specialize=WARP_SPEC and PIPELINE != "k_loop",
     ):
-        tile_id = grouped_tile_order(logical_tile_id, total_m_tiles, num_n_tiles, GROUP_SIZE_M=GROUP_SIZE_M)
-        if PACKED_SCHEDULE and PIPELINE != "k_loop":
-            prefetched = prefetch_packed_entry(Schedule, tile_id // num_n_tiles, total_m_tiles)
-        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start = (
-            resolve_grouped_tile_packed(
-                tile_id, num_n_tiles, prefetched,
-                GatherIdx, ScatterIdx, BLOCK_SIZE_N, BLOCK_SIZE_M, GATE,
-            ) if PACKED_SCHEDULE else resolve_grouped_tile(
-                tile_id, num_n_tiles, exp_start, freqs, tile_start_excl, e_offs,
-                GatherIdx, ScatterIdx, BLOCK_SIZE_N, BLOCK_SIZE_M, GATE,
-            )
+        pid_m, pid_n, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start, prefetched = grouped_schedule_tile(
+            logical_tile_id, prefetched, Schedule, layout, num_n_tiles, total_m_tiles, NUM_PROGRAMS, GatherIdx, ScatterIdx,
+            BLOCK_SIZE_N, BLOCK_SIZE_M, GATE, PACKED_SCHEDULE, PIPELINE, GROUP_SIZE_M,
         )
-        if PACKED_SCHEDULE and PIPELINE == "k_loop":
-            prefetched = prefetch_packed_entry(
-                Schedule, grouped_tile_order(logical_tile_id + NUM_PROGRAMS, total_m_tiles, num_n_tiles, GROUP_SIZE_M=GROUP_SIZE_M) // num_n_tiles, total_m_tiles
-            )
         offs_bn = offs_bn % (2 * N if GATE else N)  # non-128 N: pointer rows wrap; wrapped cols masked (N_COLS) in epilogue
         a_ptrs = operand_tile_ptrs(A, in_row, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
         b_ptrs = weight_tile_ptrs(
@@ -1348,7 +1212,7 @@ def mx_weight_only_matmul_grouped_kernel(
             kb_off = tl.minimum((k + 1) * BLOCK_SIZE_K, K - BLOCK_SIZE_K) // WEIGHT_VALUES_PER_BYTE
 
         gemm_epilogue(
-            C, C, acc, out_row, pid_n, tile_id // num_n_tiles, row_mask,
+            C, C, acc, out_row, pid_n, pid_m, row_mask,
             stride_c_m, stride_c_n, 1, 1,
             BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, 1,
             ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
@@ -1451,7 +1315,7 @@ def _int_grouped_configs():
             block_fits_dim_pruner("K"),
             int_scale_group_tile_pruner(),
             gate_stacked_tmem_trap_pruner(),
-            descriptor_box_pruner(),
+            descriptor_support_pruner(),
             exact_memory_pruner(weight_only_grouped_smem, weight_only_grouped_tmem, fallback=smem_pruner()),
             warp_spec_compile_guard_pruner(),
             warp_spec_scatter_epilogue_pruner(),
@@ -1481,7 +1345,7 @@ def int_weight_only_matmul_grouped_kernel(
     K,
     stride_a_m,
     stride_a_k,
-    stride_asglobal_e,
+    stride_as_global,
     stride_b_e,
     stride_b_k,
     stride_b_n,
@@ -1491,7 +1355,7 @@ def int_weight_only_matmul_grouped_kernel(
     stride_bz_e,
     stride_bz_n,
     stride_bz_k,
-    stride_bsglobal_e,
+    stride_bs_global,
     stride_c_m,
     stride_c_n,
     stride_bias_e,
@@ -1503,25 +1367,25 @@ def int_weight_only_matmul_grouped_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     NUM_EXPERTS_POW2: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
+    INT_BITS: tl.constexpr = 4,
     A_MEMORY_MODE: tl.constexpr = "pointer",
     B_MEMORY_MODE: tl.constexpr = "pointer",
+    # "scalar": the CUDA-core reduce over 1-4 row tiles and 8-32 weight rows (the batched kernel's decode arm), for
+    # experts holding a row or two, where an MMA tile is mostly padding and the decode grid too coarse
+    COMPUTE_MODE: tl.constexpr = "dot",
+    SCALE_MODE: tl.constexpr = "tile",  # where the group scale lands (int_weight_only_compute)
+    SWAP_AB: tl.constexpr = False,
     WARP_SPEC: tl.constexpr = False,
+    PIPELINE: tl.constexpr = "k_loop",
     PACKED_SCHEDULE: tl.constexpr = False,
+    PROGRAMS_PER_SM: tl.constexpr = 1,
+    GROUP_SIZE_M: tl.constexpr = 1,
     GATE: tl.constexpr = False,
     ACT_FN: tl.constexpr = "silu",
     SWIGLU_ALPHA: tl.constexpr = None,
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
-    INT_BITS: tl.constexpr = 4,
-    PROGRAMS_PER_SM: tl.constexpr = 1,
-    SWAP_AB: tl.constexpr = False,
-    PIPELINE: tl.constexpr = "k_loop",
-    GROUP_SIZE_M: tl.constexpr = 1,
-    # "scalar": the CUDA-core reduce over 1-4 row tiles and 8-32 weight rows (the batched kernel's decode arm), for
-    # experts holding a row or two, where an MMA tile is mostly padding and the decode grid too coarse
-    COMPUTE_MODE: tl.constexpr = "dot",
-    SCALE_MODE: tl.constexpr = "tile",  # where the group scale lands (int_weight_only_compute)
 ):
     """Integer grouped expert matmul: bf16/fp16 weight-only, calibrated INT4/FP8, or INT8 SmoothQuant.
     Persistent grid-stride; pointer or host-TMA operands, affine scales.
@@ -1532,17 +1396,9 @@ def int_weight_only_matmul_grouped_kernel(
     ROWS_MAJOR: tl.constexpr = SWAP_AB or BLOCK_SIZE_M < 64
     NUM_PROGRAMS = tl.num_programs(axis=0)  # persistent_programs_per_sm per SM
     start_pid = tl.program_id(axis=0)
-    if PACKED_SCHEDULE:
-        total_m_tiles = load_packed_schedule(Schedule, BLOCK_SIZE_M)
-        if PIPELINE == "k_loop":
-            prefetched = prefetch_packed_entry(
-                Schedule, grouped_tile_order(start_pid, total_m_tiles, tl.cdiv(N, BLOCK_SIZE_N), GROUP_SIZE_M=GROUP_SIZE_M) // tl.cdiv(N, BLOCK_SIZE_N), total_m_tiles
-            )
-    else:
-        exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = build_tile_layout(
-            ExpertStart, NUM_EXPERTS_POW2, BLOCK_SIZE_M
-        )
-    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
+    num_n_tiles, total_m_tiles, layout, prefetched = grouped_tile_schedule(
+        Schedule, ExpertStart, start_pid, N, NUM_EXPERTS_POW2, BLOCK_SIZE_M, BLOCK_SIZE_N, PACKED_SCHEDULE, PIPELINE, GROUP_SIZE_M
+    )
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     VPW: tl.constexpr = 32 // INT_BITS  # values per uint32 word
     offs_kb = tl.arange(0, BLOCK_SIZE_K // VPW)
@@ -1550,23 +1406,10 @@ def int_weight_only_matmul_grouped_kernel(
         start_pid, total_m_tiles * num_n_tiles, NUM_PROGRAMS,
         flatten=PIPELINE == "flattened", warp_specialize=WARP_SPEC and PIPELINE != "k_loop",
     ):
-        tile_id = grouped_tile_order(logical_tile_id, total_m_tiles, num_n_tiles, GROUP_SIZE_M=GROUP_SIZE_M)
-        if PACKED_SCHEDULE and PIPELINE != "k_loop":
-            # Let the outer pipeline schedule this tile's entry instead of carrying a second prefetch across it.
-            prefetched = prefetch_packed_entry(Schedule, tile_id // num_n_tiles, total_m_tiles)
-        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start = (
-            resolve_grouped_tile_packed(
-                tile_id, num_n_tiles, prefetched,
-                GatherIdx, ScatterIdx, BLOCK_SIZE_N, BLOCK_SIZE_M, GATE,
-            ) if PACKED_SCHEDULE else resolve_grouped_tile(
-                tile_id, num_n_tiles, exp_start, freqs, tile_start_excl, e_offs,
-                GatherIdx, ScatterIdx, BLOCK_SIZE_N, BLOCK_SIZE_M, GATE,
-            )
+        pid_m, pid_n, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start, prefetched = grouped_schedule_tile(
+            logical_tile_id, prefetched, Schedule, layout, num_n_tiles, total_m_tiles, NUM_PROGRAMS, GatherIdx, ScatterIdx,
+            BLOCK_SIZE_N, BLOCK_SIZE_M, GATE, PACKED_SCHEDULE, PIPELINE, GROUP_SIZE_M,
         )
-        if PACKED_SCHEDULE and PIPELINE == "k_loop":
-            prefetched = prefetch_packed_entry(
-                Schedule, grouped_tile_order(logical_tile_id + NUM_PROGRAMS, total_m_tiles, num_n_tiles, GROUP_SIZE_M=GROUP_SIZE_M) // num_n_tiles, total_m_tiles
-            )
         offs_bn = offs_bn % (2 * N if GATE else N)  # non-128 N: pointer rows wrap; wrapped cols masked (N_COLS) in epilogue
         a_ptrs = operand_tile_ptrs(A, in_row, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
         b_ptrs = weight_tile_ptrs(
@@ -1601,7 +1444,7 @@ def int_weight_only_matmul_grouped_kernel(
                 stride_bs_e, stride_bs_n, stride_bs_k, GATE, False,
                 BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, GROUPED=True,
             )
-            w, _w_unused = load_weight_plain(
+            w, _ws = load_weight_plain(
                 b_ptrs, BDescriptor, row0, n_off, kb_off, GATE, True, B_MEMORY_MODE, ROWS_MAJOR,
                 BLOCK_SIZE_N, BLOCK_SIZE_K, VPW,
             )
@@ -1613,26 +1456,26 @@ def int_weight_only_matmul_grouped_kernel(
                 )
             acc = int_weight_only_compute(
                 acc, a, w, w_s, w_z, BLOCK_SIZE_K, n_width, SCALE_GROUP_K, COMPUTE_MODE, ROWS_MAJOR, INT_BITS, SWAP_AB,
-                weight_global=None if BsGlobal is None else tl.load(BsGlobal + expert_id64 * stride_bsglobal_e),
+                weight_global=None if BsGlobal is None else tl.load(BsGlobal + expert_id64 * stride_bs_global),
                 SCALE_MODE=SCALE_MODE,
             )
             a_ptrs += BLOCK_SIZE_K * stride_a_k
             b_ptrs += (BLOCK_SIZE_K // VPW) * stride_b_k
 
         output_scale = BsGlobal
-        output_scale_stride = stride_bsglobal_e
+        output_scale_stride = stride_bs_global
         if A.dtype.element_ty == tl.int8:
             output_scale = Bs + offs_bn * stride_bs_n
             output_scale_stride = stride_bs_e
         gemm_epilogue(
-            C, C, acc, out_row, pid_n, tile_id // num_n_tiles, row_mask,
+            C, C, acc, out_row, pid_n, pid_m, row_mask,
             stride_c_m, stride_c_n, 1, 1,
             BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, 1,
             ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
             N_COLS=N,
             global_row=expert_id64,
             GlobalScale=output_scale, stride_global_e=output_scale_stride,
-            GlobalScaleA=AsGlobal, stride_global_a=stride_asglobal_e,
+            GlobalScaleA=AsGlobal, stride_global_a=stride_as_global,
             Bias=Bias,
             stride_bias_e=stride_bias_e,
             stride_bias_n=stride_bias_n,
@@ -1667,8 +1510,7 @@ def _full_precision_grouped_configs():
             for bn in (64, 128) for g in (1, 8) for w in (4, 8) for st in (3, 4)
         )
         configs.extend(
-            triton.Config(dict(c.kwargs, SWAP_AB=True), num_warps=c.num_warps, num_stages=c.num_stages,
-                          num_ctas=c.num_ctas, maxnreg=c.maxnreg, pre_hook=c.pre_hook)
+            clone_config(c, SWAP_AB=True)
             for c in list(configs)
             if c.kwargs["BLOCK_SIZE_M"] in (16, 32, 64, 128) and c.kwargs["BLOCK_SIZE_N"] == 128
             and c.kwargs["PIPELINE"] == "k_loop" and not c.kwargs["SWAP_AB"]
@@ -1696,7 +1538,7 @@ def _full_precision_grouped_configs():
             warp_spec_scatter_epilogue_pruner(),
             warp_spec_memory_mode_pruner(gather_only=True),
             packed_schedule_scope_pruner(),
-            descriptor_box_pruner(),
+            descriptor_support_pruner(),
             gate_stacked_tmem_trap_pruner(),
             smem_pruner(),
             grouped_swap_scope_pruner(),
@@ -1736,15 +1578,19 @@ def full_precision_matmul_grouped_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     NUM_EXPERTS_POW2: tl.constexpr,
+    A_MEMORY_MODE: tl.constexpr = "pointer",
+    # descriptor modes (host-built TMA / in-kernel tensormap) load weight tiles via the
+    # descriptor and run the swapped (weights-in-M) loop; "pointer" is the natural loop.
+    B_MEMORY_MODE: tl.constexpr = "pointer",
+    # weight rows on the MMA's M side and the token tile on N (see _full_precision_grouped_configs)
+    SWAP_AB: tl.constexpr = False,
     WARP_SPEC: tl.constexpr = False,
+    PIPELINE: tl.constexpr = "k_loop",
     # tuner axis: resolve M-tiles from the packed schedule (3 scalar loads) instead of the
     # E-wide register-resident layout — pure register relief, bit-identical tiles; wins only
     # at pressure-walled big-tile configs (dsv4 BM128/BK256: regs 244->187, +8%)
     PACKED_SCHEDULE: tl.constexpr = False,
-    # descriptor modes (host-built TMA / in-kernel tensormap) load weight tiles via the
-    # descriptor and run the swapped (weights-in-M) loop; "pointer" is the natural loop.
-    B_MEMORY_MODE: tl.constexpr = "pointer",
-    A_MEMORY_MODE: tl.constexpr = "pointer",
+    GROUP_SIZE_M: tl.constexpr = 8,
     # Gate|up fusion epilogue (GATE=False -> plain grouped GEMM). No requant arm: the
     # full-precision chain has no quantized intermediate — down consumes the GLU output as is.
     GATE: tl.constexpr = False,
@@ -1753,10 +1599,6 @@ def full_precision_matmul_grouped_kernel(
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
-    PIPELINE: tl.constexpr = "k_loop",
-    GROUP_SIZE_M: tl.constexpr = 8,
-    # weight rows on the MMA's M side and the token tile on N (see _full_precision_grouped_configs)
-    SWAP_AB: tl.constexpr = False,
 ):
     """Full-precision grouped expert matmul kernel — persistent grid-stride over tiles.
 
@@ -1766,52 +1608,18 @@ def full_precision_matmul_grouped_kernel(
     emitting the intermediate; ``GATE=False`` is the plain GEMM (bit-identical)."""
     NUM_PROGRAMS = tl.num_programs(axis=0)
     start_pid = tl.program_id(axis=0)
-    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
-    if PACKED_SCHEDULE:
-        total_m_tiles = load_packed_schedule(Schedule, BLOCK_SIZE_M)
-        if PIPELINE == "k_loop":
-            prefetched = prefetch_packed_entry(
-                Schedule, grouped_tile_order(start_pid, total_m_tiles, num_n_tiles, GROUP_SIZE_M=GROUP_SIZE_M) // num_n_tiles, total_m_tiles
-            )
-    else:
-        exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = build_tile_layout(
-            ExpertStart, NUM_EXPERTS_POW2, BLOCK_SIZE_M
-        )
+    num_n_tiles, total_m_tiles, layout, prefetched = grouped_tile_schedule(
+        Schedule, ExpertStart, start_pid, N, NUM_EXPERTS_POW2, BLOCK_SIZE_M, BLOCK_SIZE_N, PACKED_SCHEDULE, PIPELINE, GROUP_SIZE_M
+    )
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     for logical_tile_id in tl.range(
         start_pid, total_m_tiles * num_n_tiles, NUM_PROGRAMS,
         flatten=PIPELINE == "flattened", warp_specialize=WARP_SPEC and PIPELINE != "k_loop",
     ):
-        tile_id = grouped_tile_order(logical_tile_id, total_m_tiles, num_n_tiles, GROUP_SIZE_M=GROUP_SIZE_M)
-        if PACKED_SCHEDULE and PIPELINE != "k_loop":
-            prefetched = prefetch_packed_entry(Schedule, tile_id // num_n_tiles, total_m_tiles)
-        if PACKED_SCHEDULE:
-            pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start = (
-                resolve_grouped_tile_packed(
-                    tile_id, num_n_tiles, prefetched,
-                    GatherIdx, ScatterIdx, BLOCK_SIZE_N, BLOCK_SIZE_M, GATE,
-                )
-            )
-        else:
-            pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start = (
-                resolve_grouped_tile(
-                    tile_id,
-                    num_n_tiles,
-                    exp_start,
-                    freqs,
-                    tile_start_excl,
-                    e_offs,
-                    GatherIdx,
-                    ScatterIdx,
-                    BLOCK_SIZE_N,
-                    BLOCK_SIZE_M,
-                    GATE,
-                )
-            )
-        if PACKED_SCHEDULE and PIPELINE == "k_loop":
-            prefetched = prefetch_packed_entry(
-                Schedule, grouped_tile_order(logical_tile_id + NUM_PROGRAMS, total_m_tiles, num_n_tiles, GROUP_SIZE_M=GROUP_SIZE_M) // num_n_tiles, total_m_tiles
-            )
+        pid_m, pid_n, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start, prefetched = grouped_schedule_tile(
+            logical_tile_id, prefetched, Schedule, layout, num_n_tiles, total_m_tiles, NUM_PROGRAMS, GatherIdx, ScatterIdx,
+            BLOCK_SIZE_N, BLOCK_SIZE_M, GATE, PACKED_SCHEDULE, PIPELINE, GROUP_SIZE_M,
+        )
         a_ptrs = operand_tile_ptrs(A, in_row, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
         # GATE reads the interleaved gate|up rows as one [BK, 2*BN] tile.
         # GATE=False -> the plain [BK, BN] tile. Pointer arm — the descriptor modes
@@ -1834,7 +1642,7 @@ def full_precision_matmul_grouped_kernel(
         # K-contiguous axes are the orientation the Xe 2D block load needs to reach rate (a
         # (K, N) view, what the pointer arm effectively does, falls well off it). A needs no
         # such care — its box is 2D either way, and no gather reaches the descriptor arm here
-        # (``descriptor_box_pruner`` fences gathered descriptor A to sm_100), so the rows are
+        # (``descriptor_support_pruner`` fences gathered descriptor A to sm_100), so the rows are
         # the contiguous span at ``m_start``, tails zero-fill like the affine arm's mask, and
         # rows outside the expert are dropped by the epilogue's row_mask.
         a_desc = operand_tile_descriptor(
@@ -1873,7 +1681,7 @@ def full_precision_matmul_grouped_kernel(
             acc,
             out_row,
             pid_n,
-            tile_id // num_n_tiles,
+            pid_m,
             row_mask,
             stride_c_m,
             stride_c_n,
@@ -1906,8 +1714,7 @@ def _block_fp8_weight_only_grouped_configs():
     # 16-row token tile empty (B200, E128 H=I=6144 top-4 gate|up T=64: 1477 -> 1360 us; Qwen3-30B-A3B T=8
     # 37.1 -> 34.9 us). The INT grouped kernel measured slower swapped (its rows-major decode costs more).
     configs.extend(
-        triton.Config(dict(c.kwargs, SWAP_AB=True), num_warps=c.num_warps, num_stages=c.num_stages,
-                      num_ctas=c.num_ctas, maxnreg=c.maxnreg, pre_hook=c.pre_hook)
+        clone_config(c, SWAP_AB=True)
         for c in list(configs)
         if c.kwargs["BLOCK_SIZE_M"] <= 32 and not c.kwargs["WARP_SPEC"] and c.num_warps == 4
         and c.kwargs["BLOCK_SIZE_N"] in (64, 128) and c.kwargs["BLOCK_SIZE_K"] in (128, 256)
@@ -1942,7 +1749,7 @@ def _block_fp8_weight_only_grouped_configs():
             warp_spec_scatter_epilogue_pruner(),
             warp_spec_memory_mode_pruner(gather_only=True),
             packed_schedule_scope_pruner(),
-            descriptor_box_pruner(),
+            descriptor_support_pruner(),
             gate_stacked_tmem_trap_pruner(),
             exact_memory_pruner(weight_only_grouped_smem, weight_only_grouped_tmem, fallback=smem_pruner(raw_a_staged=True)),
             block_fp8_scale_mode_pruner(),
@@ -1961,13 +1768,11 @@ def block_fp8_weight_only_matmul_grouped_kernel(
     GatherIdx,  # (S,) int32 — sorted position -> source row of A; read only when not None
     ScatterIdx,  # (S,) int32 — sorted position -> destination row of C; read only when not None
     ExpertStart,  # (NUM_EXPERTS_POW2 + 1,) int32 — cumulative row starts, S sentinel
-    Schedule,  # packed tile schedule; read iff PACKED_SCHEDULE
+    Schedule,  # packed tile schedule (fill_packed_schedule); read iff PACKED_SCHEDULE
     # Shape
     S,
     N,
     K,
-    num_experts,
-    tokens_per_expert_bit_length,  # autotune key only
     # Strides
     stride_a_m,
     stride_a_k,
@@ -1981,19 +1786,26 @@ def block_fp8_weight_only_matmul_grouped_kernel(
     stride_c_n,
     stride_bias_e,
     stride_bias_n,
+    num_experts,
+    tokens_per_expert_bit_length,  # autotune key only
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    NUM_EXPERTS_POW2: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    NUM_EXPERTS_POW2: tl.constexpr,
-    WARP_SPEC: tl.constexpr = False,
-    PACKED_SCHEDULE: tl.constexpr = False,
-    B_MEMORY_MODE: tl.constexpr = "pointer",
     A_MEMORY_MODE: tl.constexpr = "pointer",
-    PIPELINE: tl.constexpr = "k_loop",
+    B_MEMORY_MODE: tl.constexpr = "pointer",
+    # Where the coarse block scale lands (block_fp8_weight_only_dot): the tuned "tile" / "acc" / "act", or
+    # "post" — the epilogue's output scale — whenever one scale block spans K (SCALE_POST, set at launch).
+    SCALE_MODE: tl.constexpr = "tile",
+    SCALE_POST: tl.constexpr = False,
     SWAP_AB: tl.constexpr = False,
+    WARP_SPEC: tl.constexpr = False,
+    PIPELINE: tl.constexpr = "k_loop",
+    PACKED_SCHEDULE: tl.constexpr = False,
+    GROUP_SIZE_M: tl.constexpr = 8,
     GATE: tl.constexpr = False,
     GATE_SCALES: tl.constexpr = False,
     ACT_FN: tl.constexpr = "silu",
@@ -2001,62 +1813,23 @@ def block_fp8_weight_only_matmul_grouped_kernel(
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
-    GROUP_SIZE_M: tl.constexpr = 8,
-    # Where the coarse block scale lands (block_fp8_weight_only_dot): the tuned "tile" / "acc" / "act", or
-    # "post" — the epilogue's output scale — whenever one scale block spans K (SCALE_POST, set at launch).
-    SCALE_MODE: tl.constexpr = "tile",
-    SCALE_POST: tl.constexpr = False,
 ):
     """Persistent FP8 W8A16 GEMM with optional fused gate/up activation."""
     MODE: tl.constexpr = "post" if SCALE_POST else SCALE_MODE  # one scale block spans K: the output scale
     NUM_PROGRAMS = tl.num_programs(axis=0)
     start_pid = tl.program_id(axis=0)
-    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
-    if PACKED_SCHEDULE:
-        total_m_tiles = load_packed_schedule(Schedule, BLOCK_SIZE_M)
-        if PIPELINE == "k_loop":
-            prefetched = prefetch_packed_entry(
-                Schedule, grouped_tile_order(start_pid, total_m_tiles, num_n_tiles, GROUP_SIZE_M=GROUP_SIZE_M) // num_n_tiles, total_m_tiles
-            )
-    else:
-        exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = build_tile_layout(
-            ExpertStart, NUM_EXPERTS_POW2, BLOCK_SIZE_M
-        )
+    num_n_tiles, total_m_tiles, layout, prefetched = grouped_tile_schedule(
+        Schedule, ExpertStart, start_pid, N, NUM_EXPERTS_POW2, BLOCK_SIZE_M, BLOCK_SIZE_N, PACKED_SCHEDULE, PIPELINE, GROUP_SIZE_M
+    )
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     for logical_tile_id in tl.range(
         start_pid, total_m_tiles * num_n_tiles, NUM_PROGRAMS,
         flatten=PIPELINE == "flattened", warp_specialize=WARP_SPEC and PIPELINE != "k_loop",
     ):
-        tile_id = grouped_tile_order(logical_tile_id, total_m_tiles, num_n_tiles, GROUP_SIZE_M=GROUP_SIZE_M)
-        if PACKED_SCHEDULE and PIPELINE != "k_loop":
-            prefetched = prefetch_packed_entry(Schedule, tile_id // num_n_tiles, total_m_tiles)
-        if PACKED_SCHEDULE:
-            pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start = (
-                resolve_grouped_tile_packed(
-                    tile_id, num_n_tiles, prefetched,
-                    GatherIdx, ScatterIdx, BLOCK_SIZE_N, BLOCK_SIZE_M, GATE,
-                )
-            )
-        else:
-            pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start = (
-                resolve_grouped_tile(
-                    tile_id,
-                    num_n_tiles,
-                    exp_start,
-                    freqs,
-                    tile_start_excl,
-                    e_offs,
-                    GatherIdx,
-                    ScatterIdx,
-                    BLOCK_SIZE_N,
-                    BLOCK_SIZE_M,
-                    GATE,
-                )
-            )
-        if PACKED_SCHEDULE and PIPELINE == "k_loop":
-            prefetched = prefetch_packed_entry(
-                Schedule, grouped_tile_order(logical_tile_id + NUM_PROGRAMS, total_m_tiles, num_n_tiles, GROUP_SIZE_M=GROUP_SIZE_M) // num_n_tiles, total_m_tiles
-            )
+        pid_m, pid_n, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start, prefetched = grouped_schedule_tile(
+            logical_tile_id, prefetched, Schedule, layout, num_n_tiles, total_m_tiles, NUM_PROGRAMS, GatherIdx, ScatterIdx,
+            BLOCK_SIZE_N, BLOCK_SIZE_M, GATE, PACKED_SCHEDULE, PIPELINE, GROUP_SIZE_M,
+        )
         a_ptrs = operand_tile_ptrs(A, in_row, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
         b_ptrs = weight_tile_ptrs(
             B + expert_id64 * stride_b_e,
@@ -2102,7 +1875,7 @@ def block_fp8_weight_only_matmul_grouped_kernel(
             acc,
             out_row,
             pid_n,
-            tile_id // num_n_tiles,
+            pid_m,
             row_mask,
             stride_c_m,
             stride_c_n,
@@ -2126,7 +1899,6 @@ def block_fp8_weight_only_matmul_grouped_kernel(
             GlobalScale=Bs + weight_scale_rows(offs_bn, BLOCK_N, GATE_SCALES) * stride_bs_n if MODE == "post" else None,
             stride_global_e=stride_bs_e,
         )
-
 
 
 @compile_time_only_triton_op(
@@ -2228,7 +2000,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
     with device_context(A.device):
         bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(w8a8_block_dynamic_fp8_matmul_grouped_kernel)[
-            lambda meta: (persistent_program_count(A.device.index, meta["BLOCK_SIZE_M"]),)
+            persistent_grid(A.device.index)
         ](
             A,
             a_descriptor,
@@ -2358,7 +2130,7 @@ def w8a8_block_static_fp8_matmul_grouped(
     with device_context(A.device):
         bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(w8a8_block_static_fp8_matmul_grouped_kernel)[
-            lambda meta: (persistent_program_count(A.device.index, meta["BLOCK_SIZE_M"]),)
+            persistent_grid(A.device.index)
         ](
             A_q,
             a_descriptor,
@@ -2494,7 +2266,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
     with device_context(A.device):
         bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(w8a8_tensor_dynamic_fp8_matmul_grouped_kernel)[
-            lambda meta: (persistent_program_count(A.device.index, meta["BLOCK_SIZE_M"]),)
+            persistent_grid(A.device.index)
         ](
             A,
             a_descriptor,
@@ -2582,9 +2354,9 @@ def mx_dynamic_matmul_grouped(
     scatter_idx: optional (S,) — sorted position -> destination row of C; None = C stays expert-sorted
     """
     assert A.ndim == 2 and B.ndim == 3 and Bs.ndim in (3, 5)  # 5D = pre-swizzled
+    num_rows = routed_rows(A, gather_idx, scatter_idx, expert_start, B.shape[0])
     if a_pre_quant_scale is not None and activation_format != "fp8":
         assert As is None, "pre_quant_scale applies before activation quantization; pass raw inputs"
-        num_rows = routed_rows(A, gather_idx, scatter_idx, expert_start, B.shape[0])
         A = permute_routed_rows(
             A, None, num_rows, gather_idx, expert_start=expert_start,
             pre_quant_scale=a_pre_quant_scale, num_experts=B.shape[0],
@@ -2594,7 +2366,6 @@ def mx_dynamic_matmul_grouped(
         assert not quantize_output and a_global_scale is None, "ordinary FP8 inputs use As=input_scale and no fused requant"
         output_dtype = resolve_output_dtype(output_dtype, A, None)
         group = mx_scale_family(Bs, A.shape[-1])
-        num_rows = routed_rows(A, gather_idx, scatter_idx, expert_start, B.shape[0])
         weight_upcast = Bs.ndim == 3 and Bs.dtype == torch.float8_e4m3fn and group == MX_SCALE_GROUP_K
         A, As, a_global_scale = prepare_fp8_mx_inputs(
             A, As, ue8m0_as_uint8(Bs).dtype, group, B.shape[0], num_rows,
@@ -2813,7 +2584,7 @@ def mx_dynamic_matmul_grouped(
     with device_context(A.device):
         bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(mx_dynamic_matmul_grouped_kernel)[
-            lambda meta: (persistent_program_count(A.device.index, meta["BLOCK_SIZE_M"]),)
+            persistent_grid(A.device.index)
         ](
             a_u8,
             a_descriptor,
@@ -2931,7 +2702,7 @@ def full_precision_matmul_grouped(
     with device_context(A.device):
         bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(full_precision_matmul_grouped_kernel)[
-            lambda meta: (persistent_program_count(A.device.index, meta["BLOCK_SIZE_M"]),)
+            persistent_grid(A.device.index)
         ](
             A,
             a_descriptor,
@@ -2994,8 +2765,6 @@ def block_fp8_weight_only_matmul_grouped(
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
-    activation_format: str | None = None,
-    quantize_output: bool = False,
     output_dtype: torch.dtype | None = None,
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
@@ -3004,9 +2773,6 @@ def block_fp8_weight_only_matmul_grouped(
     """FP8 W8A16 grouped GEMM; stage weights only when routed reuse amortizes conversion."""
     validate_dense_operands(A, B)
     assert A.dtype in (torch.bfloat16, torch.float16), "FP8 weight-only takes raw BF16/FP16 activations"
-    assert activation_format in (None, "bf16") and not quantize_output, (
-        "FP8 weight-only requires unquantized activations and output"
-    )
 
     _, K = A.shape
 
@@ -3019,8 +2785,7 @@ def block_fp8_weight_only_matmul_grouped(
         )
         return full_precision_matmul_grouped(
             A, weights, expert_start, gate, act_fn, swiglu_alpha, swiglu_limit,
-            simulate_unfused, activation_format, quantize_output, output_dtype,
-            gather_idx, scatter_idx, bias=bias,
+            simulate_unfused, None, False, output_dtype, gather_idx, scatter_idx, bias=bias,
         )
     Bs, scale_block_n, scale_block_k = block_fp8_weight_scale_grid(B, Bs, gate)
     Bs = ue8m0_as_uint8(Bs)
@@ -3035,7 +2800,7 @@ def block_fp8_weight_only_matmul_grouped(
     with device_context(A.device):
         bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(block_fp8_weight_only_matmul_grouped_kernel)[
-            lambda meta: (persistent_program_count(A.device.index, meta["BLOCK_SIZE_M"]),)
+            persistent_grid(A.device.index)
         ](
             A,
             a_descriptor,
@@ -3051,8 +2816,6 @@ def block_fp8_weight_only_matmul_grouped(
             S,
             N,
             K,
-            num_experts,
-            tokens_per_expert_bucket(S, num_experts),
             A.stride(0),
             A.stride(1),
             B.stride(0),
@@ -3065,6 +2828,8 @@ def block_fp8_weight_only_matmul_grouped(
             C.stride(1),
             bias_stride_e,
             bias_stride_n,
+            num_experts,
+            tokens_per_expert_bucket(S, num_experts),
             NUM_EXPERTS_POW2=triton.next_power_of_2(num_experts),
             BLOCK_N=scale_block_n,
             BLOCK_K=scale_block_k,
@@ -3131,7 +2896,7 @@ def mx_weight_only_matmul_grouped(
     # Staged weights are exact (an E2M1/E4M3 value times a UE8M0 scale), so the GEMM is bit-identical. GPT-OSS-120B,
     # B200, graph: gate|up 256 rows per expert in-loop 1906 vs 2461us, down 1085 vs 1497us; 1024 staged 10307 vs 12249us
     if (
-        mx_scale_family(Bs, K) == MX_SCALE_GROUP_K and b_global_scale is None and a_global_scale is None
+        scale_group == MX_SCALE_GROUP_K and b_global_scale is None and a_global_scale is None
         and A.dtype != torch.float32
         and _dequantizes_offline(mx_weight_only_matmul_grouped, S, num_experts, N, K, gate, str(A.dtype), str(B.dtype))
     ):
@@ -3155,7 +2920,7 @@ def mx_weight_only_matmul_grouped(
     with device_context(A.device):
         bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(mx_weight_only_matmul_grouped_kernel)[
-            lambda meta: (persistent_program_count(A.device.index, meta["BLOCK_SIZE_M"]),)
+            persistent_grid(A.device.index)
         ](
             A,
             a_descriptor,
@@ -3242,7 +3007,7 @@ def int_weight_only_matmul_grouped(
     a_scale = normalize_global_scale(a_scale, B.shape[0])
     b_scale2 = normalize_global_scale(b_scale2, B.shape[0])
     _, K = A.shape
-    num_experts, rows, K_b = B.shape
+    num_experts, rows, _ = B.shape
     N = rows // 2 if gate else rows
     S = routed_rows(A, gather_idx, scatter_idx, expert_start, num_experts)
     output_dtype = resolve_output_dtype(output_dtype, A, None)
@@ -3395,7 +3160,7 @@ def matmul_grouped(
     it requires raw activations and applies before conversion to E4M3.
     """
     Bs = csf_weight_scales(Bs, b_scale_exceptions, b_scale_exception_offsets, expert_start)
-    _validate_quantization_args(
+    validate_quantization_args(
         A, As, B, Bs, a_global_scale, b_global_scale, output_global_scale,
         b_zero, b_perm, a_pre_quant_scale, activation_format, quantize_output, activation_scale_ub,
     )
@@ -3410,18 +3175,14 @@ def matmul_grouped(
         assert As is None and not quantize_output, "weight-only takes raw activations without requantization"
         out = block_fp8_weight_only_matmul_grouped(
             A, B, Bs, expert_start, gate, act_fn, swiglu_alpha, swiglu_limit,
-            simulate_unfused, activation_format, quantize_output, output_dtype,
-            gather_idx, scatter_idx, bias=bias,
+            simulate_unfused, output_dtype, gather_idx, scatter_idx, bias=bias,
         )
         return out[0]
     # a calibrated (static) scale on a raw A (see `tensor_wide_act_operands`): block-scale weights
     # have a dedicated static kernel, per-tensor ones read the same As on the tensor-wide arm
     static_act = B.dtype not in INT_WEIGHT_DTYPES and not is_mx(B, Bs) and As is not None and As.ndim <= 1 and As.numel() in (1, B.shape[0]) and A.dtype != FP8_DTYPE
     if static_act:
-        assert Bs is not None and not is_mx(B, Bs), (
-            "a calibrated (static) activation scale is an FP8 form — MX activations carry a scale "
-            "per group, derived per call"
-        )
+        assert Bs is not None, "a calibrated (static) activation scale needs FP8 weight scales"
     if static_act and weight_block_size(B, Bs) is not None:
         out = w8a8_block_static_fp8_matmul_grouped(
             A,

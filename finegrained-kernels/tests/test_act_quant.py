@@ -416,6 +416,7 @@ def test_fp8_act_quant_block_dynamic_matches_reference(shape):
     torch.testing.assert_close(s, s_ref, atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(y.float(), y_ref.float(), atol=1e-2, rtol=1e-2)
 
+
 def test_the_grouped_quant_grid_admits_only_its_tile_height():
     """The expert-sorted grid launches one program per 128-row tile (``build_tile_layout``'s pad
     granularity), and its row count is computed host-side from that, so a config with any other
@@ -435,6 +436,6 @@ def test_the_grouped_quant_grid_admits_only_its_tile_height():
         dense = _quant_block_k_pruner(
             configs,
             {"K": 256, "SCALE_GROUP_K": 16, "SWIZZLED": swizzled, "GROUPED": False, "T": 16384,
-             "X": torch.empty(1, device="cuda")},
+             "X": torch.empty(1, device=TEST_DEVICE)},
         )
         assert {c.kwargs["BLOCK_T"] for c in dense} == {32, 128}

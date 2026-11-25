@@ -147,7 +147,6 @@ def weighted_reduce_kernel(
     )
 
 
-
 # opaque, so torch.compile never reads the PDL inline asm, which its kernel analysis cannot parse
 @compile_time_only_triton_op(add_op_namespace_prefix("weighted_reduce"), mutates_args=(), opaque=True)
 def weighted_reduce(
@@ -204,12 +203,12 @@ def _validate_moe(
     """Both projections share a weight format, scale grouping and integer zero-point recipe."""
     gate_up_int = gate_up_proj.dtype in INT_WEIGHT_DTYPES
     down_int = down_proj.dtype in INT_WEIGHT_DTYPES
+    hidden = down_proj.shape[-2]
+    intermediate = gate_up_proj.shape[-2] // (2 if gate else 1)
     if gate_up_int or down_int:
         error = "gate_up_proj and down_proj must use the same integer quantization recipe"
         if not (gate_up_int and down_int) or gate_up_proj_scale is None or down_proj_scale is None:
             raise ValueError(error)
-        hidden = down_proj.shape[-2]
-        intermediate = gate_up_proj.shape[-2] // (2 if gate else 1)
         gate_up_bits = int_weight_bits(hidden, gate_up_proj)
         down_bits = int_weight_bits(intermediate, down_proj)
         gate_up_groups, down_groups = gate_up_proj_scale.shape[-1], down_proj_scale.shape[-1]
@@ -242,8 +241,6 @@ def _validate_moe(
             "(weight format and scale granularity)."
         )
     if gate_up_is_mx:
-        hidden = down_proj.shape[-2]
-        intermediate = gate_up_proj.shape[-2] // (2 if gate else 1)
         if (
             mx_scale_family(gate_up_proj_scale, hidden) != mx_scale_family(down_proj_scale, intermediate)
         ):
@@ -491,9 +488,8 @@ def moe_fused_grouped(
     if moe_fused_grouped.paths.choose(key, offered) == "batched":
         return moe_fused_batched(**params)
     num_top_k = top_k_index.size(-1)
-    NUM_EXPERTS = gate_up_proj.size(0)
     expert_start, gather_idx, scatter_idx = compute_grouped_scheduling(
-        top_k_index, NUM_EXPERTS, num_top_k
+        top_k_index, num_experts, num_top_k
     )
     gate_up_proj_scale_inv, down_proj_scale_inv = _csf_weight_scales(
         gate_up_proj_scale_inv, gate_up_proj_scale_exceptions, gate_up_proj_scale_exception_offsets,
@@ -576,7 +572,7 @@ def moe_fused_grouped(
         down_out, post_expert_norm, post_expert_norm_weight, post_expert_norm_eps
     )
     return weighted_reduce(
-        rows, top_k_index, top_k_weights, NUM_EXPERTS, simulate_unfused, **norm_kwargs
+        rows, top_k_index, top_k_weights, num_experts, simulate_unfused, **norm_kwargs
     )
 
 

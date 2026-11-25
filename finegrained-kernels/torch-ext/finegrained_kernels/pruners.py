@@ -58,7 +58,7 @@ from .mma import MMA_N_ATOM_WIDTH
 #     nvfp4_native_ok (mx_config_pruner)  E4M3-scale dot_scaled PassManager-fails off the
 #                               native staging: M operand < 128, num_warps outside {4, 8},
 #                               or a weight-only kernel (no As — never native)
-#     descriptor_box_pruner     Descriptor strides and gather architecture — descriptor-axis kernels
+#     descriptor_support_pruner     Descriptor strides and gather architecture — descriptor-axis kernels
 #     smem_pruner               IR allocation bounds (B200-verified, keep-side error) —
 #                               bd/static/mx/weight-only 2D; tensor/fp grouped; mx batched;
 #                               the off-sm_10x fallback of exact_memory_pruner
@@ -107,6 +107,11 @@ SM10X_SCALED_MMA_MAX_N = 256
 # Widest N tile the raw-activation (per-expert calibrated) arm survives; see
 # raw_activation_pointer_pruner for the bisect.
 RAW_ACT_MAX_BN = 128
+
+# Storage dtypes of packed FP4 (two E2M1 values a byte).
+_FP4_STORAGE = (torch.int8, torch.uint8)
+
+TMEM_COLUMNS = 512  # sm_10x tensor memory per CTA: 128 lanes x 512 fp32 columns
 
 # Branch axes that RELOCATE the tile optimum (compute unit / operand orientation): the
 # tuner's guaranteed max-tile anchors group by these (``path_anchor_axes`` — a declaration,
@@ -204,8 +209,7 @@ def int_scale_group_tile_pruner(divides_k: bool = True):
     broadcasts over its columns of the dequantized tile) or a whole number of tiles per group (a group wider than the
     tile, per-channel included), and a tile that divides K wherever the K-loop has no tail (``divides_k``: the 2D and
     grouped kernels) or a group spans tiles (a slid-back tail tile would straddle two groups). The batched loop slides
-    its last tile back in bounds otherwise. Newly admitted within-group tiles start at 128, preserving
-    the existing group-128 grid; narrower tiles add K-loop and metadata traffic. ``SCALE_MODE="acc"``
+    its last tile back in bounds otherwise. ``SCALE_MODE="acc"``
     (``int_weight_only_compute``) needs one group over the tile and a bf16/fp16 MMA without a second-level scale."""
 
     def ok(c, args):
@@ -228,18 +232,14 @@ def int_scale_group_tile_pruner(divides_k: bool = True):
             return group % bk == 0 and args["K"] % bk == 0
         return bk % group == 0 and (not divides_k or args["K"] % bk == 0)
 
-    def wide_tile(c, args):  # advisory: within-group tiles from 128, unless only narrower ones are correct
-        return c.kwargs["BLOCK_SIZE_K"] >= 128 or args["SCALE_GROUP_K"] <= c.kwargs["BLOCK_SIZE_K"]
-
     def raise_no_tile(configs, args):
         raise ValueError(
             f"no K tile fits K={args['K']} with scale group {args['SCALE_GROUP_K']}: every remaining config "
             f"would skip or straddle part of K"
         )
 
-    # correctness vetoes raise when they empty the grid (the fallback would drop the K tail);
-    # the 128 preference only narrows what survives
-    return compose_pruners(config_filter(ok, on_empty=raise_no_tile), config_filter(wide_tile))
+    # correctness vetoes raise when they empty the grid (the fallback would drop the K tail)
+    return config_filter(ok, on_empty=raise_no_tile)
 
 
 def block_fits_dim_pruner(dim_arg: str, block_key: str = "BLOCK_SIZE_K"):
@@ -343,8 +343,11 @@ def warp_spec_compile_guard_pruner():
         # WS when swapped). dot_scaled + WS + TMA DOES compile here (measured 1995 on a clean
         # context) — the old "dot_scaled never WS-compiles" was a num_warps=2 misdiagnosis on a
         # trap-contaminated GPU. Callers needing dot_scaled+WS off (block-dynamic swap arm) fence it.
+        # Triton 3.9 drops the M-work law: WS at 4/8/16 warps with a 16- or 32-row MMA M side runs correct (forced
+        # drops on GPT-OSS, Qwen3, GLM-5 BF16, FP8 weight-only and Mistral, 2026-11-24); 2-warp WS still fails.
         mma_m = "BLOCK_SIZE_N" if c.kwargs.get("SWAP_AB") else "BLOCK_SIZE_M"
-        return config_dim(c, args, mma_m) >= 64 and c.num_warps % 4 == 0
+        enough_m = is_triton_greater_or_equal("3.9") or config_dim(c, args, mma_m) >= 64
+        return enough_m and c.num_warps % 4 == 0
 
     return config_filter(ok, when=lambda args: get_active_device_type() == "cuda")
 
@@ -434,7 +437,8 @@ def gated_pointer_weight_warp_spec_pruner():
             return True
         if c.kwargs.get("B_MEMORY_MODE", "pointer") != "pointer":
             return True
-        return not (
+        # Triton 3.9 lowers them (GPT-OSS 60/60 and Qwen3 59/60 forced drops correct, the 60th a clean OutOfResources)
+        return is_triton_greater_or_equal("3.9") or not (
             c.kwargs.get("A_MEMORY_MODE", "pointer") != "pointer"
             or c.num_warps >= 16
             or config_dim(c, args, "BLOCK_SIZE_M") < 128
@@ -446,18 +450,11 @@ def gated_pointer_weight_warp_spec_pruner():
 
 
 def fp4_act_gate_warp_spec_pruner():
-    """``early_config_prune`` dropping the ``warp_specialize`` configs of the 2D MX kernel's GATE arm on
-    packed fp4 activations that cannot lower: ``TritonGPUOptimizePartitionWarps`` fails
-    (``RuntimeError: PassManager::run failed``) at BM=64 below 16 warps when the partitioner has to split a
-    descriptor-mode A, or a descriptor-mode B at 8 warps — the same pass as
-    ``gated_pointer_weight_warp_spec_pruner``, here on the activation side.
-
-    Region measured over every admitted config of the forced-config sweep's MXFP4 W4A4 gate|up cell
-    (N=K=320, B200, Triton 3.8): its 25 compile failures are exactly this predicate, and it drops none of
-    the 75 warp-specialized ``dot_scaled`` configs that compiled (BM=128, 16 warps and pointer/pointer all
-    lower). The MXFP8 cell of the same kernel compiled every warp-specialized config. One shape: the
-    clause to revisit if a later probe contradicts it. The raw bf16 A quantized to MXFP4 in the loop fails the same
-    25 configs (B200, Triton 3.9). CUDA-only; a no-op off the fp4-activation GATE arm."""
+    """``early_config_prune`` dropping the warp-specialized ``dot_scaled`` configs of the 2D MX kernel's GATE arm on
+    FP4 activations that ``TritonGPUOptimizePartitionWarps`` cannot lower (``PassManager::run failed``): BM=64 below
+    16 warps with a descriptor A, or a descriptor B at 8 warps. Measured: exactly the 25 compile failures of the MXFP4
+    W4A4 gate|up forced sweep (N=K=320, B200, Triton 3.8/3.9, pre-quantized and inline-quantized A), none of its 75
+    compiling WS configs."""
 
     def ok(c, args):
         if not c.kwargs.get("WARP_SPEC") or c.kwargs.get("COMPUTE_MODE") != "dot_scaled":
@@ -474,7 +471,7 @@ def fp4_act_gate_warp_spec_pruner():
 def _fp4_activations(args) -> bool:
     """Whether the MX kernel's A reaches the K loop as packed FP4: pre-quantized (int8/uint8 storage) or a raw bf16
     tile the loop quantizes to MXFP4/NVFP4. CUDA only."""
-    fp4 = args["A"].dtype in (torch.int8, torch.uint8) or args.get("ACTIVATION_FORMAT") in ("mxfp4", "nvfp4")
+    fp4 = args["A"].dtype in _FP4_STORAGE or args.get("ACTIVATION_FORMAT") in ("mxfp4", "nvfp4")
     return fp4 and get_active_device_type() == "cuda"
 
 
@@ -630,10 +627,11 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None, block_within_k: bool 
         ):
             return False
         # Triton <= 3.8.0 mis-lowers native dot_scaled with UE8M0 scales at BM=128 / BN=64 /
-        # BK=64 / 8 warps: wrong results at any K (fixed upstream after 3.8.0). Admitted wherever
-        # BK=128 cannot divide K.
+        # BK=64 / 8 warps: wrong results at any K (fixed upstream after 3.8.0; bit-exact on 3.9 in fresh
+        # processes, 2026-11-24). Admitted wherever BK=128 cannot divide K.
         if (
-            not c.kwargs.get("SWAP_AB")
+            not is_triton_greater_or_equal("3.9")
+            and not c.kwargs.get("SWAP_AB")
             and c.kwargs.get("BLOCK_SIZE_M", args.get("BLOCK_SIZE_M")) == 128
             and config_dim(c, args, "BLOCK_SIZE_K") == 64
             and config_dim(c, args, "BLOCK_SIZE_N") == 64
@@ -645,7 +643,8 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None, block_within_k: bool 
         # accumulator-init miscompile (uninitialized TMEM alloc must be mutable).
         # Bites only small K (e.g. a K=512 gate_up with BK=512): silently wrong results
         # the tuner would happily time and pick (surfaced as a 35% MXFP4 fused-MoE error).
-        if config_dim(c, args, "BLOCK_SIZE_K") >= args[k_arg]:
+        # Fixed in Triton 3.9 (K=512 MXFP4 gate|up at BK=512, bit-exact in fresh processes, 2026-11-24).
+        if config_dim(c, args, "BLOCK_SIZE_K") >= args[k_arg] and not is_triton_greater_or_equal("3.9"):
             return False
         # tcgen05 microscaled-fp4 MMA silently no-ops at the GATE stacked N=2*BN=64 shape (BN<64):
         # the IR emits a correct tc_gen5_mma_scaled (128x64 acc, 64x2 scale) but it never writes the
@@ -655,8 +654,10 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None, block_within_k: bool 
         # BN=32 (favoured at small N) would silently return zeros — larger shapes pass only because
         # BN>=64 wins. (BN=32 is recoverable only by emitting gate/up as two separate BN dots
         # instead of one stacked 2*BN dot; not worth it — a sub-64 gated tile rarely wins over BN=64.)
+        # Fixed in Triton 3.9 (BN=32 W4A8 and W4A4 gate|up bit-exact in fresh processes, 2026-11-24).
         if (
-            args.get("GATE")
+            not is_triton_greater_or_equal("3.9")
+            and args.get("GATE")
             and config_dim(c, args, "BLOCK_SIZE_N") < 64
             and getattr(args.get("B"), "dtype", None) == torch.uint8
         ):
@@ -722,7 +723,8 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None, block_within_k: bool 
         # warps/operand law 2026-08-12). Triton 3.9 compiles some of these (the BM=16 grouped
         # NVFP4 down) and returns wrong output (0.95 relative error), so this is a correctness
         # fence, not just a compile guard. Native staging needs the M operand >= 128 AND
-        # num_warps in {4, 8} (2 and 16 both fail across every BN/BK/stages cell) AND
+        # num_warps in {4, 8} below Triton 3.9 (2 and 16 both fail across every BN/BK/stages cell;
+        # 3.9 stages them: 120/120 forced GLM-5 NVFP4 grouped drops bit-exact, 2026-11-24) AND
         # both operands microscaled — the weight-only kernels (no ``As``: raw bf16 acts,
         # in-register inline quant) never stage it, so their E4M3-scale dot_scaled fails
         # at every tile (their dot/scalar arms compete instead). dot_scaled-only
@@ -734,7 +736,9 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None, block_within_k: bool 
         if args.get("SCALE_GROUP_K") == 32:
             # Mixed tensor-FP8 / group-32 E4M3 FP4 is not the group-16 FP4xFP4 MMA.
             return False
-        if not acts_are_scaled(args) or not 4 <= c.num_warps <= 8:
+        if not acts_are_scaled(args):
+            return False
+        if not 4 <= c.num_warps <= 8 and not is_triton_greater_or_equal("3.9"):
             return False
         if c.kwargs.get("SWAP_AB"):
             return (2 if args.get("GATE") else 1) * config_dim(c, args, "BLOCK_SIZE_N") >= 128
@@ -1045,7 +1049,7 @@ def tile_order_pruner(min_m_tiles_per_expert: int = 2):
 
     def ok(c, args):
         bm = config_dim(c, args, "BLOCK_SIZE_M")
-        ordered = -(-args["S"] // args["num_experts"]) >= min_m_tiles_per_expert * bm
+        ordered = triton.cdiv(args["S"], args["num_experts"]) >= min_m_tiles_per_expert * bm
         return ordered or c.kwargs.get("GROUP_SIZE_M", 1) == 1
 
     return config_filter(ok)
@@ -1065,6 +1069,67 @@ _WEIGHT_ONLY_POINTER_TRAPS = {
 def _warp_spec_needs_descriptor_tile() -> bool:
     """Triton >= 3.8, where a TMA-descriptor operand narrows WS to one tile (see the pruner)."""
     return is_triton_greater_or_equal("3.8")
+
+
+def _ws_w8_prefill_tile(c, args) -> bool:
+    """The weight-only ``dot`` prefill K loop at w8: 128x128 (BN x BK) host-descriptor tiles, stages 2/3, inline
+    schedule, ungathered A; not the swapped down loop of MXFP8 (or of MXFP4 below Triton 3.9, GPT-OSS T=64 s2/s3)."""
+    a, b = c.kwargs.get("A_MEMORY_MODE"), c.kwargs.get("B_MEMORY_MODE")
+    return (
+        c.kwargs.get("COMPUTE_MODE") == "dot"
+        and a == b == "host_descriptor" and args.get("GatherIdx") is None
+        and not c.kwargs.get("PACKED_SCHEDULE")
+        and c.kwargs.get("PIPELINE", "k_loop") == "k_loop"
+        and not (
+            c.kwargs.get("SWAP_AB") and not args.get("GATE", False) and (
+                args.get("WEIGHT_VALUES_PER_BYTE") == 1
+                or "WEIGHT_VALUES_PER_BYTE" in args and not is_triton_greater_or_equal("3.9")
+            )
+        )
+        and config_dim(c, args, "BLOCK_SIZE_N") == 128
+        and config_dim(c, args, "BLOCK_SIZE_K") == 128
+        and c.num_stages in (2, 3)
+    )
+
+
+def _ws_w8_pipeline_tile(c, args) -> bool:
+    """The weight-only swapped output-tile pipelines at w8, stage 2, host descriptors, ungathered A: the
+    BN=64 BK=256 gate tile, the INT packed flattened BN=128 BK=256 down tile, and the MX BN=128 BK=128 down tile (its
+    gate|up tile fails to lower)."""
+    a, b = c.kwargs.get("A_MEMORY_MODE"), c.kwargs.get("B_MEMORY_MODE")
+    return (
+        c.kwargs.get("PIPELINE") in ("tile_loop", "flattened")
+        and c.kwargs.get("SWAP_AB")
+        and a == b == "host_descriptor" and args.get("GatherIdx") is None
+        and c.num_stages == 2
+        and (
+            config_dim(c, args, "BLOCK_SIZE_K") == 256 and (
+                args.get("GATE", False) and config_dim(c, args, "BLOCK_SIZE_N") == 64
+                or (
+                    args.get("INT_BITS") in (2, 4, 8) and not args.get("GATE", False)
+                    and config_dim(c, args, "BLOCK_SIZE_N") == 128
+                    and c.kwargs.get("PACKED_SCHEDULE") and c.kwargs.get("PIPELINE") == "flattened"
+                )
+            )
+            or (
+                "WEIGHT_VALUES_PER_BYTE" in args and not args.get("GATE", False)
+                and config_dim(c, args, "BLOCK_SIZE_N") == 128
+                and config_dim(c, args, "BLOCK_SIZE_K") == 128
+            )
+        )
+    )
+
+
+def _ws_w8_fp8_tile(c, args) -> bool:
+    """An FP8-activation ``dot`` loop at w8 with host descriptors, pipelined across output tiles or with an ungathered
+    A (Mistral-4 tensor-wide grouped gate|up tile_loop w8 s4 runs; DeepSeek-V3 block-dynamic gate|up T=8192 K loop
+    5.7 -> 5.3 ms, bit-identical). A descriptor gather in the K loop fails every cell."""
+    a, b = c.kwargs.get("A_MEMORY_MODE"), c.kwargs.get("B_MEMORY_MODE")
+    return (
+        getattr(args.get("A"), "dtype", None) == FP8_DTYPE
+        and (c.kwargs.get("PIPELINE", "k_loop") != "k_loop" or args.get("GatherIdx") is None)
+        and a == b == "host_descriptor"
+    )
 
 
 def warp_spec_scatter_epilogue_pruner(max_tile_bytes: int = 64 * 1024):
@@ -1106,22 +1171,14 @@ def warp_spec_memory_mode_pruner(weight_only: bool = False, gather_only: bool = 
     REGRESSED in 3.8 and pointer+WS was FIXED. So each version gets the rule its own sweep
     measured, rather than an intersection that would fence off a whole memory mode on both.
 
-    ``gather_only`` applies this restriction only to gathered descriptor A. The raw-activation
-    grouped kernel reproduces the TMA gather layout failure with both BF16 and rescaled FP8
-    weights, while non-gathered descriptor boxes compile at the other warp counts. Pointer A
-    and non-gathered launches retain their existing search space.
+    Exceptions (each measured):
 
-    Weight-only dot prefill additionally supports the measured w8 128x128x128 tile at
-    stages 2/3 with both host descriptors, inline scheduling and an already expert-sorted A. Both original
-    and swapped operand orientations lower, except the swapped MXFP8 down K loop (and, below Triton 3.9,
-    the swapped MXFP4 one); descriptor gather is outside this exception.
-    Integer outer pipelines also support eight warps for the 128x64x256 gate tile and
-    the packed, flattened 128x128x256 down tile at stage 2; MX outer pipelines support the
-    swapped 128x128x128 down tile at stage 2 (its gate|up tile fails to lower).
-
-    ``weight_only`` adds the rows that kernel charted for itself and the sweep did not re-probe:
-    ``BN == 32`` with WS, which failed 9/9 cells there, and (below 3.8) its trapping
-    pointer/pointer warp counts.
+    - ``gather_only``: the restriction applies only to a gathered descriptor A (the raw-activation grouped kernel
+      fails the TMA gather layout with BF16 and rescaled FP8 weights; non-gathered boxes compile at other warps).
+    - Triton >= 3.8: a descriptor BM=128 config also lowers at w8 for ``_ws_w8_prefill_tile`` and
+      ``_ws_w8_pipeline_tile`` (weight-only) and ``_ws_w8_fp8_tile`` (FP8 activations).
+    - ``weight_only``: ``BN == 32`` with WS is dropped (failed 9/9 cells), and below 3.8 its trapping pointer/pointer
+      warp counts.
 
     NOT covered here, deliberately: ``mx_dynamic``'s ``dot`` arm dies with a descriptor operand on
     BOTH versions, and it is not a WS failure at all — it raises ``descriptor gather of uint8 must
@@ -1140,56 +1197,13 @@ def warp_spec_memory_mode_pruner(weight_only: bool = False, gather_only: bool = 
         a, b = c.kwargs.get("A_MEMORY_MODE"), c.kwargs.get("B_MEMORY_MODE")
         descriptor = a != "pointer" or b != "pointer"
         if _warp_spec_needs_descriptor_tile():
-            prefill_tile = (
-                weight_only and c.kwargs.get("COMPUTE_MODE") == "dot"
-                and a == b == "host_descriptor" and args.get("GatherIdx") is None
-                and not c.kwargs.get("PACKED_SCHEDULE")
-                and c.kwargs.get("PIPELINE", "k_loop") == "k_loop"
-                and not (
-                    c.kwargs.get("SWAP_AB") and not args.get("GATE", False) and (
-                        args.get("WEIGHT_VALUES_PER_BYTE") == 1
-                        # the swapped MXFP4 down tile fails to lower on Triton 3.8 too (GPT-OSS T=64, s2 and s3)
-                        or "WEIGHT_VALUES_PER_BYTE" in args and not is_triton_greater_or_equal("3.9")
-                    )
-                )
-                and config_dim(c, args, "BLOCK_SIZE_N") == 128
-                and config_dim(c, args, "BLOCK_SIZE_K") == 128
-                and c.num_stages in (2, 3)
-            )
-            pipeline_tile = (
-                weight_only and c.kwargs.get("PIPELINE") in ("tile_loop", "flattened")
-                and c.kwargs.get("SWAP_AB")
-                and a == b == "host_descriptor" and args.get("GatherIdx") is None
-                and c.num_stages == 2
-                and (
-                    config_dim(c, args, "BLOCK_SIZE_K") == 256 and (
-                        args.get("GATE", False) and config_dim(c, args, "BLOCK_SIZE_N") == 64
-                        or (
-                            args.get("INT_BITS") in (2, 4, 8) and not args.get("GATE", False)
-                            and config_dim(c, args, "BLOCK_SIZE_N") == 128
-                            and c.kwargs.get("PACKED_SCHEDULE") and c.kwargs.get("PIPELINE") == "flattened"
-                        )
-                    )
-                    or (
-                        "WEIGHT_VALUES_PER_BYTE" in args and not args.get("GATE", False)
-                        and config_dim(c, args, "BLOCK_SIZE_N") == 128
-                        and config_dim(c, args, "BLOCK_SIZE_K") == 128
-                    )
-                )
-            )
-            # FP8-activation dot loops pipelined across output tiles lower at w8 too (tensor-wide grouped
-            # gate|up, Mistral-4: BM128 BN128 BK128 tile_loop w8 s4 runs, 0.85x the k_loop crown)
-            # the K-loop form lowers too when A is not gathered (expanded prefill rows: DeepSeek-V3 FP8 block-dynamic
-            # gate|up T=8192 5.7 -> 5.3 ms, bit-identical, against the flattened w8 crown); with a descriptor gather it
-            # fails every cell
-            fp8_pipeline_tile = (
-                not weight_only and getattr(args.get("A"), "dtype", None) == FP8_DTYPE
-                and (c.kwargs.get("PIPELINE", "k_loop") != "k_loop" or args.get("GatherIdx") is None)
-                and a == b == "host_descriptor"
+            w8_tile = (
+                weight_only and (_ws_w8_prefill_tile(c, args) or _ws_w8_pipeline_tile(c, args))
+                or not weight_only and _ws_w8_fp8_tile(c, args)
             )
             return not descriptor or (
                 config_dim(c, args, "BLOCK_SIZE_M") == 128
-                and (c.num_warps == 4 or ((prefill_tile or pipeline_tile or fp8_pipeline_tile) and c.num_warps == 8))
+                and (c.num_warps == 4 or (w8_tile and c.num_warps == 8))
             )
         if descriptor:
             return True
@@ -1475,7 +1489,7 @@ def swizzled_scale_config_pruner(allow_gate_subblock=False):
             # (mxfp4_swizzled N=128 forced at BN=256 fails parity on triton 3.7.1 and 3.8 alike;
             # the BN=256 prefill wins were measured at N % 256 == 0 shapes).
             n = args.get("N")
-            if n is not None and -(-n // bn) * bn > -(-n // 128) * 128:
+            if n is not None and triton.cdiv(n, bn) * bn > triton.cdiv(n, 128) * 128:
                 return False
         return bn <= 128 or bn % 128 == 0
 
@@ -1635,13 +1649,17 @@ def scalar_block_m_pruner(m_arg: str):
 
 
 def mx_auxiliary_pruner():
-    """Split the single-token decode reduction (the launch allocates the partials for M=1 without GATE), or persist
-    across SVDQuant prefill tiles. Plain M=1 splits only the scalar BM=1 reduce: the native split tile pads the token
-    to 128 MMA rows and never crowns there (B200 graph, NVFP4: 5120x5120 scalar 11.3us, scalar split 10.2us, native
-    split 26.2us; N1024 K14336 22.6 / 7.7 / 31.5us); SVDQuant keeps the native split (down: 27.4us vs FlashInfer 33.1us).
-    The scalar split only runs where its unsplit grid leaves SMs idle: at a wide N the BN 32/64 tiles already fill the
-    GPU, splitting gains nothing, and its rows crowd the swapped NVFP4 arm out of the search (GLM-5.2 attn
-    N18432 K6144: swap 14.5us, scalar 22.9us, scalar split 23.5us, and the full tune crowned scalar)."""
+    """``early_config_prune`` for the MX 2D kernel's auxiliary schedules (sm_10x, no GATE):
+
+    - split (``SPLIT_K``; the launch allocates the partials for M=1): M=1 with >= 2 K tiles a split. Plain launches
+      split only the scalar BM=1 reduce, and only while its unsplit grid leaves SMs idle; the native split tile pads
+      the token to 128 MMA rows and never crowns (B200 graph, NVFP4 5120x5120: scalar 11.3us, scalar split 10.2us,
+      native split 26.2us), and at wide N the split crowds the swapped arm out (GLM-5.2 attn N18432 K6144: swap
+      14.5us, scalar split 23.5us). SVDQuant (``LORA_RANK > 0``) keeps the native split (down: 27.4us vs FlashInfer
+      33.1us).
+    - persistent (``PERSISTENT``): SVDQuant prefill (M >= 128) only, without warp specialization (Triton 3.9's
+      partition verifier rejects a warp-specialized persistent tile loop)."""
+
     def ok(c, args):
         split = c.kwargs.get("SPLIT_K", 1)
         persistent = c.kwargs.get("PERSISTENT", False)
@@ -1649,15 +1667,16 @@ def mx_auxiliary_pruner():
             return True
         if not is_sm10x() or args["GATE"]:
             return False
+        lora = args.get("LORA_RANK", 0) > 0
         if persistent:
             # a warp-specialized persistent tile loop (flattened or tile_loop) fails Triton 3.9's partition verifier:
             # "'scf.if' op partition ids in attr ttg.partition does not contain partition ids of all child ops"
-            return args.get("LORA_RANK", 0) > 0 and args["M"] >= 128 and not c.kwargs.get("WARP_SPEC")
-        if c.kwargs["COMPUTE_MODE"] != "scalar" and args.get("LORA_RANK", 0) == 0:
+            return lora and args["M"] >= 128 and not c.kwargs.get("WARP_SPEC")
+        if c.kwargs["COMPUTE_MODE"] != "scalar" and not lora:
             return False
         return (
             args["M"] == 1 and args["K"] // c.kwargs["BLOCK_SIZE_K"] >= 2 * split
-            and (args.get("LORA_RANK", 0) > 0
+            and (lora
                  or triton.cdiv(args["N"], c.kwargs["BLOCK_SIZE_N"]) < sm_count(args["A"].device.index))
         )
     return config_filter(ok)
@@ -1718,7 +1737,7 @@ def descriptor_needs_prequant_pruner():
     )
 
 
-def descriptor_box_pruner(k_dim="BLOCK_SIZE_K"):
+def descriptor_support_pruner():
     """Fence descriptor strides and gather support. Triton splits logical tiles into
     legal physical TMA boxes; the logical tile may exceed 256 elements per dimension.
     Pointer configs pass untouched."""
@@ -1752,14 +1771,14 @@ def descriptor_box_pruner(k_dim="BLOCK_SIZE_K"):
 def persistent_tmem_pruner():
     """``early_config_prune`` for the persistent output-tile pipelines (``PIPELINE`` ``"tile_loop"`` / ``"flattened"``)
     on sm_10x: they double-buffer the accumulator in tensor memory so the epilogue overlaps the next tile, two sets of
-    ``BLOCK_SIZE_N`` fp32 columns (``2 * BLOCK_SIZE_N`` under GATE) against 512. Above that the compile fails cleanly
+    ``BLOCK_SIZE_N`` fp32 columns (``2 * BLOCK_SIZE_N`` under GATE) against ``TMEM_COLUMNS``. Above that the compile fails cleanly
     (``OutOfResources: tensor memory, Required: 1024``, the dense block-dynamic GATE BM128 BN256 warp-specialized
     tile loop) in every tune that samples it; this drops them before the compile."""
 
     def ok(c, args):
         if c.kwargs.get("PIPELINE", "k_loop") == "k_loop":
             return True
-        return 2 * (2 if args.get("GATE") else 1) * config_dim(c, args, "BLOCK_SIZE_N") <= 512
+        return 2 * _weight_rows(args, config_dim(c, args, "BLOCK_SIZE_N")) <= TMEM_COLUMNS
 
     return config_filter(ok, when=lambda args: is_sm10x())
 
@@ -1794,8 +1813,10 @@ def gate_stacked_tmem_trap_pruner():
     def ok(c, args):
         if not args.get("GATE") or config_dim(c, args, "BLOCK_SIZE_N") != 256:
             return True
-        if config_dim(c, args, "BLOCK_SIZE_M") == 64:
-            return False  # the probed sm_100 trap point — fenced on every arch
+        if config_dim(c, args, "BLOCK_SIZE_M") == 64 and not is_triton_greater_or_equal("3.9"):
+            # the probed sm_100 trap point — fenced on every arch below Triton 3.9, which runs it correct (GPT-OSS
+            # K=2880, GLM-5 BF16, Qwen3 INT4, FP8 weight-only: 204/204 forced drops correct, no trap, 2026-11-24)
+            return False
         return not is_sm90()  # sm_90 has no tensor memory, so nothing self-reports the overflow
 
     def raise_all_trap(configs, args):
@@ -1811,55 +1832,34 @@ def smem_pruner(
     k_dim="BLOCK_SIZE_K", full_stages: bool = False, pointer_ws_extra_stage: bool = False,
     ws_full_stages: bool = False, raw_a_staged: bool = False,
 ):
-    """``early_config_prune`` dropping configs whose shared memory certainly cannot fit,
-    with bounds derived from TTGIR allocations and checked against ``metadata.shared``:
+    """``early_config_prune`` dropping configs whose shared memory certainly cannot fit: lower bounds on the TTGIR
+    ``local_alloc`` buffers (checked against ``metadata.shared``), so omitted storage only keeps borderline configs for
+    the compiler to check. Law per operand kind:
 
-    - both operands >= 2-byte floats (the unquantized loops): ``num_stages`` full
-      buffers of both tiles (exact) plus the fixed barrier terms at their sampled
-      MINIMA (+16 base; +28 warp-spec, observed up to 48 varying with warps; +32
-      host-descriptor) — minima keep the bound below the true usage, so a config is
-      only ever dropped when its operand buffers alone cannot fit.
-    - quantized ``dot_scaled``:
-      the per-allocation law, every term named by its TTGIR ``local_alloc`` and exact to
-      the allocator's alignment/packing slack (<= 16 B observed; barriers pack into
-      padding, so no fixed constant is added — the slack is keep-side) —
-      ``num_stages - 1`` buffers of operands+scales at the native M=128 staging (weights
-      full-width even when fp4-packed; GATE shifts the A tile to a full ``num_stages``),
-      or the bf16-upcast fallback below the gate (one single-buffered upcast tile,
-      packed weights, no A-scale buffers).
-    - FP8 weight-only, natural-orientation K loop with host descriptors: ``num_stages``
-      BF16/FP16 A buffers, ``num_stages - 1`` raw FP8 B buffers (``num_stages`` under
-      warp specialization), plus one decoded BF16/FP16 B buffer. Scales, barriers and
-      alignment are omitted from this lower bound. Swapped/output-tile pipelines use
-      different storage and retain the raw floor.
-    - other quantized ``dot``/``scalar``: the raw-operand floor.
+    - unquantized (both operands >= 2-byte floats): ``stages`` sets of both tiles plus the fixed barrier terms at
+      their sampled minima (+16 base, +28 warp-spec, +32 host descriptor).
+    - quantized ``dot_scaled``: half of one set of packed operands and group-scale tiles (the pipeliner clamps stages
+      and the 2D NVFP4 arm can compile half a set); est <= actual over 1,099 ``metadata.shared`` samples.
+    - other quantized ``dot``/``scalar``: the raw-operand floor, ``stages`` sets of A (one byte a value) and the
+      packed weight tile.
 
-    ``full_stages``: the loop stages every one of ``num_stages`` raw-operand buffers (no
-    pipeliner clamp), so the raw floor counts them all. Measured on the static block-FP8 grouped
-    gate|up loop (B200, BN=128 stacked, BK=128): BM=128 s5 262152 B and s6 327688 B, BM=64 s6
-    245768 B, each above ``num_stages * BK * (BM + 2*BN)``; over the block-dynamic grouped tune
-    logs (DSV3/E16 keys, ~4k trials) that floor drops 109 failed configs and no compiling one.
-    ``pointer_ws_extra_stage``: a warp-specialized pointer/pointer loop holds one more set (the
-    block-dynamic kernel: BM=128 s4 gate|up 245784 B = 5 sets); with it the dynamic floor drops all
-    155 logged failures and none of 3302 compiling configs; on the dense block-dynamic kernel (BM64 BN256 BK128 s6
-    286776 B = 7 sets) it drops 32 (plain) and 96 (gate|up) configs at N=4096 K=7168, every one above the limit
-    when compiled. The static kernel does not (its pointer/pointer WS s4 tiles compile), so it is off there.
-    ``raw_a_staged``: the K loop buffers A at its launch width — a raw bf16 A the kernel quantizes per
-    tile stays bf16 in shared memory — outside warp specialization, which stages it narrower. From the
-    TTGIR of every admitted config in the forced-config sweep (B200, Triton 3.8: per-tensor/row-wise FP8
-    2D and grouped, FP8 weight-only grouped, ``(S-1) x BM x BK`` bf16 A buffers): with it the floor drops
-    300 of their 887 shared-memory overflows and none of their 15,332 configs that fit; under warp
-    specialization, or on the static block-FP8 kernel (which quantizes A before staging), the wider A
-    dropped configs that fit, so it stays off there.
-    ``ws_full_stages``: ``full_stages`` for warp-specialized configs only (the K-loop pipeliner still
-    clamps the others): the tensor-wide grouped gate|up tune at Mistral-4 drops all 32 WS
-    shared-memory failures and none of 105 compiling configs.
+    ``stages`` is ``num_stages - 1`` (the K-loop pipeliner clamp), or ``num_stages`` when every stage stays live: a
+    persistent output-tile ``PIPELINE``, unquantized operands before Triton 3.9, or the flags below. Each flag drops
+    only configs that fail to compile in the tune logs it was fitted on (B200):
 
-    These are lower bounds on the observed IR allocations, not a complete allocator
-    model: omitted storage keeps borderline configs for the compiler to check. Samples
-    were taken on B200 (sm_100); the FP8 weight-only extension is scoped to that arch —
-    re-verify on a Triton bump AND on H100 or the target device (smem capacity and
-    allocator behavior are per-arch). Non-empty fallback."""
+    - ``full_stages``: every one of the ``num_stages`` raw-operand buffers (static block-FP8 grouped gate|up: drops
+      109 failed configs of ~4k trials, no compiling one).
+    - ``ws_full_stages``: ``full_stages`` for warp-specialized configs only (tensor-wide grouped gate|up, Mistral-4:
+      all 32 WS failures, none of 105 compiling).
+    - ``pointer_ws_extra_stage``: a warp-specialized pointer/pointer loop holds one more set (block-dynamic grouped:
+      all 155 failures, none of 3302 compiling; dense block-dynamic too). Off on the static kernel, whose WS s4
+      tiles compile.
+    - ``raw_a_staged``: A buffered at its launch width (a raw bf16 A the loop quantizes per tile) outside warp
+      specialization (per-tensor/row-wise FP8 2D and grouped, FP8 weight-only grouped: 300 of 887 overflows, none of
+      15,332 fitting configs).
+
+    Re-verify on a Triton bump and per arch (shared-memory capacity and allocator behaviour differ). Non-empty
+    fallback."""
 
     def ok(c, args):
         a, b = args["A"], args["B"]
@@ -1870,7 +1870,11 @@ def smem_pruner(
         # BM64xBN256 s6 needs 254084 B and BM128xBN256 s5 262276 B, both above that full-stage floor
         pipelined = c.kwargs.get("PIPELINE", "k_loop") != "k_loop"
         all_live = full_stages or pipelined or (ws_full_stages and c.kwargs.get("WARP_SPEC"))
-        stages = c.num_stages if unquantized or all_live else c.num_stages - 1
+        # Triton 3.9's K-loop pipeliner holds num_stages - 1 sets of two-byte operands too (GLM-5 BF16 grouped
+        # T=8192: all 18 of 120 forced drops that fit have (s-1) sets <= 227 KB; all 91 with (s-1) sets over it fail
+        # OutOfResources, 2026-11-24). Older Triton buffers all num_stages.
+        full_unquantized = unquantized and not is_triton_greater_or_equal("3.9")
+        stages = c.num_stages if full_unquantized or all_live else c.num_stages - 1
         if pointer_ws_extra_stage and c.kwargs.get("WARP_SPEC") and (
             c.kwargs.get("A_MEMORY_MODE", "pointer") == c.kwargs.get("B_MEMORY_MODE", "pointer") == "pointer"
         ):
@@ -1902,7 +1906,7 @@ def smem_pruner(
             # A's smem bytes follow its LAUNCH dtype: packed E2M1 (int8/uint8) = 2 values/byte,
             # E4M3 = 1 B/value, raw bf16/fp16 (weight-only) = element_size B/value
             a_dtype = a.dtype
-            if a_dtype in (torch.int8, torch.uint8):
+            if a_dtype in _FP4_STORAGE:
                 a_bytes = (bk // 2) * bm
             else:
                 a_bytes = bk * bm * a.element_size()
@@ -1914,20 +1918,6 @@ def smem_pruner(
             # in any observed form — everything else is kept and self-reports as a benign inf.
             b_bytes = (bk // packed) * tiles * bn
             need = (a_bytes + b_bytes + (bk // group) * bm + (bk // group) * tiles * bn) // 2
-        elif (
-            is_sm10x()
-            and a.dtype in (torch.bfloat16, torch.float16) and b.dtype == FP8_DTYPE
-            and "BLOCK_K" in args
-            and not c.kwargs.get("SWAP_AB", False)
-            and c.kwargs.get("PIPELINE", "k_loop") == "k_loop"
-            and c.kwargs.get("A_MEMORY_MODE") == "host_descriptor"
-            and c.kwargs.get("B_MEMORY_MODE") == "host_descriptor"
-        ):
-            # Concurrent local_alloc buffers: staged raw A/B and one decoded rhs.
-            # Pointer loads can use fewer buffers; a swapped lhs can live in tmem.
-            b_stages = c.num_stages if c.kwargs.get("WARP_SPEC") else c.num_stages - 1
-            need = bk * (c.num_stages * a.element_size() * bm
-                         + (b_stages + a.element_size()) * tiles * bn)
         else:
             # Other dot/scalar pipelines retain their raw-operand lower bound (A at its launch width
             # with ``raw_a_staged``).
@@ -1952,9 +1942,6 @@ def tcgen05_dot(m_rows: int, num_warps: int) -> bool:
     return is_sm10x() and m_rows >= 64 and num_warps in (4, 8)
 
 
-TMEM_COLUMNS = 512  # sm_10x tensor memory per CTA: 128 lanes x 512 fp32 columns
-
-
 def exact_memory_pruner(smem, tmem=None, fallback=None):
     """``early_config_prune`` keeping the configs whose modeled shared memory (``smem(config, args)``, bytes) fits
     the device and whose modeled tensor memory (``tmem(config, args)``, fp32 columns) fits ``TMEM_COLUMNS``, on sm_10x
@@ -1977,7 +1964,23 @@ def exact_memory_pruner(smem, tmem=None, fallback=None):
 def _k_bytes(t, bk: int) -> int:
     """Bytes one row of a ``bk``-wide K tile of ``t`` takes in shared memory: packed FP4 (int8/uint8 storage) holds
     two values per byte, everything else its element size."""
-    return bk // 2 if t.dtype in (torch.int8, torch.uint8) else bk * t.element_size()
+    return bk // 2 if t.dtype in _FP4_STORAGE else bk * t.element_size()
+
+
+def _weight_rows(args, bn: int) -> int:
+    """Weight rows one tile reads: ``bn``, or the stacked gate|up ``2 * bn`` under GATE."""
+    return (2 if args.get("GATE") else 1) * bn
+
+
+def _tma_operands(c) -> tuple[bool, bool]:
+    """Whether A and B arrive by TMA (any non-pointer memory mode)."""
+    k = c.kwargs
+    return k.get("A_MEMORY_MODE", "pointer") != "pointer", k.get("B_MEMORY_MODE", "pointer") != "pointer"
+
+
+def _mbarrier_bytes(a_sets: int, tma_a: bool, b_sets: int, tma_b: bool, tc: bool) -> int:
+    """mbarriers: one (8 B) per buffered set of each TMA operand, and a tcgen05 MMA's pair."""
+    return 8 * (a_sets * tma_a + b_sets * tma_b) + (16 if tc else 0)
 
 
 def tensor_batched_smem(c, args) -> int:
@@ -1986,7 +1989,7 @@ def tensor_batched_smem(c, args) -> int:
     at its launch width (a raw bf16 row on the calibrated arm), ``num_stages - 1`` deep; and the swapped dot's 16-row
     FP8 operand. Measured fit verdicts: 9120 compiled configs over 8 launches, none mispredicted."""
     k = c.kwargs
-    rows = (2 if args.get("GATE") else 1) * k["BLOCK_SIZE_N"]
+    rows = _weight_rows(args, k["BLOCK_SIZE_N"])
     bk, stages = k["BLOCK_SIZE_K"], c.num_stages
     swap = k.get("SWAP_AB")
     weight_sets = stages if swap and tcgen05_dot(rows, c.num_warps) else stages - 1
@@ -2009,7 +2012,7 @@ def mx_grouped_smem(c, args) -> int:
     pipeline buffers and only show (<= 64 KB) when those are smaller. Measured fit verdicts: 31912 compiled configs
     over 14 launches (MXFP8/MXFP4/NVFP4/W4A8, swizzled and affine scales), none mispredicted."""
     k = c.kwargs
-    rows = (2 if args.get("GATE") else 1) * k["BLOCK_SIZE_N"]
+    rows = _weight_rows(args, k["BLOCK_SIZE_N"])
     bm, bk, stages, warps = k["BLOCK_SIZE_M"], k["BLOCK_SIZE_K"], c.num_stages, c.num_warps
     per_set = bm * _k_bytes(args["A"], bk) + rows * _k_bytes(args["B"], bk)
     if k.get("COMPUTE_MODE") != "dot_scaled":
@@ -2019,8 +2022,7 @@ def mx_grouped_smem(c, args) -> int:
     swap, swizzled = k.get("SWAP_AB"), args.get("SWIZZLED_SCALES")
     tc = tcgen05_dot(64, warps)
     native = tc and not swap and bm >= 128
-    fp4 = (torch.int8, torch.uint8)
-    if (native or (tc and swap)) and args["B"].dtype in fp4 and args["A"].dtype not in fp4:
+    if (native or (tc and swap)) and args["B"].dtype in _FP4_STORAGE and args["A"].dtype not in _FP4_STORAGE:
         # a mixed FP8 x FP4 tcgen05 MMA (kind::f8f6f4) reads FP4 padded to a byte per value
         per_set += rows * bk // 2
     if swizzled:
@@ -2041,17 +2043,16 @@ def mx_batched_smem(c, args) -> int:
     reduce stages only an unbuffered TMA weight tile. Measured fit verdicts: 12720 compiled configs over 9 launches,
     none mispredicted."""
     k = c.kwargs
-    rows = (2 if args.get("GATE") else 1) * k["BLOCK_SIZE_N"]
+    rows = _weight_rows(args, k["BLOCK_SIZE_N"])
     bk, stages, warps = k["BLOCK_SIZE_K"], c.num_stages, c.num_warps
     a, b = args["A"], args["B"]
-    tma_b = k.get("B_MEMORY_MODE", "pointer") != "pointer"
+    _, tma_b = _tma_operands(c)
     b_k = _k_bytes(b, bk)
     if k.get("COMPUTE_MODE") != "dot_scaled":
         return rows * b_k if tma_b else 0
-    fp4 = (torch.int8, torch.uint8)
-    fp4_acts = a.dtype in fp4 or args.get("ACTIVATION_FORMAT") in ("mxfp4", "nvfp4")
+    fp4_acts = a.dtype in _FP4_STORAGE or args.get("ACTIVATION_FORMAT") in ("mxfp4", "nvfp4")
     swap = k.get("SWAP_AB")
-    if swap and b.dtype in fp4 and not fp4_acts and tcgen05_dot(rows, warps):
+    if swap and b.dtype in _FP4_STORAGE and not fp4_acts and tcgen05_dot(rows, warps):
         b_k = bk  # a mixed FP8 x FP4 tcgen05 MMA (kind::f8f6f4) reads FP4 padded to a byte per value
     sb = bk // (16 if args["Bs"].dtype == torch.float8_e4m3fn else 32)
     per_set = rows * b_k + (rows * sb if _affine_scales_stream(args["Bs"], rows, sb, warps) else 0)
@@ -2074,7 +2075,7 @@ def weight_only_grouped_smem(c, args, two_d: bool = False) -> int:
     k = c.kwargs
     if k.get("COMPUTE_MODE") == "scalar":
         return 0
-    rows = (2 if args.get("GATE") else 1) * k["BLOCK_SIZE_N"]
+    rows = _weight_rows(args, k["BLOCK_SIZE_N"])
     bm, bk, stages, warps = k["BLOCK_SIZE_M"], k["BLOCK_SIZE_K"], c.num_stages, c.num_warps
     a, b = args["A"], args["B"]
     int_words = b.dtype == torch.uint32
@@ -2082,8 +2083,7 @@ def weight_only_grouped_smem(c, args, two_d: bool = False) -> int:
     b_k = bk * 4 * b.shape[-1] // args["K"] if int_words else _k_bytes(b, bk)
     swap, ws = k.get("SWAP_AB"), k.get("WARP_SPEC")
     tc = tcgen05_dot(rows if swap else bm, warps)
-    tma_a = k.get("A_MEMORY_MODE", "pointer") != "pointer"
-    tma_b = k.get("B_MEMORY_MODE", "pointer") != "pointer"
+    tma_a, tma_b = _tma_operands(c)
     a_sets = stages if (tc and not swap) or (ws and tma_a) else stages - 1
     b_sets = stages if ws and tma_b else stages - 1
     block_scaled = "BLOCK_K" in args and args["Bs"].shape[-1] > 1
@@ -2127,8 +2127,7 @@ def weight_only_grouped_smem(c, args, two_d: bool = False) -> int:
             decoded += rows * args["Bs"].element_size()
         if swap and mode == "act":  # the scaled activation tile is restaged as the swapped MMA's operand
             decoded += bm * bk * a.element_size()
-    # mbarriers: one per buffered set of each TMA operand, and a tcgen05 MMA's pair
-    barriers = 8 * (a_sets * tma_a + b_sets * tma_b) + (16 if tc else 0)
+    barriers = _mbarrier_bytes(a_sets, tma_a, b_sets, tma_b, tc)
     return a_sets * bm * bk * a.element_size() + weight_tiles + (stages - 1) * scales + decoded + barriers
 
 
@@ -2143,12 +2142,11 @@ def mx_weight_only_grouped_smem(c, args) -> int:
     k = c.kwargs
     if k.get("COMPUTE_MODE") == "scalar":
         return 0
-    rows = (2 if args.get("GATE") else 1) * k["BLOCK_SIZE_N"]
+    rows = _weight_rows(args, k["BLOCK_SIZE_N"])
     bm, bk, stages = k["BLOCK_SIZE_M"], k["BLOCK_SIZE_K"], c.num_stages
     a = args["A"]
     ws = k.get("WARP_SPEC")
-    tma_a = k.get("A_MEMORY_MODE", "pointer") != "pointer"
-    tma_b = k.get("B_MEMORY_MODE", "pointer") != "pointer"
+    tma_a, tma_b = _tma_operands(c)
     a_tile = bm * bk * a.element_size()
     scaled = k.get("COMPUTE_MODE") == "dot_scaled"
     tc = tcgen05_dot(rows if scaled else bm, c.num_warps)
@@ -2157,7 +2155,7 @@ def mx_weight_only_grouped_smem(c, args) -> int:
     else:
         extra = rows * bk * a.element_size() if tc else a_tile
         # the UE8M0 scale tile is restaged for the decode, except beside a TMA-loaded FP4 weight (measured)
-        if not ws and not (tma_b and args["B"].dtype in (torch.int8, torch.uint8)):
+        if not ws and not (tma_b and args["B"].dtype in _FP4_STORAGE):
             # twice and at most 16 B a thread for tcgen05; one copy of at most a weight row a thread for mma.sync
             sb = bk // 32
             extra += min(2 * rows * sb, 512 * c.num_warps) if tc else min(rows, 32 * c.num_warps) * sb
@@ -2178,7 +2176,7 @@ def weight_only_grouped_tmem(c, args) -> int:
     ``gate_stacked_tmem_trap_pruner``. B200: the double-buffered swapped INT gate|up tile (BN=128, BK=256) needs
     2 x 256 + 256 = 768."""
     k = c.kwargs
-    rows = (2 if args.get("GATE") else 1) * k["BLOCK_SIZE_N"]
+    rows = _weight_rows(args, k["BLOCK_SIZE_N"])
     swap = k.get("SWAP_AB")
     if not tcgen05_dot(rows if swap else k["BLOCK_SIZE_M"], c.num_warps) or k.get("COMPUTE_MODE") == "scalar":
         return 0
@@ -2192,7 +2190,7 @@ def mx_weight_only_grouped_tmem(c, args) -> int:
     in tensor memory and whose ``dot_scaled`` arm puts the weight rows on the MMA M side with the upcast weights as
     the tensor-memory operand. GPT-OSS gate|up (BN=256, BK=128): 512 + 64 = 576."""
     k = c.kwargs
-    rows = (2 if args.get("GATE") else 1) * k["BLOCK_SIZE_N"]
+    rows = _weight_rows(args, k["BLOCK_SIZE_N"])
     bm, bk = k["BLOCK_SIZE_M"], k["BLOCK_SIZE_K"]
     if k.get("COMPUTE_MODE") == "dot_scaled":
         if not tcgen05_dot(rows, c.num_warps):
@@ -2213,12 +2211,11 @@ def fp8_dot_smem(c, args, pointer_ws_extra_set: bool = False) -> int:
     ``"tile_loop"``/``"flattened"``) also stage a quarter of the output tile for the epilogue (fp32 and gate|up wide
     when the halves are stored unfused)."""
     k = c.kwargs
-    rows = (2 if args.get("GATE") else 1) * config_dim(c, args, "BLOCK_SIZE_N")
+    rows = _weight_rows(args, config_dim(c, args, "BLOCK_SIZE_N"))
     bm, bk, stages = config_dim(c, args, "BLOCK_SIZE_M"), k.get("BLOCK_SIZE_K", args.get("block_k")), c.num_stages
     a_es = args["A"].element_size()
     ws = k.get("WARP_SPEC")
-    tma_a = k.get("A_MEMORY_MODE", "pointer") != "pointer"
-    tma_b = k.get("B_MEMORY_MODE", "pointer") != "pointer"
+    tma_a, tma_b = _tma_operands(c)
     tc = tcgen05_dot(bm, c.num_warps)
     native_scaled = tc and bm >= 128 and getattr(args.get("As"), "dtype", None) == torch.uint8
     b_sets = stages if tc and not native_scaled else stages - 1
@@ -2227,7 +2224,7 @@ def fp8_dot_smem(c, args, pointer_ws_extra_set: bool = False) -> int:
         a_sets, b_sets = 1, (1 if a_es == 1 else 0)
     elif ws and tc and not (tma_a or tma_b) and pointer_ws_extra_set:
         a_sets = b_sets = stages + 1
-    barriers = 8 * (a_sets * tma_a + b_sets * tma_b) + (16 if tc else 0)
+    barriers = _mbarrier_bytes(a_sets, tma_a, b_sets, tma_b, tc)
     epilogue = 0
     if k.get("PIPELINE", "k_loop") != "k_loop":
         out = args["C"]
@@ -2247,7 +2244,7 @@ def fp8_dot_tmem(c, args) -> int:
     launches; the GATE BM128 BN256 tile needs 1024), single under a per-tensor/row-wise one (512)."""
     if not tcgen05_dot(config_dim(c, args, "BLOCK_SIZE_M"), c.num_warps):
         return 0
-    rows = (2 if args.get("GATE") else 1) * config_dim(c, args, "BLOCK_SIZE_N")
+    rows = _weight_rows(args, config_dim(c, args, "BLOCK_SIZE_N"))
     block_scaled_ws = c.kwargs.get("WARP_SPEC") and "block_k" in args
     return (2 if block_scaled_ws else _accumulator_buffers(c)) * rows
 
@@ -2275,12 +2272,11 @@ def weight_only_2d_smem(c, args) -> int:
 
     Measured fit verdicts: 53960 block-FP8 and 52600 INT compiled configs over 9 launches, none mispredicted."""
     k = c.kwargs
-    rows = (2 if args.get("GATE") else 1) * config_dim(c, args, "BLOCK_SIZE_N")
+    rows = _weight_rows(args, config_dim(c, args, "BLOCK_SIZE_N"))
     bm, bk, stages, warps = config_dim(c, args, "BLOCK_SIZE_M"), k["BLOCK_SIZE_K"], c.num_stages, c.num_warps
     a, b = args["A"], args["B"]
     swap, ws = k.get("SWAP_AB"), k.get("WARP_SPEC")
-    tma_a = k.get("A_MEMORY_MODE", "pointer") != "pointer"
-    tma_b = k.get("B_MEMORY_MODE", "pointer") != "pointer"
+    tma_a, tma_b = _tma_operands(c)
     tc = tcgen05_dot(rows if swap else bm, warps)
     if k.get("COMPUTE_MODE") == "scalar" or not (swap and b.dtype == torch.uint32):
         need = weight_only_grouped_smem(c, args, two_d=True)
@@ -2296,7 +2292,7 @@ def weight_only_2d_smem(c, args) -> int:
     staged = bm >= 64 or (args.get("Bz") is None and not (tc and bk >= 256)) or (int8 and rows * bk <= 128 * 32 * warps)
     decoded = rows * bk * a.element_size() + (1024 * warps if int8 and bm < 64 else 0) if staged else 0
     weight_set = rows * (bk * 4 * b.shape[-1] // args["K"]) + _int_group_tiles(c, args, rows)
-    barriers = 8 * (a_sets * tma_a + (stages - 1) * tma_b) + (16 if tc else 0)
+    barriers = _mbarrier_bytes(a_sets, tma_a, stages - 1, tma_b, tc)
     return a_sets * bm * bk * a.element_size() + (stages - 1) * weight_set + decoded + barriers
 
 
@@ -2305,10 +2301,10 @@ def int_weight_only_batched_smem(c, args) -> int:
     packed weight tiles and A tiles, plus the A tile the dot reads; the ``scalar`` reduce stages only an unbuffered
     TMA weight tile. Measured fit verdicts: 11800 compiled configs over 3 launches, none mispredicted."""
     k = c.kwargs
-    rows = (2 if args.get("GATE") else 1) * config_dim(c, args, "BLOCK_SIZE_N")
+    rows = _weight_rows(args, config_dim(c, args, "BLOCK_SIZE_N"))
     bk, stages = k["BLOCK_SIZE_K"], c.num_stages
     weight_tile = rows * (bk * 4 * args["B"].shape[-1] // args["K"])
-    tma_b = k.get("B_MEMORY_MODE", "pointer") != "pointer"
+    _, tma_b = _tma_operands(c)
     if k.get("COMPUTE_MODE") == "scalar":
         return weight_tile if tma_b else 0
     a_tile = config_dim(c, args, "BLOCK_SIZE_M") * bk * args["A"].element_size()
@@ -2329,14 +2325,12 @@ def mx_dynamic_2d_smem(c, args) -> int:
     Measured fit verdicts: 28695 compiled configs over 13 launches (MXFP8/MXFP4/NVFP4, swizzled and affine scales,
     raw and pre-quantized activations), none mispredicted."""
     k = c.kwargs
-    rows = (2 if args.get("GATE") else 1) * config_dim(c, args, "BLOCK_SIZE_N")
+    rows = _weight_rows(args, config_dim(c, args, "BLOCK_SIZE_N"))
     bm, bk, stages, warps = config_dim(c, args, "BLOCK_SIZE_M"), k["BLOCK_SIZE_K"], c.num_stages, c.num_warps
     a, b = args["A"], args["B"]
-    tma_a = k.get("A_MEMORY_MODE", "pointer") != "pointer"
-    tma_b = k.get("B_MEMORY_MODE", "pointer") != "pointer"
+    tma_a, tma_b = _tma_operands(c)
     if k.get("COMPUTE_MODE") != "dot_scaled":
         return rows * _k_bytes(b, bk) if tma_b else 0
-    fp4 = (torch.int8, torch.uint8)
     fp4_acts = args.get("ACTIVATION_FORMAT") in ("mxfp4", "nvfp4")
     raw = a.dtype in (torch.bfloat16, torch.float16)
     a_k = bk // 2 if fp4_acts else bk  # the quantized A's bytes a row
@@ -2346,7 +2340,7 @@ def mx_dynamic_2d_smem(c, args) -> int:
     sb = bk // (16 if args["Bs"].dtype == torch.float8_e4m3fn else 32)
     a_set = bm * (bk * a.element_size() if raw else a_k)
     b_set = rows * _k_bytes(b, bk)
-    if native and b.dtype in fp4 and not fp4_acts:
+    if native and b.dtype in _FP4_STORAGE and not fp4_acts:
         b_set += rows * bk // 2  # a mixed FP8 x FP4 tcgen05 MMA (kind::f8f6f4) reads FP4 padded to a byte per value
     if swizzled:
         scales = (bm + rows) * sb
@@ -2366,7 +2360,7 @@ def mx_dynamic_2d_smem(c, args) -> int:
         restaged += bm * sb
     if tc and bm == 64:
         restaged += 2 * bk * rows + (256 * warps if not ws or tma_a or tma_b else 0)
-    barriers = 8 * (a_sets * tma_a + b_sets * tma_b) + (16 if tc else 0)
+    barriers = _mbarrier_bytes(a_sets, tma_a, b_sets, tma_b, tc)
     if ws and tc and (tma_a or tma_b):  # the partitions' hand-off barriers, and a pointer weight's row offsets
         barriers += 128 + (512 if tma_a and not tma_b else 0)
     loop = a_sets * a_set + b_sets * b_set + (stages - 1) * scales + restaged + barriers

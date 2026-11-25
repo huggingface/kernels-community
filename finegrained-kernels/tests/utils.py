@@ -84,6 +84,12 @@ def sweep_configs(configs):
     return list(kept.values())
 
 
+def is_memory_overflow(err: str) -> bool:
+    """A compiled config that exceeds the device's shared / tensor memory: the compiler's per-shape choice, not a
+    pruner gap, so the forced-config sweeps report it instead of failing."""
+    return "out of resource: shared memory" in err or "out of resource: tensor memory" in err
+
+
 def maybe_compile(fn, enabled):
     """Wrap ``fn`` in ``torch.compile`` (max-autotune, fullgraph) when ``enabled``,
     resetting the compiler and clearing the allocator cache first; otherwise return
@@ -389,6 +395,28 @@ def dq_int(B, Bs, Bz=None, dtype=None, group=INT_GROUP):
     return (W if dtype is None else W.to(dtype)).float()
 
 
+def int_group(problem, K) -> int:
+    """The scenario's integer scale group along a projection's ``K``; ``int_group=None`` is per-channel (spans K)."""
+    return problem.int_group or K
+
+
+def int_fp8_global(B, Bs, group) -> torch.Tensor:
+    """Per-expert W4A8 weight global: the dequantized integer weight's amax mapped onto E4M3's 448, ``(E,)`` fp32."""
+    return dq_int(B, Bs, group=group).abs().amax(dim=(-2, -1)).div(448).clamp(min=1e-12)
+
+
+def _int_row(bits):
+    """A ``WEIGHTS`` row for ``bits``-wide integer weights: weight-only, no activation formats."""
+    return dict(
+        make=_make_int(bits),
+        dequant=lambda B, Bs, g=None: dq_int(B, Bs),
+        activation_formats=(),
+        requant_formats=(),
+        act_quant={None: None},
+        dq_act=None,
+    )
+
+
 # None follows the weight family, so MXFP8 and MXFP4 rows resolve it differently
 _MX8_ACT = {None: mxfp8_act_quant, "mxfp8": mxfp8_act_quant, "mxfp4": mxfp4_act_quant}
 _MX4_ACT = {None: mxfp4_act_quant, "mxfp8": mxfp8_act_quant, "mxfp4": mxfp4_act_quant}
@@ -485,30 +513,7 @@ WEIGHTS = {
         act_quant={None: nvfp4_act_quant, "nvfp4": nvfp4_act_quant},
         dq_act=lambda q, s: dq_grouped(q, s, NVFP4_SCALE_GROUP_K),
     ),
-    "int4": dict(
-        make=_make_int(4),
-        dequant=lambda B, Bs, g=None: dq_int(B, Bs),
-        activation_formats=(),
-        requant_formats=(),
-        act_quant={None: None},
-        dq_act=None,
-    ),
-    "int8": dict(
-        make=_make_int(8),
-        dequant=lambda B, Bs, g=None: dq_int(B, Bs),
-        activation_formats=(),
-        requant_formats=(),
-        act_quant={None: None},
-        dq_act=None,
-    ),
-    "int2": dict(
-        make=_make_int(2),
-        dequant=lambda B, Bs, g=None: dq_int(B, Bs),
-        activation_formats=(),
-        requant_formats=(),
-        act_quant={None: None},
-        dq_act=None,
-    ),
+    **{name: _int_row(bits) for name, bits in INT_BITS.items()},
     "bf16": dict(
         make=_make_full(torch.bfloat16),
         dequant=lambda B, Bs, g=None: B.float(),
@@ -586,11 +591,12 @@ def dequantize_weight(
     return out
 
 
-def make_gptq_act_order(N, K, E, group=INT_GROUP, scale_dtype=torch.bfloat16):
+def make_gptq_act_order(N, K, E):
     """``E`` act-order GPTQ int4 linears (``desc_act=True``: each one's groups scattered across K by a random
     ``g_idx``), packed in GPTQ's own layout and repacked: ``(W, Ws, Wz, perm, W_ref)``, ``W``/``Ws``/``Wz`` stacked
     ``(E, N, ...)``, ``perm`` ``(E, K)`` int32 and ``W_ref`` ``(E, N, K)`` fp32 the dequantized weight in A's natural
     K order, ``(q - zero) * scale`` rounded in the scale dtype."""
+    group, scale_dtype = INT_GROUP, torch.bfloat16
     nibble = 4 * torch.arange(8, device=TEST_DEVICE, dtype=torch.int32)
     out = []
     for _ in range(E):

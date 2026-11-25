@@ -27,9 +27,9 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from .bayesian_autotuner import bayesian_autotune
 from .path_autotuner import path_autotune
 from ._ops import add_op_namespace_prefix
-from .compat import FP8_DTYPE, is_sm10x, launches_skipped, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, pdl_launch_kwargs, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, narrow_dot_autotuning_configs, narrow_scalar_autotuning_configs, split_k_autotuning_configs, persistent_program_count, pipeline_autotuning_configs, block_fp8_scale_mode_configs, int_scale_mode_configs, FP8_MAX, is_triton_greater_or_equal
-from .descriptors import can_back_descriptor, maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_tiled_descriptors, rebind_weight_only_descriptors, weight_descriptor
-from .formats import block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, normalize_global_scale, e2m1_as_uint8, is_mx, is_rowwise, mx_scale_family, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_2d_operands, weight_format, validate_int_operands, validate_svdquant_operands, INT_WEIGHT_DTYPES
+from .compat import FP8_DTYPE, is_sm10x, is_sm90, launches_skipped, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, pdl_launch_kwargs, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, narrow_dot_autotuning_configs, narrow_scalar_autotuning_configs, split_k_autotuning_configs, persistent_program_count, clone_config, pipeline_autotuning_configs, block_fp8_scale_mode_configs, int_scale_mode_configs, FP8_MAX, is_triton_greater_or_equal
+from .descriptors import can_back_descriptor, maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_tiled_descriptors, weight_descriptor
+from .formats import block_fp8_weight_scale_grid, validate_quantization_args, global_scale_stride, gate_out_cols, normalize_global_scale, e2m1_as_uint8, is_mx, is_rowwise, mx_scale_family, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_2d_operands, weight_format, validate_int_operands, validate_svdquant_operands, INT_WEIGHT_DTYPES
 from .bench import gemm_cold_banks
 from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, maybe_act_quant, mxfp8_act_quant, nvfp4_act_quant, quantize_calibrated_act, quantize_rows_static, tensor_wide_act_operands, prepare_fp8_mx_inputs, permute_act_cols, svdquant_act_quant
@@ -55,7 +55,7 @@ from .loading.tiles import (
     swizzle_offsets,
 )
 from .epilogue import acc_finalize, acc_init, add_bias, bias_strides, gemm_epilogue, store_masked, store_masked_oriented
-from .pruners import PATH_ANCHOR_AXES, block_fp8_scale_mode_pruner, group_size_m_pruner, persistent_tmem_pruner, fp8_dot_warp_pruner, fp4_act_gate_warp_spec_pruner, fp4_activation_unpack_pruner, gate_stacked_tmem_trap_pruner, block_dynamic_2d_warp_spec_pruner, block_dynamic_mma_width_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, descriptor_needs_prequant_pruner, matched_memory_modes_pruner, mx_2d_swap_scope_pruner, native_mma_m_pruner, mx_config_pruner, scalar_max_m_pruner, smem_pruner, swap_decode_scope_pruner, swap_max_m_pruner, k_slices_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, warp_spec_compile_guard_pruner, warp_spec_memory_mode_pruner, mx_auxiliary_pruner, block_m_cap_pruner, int_2d_warp_spec_pruner, int_split_k_pruner, scalar_block_m_pruner, int_scale_group_tile_pruner, nvfp4_requant_warps_pruner, exact_memory_pruner, block_dynamic_2d_smem, fp8_dot_smem, fp8_dot_tmem, mx_dynamic_2d_smem, weight_only_2d_smem, weight_only_grouped_tmem
+from .pruners import PATH_ANCHOR_AXES, block_fp8_scale_mode_pruner, group_size_m_pruner, persistent_tmem_pruner, fp8_dot_warp_pruner, fp4_act_gate_warp_spec_pruner, fp4_activation_unpack_pruner, gate_stacked_tmem_trap_pruner, block_dynamic_2d_warp_spec_pruner, block_dynamic_mma_width_pruner, block_within_dim_pruner, compose_pruners, descriptor_support_pruner, descriptor_needs_prequant_pruner, matched_memory_modes_pruner, mx_2d_swap_scope_pruner, native_mma_m_pruner, mx_config_pruner, scalar_max_m_pruner, smem_pruner, swap_decode_scope_pruner, swap_max_m_pruner, k_slices_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, warp_spec_compile_guard_pruner, warp_spec_memory_mode_pruner, mx_auxiliary_pruner, block_m_cap_pruner, int_2d_warp_spec_pruner, int_split_k_pruner, scalar_block_m_pruner, int_scale_group_tile_pruner, nvfp4_requant_warps_pruner, exact_memory_pruner, block_dynamic_2d_smem, fp8_dot_smem, fp8_dot_tmem, mx_dynamic_2d_smem, weight_only_2d_smem, weight_only_grouped_tmem
 
 # The 2D-grid kernels' L2-locality swizzle depth is derived per-tile inside
 # ``swizzle_offsets`` (see SWIZZLE_GROUP_A_BYTES there) — no per-kernel constant here.
@@ -79,18 +79,50 @@ def _holds_rows(t: torch.Tensor, rows: int) -> bool:
     return t.untyped_storage().nbytes() >= (t.storage_offset() + rows * t.stride(0)) * t.element_size()
 
 
-# Block-dynamic has NO gate: offline wins at EVERY M incl. M=1 (24.7 vs 31.0us, isolated
-# arm A/B, graph-timed, H=6144 b128) — the inline arm pays a per-tile fp32 amax+div. The
-# always-offline paths (bd 2D/batched/grouped, fused gate_ups, MX grouped) quantize
-# unconditionally; only the two gates above have a real M=1 inline win.
+def _cublas_linear(A: torch.Tensor, W: torch.Tensor, bias: torch.Tensor | None = None) -> List[torch.Tensor]:
+    """``F.linear`` outside autocast, so a caller's autocast region cannot make the output dtype depend on the path."""
+    native_bias = bias[0] if bias is not None and bias.ndim == 2 else bias
+    with torch.autocast(A.device.type, enabled=False):
+        return [torch.nn.functional.linear(A, W, native_bias)]
+
+
+def _dense_2d_grid(M: int, N: int, device_index: int):
+    """Launch grid of the FP8 2D kernels: one program per output tile (times ``SPLIT_K``) on the ``k_loop``
+    pipeline, else a persistent grid capped at the tile count."""
+
+    def grid(META):
+        if META.get("PIPELINE", "k_loop") != "k_loop":
+            tiles = triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"])
+            return (min(tiles, persistent_program_count(device_index, META["BLOCK_SIZE_M"], META.get("WARP_SPEC", False))),)
+        return (triton.cdiv(M, META["BLOCK_SIZE_M"]), triton.cdiv(N, META["BLOCK_SIZE_N"]), META.get("SPLIT_K", 1))
+
+    return grid
+
+
+# Block-dynamic quantizes activations offline at every M: offline wins even at M=1 (24.7 vs 31.0us, graph-timed,
+# H=6144 b128), as the inline arm pays a per-tile fp32 amax+div.
 
 
 SPLIT_K_VALUES = (2, 4, 8)
-SPLIT_K_MAX_M = 16
+# block FP8 splits K up to batch-sized M: a narrow layer (N=2048) gives 16-32 output tiles at M=64-256, a fraction of
+# the SMs (2048x6144 at M=64, B200, CUDA graph: 14.3 -> 11.5 us at split 8). Its split tiles reach BM=64.
+BLOCK_FP8_SPLIT_K_MAX_M = 256
+BLOCK_FP8_SPLIT_K_MAX_BLOCK_M = 64
+# the narrowest block FP8 split-K tile (BM and BN): the arrival counters are sized for its tile grid
+BLOCK_FP8_SPLIT_K_MIN_BLOCK = 16
 # the widest split-K N tile: the split-K partials buffers are sized for the tile grid at this width
 SPLIT_K_MAX_BLOCK_N = 64
 # the narrowest MX split-K N tile: mx_dynamic_matmul sizes its arrival counters for the tile grid at this width
 MX_SPLIT_K_MIN_BLOCK_N = 32
+# the widest MX split-K N tile: the partials are sized for the tile grid at this width
+MX_SPLIT_K_MAX_BLOCK_N = 256
+
+
+def _pipeline_seeds(configs):
+    """The unswapped warp-specialized host-TMA prefill tiles (BM >= 64) the output-tile pipelines expand."""
+    return [c for c in configs if c.kwargs.get("WARP_SPEC") and c.kwargs.get("BLOCK_SIZE_M", 0) >= 64
+            and not c.kwargs.get("SWAP_AB")
+            and c.kwargs.get("A_MEMORY_MODE") == c.kwargs.get("B_MEMORY_MODE") == "host_descriptor"]
 
 
 def _block_dynamic_2d_configs():
@@ -107,15 +139,13 @@ def _block_dynamic_2d_configs():
     )
     for c in configs:
         c.kwargs["SPLIT_K"] = 1
-    seeds = [c for c in configs if c.kwargs.get("WARP_SPEC") and c.kwargs.get("BLOCK_SIZE_M", 0) >= 64
-             and c.kwargs.get("A_MEMORY_MODE") == c.kwargs.get("B_MEMORY_MODE") == "host_descriptor"]
-    # decode tiles split along K: a narrow N leaves most SMs idle on a deep K (DeepSeek-V3 kv_a, N=576, runs 9
-    # programs), and under one program per SM a single program streams too little of the weight to saturate HBM
-    # (BM=16 only: the partials buffer is sized for 16-row tiles)
-    decode = [c for c in configs if c.kwargs["BLOCK_SIZE_M"] == 16 and not c.kwargs["WARP_SPEC"]
+    # decode and small-batch tiles split along K: a narrow N leaves most SMs idle on a deep K (DeepSeek-V3 kv_a,
+    # N=576, runs 9 programs), and under one program per SM a single program streams too little of the weight to
+    # saturate HBM (the partials buffer is sized for the widest split tile)
+    decode = [c for c in configs if c.kwargs["BLOCK_SIZE_M"] <= BLOCK_FP8_SPLIT_K_MAX_BLOCK_M and not c.kwargs["WARP_SPEC"]
               and c.kwargs["BLOCK_SIZE_N"] <= SPLIT_K_MAX_BLOCK_N]
-    return (configs + pipeline_autotuning_configs(seeds, ("tile_loop", "flattened"))
-            + split_k_autotuning_configs(SPLIT_K_VALUES, configs=decode))
+    return (configs + pipeline_autotuning_configs(_pipeline_seeds(configs), ("tile_loop", "flattened"))
+            + split_k_autotuning_configs(SPLIT_K_VALUES, decode))
 
 
 @bayesian_autotune(
@@ -154,7 +184,7 @@ def _block_dynamic_2d_configs():
             fp8_dot_warp_pruner(),
             warp_spec_compile_guard_pruner(),
             matched_memory_modes_pruner(),
-            descriptor_box_pruner("block_k"),
+            descriptor_support_pruner(),
             exact_memory_pruner(
                 block_dynamic_2d_smem, fp8_dot_tmem,
                 fallback=smem_pruner("block_k", pointer_ws_extra_stage=True),
@@ -162,7 +192,7 @@ def _block_dynamic_2d_configs():
             persistent_tmem_pruner(),
             block_dynamic_mma_width_pruner(),
             block_dynamic_2d_warp_spec_pruner(),
-            int_split_k_pruner("M", SPLIT_K_MAX_M, block_k_arg="block_k"),
+            int_split_k_pruner("M", BLOCK_FP8_SPLIT_K_MAX_M, block_k_arg="block_k"),
         )
     },
 )
@@ -198,17 +228,24 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     stride_c_n,
     stride_bias_e,
     stride_bias_n,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
     # Weight-quantization blocks (the caller's block_size); block_k is also the K tile
     # (the activation scale groups are per block_k)
     block_n: tl.constexpr,
     block_k: tl.constexpr,
-    # Meta-parameters
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    WARP_SPEC: tl.constexpr = False,
-    B_MEMORY_MODE: tl.constexpr = "pointer",
     A_MEMORY_MODE: tl.constexpr = "pointer",
+    B_MEMORY_MODE: tl.constexpr = "pointer",
     SWAP_AB: tl.constexpr = False,
+    WARP_SPEC: tl.constexpr = False,
+    # output-tile pipeline: "k_loop" = one tile per program, WS on the K loop; "tile_loop" /
+    # "flattened" = a persistent loop over output tiles, warp-specialized across tiles so one
+    # tile's epilogue overlaps the next tile's MMA (the grouped kernels' PIPELINE axis)
+    PIPELINE: tl.constexpr = "k_loop",
+    GROUP_SIZE_M: tl.constexpr = None,
+    # decode split-K: K split across SPLIT_K programs per output tile (grid axis 2), reduced in-kernel
+    SPLIT_K: tl.constexpr = 1,
     # Dense gate|up fusion: B is the (2N, K) gate|up stack, C the [M, N] GLU output (bf16 — the
     # requant output formats live on the MX kernel). Every arm folds out at compile time when
     # GATE=False (the plain dense GEMM, unchanged).
@@ -219,13 +256,6 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
     PDL: tl.constexpr = False,
-    # output-tile pipeline: "k_loop" = one tile per program, WS on the K loop; "tile_loop" /
-    # "flattened" = a persistent loop over output tiles, warp-specialized across tiles so one
-    # tile's epilogue overlaps the next tile's MMA (the grouped kernels' PIPELINE axis)
-    PIPELINE: tl.constexpr = "k_loop",
-    GROUP_SIZE_M: tl.constexpr = None,
-    # decode split-K: K split across SPLIT_K programs per output tile (grid axis 2), reduced in-kernel
-    SPLIT_K: tl.constexpr = 1,
 ):
     """Block-scale FP8 GEMM kernel.
 
@@ -378,10 +408,7 @@ def _tensor_2d_configs():
     )
     for c in configs:
         c.kwargs["PIPELINE"] = "k_loop"
-    seeds = [c for c in configs if c.kwargs.get("WARP_SPEC") and c.kwargs.get("BLOCK_SIZE_M", 0) >= 64
-             and not c.kwargs.get("SWAP_AB")
-             and c.kwargs.get("A_MEMORY_MODE") == c.kwargs.get("B_MEMORY_MODE") == "host_descriptor"]
-    return configs + pipeline_autotuning_configs(seeds, ("tile_loop", "flattened"))
+    return configs + pipeline_autotuning_configs(_pipeline_seeds(configs), ("tile_loop", "flattened"))
 
 
 @bayesian_autotune(
@@ -408,7 +435,7 @@ def _tensor_2d_configs():
             matched_memory_modes_pruner(),
             swap_decode_scope_pruner(),
             native_mma_m_pruner(),
-            descriptor_box_pruner(),
+            descriptor_support_pruner(),
             exact_memory_pruner(fp8_dot_smem, fp8_dot_tmem, fallback=smem_pruner(raw_a_staged=True)),
         )
     },
@@ -443,10 +470,12 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
-    WARP_SPEC: tl.constexpr = False,
     A_MEMORY_MODE: tl.constexpr = "pointer",
     B_MEMORY_MODE: tl.constexpr = "pointer",
     SWAP_AB: tl.constexpr = False,
+    WARP_SPEC: tl.constexpr = False,
+    PIPELINE: tl.constexpr = "k_loop",
+    GROUP_SIZE_M: tl.constexpr = None,
     # Dense gate|up fusion: B is the (2N, K) gate|up stack, C the [M, N] GLU output. Every arm
     # folds out at compile time when GATE=False (the plain dense GEMM, unchanged).
     GATE: tl.constexpr = False,
@@ -456,8 +485,6 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
     PDL: tl.constexpr = False,
-    GROUP_SIZE_M: tl.constexpr = None,
-    PIPELINE: tl.constexpr = "k_loop",
 ):
     """Tensor-scale / row-wise FP8 GEMM kernel.
 
@@ -578,7 +605,7 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
             warp_spec_compile_guard_pruner(),
             descriptor_needs_prequant_pruner(),
             matched_memory_modes_pruner(),
-            descriptor_box_pruner("block_k"),
+            descriptor_support_pruner(),
             smem_pruner("block_k"),
         )
     },
@@ -609,15 +636,16 @@ def w8a8_block_static_fp8_matmul_kernel(
     stride_c_n,
     stride_bias_e,
     stride_bias_n,
-    # Weight-quantization blocks (see the block-dynamic kernel)
-    block_n: tl.constexpr,
-    block_k: tl.constexpr,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
-    WARP_SPEC: tl.constexpr = False,
+    # Weight-quantization blocks (see the block-dynamic kernel)
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
     A_MEMORY_MODE: tl.constexpr = "pointer",
     B_MEMORY_MODE: tl.constexpr = "pointer",
+    WARP_SPEC: tl.constexpr = False,
+    GROUP_SIZE_M: tl.constexpr = None,
     # Dense gate|up fusion: B is the (2N, K) gate|up stack, C the [M, N] GLU output. Every arm
     # folds out at compile time when GATE=False (the plain dense GEMM, unchanged).
     GATE: tl.constexpr = False,
@@ -627,7 +655,6 @@ def w8a8_block_static_fp8_matmul_kernel(
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
     PDL: tl.constexpr = False,
-    GROUP_SIZE_M: tl.constexpr = None,
 ):
     """Block-scale FP8 GEMM with static (per-tensor) activation scale.
 
@@ -745,6 +772,7 @@ def split_k_workspace(device: torch.device, partials_numel: int, counters_numel:
 
 
 def _mx_matmul_configs():
+    """The MX 2D tuning grid, plus split-K decode tiles and persistent native scaled-MMA prefill tiles."""
     configs = get_accelerator_autotuning_configs(
         group_sizes_m=DENSE_GROUP_SIZES_M,
         mx=True,
@@ -769,8 +797,7 @@ def _mx_matmul_configs():
               and c.kwargs["BLOCK_SIZE_M"] == 128 and c.kwargs["BLOCK_SIZE_N"] >= 128
               and c.kwargs["A_MEMORY_MODE"] == c.kwargs["B_MEMORY_MODE"] == "host_descriptor"
               and not c.kwargs["SWAP_AB"] and c.kwargs["WARP_SPEC"] and c.num_warps in (4, 8)]
-    persistent = [triton.Config(dict(c.kwargs, PERSISTENT=True), num_warps=c.num_warps,
-                                num_stages=c.num_stages, pre_hook=c.pre_hook) for c in native]
+    persistent = [clone_config(c, PERSISTENT=True) for c in native]
     # the persistent tiles also warp-specialize the tile loop (one tile's epilogue overlaps the next tile's MMA)
     persistent += pipeline_autotuning_configs(persistent, ("tile_loop", "flattened"))
     # the single-token scalar reduce, split along K: its BM=1 GEVM leaves most SMs idle on a deep K
@@ -779,7 +806,7 @@ def _mx_matmul_configs():
               and not c.kwargs["SWAP_AB"] and not c.kwargs["WARP_SPEC"]
               and c.kwargs["BLOCK_SIZE_N"] in (32, 64) and c.kwargs["BLOCK_SIZE_K"] in (256, 512)
               and c.num_warps in (2, 4, 8) and c.num_stages in (2, 3, 5)]
-    return configs + split_k_autotuning_configs(SPLIT_K_VALUES, configs=native + scalar) + persistent
+    return configs + split_k_autotuning_configs(SPLIT_K_VALUES, native + scalar) + persistent
 
 
 @bayesian_autotune(
@@ -799,7 +826,7 @@ def _mx_matmul_configs():
     # BM ceiling and it is NOT noise: cross-applying configs (N=K=4096) costs +62% at M=128 and +245%
     # at M=4096 (the thin M=128 tile can't saturate the wide GEMM), so don't collapse the buckets.
     # ACTIVATION_FORMAT keys the inline act-quant grid: A stays raw bf16 under every
-    # format below the pre-quant M threshold, so the dtype-appended key can't
+    # format on the inline-quant path, so the dtype-appended key can't
     # split W4A8 from W4A4 itself. OUTPUT_FORMAT/SWIZZLED_OUT key the requant epilogue
     # explicitly (today the C/Cs dtypes split them incidentally; a descriptor Cs has no
     # dtype token, so don't lean on the append).
@@ -823,7 +850,7 @@ def _mx_matmul_configs():
             mx_2d_swap_scope_pruner(),
             scalar_max_m_pruner("M"),
             exact_memory_pruner(mx_dynamic_2d_smem, fallback=smem_pruner()),
-            descriptor_box_pruner("BLOCK_SIZE_K"),
+            descriptor_support_pruner(),
             swizzled_scale_config_pruner(),
             nvfp4_requant_warps_pruner(),
             warp_spec_compile_guard_pruner(),
@@ -838,14 +865,14 @@ def mx_dynamic_matmul_kernel(
     ADescriptor,  # host TMA descriptor over A (M, K_bytes), box (BM, BK_bytes); read iff A_MEMORY_MODE != "pointer"
     As,  # activation scales: SWIZZLE_32_4_4 (swizzled arm — bulk via ASDescriptor at BM=128, or this pointer for the BM<128 gather) or (M, K // 32) UE8M0 affine
     ASDescriptor,  # host TMA descriptor over the SWIZZLE_32_4_4 A scales (BM=128 bulk load); read iff SWIZZLED_SCALES
-    LoraInput,  # BF16 down projection or decode FP32 partials; None without SVDQuant
+    LoraInput,  # (M, rank) SVDQuant BF16 down projection, or (LORA_SPLIT_K, M, rank) FP32 partials; None without SVDQuant
     B,  # (N, K) E4M3 (MXFP8) or (N, K // 2) packed E2M1 (MXFP4) weights
     BDescriptor,  # host TMA descriptor over B (N, K_bytes), box (BN, BK_bytes); read iff B_MEMORY_MODE != "pointer"
     Bs,  # weight scales: SWIZZLE_32_4_4 (swizzled arm — bulk via BSDescriptor at BN=128, or this pointer for the BN<128 gather) or (N, K // SCALE_GROUP_K) affine
     BSDescriptor,  # host TMA descriptor over the SWIZZLE_32_4_4 B scales (BN=128 bulk load); read iff SWIZZLED_SCALES
-    LoraWeight,  # (N_out, rank) BF16 correction weight
-    Partials,
-    TileCounters,
+    LoraWeight,  # (N_out, rank) BF16 SVDQuant up projection; read iff LoraInput is not None
+    Partials,  # (SPLIT_K_MAX, tiles, 1, n_width) fp32 split-K partial sums; read iff SPLIT_K > 1
+    TileCounters,  # (tiles,) int32 split-K arrival counters, zero between launches; read iff SPLIT_K > 1
     C,  # (M, N) output (the GLU intermediate under GATE)
     Cs,  # (M, N // group) row-major requant output scale — written iff OUTPUT_FORMAT and not SWIZZLED_OUT
     Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
@@ -865,13 +892,13 @@ def mx_dynamic_matmul_kernel(
     stride_as_k,  # activation-scale group-axis stride, in GROUPS (see the affine advance below):
     # 1 for the row-major (M, K // SCALE_GROUP_K) grid, a real stride under a transposed view.
     # Dead on the swizzled arm, which re-derives its block offsets instead of walking pointers.
-    stride_li_m,
+    stride_li_m,  # LoraInput strides (dead without SVDQuant)
     stride_li_r,
     stride_b_k,
     stride_b_n,
     stride_bs_k,
     stride_bs_n,
-    stride_lw_n,
+    stride_lw_n,  # LoraWeight strides (dead without SVDQuant)
     stride_lw_r,
     stride_c_m,
     stride_c_n,
@@ -887,16 +914,17 @@ def mx_dynamic_matmul_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
-    LORA_RANK: tl.constexpr,
-    LORA_SPLIT_K: tl.constexpr,
-    SPLIT_K: tl.constexpr,
-    PERSISTENT: tl.constexpr,
-    COMPUTE_MODE: tl.constexpr,
     A_MEMORY_MODE: tl.constexpr = "pointer",
     B_MEMORY_MODE: tl.constexpr = "pointer",
+    COMPUTE_MODE: tl.constexpr = "dot_scaled",
     ACTIVATION_FORMAT: tl.constexpr = "mxfp8",
+    SWAP_AB: tl.constexpr = False,  # swapped decode orientation (BM=1); scoped by mx_2d_swap_scope_pruner
     SWIZZLED_SCALES: tl.constexpr = False,  # scales pre-swizzled (5D weight + matching acts); else affine/inline
-    SWIZZLED_OUT: tl.constexpr = False,  # requant emits Cs in SWIZZLE_32_4_4 (CSDescriptor); single source: wrapper
+    WARP_SPEC: tl.constexpr = False,  # tuner axis; +4% at prefill (guard: num_warps%4, BM>=64)
+    PIPELINE: tl.constexpr = "k_loop",  # tuner axis: warp-specialize the K loop, or the persistent tile loop ("tile_loop"/"flattened")
+    PERSISTENT: tl.constexpr = False,  # one program per SM looping over output tiles (persistent native tiles)
+    GROUP_SIZE_M: tl.constexpr = None,
+    SPLIT_K: tl.constexpr = 1,  # single-token decode: K split across SPLIT_K programs (grid axis 2), reduced in-kernel
     # Dense gate|up fusion: B is the (2N, K) gate|up stack, C the [M, N] GLU output. Every arm
     # folds out at compile time when GATE=False (the plain dense GEMM, unchanged).
     GATE: tl.constexpr = False,
@@ -904,13 +932,12 @@ def mx_dynamic_matmul_kernel(
     SWIGLU_ALPHA: tl.constexpr = None,
     SWIGLU_LIMIT: tl.constexpr = None,
     OUTPUT_FORMAT: tl.constexpr = None,
+    SWIZZLED_OUT: tl.constexpr = False,  # requant emits Cs in SWIZZLE_32_4_4 (CSDescriptor); single source: wrapper
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
-    WARP_SPEC: tl.constexpr = False,  # tuner axis; +4% at prefill (guard: num_warps%4, BM>=64)
-    PIPELINE: tl.constexpr = "k_loop",  # tuner axis: warp-specialize the K loop, or the persistent tile loop ("tile_loop"/"flattened")
-    SWAP_AB: tl.constexpr = False,  # swapped decode orientation (BM=1); scoped by mx_2d_swap_scope_pruner
+    LORA_RANK: tl.constexpr = 0,  # SVDQuant low-rank correction rank (0 without SVDQuant)
+    LORA_SPLIT_K: tl.constexpr = 1,  # FP32 LoraInput partials the epilogue sums (decode); 1 for a BF16 LoraInput
     PDL: tl.constexpr = False,
-    GROUP_SIZE_M: tl.constexpr = None,
 ):
     """Unified MXFP4/MXFP8 (W4A8/W8A8; a ``uint8`` ``A`` is packed E2M1 — W4A4) GEMM.
 
@@ -927,18 +954,18 @@ def mx_dynamic_matmul_kernel(
     """
     if PDL:
         gdc_wait()
+    # uint8 A = packed-E2M1 activations (W4A4 — the dtype IS the activation format)
+    ACT_VALUES_PER_BYTE: tl.constexpr = 2 if A.dtype.element_ty == tl.uint8 else 1
+    WEIGHT_VALUES_PER_BYTE: tl.constexpr = 2 if B.dtype.element_ty == tl.uint8 else 1
+    n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
+    SCALE_COLS: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
     tile_start, tile_end, tile_step = output_tile_range(M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, PERSISTENT)
     # Two accumulators of a 256-wide tile and the block scales overflow the 512 tensor-memory columns.
     for tile_id in tl.range(
         tile_start, tile_end, tile_step,
         flatten=PIPELINE == "flattened", warp_specialize=WARP_SPEC and PIPELINE != "k_loop",
-        disallow_acc_multi_buffer=PIPELINE != "k_loop" and (2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N) >= 256,
+        disallow_acc_multi_buffer=PIPELINE != "k_loop" and n_width >= 256,
     ):
-        # uint8 A = packed-E2M1 activations (W4A4 — the dtype IS the activation format)
-        ACT_VALUES_PER_BYTE: tl.constexpr = 2 if A.dtype.element_ty == tl.uint8 else 1
-        WEIGHT_VALUES_PER_BYTE: tl.constexpr = 2 if B.dtype.element_ty == tl.uint8 else 1
-        n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
-        SCALE_COLS: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
         offs_ka = tl.arange(0, BLOCK_SIZE_K // ACT_VALUES_PER_BYTE)
         offs_kb = tl.arange(0, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE)
         # packed-fp4 weights (WEIGHT_VALUES_PER_BYTE==2) route swizzle_offsets to full L2 grouping
@@ -1042,7 +1069,7 @@ def mx_dynamic_matmul_kernel(
             )
 
 assert all(
-    MX_SPLIT_K_MIN_BLOCK_N <= c.kwargs["BLOCK_SIZE_N"] <= 256
+    MX_SPLIT_K_MIN_BLOCK_N <= c.kwargs["BLOCK_SIZE_N"] <= MX_SPLIT_K_MAX_BLOCK_N
     for c in mx_dynamic_matmul_kernel.configs if c.kwargs.get("SPLIT_K", 1) > 1
 ), "a split-K config outgrows the partials or counters mx_dynamic_matmul allocates"
 
@@ -1063,7 +1090,7 @@ assert all(
         compute_modes=("dot", "dot_scaled"),
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
-        pre_hook=rebind_weight_only_descriptors,
+        pre_hook=rebind_tiled_descriptors,
     ),
     ["N", "K", "m_bit_length", "GATE"],
     n_trials=100,
@@ -1081,7 +1108,7 @@ assert all(
             mx_config_pruner("K", "N"),  # dot_scaled shape gates
             gate_stacked_tmem_trap_pruner(),
             warp_spec_compile_guard_pruner(),
-            descriptor_box_pruner("BLOCK_SIZE_K"),
+            descriptor_support_pruner(),
             smem_pruner("BLOCK_SIZE_K"),
         )
     },
@@ -1103,7 +1130,7 @@ def mx_weight_only_matmul_2d_kernel(
     m_bit_length,  # autotune key only (log2 M bucket)
     stride_a_m,
     stride_a_k,
-    stride_as_global: tl.constexpr,
+    stride_as_global,  # expert stride of AsGlobal (0 broadcasts a shared scalar)
     stride_b_n,
     stride_b_k,
     stride_bs_n,
@@ -1121,16 +1148,16 @@ def mx_weight_only_matmul_2d_kernel(
     A_MEMORY_MODE: tl.constexpr = "pointer",
     B_MEMORY_MODE: tl.constexpr = "pointer",
     COMPUTE_MODE: tl.constexpr = "dot",
+    SWAP_AB: tl.constexpr = False,
     WARP_SPEC: tl.constexpr = False,
+    GROUP_SIZE_M: tl.constexpr = None,
     GATE: tl.constexpr = False,
     ACT_FN: tl.constexpr = "silu",
     SWIGLU_ALPHA: tl.constexpr = None,
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
-    SWAP_AB: tl.constexpr = False,
     PDL: tl.constexpr = False,
-    GROUP_SIZE_M: tl.constexpr = None,
 ):
     """weight-only dense matmul: ``C = A @ B.T`` with a RAW bf16 activation and an MXFP4/MXFP8 weight
     upcast to bf16 in-loop (unpack E2M1->E4M3, per-group group-scale multiply), then a plain bf16
@@ -1230,17 +1257,17 @@ def split_k_reduce(acc, Partials, TileCounters, tile, num_tiles, BM: tl.constexp
         k_slices=(1, 2, 4),
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
-        pre_hook=rebind_weight_only_descriptors,
+        pre_hook=rebind_tiled_descriptors,
     )
     # same branch-axis values as the union grid's BM=16 tiles, so coordinate descent steps BN 32 -> 16 within one basin
-    + narrow_dot_autotuning_configs(pre_hook=rebind_weight_only_descriptors, WARP_SPEC=False)
+    + narrow_dot_autotuning_configs(pre_hook=rebind_tiled_descriptors, WARP_SPEC=False)
     + narrow_dot_autotuning_configs(
-        block_ms=(1, 2, 4, 8), block_ns=(32, 64), pre_hook=rebind_weight_only_descriptors, WARP_SPEC=False, SWAP_AB=True,
+        block_ms=(1, 2, 4, 8), block_ns=(32, 64), pre_hook=rebind_tiled_descriptors, WARP_SPEC=False, SWAP_AB=True,
     )
     # wide swapped tiles for batch-sized M: the weight rows fill the tcgen05 M axis (INT8 4608x3584, B200: M=64 13.1 ->
     # 11.2us)
     + narrow_dot_autotuning_configs(
-        block_ms=(16, 32, 64, 128), block_ns=(64, 128), pre_hook=rebind_weight_only_descriptors, WARP_SPEC=False,
+        block_ms=(16, 32, 64, 128), block_ns=(64, 128), pre_hook=rebind_tiled_descriptors, WARP_SPEC=False,
         SWAP_AB=True,
     )
     + narrow_scalar_autotuning_configs(block_ms=(1, 2, 4))),
@@ -1264,11 +1291,12 @@ def split_k_reduce(acc, Partials, TileCounters, tile, num_tiles, BM: tl.constexp
             # M=2 7.7 vs 11.2us, M=4 9.9 vs 11.2us)
             scalar_max_m_pruner("M", max_m=4),
             scalar_block_m_pruner("M"),
-            int_split_k_pruner("M", SPLIT_K_MAX_M),
+            # no split-K configs: only the sub-16 row-tile rule applies
+            int_split_k_pruner("M", max_m=0),
             block_m_cap_pruner("M"),
             warp_spec_compile_guard_pruner(),
             int_2d_warp_spec_pruner(),
-            descriptor_box_pruner("BLOCK_SIZE_K"),
+            descriptor_support_pruner(),
             exact_memory_pruner(weight_only_2d_smem, weight_only_grouped_tmem, fallback=smem_pruner("BLOCK_SIZE_K")),
         )
     },
@@ -1285,8 +1313,6 @@ def int_weight_only_matmul_2d_kernel(
     BsGlobal,  # fp32 W4A8 second-level weight scale; None otherwise
     C,  # (M, N) output (GLU intermediate under GATE)
     Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
-    Partials,  # (SPLIT_K_MAX, tiles, BM, n_width) fp32 split-K partial sums; read iff SPLIT_K > 1
-    TileCounters,  # (tiles,) int32 split-K arrival counters, zero between launches; read iff SPLIT_K > 1
     M,
     N,
     K,
@@ -1319,7 +1345,6 @@ def int_weight_only_matmul_2d_kernel(
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
-    SPLIT_K: tl.constexpr = 1,
     INT_BITS: tl.constexpr = 4,
     ACT_QUANT: tl.constexpr = None,  # "fp8" / "int8": A is raw and quantized against AsGlobal on load (decode)
     K_SLICES: tl.constexpr = 1,
@@ -1328,9 +1353,7 @@ def int_weight_only_matmul_2d_kernel(
 ):
     """Integer dense matmul: bf16/fp16 weight-only, calibrated INT4/FP8, or INT8 SmoothQuant.
     ``int_weight_only_compute`` runs the MMA or small-token scalar reduce. ``GATE`` loads the stacked (2N, K)
-    gate|up weight as one ``2*BN``-wide tile + applies the GLU. ``SPLIT_K`` (decode) splits K across that many
-    programs per output tile (``program_id(2)``); each stores its fp32 partial, and the last to arrive sums all of
-    them in split order (deterministic) and runs the epilogue, in the same launch."""
+    gate|up weight as one ``2*BN``-wide tile + applies the GLU."""
     if PDL:
         gdc_wait()
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
@@ -1365,17 +1388,6 @@ def int_weight_only_matmul_2d_kernel(
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False, tl.int32 if A_DTYPE == tl.int8 else tl.float32, K_SLICES)
     if SWAP_AB and COMPUTE_MODE == "dot":
         accumulator = tl.trans(accumulator)
-    # this program's share of the K tiles (int_split_k_pruner: the split divides them)
-    k_per_split = tl.cdiv(K, BLOCK_SIZE_K)
-    k_first = 0
-    if SPLIT_K > 1:
-        k_per_split = k_per_split // SPLIT_K
-        k_first = tl.program_id(2) * k_per_split
-        a_ptrs += k_first * BLOCK_SIZE_K * stride_a_k
-        b_ptrs += k_first * (BLOCK_SIZE_K // VPW) * stride_b_k
-        bs_ptrs += k_first * SCALE_STEP * stride_bs_k
-        if Bz is not None:
-            bz_ptrs += k_first * SCALE_STEP * stride_bz_k
     if Bz is None:
         BYTE_ZERO: tl.constexpr = False
     else:
@@ -1383,14 +1395,14 @@ def int_weight_only_matmul_2d_kernel(
     WHOLE_WORD: tl.constexpr = SM10X and SWAP_AB and INT_BITS == 4 and ROWS_MAJOR and BYTE_ZERO
     # zero points run one K step ahead: their narrow per-row read is not one the pipeliner stages, so each step issues
     # the next step's and consumes the previous one's instead of stalling on its own
-    k_last = k_first + k_per_split - 1
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
     b_z_next = None
     if Bz is not None and not WHOLE_WORD:
         b_z_next = load_weight_int_group(
-            int_group_ptrs(bz_ptrs, k_first, stride_bz_k, BLOCK_SIZE_K, SCALE_GROUP_K), Bz, 0, pid_n, k_first, N, K,
+            int_group_ptrs(bz_ptrs, 0, stride_bz_k, BLOCK_SIZE_K, SCALE_GROUP_K), Bz, 0, pid_n, 0, N, K,
             0, stride_bz_n, stride_bz_k, GATE, False, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K,
         )
-    for k in tl.range(k_first, k_first + k_per_split, warp_specialize=WARP_SPEC):
+    for k in tl.range(0, k_tiles, warp_specialize=WARP_SPEC):
         if WHOLE_WORD:
             # Expose the byte load inside this iteration to preserve whole-word MMA ownership; issue before TMA waits.
             b_z = load_weight_int_group(
@@ -1410,7 +1422,7 @@ def int_weight_only_matmul_2d_kernel(
             B_MEMORY_MODE, ROWS_MAJOR, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, BITS=INT_BITS,
         )
         if Bz is not None and not WHOLE_WORD:
-            k_next = tl.minimum(k + 1, k_last)
+            k_next = tl.minimum(k + 1, k_tiles - 1)
             b_z_next = load_weight_int_group(
                 int_group_ptrs(
                     bz_ptrs + (k_next - k) * SCALE_STEP * stride_bz_k, k_next, stride_bz_k, BLOCK_SIZE_K, SCALE_GROUP_K
@@ -1434,27 +1446,19 @@ def int_weight_only_matmul_2d_kernel(
     accumulator = k_slices_sum(accumulator, K_SLICES)
     if SWAP_AB and COMPUTE_MODE == "dot":
         accumulator = tl.trans(accumulator)
-    if SPLIT_K > 1:
-        accumulator, last = split_k_reduce(
-            accumulator, Partials, TileCounters, tl.program_id(0) * tl.num_programs(1) + tl.program_id(1),
-            tl.num_programs(0) * tl.num_programs(1), BLOCK_SIZE_M, n_width, SPLIT_K,
-        )
-    else:
-        last = True
-    if last:
-        output_scale = BsGlobal
-        if A_DTYPE == tl.int8:
-            output_scale = Bs + offs_bn_lin * stride_bs_n
-        out_row = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-        gemm_epilogue(
-            C, None, accumulator, out_row, pid_n, pid_m, out_row < M,
-            stride_c_m, stride_c_n, 0, 0,
-            BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, BLOCK_SIZE_K,
-            ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
-            COMPUTE_MODE="dot", N_COLS=N,
-            GlobalScale=output_scale, GlobalScaleA=AsGlobal,
-            Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
-        )
+    output_scale = BsGlobal
+    if A_DTYPE == tl.int8:
+        output_scale = Bs + offs_bn_lin * stride_bs_n
+    out_row = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    gemm_epilogue(
+        C, None, accumulator, out_row, pid_n, pid_m, out_row < M,
+        stride_c_m, stride_c_n, 0, 0,
+        BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, BLOCK_SIZE_K,
+        ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
+        COMPUTE_MODE="dot", N_COLS=N,
+        GlobalScale=output_scale, GlobalScaleA=AsGlobal,
+        Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
+    )
 
 @bayesian_autotune(
     block_fp8_scale_mode_configs(get_accelerator_autotuning_configs(
@@ -1463,7 +1467,7 @@ def int_weight_only_matmul_2d_kernel(
         swap_ab=True, swap_block_sizes_m=(1, 2, 4, 8, 16, 32, 64, 128), k_slices=(1, 2, 4),
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
-        pre_hook=rebind_weight_only_descriptors,
+        pre_hook=rebind_tiled_descriptors,
     )),
     ["N", "K", "m_bit_length", "GATE", "BLOCK_N", "BLOCK_K", "GATE_SCALES"],
     n_trials=100,
@@ -1478,7 +1482,7 @@ def int_weight_only_matmul_2d_kernel(
             swap_max_m_pruner("M", max_m=128),
             gate_stacked_tmem_trap_pruner(),
             warp_spec_compile_guard_pruner(),
-            descriptor_box_pruner(),
+            descriptor_support_pruner(),
             exact_memory_pruner(weight_only_2d_smem, weight_only_grouped_tmem, fallback=smem_pruner()),
             k_slices_pruner(),
             block_fp8_scale_mode_pruner(),
@@ -1499,8 +1503,12 @@ def block_fp8_weight_only_matmul_2d_kernel(
     BLOCK_K: tl.constexpr,
     A_MEMORY_MODE: tl.constexpr = "pointer",
     B_MEMORY_MODE: tl.constexpr = "pointer",
-    WARP_SPEC: tl.constexpr = False,
+    SCALE_MODE: tl.constexpr = "tile",  # where the coarse block scale lands (block_fp8_weight_only_dot)
+    SCALE_POST: tl.constexpr = False,  # one scale block spans K (set at launch): "post", the output scale
     SWAP_AB: tl.constexpr = False,
+    WARP_SPEC: tl.constexpr = False,
+    GROUP_SIZE_M: tl.constexpr = None,
+    K_SLICES: tl.constexpr = 1,
     GATE: tl.constexpr = False,
     GATE_SCALES: tl.constexpr = False,
     ACT_FN: tl.constexpr = "silu",
@@ -1508,11 +1516,7 @@ def block_fp8_weight_only_matmul_2d_kernel(
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
-    K_SLICES: tl.constexpr = 1,
     PDL: tl.constexpr = False,
-    GROUP_SIZE_M: tl.constexpr = None,
-    SCALE_MODE: tl.constexpr = "tile",  # where the coarse block scale lands (block_fp8_weight_only_dot)
-    SCALE_POST: tl.constexpr = False,  # one scale block spans K (set at launch): "post", the output scale
 ):
     """Dense FP8 W8A16 GEMM with in-tile weight rescaling."""
     MODE: tl.constexpr = "post" if SCALE_POST else SCALE_MODE
@@ -1563,7 +1567,7 @@ def block_fp8_weight_only_matmul_2d_kernel(
         tune_block_nk=True, warp_spec=True, tune_block_m=True,
         swap_ab=True, swap_block_sizes_m=(1, 2, 4, 8, 16, 32, 64, 128), k_slices=(1, 2, 4),
         a_memory_modes=("descriptor", "pointer"), b_memory_modes=("descriptor", "pointer"),
-        pre_hook=rebind_weight_only_descriptors,
+        pre_hook=rebind_tiled_descriptors,
     ),
     # GATE keys the gate|up arm separately (its stacked dot is 2*BN wide).
     ["N", "K", "m_bit_length", "GATE"],
@@ -1578,7 +1582,7 @@ def block_fp8_weight_only_matmul_2d_kernel(
             block_within_dim_pruner("K"),
             swap_max_m_pruner("M", max_m=128),
             matched_memory_modes_pruner(),
-            descriptor_box_pruner(),
+            descriptor_support_pruner(),
             gate_stacked_tmem_trap_pruner(),
             smem_pruner(),
             warp_spec_compile_guard_pruner(),
@@ -1612,10 +1616,12 @@ def full_precision_matmul_2d_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
-    WARP_SPEC: tl.constexpr = False,
     A_MEMORY_MODE: tl.constexpr = "pointer",
     B_MEMORY_MODE: tl.constexpr = "pointer",
     SWAP_AB: tl.constexpr = False,
+    WARP_SPEC: tl.constexpr = False,
+    GROUP_SIZE_M: tl.constexpr = None,
+    K_SLICES: tl.constexpr = 1,
     # Dense gate|up fusion: B is the (2N, K) gate|up stack, C the [M, N] GLU output. Folds out at
     # compile time when GATE=False (the plain dense GEMM).
     GATE: tl.constexpr = False,
@@ -1624,9 +1630,7 @@ def full_precision_matmul_2d_kernel(
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
-    K_SLICES: tl.constexpr = 1,
     PDL: tl.constexpr = False,
-    GROUP_SIZE_M: tl.constexpr = None,
 ):
     """Full-precision (BF16/FP16) 2D matmul — the single-GEMM sibling of
     ``full_precision_matmul_grouped/batched``: plain ``tl.dot``, fp32 accumulation, no scales.
@@ -1731,27 +1735,27 @@ def w8a8_block_dynamic_fp8_matmul(
     )
     # cuBLAS MXFP8 fast path for power-of-two block scales, inside the op as the MX route
     if not gate and bias is None and not simulate_unfused:
-        _smm = _torch_scaled_mm_2d_block_ue8m0(
+        _smm = _torch_scaled_mm_2d_block(
             A, B, Bs, block_size, resolve_output_dtype(output_dtype, A, None), w8a8_block_dynamic_fp8_matmul.paths
         )
         if _smm is not None:
             return [_smm]
 
     bs_u8 = ue8m0_as_uint8(Bs)
+    # split-K scratch (int_split_k_pruner): partials for the widest split over the split tiles' padded grid,
+    # counters for the narrowest tile's grid; the activation quant zeroes the counters
+    partials = counters = None
+    if M <= BLOCK_FP8_SPLIT_K_MAX_M:
+        partials, counters = split_k_workspace(
+            A.device,
+            SPLIT_K_VALUES[-1] * triton.cdiv(M, BLOCK_FP8_SPLIT_K_MAX_BLOCK_M) * BLOCK_FP8_SPLIT_K_MAX_BLOCK_M
+            * triton.cdiv(N, SPLIT_K_MAX_BLOCK_N) * SPLIT_K_MAX_BLOCK_N * (2 if gate else 1),
+            triton.cdiv(M, BLOCK_FP8_SPLIT_K_MIN_BLOCK) * triton.cdiv(N, BLOCK_FP8_SPLIT_K_MIN_BLOCK),
+            zero_counters=False,
+        )
     # UE8M0 weight scales are the DeepGEMM-Blackwell format — quantize activations to UE8M0
     # too so the kernel folds both group scales into the tcgen05 dot_scaled MMA (else fp32).
     # rows padded to the largest M tile, so the A box reads in bounds (see the tensor-dynamic op)
-    # split-K scratch (decode band only, int_split_k_pruner): partials for the widest split over the split tiles'
-    # padded grid, counters for the narrowest tile's grid; the activation quant zeroes the counters
-    partials = counters = None
-    if M <= SPLIT_K_MAX_M:
-        partials, counters = split_k_workspace(
-            A.device,
-            SPLIT_K_VALUES[-1] * triton.cdiv(M, 16) * 16
-            * triton.cdiv(N, SPLIT_K_MAX_BLOCK_N) * SPLIT_K_MAX_BLOCK_N * (2 if gate else 1),
-            triton.cdiv(M, 16) * triton.cdiv(N, 16),
-            zero_counters=False,
-        )
     A_q, A_s = fp8_act_quant_block_dynamic(
         A.view(M, K), block_k, use_ue8m0=bs_u8.dtype == torch.uint8,
         row_multiple=MATMUL_A_ROW_MULTIPLE, zero=counters,
@@ -1765,19 +1769,9 @@ def w8a8_block_dynamic_fp8_matmul(
     a_descriptor = TensorDescriptor(A_q, [a_rows, K], [K, 1], [1, block_k])
     b_descriptor = weight_descriptor(B, [1, block_k])
 
-    def grid(META):
-        if META.get("PIPELINE", "k_loop") != "k_loop":
-            tiles = triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"])
-            return (min(tiles, persistent_program_count(A.device.index or 0, META["BLOCK_SIZE_M"])),)
-        return (
-            triton.cdiv(M, META["BLOCK_SIZE_M"]),
-            triton.cdiv(N, META["BLOCK_SIZE_N"]),
-            META.get("SPLIT_K", 1),
-        )
-
     with device_context(A.device):
         bias_stride_e, bias_stride_n = bias_strides(bias)
-        compile_time_only_triton_wrap(w8a8_block_dynamic_fp8_matmul_kernel)[grid](
+        compile_time_only_triton_wrap(w8a8_block_dynamic_fp8_matmul_kernel)[_dense_2d_grid(M, N, A.device.index or 0)](
             A_q,
             a_descriptor,
             A_s,
@@ -2017,18 +2011,9 @@ def w8a8_tensor_dynamic_fp8_matmul(
     a_descriptor = TensorDescriptor(qA, [a_rows, K], [K, 1], [1, 16])
     b_descriptor = weight_descriptor(B, [1, 16])
 
-    def grid(META):
-        if META.get("PIPELINE", "k_loop") != "k_loop":
-            tiles = triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"])
-            return (min(tiles, persistent_program_count(A.device.index or 0, META["BLOCK_SIZE_M"])),)
-        return (
-            triton.cdiv(M, META["BLOCK_SIZE_M"]),
-            triton.cdiv(N, META["BLOCK_SIZE_N"]),
-        )
-
     with device_context(A.device):
         bias_stride_e, bias_stride_n = bias_strides(bias)
-        compile_time_only_triton_wrap(w8a8_tensor_dynamic_fp8_matmul_kernel)[grid](
+        compile_time_only_triton_wrap(w8a8_tensor_dynamic_fp8_matmul_kernel)[_dense_2d_grid(M, N, A.device.index or 0)](
             qA,
             a_descriptor,
             As,
@@ -2121,7 +2106,7 @@ def mx_dynamic_matmul(
     )
     assert A.stride(-1) == 1, f"A's rows must be contiguous, got strides {tuple(A.stride())}"
     # B may be row-major (the forward weight) or a transposed view of one: the kernel reads
-    # both of B's strides, and `descriptor_box_pruner` keeps the TMA arms — which need a
+    # both of B's strides, and `descriptor_support_pruner` keeps the TMA arms — which need a
     # unit-stride innermost dim — off the transposed form. This is what lets a backward pass
     # contract over N by handing in `B.t()` instead of materializing a transposed copy.
     assert B.is_contiguous() or B.t().is_contiguous(), (
@@ -2196,7 +2181,7 @@ def mx_dynamic_matmul(
     input_global_scale = normalize_global_scale(b_global_scale, 1)  # g_b
     out_global_scale = normalize_global_scale(output_global_scale, 1)
     # As given ⇒ A is already quantized (the routed-op parity: a pre-quantized activation + its
-    # scales); else quantize raw A (offline above the M threshold, inline in the kernel below it).
+    # scales); else quantize raw A (offline or inline, as the path tuner timed it).
     if svdquant_lora_a is not None:
         a_vals, as_scales, lora_input = svdquant_act_quant(
             A, svdquant_lora_a, a_pre_quant_scale, act_global_scale, swizzled_scales)
@@ -2285,11 +2270,12 @@ def mx_dynamic_matmul(
         )
 
     # split-K scratch (single-token decode without GATE, mx_auxiliary_pruner): only the one real row is reduced, so the
-    # partials cover the widest split over the BN=256 padded grid, and the counters the narrowest split tile's grid.
+    # partials cover the widest split over the widest tile's padded grid, and the counters the narrowest split tile's grid.
     partials = counters = None
     if M == 1 and not gate:
         partials, counters = split_k_workspace(
-            A.device, SPLIT_K_VALUES[-1] * triton.cdiv(N, 256) * 256, triton.cdiv(N, MX_SPLIT_K_MIN_BLOCK_N)
+            A.device, SPLIT_K_VALUES[-1] * triton.cdiv(N, MX_SPLIT_K_MAX_BLOCK_N) * MX_SPLIT_K_MAX_BLOCK_N,
+            triton.cdiv(N, MX_SPLIT_K_MIN_BLOCK_N),
         )
 
     with device_context(A.device):
@@ -2397,10 +2383,7 @@ def full_precision_matmul_2d(
         and (bias is None or bias.dtype == A.dtype)
         and full_precision_matmul_2d.paths.choose((N, K, M.bit_length(), bias is None, str(A.dtype))) == "cublas"
     ):
-        native_bias = bias[0] if bias is not None and bias.ndim == 2 else bias
-        # a caller's autocast region would recast F.linear (not the Triton kernel), making the output dtype depend on the path
-        with torch.autocast(A.device.type, enabled=False):
-            return [torch.nn.functional.linear(A, B, native_bias)]
+        return _cublas_linear(A, B, bias)
     C = A.new_empty(A.shape[:-1] + (gate_out_cols(N, gate, act_fn),), dtype=output_dtype)
 
     a_descriptor = maybe_descriptor(A.view(M, K), [16, 32])
@@ -2499,7 +2482,7 @@ def mx_weight_only_matmul_2d(
     a_global_scale = normalize_global_scale(a_global_scale, 1)
     C = A.new_empty(A.shape[:-1] + (gate_out_cols(N, gate, act_fn),), dtype=output_dtype)
     # Host-TMA descriptors over the (M, K) bf16 A and packed (N, K_bytes) weight — placeholder box
-    # rebound per tuned config by rebind_weight_only_descriptors, read only by the descriptor configs the
+    # rebound per tuned config by rebind_tiled_descriptors, read only by the descriptor configs the
     # tuner picks (pointer configs never touch them). Scales stay affine (no scale descriptor).
     a_descriptor = maybe_descriptor(A_2d, [1, 32])
     b_descriptor = weight_descriptor(b_u8, [1, 32], B)
@@ -2584,10 +2567,7 @@ def block_fp8_weight_only_matmul_2d(
         # no GLU to fuse (ungated, or the raw gate|up output): cuBLAS over the dequantized rows
         if ((not gate or act_fn is None) and output_dtype in (None, A.dtype)
                 and (bias is None or bias.dtype == A.dtype)):
-            native_bias = bias[0] if bias is not None and bias.ndim == 2 else bias
-            # a caller's autocast region would recast F.linear (not the Triton kernel), making the output dtype depend on the path
-            with torch.autocast(A.device.type, enabled=False):
-                return [torch.nn.functional.linear(A, weights, native_bias)]
+            return _cublas_linear(A, weights, bias)
         return full_precision_matmul_2d(
             A, weights,
             output_dtype, gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, bias=bias,
@@ -2655,7 +2635,7 @@ def int_weight_only_matmul_2d(
     a_scale = normalize_global_scale(a_scale, 1)
     b_scale2 = normalize_global_scale(b_scale2, 1)
     output_dtype = resolve_output_dtype(output_dtype, A, None)
-    rows, K_b = B.shape
+    rows, _ = B.shape
     K = A.shape[-1]
     M = A.numel() // K
     N = rows // 2 if gate else rows
@@ -2675,7 +2655,7 @@ def int_weight_only_matmul_2d(
     fp8_cublas_eligible = b_scale2 is not None and is_sm10x() and hasattr(torch.nn.functional, "scaled_mm") and (
         output_dtype == torch.bfloat16 and K % 16 == 0 and N % 16 == 0)
     offline_dequant = (
-        (a_scale is None and A.ndim == 2 and output_dtype in (None, A.dtype) or fp8_cublas_eligible)
+        ((a_scale is None and A.ndim == 2 and output_dtype == A.dtype) or fp8_cublas_eligible)
         and not gate and bias is None
         and int_weight_only_matmul_2d.paths.choose(
             (N, K, M.bit_length(), bits, str(A.dtype), a_scale is None), offered=("inline_dequant", "offline_dequant")
@@ -2687,25 +2667,21 @@ def int_weight_only_matmul_2d(
         A = permute_act_cols(A, b_perm, a_pre_quant_scale, a_scale, torch.int8 if smoothquant else FP8_DTYPE)
     assert A.is_contiguous(), "A must be contiguous (the host-TMA descriptor arm reads its box)"
     if offline_dequant and a_scale is None:
-        # a caller's autocast region would recast F.linear (not the Triton kernel), making the output dtype depend on the path
-        with torch.autocast(A.device.type, enabled=False):
-            return [torch.nn.functional.linear(A, dequantize_int_weight(B, Bs, K, b_zero, dtype=A.dtype))]
+        return _cublas_linear(A, dequantize_int_weight(B, Bs, K, b_zero, dtype=A.dtype))
     if offline_dequant:
         weight = dequantize_int_weight(B, Bs, K, b_zero, dtype=FP8_DTYPE, global_scale=b_scale2)
         out = _scaled_mm_2d(A.view(M, K), a_scale, weight, b_scale2, None, None, "fp8")
         return [out.view(*A.shape[:-1], N)]
     C = A.new_empty(A.shape[:-1] + (gate_out_cols(N, gate, act_fn),), dtype=output_dtype)
-    # placeholder boxes, rebound per tuned config by rebind_weight_only_descriptors
+    # placeholder boxes, rebound per tuned config by rebind_tiled_descriptors
     a_descriptor = maybe_descriptor(A.view(M, K), [1, 32])
     b_descriptor = weight_descriptor(B, [1, 32])
-
-    def grid(META):
-        return (triton.cdiv(M, META["BLOCK_SIZE_M"]), triton.cdiv(N, META["BLOCK_SIZE_N"]), META.get("SPLIT_K", 1))
 
     # no split-K: its arrival counters need zeroing, a memset node per CUDA-graph replay with no producer kernel to fold
     # it into, which costs more than the split saves (Qwen2.5-7B GPTQ INT4 qkv decode, cold weights, graph: 12.2 split
     # vs 8.2us unsplit; eager the split was 0.45us ahead)
-    partials = counters = None
+    def grid(META):
+        return (triton.cdiv(M, META["BLOCK_SIZE_M"]), triton.cdiv(N, META["BLOCK_SIZE_N"]))
 
     with device_context(A.device):
         bias_stride_e, bias_stride_n = bias_strides(bias)
@@ -2720,8 +2696,6 @@ def int_weight_only_matmul_2d(
             b_scale2,
             C,
             bias,
-            partials,
-            counters,
             M,
             N,
             K,
@@ -2741,13 +2715,13 @@ def int_weight_only_matmul_2d(
             SCALE_GROUP_K=K // Bs.shape[1],
             INT_BITS=bits,
             ACT_QUANT=("int8" if smoothquant else "fp8") if quantize_on_load else None,
-            **pdl_launch_kwargs(),
             GATE=gate,
             ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha,
             SWIGLU_LIMIT=swiglu_limit,
             SIMULATE_UNFUSED=simulate_unfused,
-            INTERMEDIATE_DTYPE=tl_dtype(resolve_output_dtype(output_dtype, A, None)),
+            INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
+            **pdl_launch_kwargs(),
         )
 
     return [C]
@@ -2884,21 +2858,25 @@ def _torch_scaled_mm_2d_tensor_wise(A, B, As, Bs, activation_format, out_dtype, 
     return out.reshape(*A.shape[:-1], B.shape[0])
 
 
-def _torch_scaled_mm_2d_block_ue8m0(A, B, Bs, block_size, out_dtype, paths):
-    """The scaled_mm route for 128x128 UE8M0 block FP8 (the DeepGEMM-Blackwell checkpoints), or
-    ``None`` to take the Triton kernel. A power-of-two block scale is an MX group-32 scale repeated
-    over its block, so the same operands run as cuBLAS's MXFP8 GEMM: the activation quant writes each
-    ``1 x 128`` scale into its four swizzled group-32 slots, and the weight's ``128 x 128`` grid
-    expands to one row per weight row. Bit-identical to the Triton kernel (same quant, fp32
-    accumulate); DeepSeek-V4 qkv prefill (B200, M=8192 N=12288 K=4096) GEMM 489 -> 288 us."""
+def _torch_scaled_mm_2d_block(A, B, Bs, block_size, out_dtype, paths):
+    """The scaled_mm route for 128x128 block FP8, or ``None`` to take the Triton kernel. Same activation quant as the
+    Triton kernel, fp32 accumulate.
+    - sm_90: cuBLAS's block-scaled GEMM (``1 x 128`` activation, ``128 x 128`` weight fp32 scales), which promotes each
+      block's partial in the warpgroup MMA pipeline: from M=256 it runs 2-3x the Triton kernel (H200, N=2048-6144,
+      K=2048-7168, cold weights, CUDA graph); below M=16 cuBLAS has no kernel and Triton wins anyway.
+    - sm_10x (UE8M0 scales, the DeepGEMM-Blackwell checkpoints): cuBLAS's MXFP8 GEMM, a power-of-two block scale being
+      an MX group-32 scale repeated over its block (the activation quant writes each ``1 x 128`` scale into its four
+      swizzled group-32 slots, the weight's ``128 x 128`` grid expands to one row per weight row), bit-identical;
+      DeepSeek-V4 qkv prefill (B200, M=8192 N=12288 K=4096) GEMM 489 -> 288 us. Blackwell has no cuBLAS fp32-scale
+      block GEMM."""
     if os.environ.get("FINEGRAINED_DISABLE_SCALED_MM"):
         return _smm_reject("env-disabled")
-    if not is_sm10x():
-        return _smm_reject("not-sm10x")
+    if not (is_sm10x() or is_sm90()):
+        return _smm_reject("arch")
     if not (hasattr(torch.nn.functional, "scaled_mm") and hasattr(torch.nn.functional, "ScalingType")):
         return _smm_reject("no-F.scaled_mm")
     bs_u8 = ue8m0_as_uint8(Bs)
-    if bs_u8.dtype != torch.uint8:
+    if is_sm10x() and bs_u8.dtype != torch.uint8:
         return _smm_reject("fp32 block scale")  # not a power of two: no MX form
     if list(block_size) != [128, 128]:
         return _smm_reject("block")
@@ -2910,8 +2888,19 @@ def _torch_scaled_mm_2d_block_ue8m0(A, B, Bs, block_size, out_dtype, paths):
         return _smm_reject("shape")
     if B.stride(-1) != 1:
         return _smm_reject("weight-layout")
+    if is_sm90() and M < 16:
+        return _smm_reject("rows")
     if paths.choose((N, K, M.bit_length(), str(A.dtype))) != "cublas":
         return _smm_reject("tuned to Triton")
+    if is_sm90():
+        Aq, As = fp8_act_quant_block_dynamic(A.reshape(M, K), 128)
+        F = torch.nn.functional
+        out = F.scaled_mm(
+            Aq, B.t(), As.t().contiguous().t(), F.ScalingType.BlockWise1x128,  # cuBLAS takes M-major activation scales
+            Bs.float().t(), F.ScalingType.BlockWise128x128,
+            swizzle_a=F.SwizzleType.NO_SWIZZLE, swizzle_b=F.SwizzleType.NO_SWIZZLE, output_dtype=torch.bfloat16,
+        )
+        return out.reshape(*A.shape[:-1], N)
     Aq, As = fp8_act_quant_block_dynamic(A.reshape(M, K), 128, use_ue8m0=True, swizzled=True)
     weight_rows = torch.arange(N, device=B.device, dtype=torch.int32) // 128
     Bs_mx = swizzle_mx_scales(bs_u8.repeat_interleave(4, dim=1), gather_idx=weight_rows)
@@ -3041,7 +3030,7 @@ def matmul_2d(
     """
     if b_scale_exceptions is not None:  # one prepared matrix decodes as a 1-expert stack
         Bs = csf_weight_scales(Bs, b_scale_exceptions, b_scale_exception_offsets)[0]
-    _validate_quantization_args(
+    validate_quantization_args(
         A, As, B, Bs, a_global_scale, b_global_scale, output_global_scale,
         b_zero, b_perm, a_pre_quant_scale, activation_format, quantize_output, activation_scale_ub,
     )

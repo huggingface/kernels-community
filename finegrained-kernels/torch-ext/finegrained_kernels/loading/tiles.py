@@ -335,15 +335,10 @@ def load_act_plain(
 
 
 @triton.jit
-def gather_act_cols(a_rows, k_perm, k_off, row_mask, stride_a_k, BLOCK_SIZE_K: tl.constexpr):
+def gather_act_cols(a_rows, k_perm, k_off, stride_a_k, BLOCK_SIZE_K: tl.constexpr):
     """An activation K-tile with its columns gathered by an act-order K order: ``a_rows`` holds the tile's
-    ``[BM, 1]`` row pointers and column ``j`` reads ``k_perm[k_off + j]``. ``row_mask`` None loads maskless."""
-    ptrs = a_rows + tl.load(k_perm + k_off + tl.arange(0, BLOCK_SIZE_K))[None, :] * stride_a_k
-    if row_mask is None:
-        a = tl.load(ptrs)
-    else:
-        a = tl.load(ptrs, mask=row_mask[:, None], other=0.0)
-    return a
+    ``[BM, 1]`` row pointers (in bounds) and column ``j`` reads ``k_perm[k_off + j]``."""
+    return tl.load(a_rows + tl.load(k_perm + k_off + tl.arange(0, BLOCK_SIZE_K))[None, :] * stride_a_k)
 
 
 @triton.jit

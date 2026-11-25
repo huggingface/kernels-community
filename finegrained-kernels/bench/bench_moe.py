@@ -69,8 +69,8 @@ Regimes: decode T=1 and prefill T=8192 (routed through top_k experts; attn row: 
 and a 256-token prefill.
 
 Run: python bench/bench_moe.py                         (all rows, single GPU)
-     python bench/bench_moe.py --gpus 8                (shard problems across 8 GPUs, one process per GPU)
-     python bench/bench_moe.py --gpus 5 --devices 3,4,5,6,7  (pin those shards to GPUs 3-7)
+     python bench/bench_moe.py --gpus 8                (8 GPUs take cases from one shared queue, a fresh process per case)
+     python bench/bench_moe.py --gpus 5 --devices 3,4,5,6,7  (the same queue on GPUs 3-7)
      python bench/bench_moe.py --smoke                 (fast compile check)
      python bench/bench_moe.py --no-preswizzle         (affine MX scales instead of the fast path)
      python bench/bench_moe.py GPTQ AWQ --smoke         (integer weight-only examples)
@@ -107,8 +107,8 @@ _parser.add_argument("--gpus", type=int, default=1,
                      help="run cases across this many GPUs, with a fresh process per case; "
                           "the coordinator merges the CSVs and plots (default 1)")
 _parser.add_argument("--devices", default="",
-                     help="comma-separated physical GPUs for the shards (default 0..gpus-1); shard g "
-                          "still owns tasks where i %% gpus == g, only the device it runs on changes")
+                     help="comma-separated physical GPUs that take cases from the shared queue "
+                          "(default 0..gpus-1)")
 _parser.add_argument("--smoke", action="store_true",
                      help="fast everything-compiles pass: fast-mode tunes and a 256-token prefill")
 _parser.add_argument("--mock", action="store_true",
@@ -135,17 +135,17 @@ GPUS = ARGS.gpus
 SMOKE = ARGS.smoke
 MOCK = ARGS.mock
 REPLOT = ARGS.replot
-# BENCH_SHARD="g/n" marks a worker subprocess spawned by the --gpus coordinator (owns tasks where
-# i % n == g); it is the one switch that stays in the environment because the coordinator sets it.
+# BENCH_SHARD="i/n" marks a worker subprocess spawned by the coordinator to run case i of n; it is
+# the one switch that stays in the environment because the coordinator sets it.
 _SHARD = os.environ.get("BENCH_SHARD")
 if SMOKE:
     os.environ.setdefault("FINEGRAINED_AUTOTUNE_CONFIG", "fast")
 
 import torch  # noqa: E402
 try:
-    from torch.nn.functional import ScalingType, scaled_mm  # noqa: E402
+    from torch.nn.functional import ScalingType, SwizzleType, scaled_mm  # noqa: E402
 except ImportError:
-    ScalingType = scaled_mm = None
+    ScalingType = SwizzleType = scaled_mm = None
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
@@ -216,6 +216,7 @@ def _nvfp4_input_globals(cfg, hidden, gu, gus, gu_g):
         weights = dq_nvfp4_two_level(gu[:4], gus[:4], gu_g[:4]).float()
         gate_up = torch.einsum("th,eih->eti", sample, weights)
         inter = _glu(gate_up[..., : cfg["I"]], gate_up[..., cfg["I"]:], cfg)
+
         def amax(t):
             return (t.abs().amax() / (6.0 * 448.0)).clamp(min=1e-30).float().reshape(1)
         _NVFP4_GLOBALS[key] = (amax(hidden), amax(inter))
@@ -282,15 +283,15 @@ except ImportError:
 # FlashInfer's CUTLASS fused MoE (the kernel vLLM's FlashInferExperts wraps)
 try:
     from flashinfer.fused_moe import cutlass_fused_moe as _fi_cutlass_moe  # noqa: E402
-    from flashinfer.fp4_quantization import block_scale_interleave as _fi_sf_interleave_moe  # noqa: E402
+    from flashinfer.fp4_quantization import block_scale_interleave as _fi_sf_interleave  # noqa: E402
 except (ImportError, OSError):
     _fi_cutlass_moe = None
 # FlashInfer's dense FP4/MXFP8 GEMMs (the linear rows' FlashInfer arm), CUTLASS backend
 try:
-    from flashinfer import fp4_quantize as _fi_fp4_quant  # noqa: E402
+    from flashinfer import fp4_quantize as _fi_fp4_quantize  # noqa: E402
     from flashinfer import mm_fp4 as _fi_mm_fp4  # noqa: E402
     from flashinfer import mm_mxfp8 as _fi_mm_mxfp8  # noqa: E402
-    from flashinfer import mxfp8_quantize as _fi_mxfp8_quant  # noqa: E402
+    from flashinfer import mxfp8_quantize as _fi_mxfp8_quantize  # noqa: E402
 except (ImportError, OSError):
     _fi_mm_fp4 = None
 try:
@@ -388,6 +389,7 @@ except Exception:
 # arm. Loaded like the rest of the roster.
 _megablocks = None  # loaded only by a BF16 task
 
+
 # FlashInfer TRT-LLM fused MoE (NVIDIA's Blackwell serving kernels) — installed --no-deps
 # (its PyPI pin would downgrade torch; the JIT has no torch ABI coupling). JIT needs
 # CUDA_HOME >= 12.8 at first compile; the built module is cached under ~/.cache/flashinfer.
@@ -453,14 +455,16 @@ try:
     from flashinfer import autotune as flashinfer_autotune
     from flashinfer.fused_moe import trtllm_mxint4_block_scale_routed_moe
     from flashinfer.fused_moe.core import convert_to_block_layout
-    from flashinfer.fused_moe.core import _maybe_get_cached_w3_w1_permute_indices
-    from flashinfer.fused_moe.core import get_w2_permute_indices_with_cache
-    from flashinfer.fp4_quantization import block_scale_interleave
+    from flashinfer.fused_moe.core import (
+        _maybe_get_cached_w3_w1_permute_indices as _fi_w13_permute,
+        get_w2_permute_indices_with_cache as _fi_w2_permute,
+    )
+    from flashinfer.fp4_quantization import block_scale_interleave as _fi_sf_interleave
 except (ImportError, OSError):
     trtllm_mxint4_block_scale_routed_moe = None
 
 try:
-    from flashinfer import autotune as flashinfer_svdquant_autotune
+    from flashinfer import autotune as flashinfer_autotune
     from flashinfer.gemm import svdquant_linear as flashinfer_svdquant_linear
 except (ImportError, OSError):
     flashinfer_svdquant_linear = None
@@ -847,51 +851,37 @@ IMPL_COLORS = {
 }
 
 
+_IMPL_LABELS = {
+    "finegrained-kernels-unfused": "finegrained-kernels unfused",
+    "torch_weight_only": "torch runtime dequant + BF16 GEMM",
+    "marlin": "vLLM Marlin FP8 W8A16",
+    "torch": "torch.nn.functional.scaled_grouped_mm",
+    "torch_rowwise": "torch.nn.functional.scaled_mm (per expert)",
+    "fbgemm": "FBGEMM / MSLK",
+    "torch_mm": "torch.nn.functional.scaled_mm",
+    "nvfp4_gemm": "nvfp4-gemm",
+    "vllm_exllama": "ExLlama (vLLM)",
+    "vllm_marlin": "vLLM Marlin",
+    "flashinfer_mxint4": "FlashInfer TRT-LLM MXINT4",
+    "vllm": "vLLM fused_moe",
+    "vllm_mm": "vLLM CUTLASS",
+    "trtllm": "FlashInfer TRT-LLM",
+    "flashinfer_mm": "FlashInfer",
+    "flashinfer_cutlass_moe": "FlashInfer CUTLASS",
+    "flashinfer_svdquant": "FlashInfer SVDQuant",
+    "humming": "humming (vLLM)",
+}
+# transformers' BF16 experts forward is batched_mm at decode, grouped_mm from a batch up
+_TRANSFORMERS_LABELS = {"decode": "torch.bmm", "batch": "torch.nn.functional.grouped_mm",
+                        "prefill": "torch.nn.functional.grouped_mm"}
+
+
 def _impl_label(impl, regime=None):
-    """Legend name. The reference forwards ARE plain torch ops — name them by the op:
-    transformers batched_mm -> torch.bmm (decode) / grouped_mm -> torch.nn.functional.grouped_mm (bf16);
-    ``torch`` -> torch.nn.functional.scaled_grouped_mm (the quantized cuBLAS path). Every other impl
-    (finegrained-kernels, deepgemm, ...) is its own label."""
-    if impl == "finegrained-kernels-unfused":
-        return "finegrained-kernels unfused"
-    if impl == "torch_weight_only":
-        return "torch runtime dequant + BF16 GEMM"
-    if impl == "marlin":
-        return "vLLM Marlin FP8 W8A16"
-    if impl == "transformers":  # batched_mm at decode, grouped_mm from a batch up
-        return {"decode": "torch.bmm", "batch": "torch.nn.functional.grouped_mm",
-                "prefill": "torch.nn.functional.grouped_mm"}.get(regime, "torch.bmm / torch.nn.functional.grouped_mm")
-    if impl == "torch":
-        return "torch.nn.functional.scaled_grouped_mm"
-    if impl == "torch_rowwise":
-        return "torch.nn.functional.scaled_mm (per expert)"
-    if impl == "fbgemm":
-        return "FBGEMM / MSLK"
-    if impl == "torch_mm":
-        return "torch.nn.functional.scaled_mm"
-    if impl == "nvfp4_gemm":
-        return "nvfp4-gemm"
-    if impl == "vllm_exllama":
-        return "ExLlama (vLLM)"
-    if impl == "vllm_marlin":
-        return "vLLM Marlin"
-    if impl == "flashinfer_mxint4":
-        return "FlashInfer TRT-LLM MXINT4"
-    if impl == "vllm":
-        return "vLLM fused_moe"
-    if impl == "vllm_mm":
-        return "vLLM CUTLASS"
-    if impl == "trtllm":
-        return "FlashInfer TRT-LLM"
-    if impl == "flashinfer_mm":
-        return "FlashInfer"
-    if impl == "flashinfer_cutlass_moe":
-        return "FlashInfer CUTLASS"
-    if impl == "flashinfer_svdquant":
-        return "FlashInfer SVDQuant"
-    if impl == "humming":
-        return "humming (vLLM)"
-    return impl
+    """Legend name. The reference forwards ARE plain torch ops, so they are named by the op; every other impl
+    (finegrained-kernels, deepgemm, ...) not in ``_IMPL_LABELS`` is its own label."""
+    if impl == "transformers":
+        return _TRANSFORMERS_LABELS.get(regime, "torch.bmm / torch.nn.functional.grouped_mm")
+    return _IMPL_LABELS.get(impl, impl)
 
 
 def _mark_static(*tensors):
@@ -970,7 +960,6 @@ def build(cfg):
     torch.manual_seed(0)
     E, H, inter = cfg["E"], cfg["H"], cfg["I"]
     if cfg["weights"] in INT_BITS:
-        torch.manual_seed(0)
         gu, gus, guz = _integer_weight(cfg, 2 * inter, H, E)
         dn, dns, dnz = _integer_weight(cfg, H, inter, E)
         _mark_static(gu, gus, guz, dn, dns, dnz)
@@ -1165,11 +1154,11 @@ def torch_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_):
     return lambda: fgm.moe.moe_torch_grouped(hidden, idx, w, gu, dn, gus_b, dns_b, **kw)
 
 
-def _check_upstream_fp8_offsets(cfg, grouped, gu, dn, *, fused=False):
-    # Pinned MX grouped readers use int32 expert offsets; the fused path also faults at the boundary.
+def _check_upstream_fp8_offsets(cfg, grouped, gu, dn):
+    # the pinned finegrained-fp8 MX grouped readers behind transformers@main use int32 expert offsets
     if grouped and cfg["weights"] in _MX_WEIGHTS:
         size = max(t.numel() * t.element_size() for t in (gu, dn))
-        if size > 2**31 or (fused and size == 2**31):
+        if size > 2**31:
             raise RuntimeError("finegrained-fp8 hub kernel: MX prefill has unsafe 32-bit expert offsets for this weight stack")
 
 
@@ -1268,6 +1257,7 @@ def _trtllm_gated_scalars(cfg, num_experts, device):
     (dropping them silently computes plain SwiGLU and the arm answers a different function)."""
     if cfg["swiglu_alpha"] is None and cfg["swiglu_limit"] is None:
         return None, None, None
+
     def full(v):
         return torch.full((num_experts,), v, device=device, dtype=torch.float32)
     return (full(cfg["swiglu_alpha"]) if cfg["swiglu_alpha"] is not None else None,
@@ -1322,6 +1312,7 @@ def _trtllm_fp4_arm(cfg, hidden, idx, packed, gu, gus, dn, dns, gu_g, dn_g):
     nvfp4 = cfg["weights"] == "nvfp4"
     group = 16 if nvfp4 else 32
     Hp, Ip = -(-H // 256) * 256, -(-inter // 256) * 256
+
     def swap(t):
         return torch.cat([t[:, inter:], t[:, :inter]], dim=1).contiguous()
     w13 = _trtllm_fp4_pad(swap(gu.view(torch.uint8).reshape(E, I2, H // 2)),
@@ -1407,6 +1398,7 @@ def trtllm_per_tensor_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, 
     # Default = softmax over ALL experts then top-k, matching the bench's routing(). Their
     # Renormalize rescales the top-k weights to sum to 1 (rel 4.17, exactly 1/sum(w) off) —
     # same experts, a per-token rescale of the combine weights.
+
     def run():
         # the act quant is INSIDE the timed call and is the STACK'S OWN kernel, as on the
         # block-scale arm: a static scheme still quantizes the hidden every forward, and every
@@ -1581,6 +1573,7 @@ def _vllm_swigluoai(cfg):
 def marlin_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, logits, guz, dnz):
     if cfg["weights"] == "mxfp4":
         return _marlin_mxfp4_moe_arm(cfg, hidden, idx, w, gu, gus, dn, dns)
+
     def pack(weight, scales, zeros):
         triples = [_marlin_weight(cfg, weight[e], scales[e], None if zeros is None else zeros[e])
                    for e in range(cfg["E"])]
@@ -1771,9 +1764,10 @@ def flashinfer_cutlass_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, g
 
     w1 = swap(gu.view(torch.uint8)).view(torch.long)
     w2 = dn.view(torch.uint8).contiguous().view(torch.long)
+
     def interleave(t):  # their 128x4 scale tiles, returned flat: (E, rows padded to 128, cols to 4)
         rows, cols = -(-t.shape[1] // 128) * 128, -(-t.shape[2] // 4) * 4
-        return _fi_sf_interleave_moe(t).reshape(t.shape[0], rows, cols).view(torch.int32)
+        return _fi_sf_interleave(t).reshape(t.shape[0], rows, cols).view(torch.int32)
 
     w1s = interleave(swap(gus.view(torch.uint8)))
     w2s = interleave(dns.view(torch.uint8).contiguous())
@@ -1800,6 +1794,7 @@ def flashinfer_int4_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn
     assert cfg["weights"] == "int4" and guz is None and dnz is None
     assert hidden.dtype == gus.dtype == torch.bfloat16 and cfg["group"] % 32 == 0
     cache = {}
+
     def pack(weight, scales, gated):
         weights_out, scales_out = [], []
         for e in range(cfg["E"]):
@@ -1811,17 +1806,18 @@ def flashinfer_int4_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn
                 half = q.shape[0] // 2
                 q = torch.cat((q[half:], q[:half]))
                 scale = torch.cat((scale[half:], scale[:half]))
-                p = _maybe_get_cached_w3_w1_permute_indices(cache, q, 128)
-                sp = _maybe_get_cached_w3_w1_permute_indices(cache, scale, 128, num_elts_per_sf=32)
+                p = _fi_w13_permute(cache, q, 128)
+                sp = _fi_w13_permute(cache, scale, 128, num_elts_per_sf=32)
             else:
-                p = get_w2_permute_indices_with_cache(cache, q, 128)
-                sp = get_w2_permute_indices_with_cache(cache, scale, 128, num_elts_per_sf=16)
+                p = _fi_w2_permute(cache, q, 128)
+                sp = _fi_w2_permute(cache, scale, 128, num_elts_per_sf=16)
             weights_out.append(convert_to_block_layout(q[p.to(q.device)].contiguous(), 128))
-            scales_out.append(block_scale_interleave(scale[sp.to(scale.device)].contiguous()))
+            scales_out.append(_fi_sf_interleave(scale[sp.to(scale.device)].contiguous()))
         return torch.stack(weights_out), torch.stack(scales_out).view(torch.bfloat16)
     g, gs = pack(gu, gus, True)
     d, ds = pack(dn, dns, False)
     _mark_static(g, gs, d, ds)
+
     def run():
         # Keep routing-weight conversion in the timed call: this backend consumes BF16
         # weights in its packed routing ids, while the shared router produces FP32 weights.
@@ -1947,6 +1943,7 @@ def megablocks_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
     scores = torch.zeros(hidden.shape[0], E, device=hidden.device, dtype=torch.bfloat16)
     scores.scatter_(1, idx.long(), w.to(torch.bfloat16))
     # belt and braces: some builds still hand back (out, bias)
+
     def run():
         out = mlp(hidden, scores, w.to(torch.bfloat16), idx.long())
         return out[0] if isinstance(out, tuple) else out
@@ -2070,9 +2067,8 @@ def bench_modes(runs, tag, reference=None):
         out = run()
         torch.accelerator.synchronize()  # warm + tune before ANY timing/capture
         if reference is not None:
-            # the reference is the first bank's: the other banks route to other experts (cold weights)
-            error = rel_diff(out[0][:reference.shape[0]], reference)
-            if not all(torch.isfinite(output).all() for output in out) or error > 0.05:
+            error = _reference_error(out, reference)
+            if error > 0.05:
                 print(f"      [{tag} dequant reference mismatch (rel {error:.2e}); skipping timings]", flush=True)
                 return {m: None for m in MODES}, None
         res["eager"] = do_bench(run, return_mode="min") * 1e3 / count
@@ -2112,8 +2108,8 @@ def bench_modes(runs, tag, reference=None):
                 if drift > 0.25:
                     raise RuntimeError(f"compiled output diverges from eager (rel {drift:.2e})")
         if reference is not None:
-            error = rel_diff(cout[0][:reference.shape[0]], reference)  # the first bank's, as in eager
-            if not all(torch.isfinite(output).all() for output in cout) or error > 0.05:
+            error = _reference_error(cout, reference)
+            if error > 0.05:
                 raise RuntimeError(f"compiled dequant reference mismatch (rel {error:.2e})")
         res["compile"] = do_bench(crun, return_mode="min") * 1e3 / count
         print(f"      {tag:14s} compile    {res['compile']:9.1f}us", flush=True)
@@ -2128,6 +2124,14 @@ def bench_modes(runs, tag, reference=None):
 def rel_diff(a, b):
     a, b = a.float(), b.float()
     return ((a - b).abs().max() / (b.abs().max() + 1e-6)).item()
+
+
+def _reference_error(outs, reference):
+    """``rel_diff`` of the first bank's output (the one the reference routes like; the other banks route to other
+    experts) against the dequant reference, ``inf`` when any bank's output is not finite."""
+    if not all(torch.isfinite(output).all() for output in outs):
+        return float("inf")
+    return rel_diff(outs[0][:reference.shape[0]], reference)
 
 
 def _mock_rows(row, pname, arms, rows_out):
@@ -2272,7 +2276,7 @@ def _svdquant_arms(x, weights, act_global):
         runs["flashinfer_svdquant"] = lambda: flashinfer_svdquant_linear(
             x, W.view(torch.uint8), fi_scales, alpha, smooth, fi_down, fi_up, fi_global)
         if not SMOKE:
-            with flashinfer_svdquant_autotune():
+            with flashinfer_autotune():
                 runs["flashinfer_svdquant"]()
     return runs
 
@@ -2369,9 +2373,7 @@ def _attn_arms(cfg, x, weights):
     # timing unlike work on a shared axis is worse than an absent bar.
     torch_mm = None
     if cfg["weights"] in _MX_WEIGHTS and _quantized_acts(cfg) and not (MOCK or REPLOT):
-        # both are version-gated: scaled_mm's scaling enums land in recent torch only, and
-        # torchao is an optional dep — importing either at module scope would gate the whole bench
-        from torch.nn.functional import SwizzleType
+        # torchao is an optional dep: importing it at module scope would gate the whole bench
         from torchao.prototype.mx_formats.utils import to_blocked
 
         nvfp4_row = cfg["weights"] == "nvfp4"
@@ -2568,21 +2570,21 @@ def _flashinfer_linear_arm(cfg, x, W, Ws, W_g):
     w_bf16 = _bf16_weight(cfg, W, Ws, W_g)
     if cfg["weights"] == "nvfp4":
         w_gs = (_FP4_RANGE / w_bf16.float().abs().amax()).reshape(1)
-        wq, wsf = _fi_fp4_quant(w_bf16, w_gs)
+        wq, wsf = _fi_fp4_quantize(w_bf16, w_gs)
         wq, wsf = wq.t(), wsf.t()
         _mark_static(wq, wsf, w_gs)
 
         def run():
             a_gs = (_FP4_RANGE / x.float().abs().amax()).reshape(1)
-            aq, asf = _fi_fp4_quant(x, a_gs)
+            aq, asf = _fi_fp4_quantize(x, a_gs)
             return _fi_mm_fp4(aq, wq, asf, wsf, 1.0 / (a_gs * w_gs), x.dtype, backend="cutlass")
         return run
-    wq, wsf = _fi_mxfp8_quant(w_bf16, True)
+    wq, wsf = _fi_mxfp8_quantize(w_bf16, True)
     wq, wsf = wq.t(), wsf.t()
     _mark_static(wq, wsf)
 
     def run():
-        aq, asf = _fi_mxfp8_quant(x, True)
+        aq, asf = _fi_mxfp8_quantize(x, True)
         return _fi_mm_mxfp8(aq, wq, asf, wsf, out_dtype=x.dtype, backend="cutlass")
     return run
 
@@ -2686,13 +2688,14 @@ print("finegrained-kernels = local build; baselines: transformers@main, DeepGEMM
       "nvfp4-gemm (transformers' NVFP4Linear kernel), megablocks (bf16 dMoE)"
       f"{f'  |  {GPUS} GPUs' if GPUS > 1 else ''}\n")
 
+
 def wanted(*names):
     return not FILTERS or any(f in n for f in FILTERS for n in names)
 
 
-# ── multi-GPU: GPUS>1 shards the per-problem tasks across GPUs, one process per GPU (each
-# owning one device via CUDA_VISIBLE_DEVICES). The coordinator spawns GPUS workers, each
-# writes a shard CSV, then the coordinator merges + plots. A single GPU (GPUS=1) runs inline. ──
+# ── the coordinator: GPUS devices take cases from one shared queue, each case in a fresh worker
+# process pinned to its device (CUDA_VISIBLE_DEVICES), even on one GPU. Each worker writes a
+# shard CSV, then the coordinator merges + plots. ──
 suffix = ARGS.suffix if ARGS.suffix is not None else (
     "_mock" if MOCK else ("_partial" if FILTERS else "")
 )
@@ -3000,107 +3003,107 @@ def _panel_shape(row, regime):
 # n groups draws a data unit at width / (n + 1.1), so a panel's bars are sized in its own units.
 bar_phys = min((0.88 / m) / (n + 1.1) for n, m in map(lambda pr: _panel_shape(*pr), panels) if n)
 for (row, regime), (ax,) in zip(panels, axes):
-        panel_impls = set()
-        missing_drawn = False
-        solid_mode, overlay_mode = REGIME_MODES[regime]
-        cells = [(p, i, r, par) for (rr, p, reg, i, r, par) in rows
-                 if rr == row and reg == regime]
-        floor = min((v for _, _, res, _ in cells for v in res.values() if v is not None and v > 0), default=1) / 2
-        ax.set_yscale("log")
-        ax.yaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())  # decade labels only
-        ax.grid(axis="y", alpha=0.2, zorder=0)
-        problems = list(dict.fromkeys(p for p, *_ in cells))
-        # ONE fixed model order across every row (was per-panel support-sort, which
-        # reordered models between rows and read as confusing). Roughly most-supported
-        # first, finegrained-kernels-only (GPT-OSS, GLM-NVFP4) last; keyed on the base model so the
-        # quantized/attn (GLM-5.2-NVFP4) and unquantized (GLM-5.2) rows line up.
-        def _model_rank(p):
-            name = p.split("/")[-1]
-            for i, m in enumerate(CANONICAL_MODEL_ORDER):
-                if name.startswith(m):
-                    return i
-            return len(CANONICAL_MODEL_ORDER)
-        problems.sort(key=_model_rank)
-        # each panel spans only its own models; a slot is sized by its most crowded group, so a
-        # sparse panel gets wide bars instead of a fullest-panel width stranded mid-axis
-        width = bar_phys * (len(problems) + 1.1)
-        overlay_drawn = False
-        eager_only_drawn = False  # any bar shown as eager because cudagraph is unsupported?
-        ticks, ticklabels = [], []
-        for gi, pname in enumerate(problems):
-            ticks.append(gi)
-            # Wrap model and recipe names; full ids remain in the CSV.
-            short = pname.split(" (")[0]
-            model, _, rest = short.partition(" ")
-            if short.startswith("unknown model "):  # a synthetic shape, no published checkpoint
-                model, rest = "synthetic", short.removeprefix("unknown model ")
-            model = model.split("/")[-1]
-            rest = rest.removeprefix("attn ").removesuffix(" qkv-shaped")
-            ticklabels.append(fill(model, 16) + (f"\n{fill(rest, 16)}" if rest else ""))
-            # bars speed-ranked within the group (fastest leftmost, crashed last),
-            # centered on the group's own arm count — colors identify the impls
-            group = [(i, r) for p, i, r, _par in cells if p == pname]
-            def _drawn(res):
-                """The value this impl will actually show: its solid mode, else — on decode —
-                its eager number. An impl that cannot be graph-captured still HAS a latency,
-                and a red X hides it behind something that reads as total failure."""
-                v = res.get(solid_mode)
-                return v if v is not None else (res.get("eager") if solid_mode == "cudagraph" else None)
+    panel_impls = set()
+    missing_drawn = False
+    solid_mode, overlay_mode = REGIME_MODES[regime]
+    cells = [(p, i, r, par) for (rr, p, reg, i, r, par) in rows
+             if rr == row and reg == regime]
+    floor = min((v for _, _, res, _ in cells for v in res.values() if v is not None and v > 0), default=1) / 2
+    ax.set_yscale("log")
+    ax.yaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())  # decade labels only
+    ax.grid(axis="y", alpha=0.2, zorder=0)
+    problems = list(dict.fromkeys(p for p, *_ in cells))
+    # ONE fixed model order across every row (was per-panel support-sort, which
+    # reordered models between rows and read as confusing). Roughly most-supported
+    # first, finegrained-kernels-only (GPT-OSS, GLM-NVFP4) last; keyed on the base model so the
+    # quantized/attn (GLM-5.2-NVFP4) and unquantized (GLM-5.2) rows line up.
+    def _model_rank(p):
+        name = p.split("/")[-1]
+        for i, m in enumerate(CANONICAL_MODEL_ORDER):
+            if name.startswith(m):
+                return i
+        return len(CANONICAL_MODEL_ORDER)
+    problems.sort(key=_model_rank)
+    # each panel spans only its own models; a slot is sized by its most crowded group, so a
+    # sparse panel gets wide bars instead of a fullest-panel width stranded mid-axis
+    width = bar_phys * (len(problems) + 1.1)
+    overlay_drawn = False
+    eager_only_drawn = False  # any bar shown as eager because cudagraph is unsupported?
+    ticks, ticklabels = [], []
+    for gi, pname in enumerate(problems):
+        ticks.append(gi)
+        # Wrap model and recipe names; full ids remain in the CSV.
+        short = pname.split(" (")[0]
+        model, _, rest = short.partition(" ")
+        if short.startswith("unknown model "):  # a synthetic shape, no published checkpoint
+            model, rest = "synthetic", short.removeprefix("unknown model ")
+        model = model.split("/")[-1]
+        rest = rest.removeprefix("attn ").removesuffix(" qkv-shaped")
+        ticklabels.append(fill(model, 16) + (f"\n{fill(rest, 16)}" if rest else ""))
+        # bars speed-ranked within the group (fastest leftmost, crashed last),
+        # centered on the group's own arm count — colors identify the impls
+        group = [(i, r) for p, i, r, _par in cells if p == pname]
+        def _drawn(res):
+            """The value this impl will actually show: its solid mode, else — on decode —
+            its eager number. An impl that cannot be graph-captured still HAS a latency,
+            and a red X hides it behind something that reads as total failure."""
+            v = res.get(solid_mode)
+            return v if v is not None else (res.get("eager") if solid_mode == "cudagraph" else None)
 
-            group.sort(key=lambda t: (_drawn(t[1]) is None, _drawn(t[1]) or 0.0))
-            for slot, (impl, res) in enumerate(group):
-                off = (slot - (len(group) - 1) / 2) * width
-                sval = res.get(solid_mode)
-                eager_fb = (res.get("eager") if sval is None and solid_mode == "cudagraph" else None)
-                panel_impls.add(impl)
-                if sval is not None:
-                    ax.bar(gi + off, sval, width, color=IMPL_COLORS[impl],
-                           zorder=2)
-                elif eager_fb is not None:
-                    # Cannot be graph-captured (megablocks' routing does a device->host copy;
-                    # nvfp4_gemm's per-expert loop has data-dependent shapes) but DOES run. Show
-                    # the eager cost, dot-hatched so it is never read as a cudagraph number —
-                    # a red X here would say "broken" about something merely 5x slower.
-                    ax.bar(gi + off, eager_fb, width, color=IMPL_COLORS[impl],
-                           alpha=0.55, edgecolor="black", hatch="..", linewidth=0.7, zorder=2)
-                    eager_only_drawn = True
-                else:
-                    # Deployment mode unavailable: keep its marker above the log-axis floor.
-                    ax.plot(gi + off, floor * 1.25, "x", color="red", markersize=9,
-                            clip_on=False, zorder=4)
-                    missing_drawn = True
-                # Overlay compile wins on the same implementation's eager/graph bar.
-                oval = res.get(overlay_mode)
-                if oval is not None and sval is not None and oval < sval:
-                    ax.bar(gi + off, oval, width, facecolor="none",
-                           edgecolor="black", hatch="////", linewidth=0.8, zorder=3)
-                    overlay_drawn = True
-        # dotted separators between model groups (so adjacent models' edge bars
-        # don't read as one cluster)
-        for sep in range(len(problems) - 1):
-            ax.axvline(sep + 0.5, color="0.7", linestyle=":", linewidth=0.8, zorder=0)
-        # same x data-range on every axis; sparse rows sit centered
-        extent = max(ticks) if ticks else 0
-        ax.set_xlim(-0.55, extent + 0.55)
-        ax.set_xticks(ticks)
-        ax.set_xticklabels(ticklabels, fontsize=8)
-        ax.set_ylim(bottom=floor)
-        ax.set_ylabel("latency (us, log scale)")
-        tok = REGIME_TOKENS[regime]
-        mode_note = (f"solid={solid_mode}, hatch=compile-if-faster" if overlay_drawn
-                     else solid_mode)
-        ax.set_title(f"{ROW_LABELS[row]} — {regime} (T={tok}; {mode_note})", loc="left")
-        # this panel's arms only, in one fixed order across panels (colors follow the arm)
-        handles = [mpatches.Patch(color=IMPL_COLORS[i], label=_impl_label(i, regime))
-                   for i in legend_order if i in panel_impls]
-        if overlay_drawn:
-            handles.append(mpatches.Patch(facecolor="none", edgecolor="black", hatch="////", label="compile (faster)"))
-        if eager_only_drawn:
-            handles.append(mpatches.Patch(facecolor="none", edgecolor="black", hatch="..", label="eager (no cudagraph)"))
-        if missing_drawn:
-            handles.append(Line2D([], [], color="red", marker="x", linestyle="none", label="unavailable"))
-        ax.legend(handles=handles, loc="upper left", bbox_to_anchor=(1.005, 1.0), fontsize=8,
-                  frameon=False, borderaxespad=0.0)
+        group.sort(key=lambda t: (_drawn(t[1]) is None, _drawn(t[1]) or 0.0))
+        for slot, (impl, res) in enumerate(group):
+            off = (slot - (len(group) - 1) / 2) * width
+            sval = res.get(solid_mode)
+            eager_fb = (res.get("eager") if sval is None and solid_mode == "cudagraph" else None)
+            panel_impls.add(impl)
+            if sval is not None:
+                ax.bar(gi + off, sval, width, color=IMPL_COLORS[impl],
+                       zorder=2)
+            elif eager_fb is not None:
+                # Cannot be graph-captured (megablocks' routing does a device->host copy;
+                # nvfp4_gemm's per-expert loop has data-dependent shapes) but DOES run. Show
+                # the eager cost, dot-hatched so it is never read as a cudagraph number —
+                # a red X here would say "broken" about something merely 5x slower.
+                ax.bar(gi + off, eager_fb, width, color=IMPL_COLORS[impl],
+                       alpha=0.55, edgecolor="black", hatch="..", linewidth=0.7, zorder=2)
+                eager_only_drawn = True
+            else:
+                # Deployment mode unavailable: keep its marker above the log-axis floor.
+                ax.plot(gi + off, floor * 1.25, "x", color="red", markersize=9,
+                        clip_on=False, zorder=4)
+                missing_drawn = True
+            # Overlay compile wins on the same implementation's eager/graph bar.
+            oval = res.get(overlay_mode)
+            if oval is not None and sval is not None and oval < sval:
+                ax.bar(gi + off, oval, width, facecolor="none",
+                       edgecolor="black", hatch="////", linewidth=0.8, zorder=3)
+                overlay_drawn = True
+    # dotted separators between model groups (so adjacent models' edge bars
+    # don't read as one cluster)
+    for sep in range(len(problems) - 1):
+        ax.axvline(sep + 0.5, color="0.7", linestyle=":", linewidth=0.8, zorder=0)
+    # same x data-range on every axis; sparse rows sit centered
+    extent = max(ticks) if ticks else 0
+    ax.set_xlim(-0.55, extent + 0.55)
+    ax.set_xticks(ticks)
+    ax.set_xticklabels(ticklabels, fontsize=8)
+    ax.set_ylim(bottom=floor)
+    ax.set_ylabel("latency (us, log scale)")
+    tok = REGIME_TOKENS[regime]
+    mode_note = (f"solid={solid_mode}, hatch=compile-if-faster" if overlay_drawn
+                 else solid_mode)
+    ax.set_title(f"{ROW_LABELS[row]} — {regime} (T={tok}; {mode_note})", loc="left")
+    # this panel's arms only, in one fixed order across panels (colors follow the arm)
+    handles = [mpatches.Patch(color=IMPL_COLORS[i], label=_impl_label(i, regime))
+               for i in legend_order if i in panel_impls]
+    if overlay_drawn:
+        handles.append(mpatches.Patch(facecolor="none", edgecolor="black", hatch="////", label="compile (faster)"))
+    if eager_only_drawn:
+        handles.append(mpatches.Patch(facecolor="none", edgecolor="black", hatch="..", label="eager (no cudagraph)"))
+    if missing_drawn:
+        handles.append(Line2D([], [], color="red", marker="x", linestyle="none", label="unavailable"))
+    ax.legend(handles=handles, loc="upper left", bbox_to_anchor=(1.005, 1.0), fontsize=8,
+              frameon=False, borderaxespad=0.0)
 cache_note = "cold weights (>2xL2)" if DEVICE == "cuda" else "backend cache defaults"
 fig.suptitle(f"GEMM + MoE quantization — finegrained-kernels vs references  "
              f"({device_name}, real model shapes; decode=cudagraph, prefill=eager; "

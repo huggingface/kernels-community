@@ -32,6 +32,8 @@ from utils import (  # type: ignore
     DTYPE_TAG,
     DTYPE_TO_TOL,
     finegrained_kernels,
+    int_fp8_global,
+    int_group,
     internals,
     make_gate_up,
     prepare_csf,
@@ -71,8 +73,7 @@ class MoEProblem:
     sentinel_fraction: float = 0.0
     negative_sentinels: bool = False  # off-rank routes as -1 rather than num_experts
     dtype: torch.dtype = torch.bfloat16
-    # in the CI subset (kernels_ci); the rest run in test_fused_extended
-    ci: bool = field(default=True, compare=False)
+    ci: bool = field(default=True, compare=False)  # carries the kernels_ci mark
     # skipped on devices with less memory, e.g. the int32 offset-overflow guard's 3.2e9-element stack
     min_device_memory_gib: float = field(default=0.0, compare=False)
     activation_format: Optional[str] = None
@@ -288,6 +289,10 @@ MOE_PROBLEMS = [
     ),
 ]
 
+_MOE_PARAMS = [
+    pytest.param(p, id=p.id, marks=pytest.mark.kernels_ci if p.ci else ()) for p in MOE_PROBLEMS
+]
+
 
 def _make_moe_weights(problem: MoEProblem):
     """gate_up ``(E, 2I, H)`` and down ``(E, H, I)`` weights + block inv-scales + per-tensor globals
@@ -300,7 +305,7 @@ def _make_moe_weights(problem: MoEProblem):
     if problem.weights in INT_BITS:  # INT groups run along K per row: the stack quantizes as is
         gate_up, gate_up_s, gate_up_g = make(
             2 * problem.intermediate_dim, problem.hidden_dim, problem.num_experts,
-            group=problem.int_group or problem.hidden_dim,
+            group=int_group(problem, problem.hidden_dim),
         )
     else:
         gate_up, gate_up_s, gate_up_g = make_gate_up(
@@ -308,15 +313,15 @@ def _make_moe_weights(problem: MoEProblem):
         )
     down, down_s, down_g = make(
         problem.hidden_dim, problem.intermediate_dim, problem.num_experts,
-        **({"group": problem.int_group or problem.intermediate_dim} if problem.weights in INT_BITS else {}),
+        **({"group": int_group(problem, problem.intermediate_dim)} if problem.weights in INT_BITS else {}),
     )
     if problem.weights == "nvfp4" and problem.activation_format == "fp8":
         gate_up_s, down_s = gate_up_s[..., ::2].contiguous(), down_s[..., ::2].contiguous()
     if problem.weights in INT_BITS and problem.activation_format in ("fp8", "int8"):
         gate_up_s, down_s = gate_up_s.float(), down_s.float()
         if problem.activation_format == "fp8":
-            gate_up_g = dq_int(gate_up, gate_up_s, group=problem.int_group or problem.hidden_dim).abs().amax(dim=(-2, -1)).div(448).clamp(min=1e-12)
-            down_g = dq_int(down, down_s, group=problem.int_group or problem.intermediate_dim).abs().amax(dim=(-2, -1)).div(448).clamp(min=1e-12)
+            gate_up_g = int_fp8_global(gate_up, gate_up_s, int_group(problem, problem.hidden_dim))
+            down_g = int_fp8_global(down, down_s, int_group(problem, problem.intermediate_dim))
     if problem.swizzled:
         if not SUPPORTS_SWIZZLED_SCALES:
             pytest.skip("the SWIZZLE_32_4_4 scale layout is the tcgen05 fast path (CUDA-only)")
@@ -382,14 +387,12 @@ def _static_scales(problem: MoEProblem, hidden, gate_up, gate_up_s, top_k_index)
     routed to it. ``None`` on a dynamic problem, which quantizes at runtime instead."""
     if not problem.static:
         return None, None
-    weight = (
-        dq_int(gate_up, gate_up_s, group=problem.int_group or problem.hidden_dim)
-        if problem.weights in INT_BITS else (
-            dq_grouped(gate_up, gate_up_s, 32)
-            if problem.weights == "nvfp4" and problem.activation_format == "fp8"
-            else dequant_gate_up(WEIGHTS[problem.weights], gate_up, gate_up_s).float()
-        )
-    )
+    if problem.weights in INT_BITS:
+        weight = dq_int(gate_up, gate_up_s, group=int_group(problem, problem.hidden_dim))
+    elif problem.weights == "nvfp4" and problem.activation_format == "fp8":
+        weight = dq_grouped(gate_up, gate_up_s, 32)
+    else:
+        weight = dequant_gate_up(WEIGHTS[problem.weights], gate_up, gate_up_s).float()
     inter = fused_glu(
         torch.einsum("th,enh->etn", hidden.float(), weight),
         problem.act_fn,
@@ -423,8 +426,8 @@ def _zero_points(problem: MoEProblem):
         return None, None
     E, H, inter = problem.num_experts, problem.hidden_dim, problem.intermediate_dim
     high = 1 << INT_BITS[problem.weights]
-    gate_up_zero = torch.randint(0, high, (E, 2 * inter, H // (problem.int_group or H)), device=TEST_DEVICE, dtype=torch.uint8)
-    down_zero = torch.randint(0, high, (E, H, inter // (problem.int_group or inter)), device=TEST_DEVICE, dtype=torch.uint8)
+    gate_up_zero = torch.randint(0, high, (E, 2 * inter, H // int_group(problem, H)), device=TEST_DEVICE, dtype=torch.uint8)
+    down_zero = torch.randint(0, high, (E, H, inter // int_group(problem, inter)), device=TEST_DEVICE, dtype=torch.uint8)
     return gate_up_zero, down_zero
 
 
@@ -577,9 +580,8 @@ def test_grouped_scheduling_defines_every_route(sentinel_fraction, negative, num
     assert torch.equal(routed[:local].sort().values, routed[:local])
 
 
-@pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
-@pytest.mark.parametrize("problem", [p for p in MOE_PROBLEMS if p.ci], ids=lambda p: p.id)
+@pytest.mark.parametrize("problem", _MOE_PARAMS)
 def test_fused_batched(problem):
     """Fused two-kernel MoE (gate_up + activation + requant + down + top-k reduce) via
     ``moe_fused_batched`` vs the unfused reference. ``simulate_unfused`` rounds each
@@ -589,27 +591,13 @@ def test_fused_batched(problem):
     _run_pair(problem, moe.moe_fused_batched, moe.moe_unfused_batched)
 
 
-@pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
-@pytest.mark.parametrize("problem", [p for p in MOE_PROBLEMS if p.ci], ids=lambda p: p.id)
+@pytest.mark.parametrize("problem", _MOE_PARAMS)
 def test_fused_grouped(problem):
     """Fused grouped MoE (gather gate_up + activation + requant + grouped down + top-k
     reduce) via ``moe_fused_grouped`` vs the same unfused reference, with
     ``simulate_unfused`` rounding each fused step through the activation dtype."""
     _run_pair(problem, moe.moe_fused_grouped, moe.moe_unfused_grouped)
-
-
-@pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
-@pytest.mark.parametrize("problem", [p for p in MOE_PROBLEMS if not p.ci], ids=lambda p: p.id)
-@pytest.mark.parametrize("forward", ["batched", "grouped"])
-def test_fused_extended(problem, forward):
-    """The MoE scenarios outside the CI subset (variants of formats the CI cells cover), on both
-    fused forwards against their unfused references."""
-    fused, unfused = {
-        "batched": (moe.moe_fused_batched, moe.moe_unfused_batched),
-        "grouped": (moe.moe_fused_grouped, moe.moe_unfused_grouped),
-    }[forward]
-    _run_pair(problem, fused, unfused)
 
 
 _PRODUCTION_ARM_PROBLEMS = [
@@ -704,11 +692,11 @@ def _run_compiled_across_shapes(fused_fn, weights):
     compiled path that returns wrong-but-finite numbers (e.g. a decomposed opaque op)."""
     torch.compiler.reset()
     compiled = torch.compile(fused_fn, fullgraph=True)
-    for problem in (
-        MoEProblem(weights=weights, num_tokens=1),
-        MoEProblem(weights=weights, num_tokens=1, hidden_dim=640, intermediate_dim=384, int_group=None)
-        if weights in INT_BITS or weights.startswith("fp8") else MoEProblem(weights=weights, num_tokens=1, hidden_dim=320, intermediate_dim=320),
-    ):
+    if weights in INT_BITS or weights.startswith("fp8"):
+        second = MoEProblem(weights=weights, num_tokens=1, hidden_dim=640, intermediate_dim=384, int_group=None)
+    else:
+        second = MoEProblem(weights=weights, num_tokens=1, hidden_dim=320, intermediate_dim=320)
+    for problem in (MoEProblem(weights=weights, num_tokens=1), second):
         torch.manual_seed(0)
         gate_up, gate_up_s, gate_up_g, down, down_s, down_g = _make_moe_weights(problem)
         hidden, top_k_index, top_k_weights = _make_moe_inputs(problem)
@@ -739,7 +727,6 @@ def test_fused_grouped_compiles_across_shapes(weights):
     additionally puts ``compute_grouped_scheduling`` (an opaque custom op) inside the
     graph, which the batched sibling never exercises."""
     _run_compiled_across_shapes(moe.moe_fused_grouped, weights)
-
 
 
 @pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")

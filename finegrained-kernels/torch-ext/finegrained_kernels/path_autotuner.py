@@ -137,8 +137,8 @@ class PathAutotuner:
                         {p: f"{t * 1e3:.1f}us" for p, t in timings.items()}, best)
             try:
                 cache.put(json.dumps({"best": best, "timings_ms": timings}), file_name, binary=False)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("[autotune] %s %s: could not cache the path choice: %s", self.name, key, e)
         return best
 
 

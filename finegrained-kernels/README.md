@@ -18,9 +18,11 @@ unvalidated.
 
 ![MoE bench: finegrained-kernels vs references on B200](https://huggingface.co/datasets/IlyasMoutawwakil/benchmarks/resolve/main/finegrained-kernels/cold-weight-timing/bench_moe.png)
 
-Real model shapes on an NVIDIA B200, against upstream `finegrained-fp8`, DeepGEMM, vLLM's fused
-MoE, FlashInfer's TRT-LLM routed-MoE kernels, transformers `grouped_mm`/`batched_mm`, SonicMoE,
-OpenAI `triton_kernels`, and `torch.scaled_grouped_mm`.
+Real model shapes on an NVIDIA B200, against `transformers@main` (its `finegrained-fp8` hub kernel
+integration), DeepGEMM, vLLM (`fused_moe`, CUTLASS, Marlin, ExLlama, humming), FlashInfer (TRT-LLM
+routed MoE, CUTLASS MoE, dense FP4/MXFP8 GEMMs, SVDQuant), FBGEMM, transformers
+`grouped_mm`/`batched_mm`, SonicMoE, OpenAI `triton_kernels`, megablocks, nvfp4-gemm and
+`torch.nn.functional.scaled_(grouped_)mm`.
 Decode is cudagraph-captured, prefill eager; a red ✕ marks a configuration that raised. Every
 baseline's output is parity-checked against the finegrained-kernels anchor in the same run. See
 [`bench/README.md`](bench/README.md) to reproduce.
@@ -98,42 +100,64 @@ matmul_grouped(A, B, As, Bs, *, expert_start, gather_idx=None, scatter_idx=None,
 | NVFP4 | packed E2M1 (`int8`, 2/byte) | E4M3 `(N, K/16)` | fp32 global(s) |
 | INT2 / INT4 / INT8 | interleaved `uint32` words (`32 / bits` values/word) | bf16 / fp16 / fp32 `(N, K/group)` | — |
 
-Integer weights use raw bf16/fp16 activations and optional `b_zero` values shaped like `Bs`
-(default: `2 ** (bits - 1)`). Dequantization rounds `(q - zero) * scale` in the scale dtype,
-then casts each weight to the activation dtype before multiplication, including per-channel
-scales (`group=K`, one scale per output row). Group widths and K tiles must divide one another;
-the K dimension must contain whole groups. Use `interleave_int_words` for naturally packed
-words, `repack_gptq_int4` for GPTQ v1/v2 (including act-order), or `repack_awq_int4` for AWQ
-GEMM checkpoints. Natural `int32` checkpoint words are rejected to prevent confusing the two layouts.
-For ModelOpt's signed exports, `repack_modelopt_int4` reads `uint8` `(N/2, K)` with two
-output channels per byte, and `repack_modelopt_int8` reads signed `int8` `(N, K)` with one
-scale per output channel. Both also accept expert stacks and return `(weight, scale, None)`
-for these same integer GEMMs. Pass an exported AWQ `pre_quant_scale` as `a_pre_quant_scale`
-to an integer GEMM, or fuse it upstream. It multiplies the raw input columns before any
-act-order permutation, rounded in the activation dtype. Dense scales are contiguous `(K,)`;
-routed scales are shared `(K,)` / `(1, K)` or per expert `(E, K)`, on the activation's device
-and in its dtype. MoE forwards accept `gate_up_proj_pre_quant_scale` and
-`down_proj_pre_quant_scale`, including a separate down input vector per expert. A fused
-gate/up stack uses a common input transform for both halves, as after ModelOpt's resmoothing.
-For ModelOpt `W4A8_AWQ`, use `activation_format="fp8"`, `As=input_scale`, and
-`b_global_scale=weight_scale_2` with the repacked symmetric INT4 weight and its original
-group scales. The kernel reconstructs the weight, rounds it to E4M3 against `weight_scale_2`,
-and restores both calibrated factors before FP32 bias/GLU. `activation_format="int8"` with
-`As=input_scale` selects ModelOpt INT8 SmoothQuant on symmetric per-channel INT8 weights:
-the dot accumulates in INT32, then applies per-channel weight scales and input scale in FP32.
-Both recipes take raw activations and keep the intermediate unquantized between projections;
-the down's own calibration and optional input transform apply before its quantization.
+Integer weights run weight-only on raw bf16/fp16 activations unless a ModelOpt recipe below quantizes the
+activations. Per checkpoint recipe:
 
-ModelOpt `W4A8_MXFP4_FP8` and `W4A8_NVFP4_FP8` also use `activation_format="fp8"` and
-`As=input_scale`. Both use group-32 FP4 weights; NVFP4's E4M3 block scales and separate
-`weight_scale_2` differ from group-16 NVFP4 W4A4. Ordinary FP8 activations keep one calibrated
-scale per tensor/expert; they are not re-quantized per block as MXFP8. The MX loops consume
-unit activation group scales; affine NVFP4 prefill instead reuses the weight-upcast GEMM,
-storing FP8-rounded inputs exactly in BF16. Both restore calibration in the FP32 epilogue. Input
-`pre_quant_scale` also supports MX/FP4 activation-quantized paths, including NVFP4 AWQ.
+| Checkpoint recipe | Weight helper | `activation_format` | `As` | `b_global_scale` |
+| --- | --- | --- | --- | --- |
+| naturally packed integer words | `interleave_int_words` | raw (`None`) | — | — |
+| GPTQ v1 / v2, including act-order | `repack_gptq_int4` (also returns `b_perm` when K is reordered) | raw | — | — |
+| AWQ GEMM | `repack_awq_int4` | raw | — | — |
+| ModelOpt INT4 (signed, `uint8` `(N/2, K)`, two output channels per byte) | `repack_modelopt_int4` | raw | — | — |
+| ModelOpt INT8 (signed `int8` `(N, K)`, one scale per output channel) | `repack_modelopt_int8` | raw | — | — |
+| ModelOpt `W4A8_AWQ` (symmetric INT4, original group scales) | `repack_modelopt_int4` | `"fp8"` | `input_scale` | `weight_scale_2` |
+| ModelOpt INT8 SmoothQuant (symmetric per-channel INT8) | `repack_modelopt_int8` | `"int8"` | `input_scale` | — |
+| ModelOpt `W4A8_MXFP4_FP8` (group-32 FP4) | — | `"fp8"` | `input_scale` | — |
+| ModelOpt `W4A8_NVFP4_FP8` (group-32 FP4, E4M3 block scales) | — | `"fp8"` | `input_scale` | `weight_scale_2` |
+| ModelOpt `NVFP4_SVD` (SVDQuant, dense only) | — | NVFP4 (default) | — (`a_global_scale=input_scale`) | `weight_scale_2` |
+| GGML `Q4_0` / `Q8_0` | `repack_ggml_int` | raw | — | — |
 
-ModelOpt `NVFP4_SVD` (SVDQuant) is supported by dense `matmul_2d`: pass the BF16
-`svdquant_lora_a` `(rank, K)`, `svdquant_lora_b` `(N, rank)` and input `pre_quant_scale`:
+Integer weights:
+
+- `b_zero` (optional) is shaped like `Bs`; the default zero point is `2 ** (bits - 1)`.
+- Dequantization rounds `(q - zero) * scale` in the scale dtype, then casts each weight to the activation
+  dtype before multiplication, including per-channel scales (`group=K`, one scale per output row).
+- Group widths and K tiles must divide one another; K must contain whole groups.
+- Natural `int32` checkpoint words are rejected, so the two word layouts cannot be confused.
+- The ModelOpt repacks also accept expert stacks and return `(weight, scale, None)`.
+- `repack_ggml_int(payload, "Q4_0" | "Q8_0")` reads canonical little-endian `uint8` GGML blocks
+  `(..., N, K/32, 18 | 34)` and returns FP32 group scales. Q8_0 is also a ModelOpt GGML recipe; Q4_0 follows
+  upstream GGML. A GGUF loader supplies the payload and its logical shape (no container parsing). IQ codebooks,
+  Q4_1 affine minima and Q5 formats are unsupported.
+- Fused integer MoE blocks require matching widths, group recipes and zero-point presence across gate/up and
+  down. Both projections may use per-channel scales despite their different K; scale dtypes and calibrated
+  values may differ between projections.
+
+AWQ `pre_quant_scale`:
+
+- Pass it as `a_pre_quant_scale` to an integer GEMM, or fuse it upstream. It multiplies the raw input columns
+  before any act-order permutation, rounded in the activation dtype.
+- Dense scales are contiguous `(K,)`; routed scales are shared `(K,)` / `(1, K)` or per expert `(E, K)`, on the
+  activation's device and in its dtype.
+- MoE forwards accept `gate_up_proj_pre_quant_scale` and `down_proj_pre_quant_scale`, the down's optionally per
+  expert. A fused gate/up stack uses one input transform for both halves, as after ModelOpt's resmoothing.
+- It also applies on the MX/FP4 activation-quantized paths, including NVFP4 AWQ.
+
+ModelOpt activation-quantized recipes:
+
+- `W4A8_AWQ` reconstructs the weight, rounds it to E4M3 against `weight_scale_2`, and restores both calibrated
+  factors before the FP32 bias/GLU.
+- INT8 SmoothQuant accumulates the dot in INT32, then applies the per-channel weight scales and the input scale
+  in FP32.
+- Both take raw activations and keep the intermediate unquantized between projections; the down's own
+  calibration and optional input transform apply before its quantization.
+- `W4A8_MXFP4_FP8` / `W4A8_NVFP4_FP8` differ from group-16 NVFP4 W4A4 (NVFP4 here: E4M3 block scales plus a
+  separate `weight_scale_2`). The FP8 activations keep one calibrated scale per tensor/expert, not re-quantized
+  per block as MXFP8. The MX loops consume unit activation group scales; affine NVFP4 prefill reuses the
+  weight-upcast GEMM, storing FP8-rounded inputs exactly in BF16. Both restore calibration in the FP32 epilogue.
+
+ModelOpt `NVFP4_SVD` (SVDQuant) runs on dense `matmul_2d` with the BF16 `svdquant_lora_a` `(rank, K)`,
+`svdquant_lora_b` `(N, rank)` and input `pre_quant_scale`:
 
 ```python
 out = matmul_2d(
@@ -145,30 +169,21 @@ out = matmul_2d(
 )
 ```
 
-Smoothing, NVFP4 activation quantization and the BF16 low-rank down projection normally share one pass.
-Large rank-32 prefill on SM10x quantizes separately from the down projection; both smooth the input
-without materializing an extra activation buffer. The up projection is fused into the GEMM epilogue
-before GLU/requant. All dot products accumulate in FP32. `simulate_unfused=True` matches the
-BF16 materialization points in ModelOpt's two linear branches and their addition; the default
-retains FP32 for the final sum.
-Factors use the checkpoint's orientation without pre-folding smoothing or global scales into them.
-Weight scales may be affine or pre-swizzled at load time. Gate/up weights and their up-factor rows
-must use the usual interleaved order; independent gate/up down factors can be concatenated with
-matching zero-padded up factors. Fused gate/up also requires shared smoothing and global scales.
-This supports dense BF16 inference with ranks divisible by 32 and K divisible by 64;
-routed SVDQuant MoE and Nunchaku's INT4/packed checkpoint layouts are not implemented.
-`python bench/bench_moe.py SVDQuant` compares the complete linear on Gemma-4-31B up/down shapes
-against FlashInfer, including smoothing, activation quantization and the correction projections.
-
-`repack_ggml_int(payload, "Q4_0" | "Q8_0")` reads canonical little-endian uint8 GGML blocks
-`(..., N, K/32, 18 | 34)` and returns the same integer operand tuple with FP32 group scales.
-Q8_0 is also a ModelOpt GGML recipe; Q4_0 follows upstream GGML. A GGUF loader supplies the
-payload and its logical shape; this helper does not parse containers. IQ codebooks, Q4_1
-affine minima, and Q5 formats are unsupported.
-GPTQ act-order repacking also returns `b_perm` when K reordering is required.
-Fused integer MoE blocks require matching widths, group recipes, and zero-point presence across
-gate/up and down. Both projections may use per-channel scales despite their different K dimensions;
-scale dtypes and calibrated values may differ between projections.
+- Smoothing, NVFP4 activation quantization and the BF16 low-rank down projection normally share one pass;
+  large rank-32 prefill on SM10x quantizes separately from the down projection. Both smooth the input without
+  an extra activation buffer.
+- The up projection is fused into the GEMM epilogue before GLU/requant. All dot products accumulate in FP32.
+- `simulate_unfused=True` matches the BF16 materialization points of ModelOpt's two linear branches and their
+  addition; the default keeps FP32 for the final sum.
+- Factors use the checkpoint's orientation, without pre-folding smoothing or global scales into them. Weight
+  scales may be affine or pre-swizzled at load time.
+- Gate/up weights and their up-factor rows use the usual interleaved order; independent gate/up down factors
+  can be concatenated with matching zero-padded up factors. Fused gate/up also requires shared smoothing and
+  global scales.
+- Supported: dense BF16 inference, ranks divisible by 32, K divisible by 64. Not implemented: routed SVDQuant
+  MoE and Nunchaku's INT4/packed checkpoint layouts.
+- `python bench/bench_moe.py SVDQuant` compares the complete linear on Gemma-4-31B up/down shapes against
+  FlashInfer, including smoothing, activation quantization and the correction projections.
 
 ### Gate|up layout contract
 
@@ -419,9 +434,14 @@ Unknown modes or keys raise. Keys are the tuner's options:
 - `runoff`: remeasure the finalists before crowning one (default `true`).
 - `basin_probes`: measure one anchor per categorical basin before the TPE (default `true`).
 - `max_refine_iters`: coordinate-refinement iterations (default `5`; `0` disables it).
+- `max_pair_trials`: two-axis neighbors of the refined winner measured after refinement (default `24`;
+  `0` disables the pair step).
+- `compile_workers`: threads that compile a tune's configs ahead of timing when it measures every pruned
+  config (default `0`: compile on first launch).
+- `force`: restrict tuning to configs with these values, e.g. `{"num_ctas": 2}` for every kernel (axes a
+  kernel lacks are ignored) or `{"<kernel name>": {...}}` for one kernel; `{"<function name>": "<path>"}`
+  pins a path choice (e.g. `{"int_weight_only_matmul_2d": "offline_dequant"}`).
 - `log_path`: append every measured config's timing as JSONL.
-- `rotate_weights`: rotate weight banks so tuning sees cold weights (default `true`);
-  `false` times warm graph replay instead. The two keep separate on-disk tuning results.
 - Debugging: `key_log_path` (tune-cache key decisions), `call_count_path` (per-kernel host launch
   counts, written at exit), `tracebacks` (full failure tracebacks), `lock_timeout` (seconds to wait
   for another rank's tune, default `1800`).

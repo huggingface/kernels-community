@@ -37,7 +37,7 @@ def maybe_descriptor(t: torch.Tensor, box: list[int]) -> TensorDescriptor | None
     needs a unit-stride innermost dim, which a transposed view (as a backward pass hands in to
     contract over the other axis) does not have, and its base and other strides on the 16-byte
     grid, which a row-strided view (e.g. one position per sequence) may not have. ``None`` is the same
-    signal the pointer arms already take for an unused descriptor, and ``descriptor_box_pruner``
+    signal the pointer arms already take for an unused descriptor, and ``descriptor_support_pruner``
     drops the configs that would read it, so the tuner is left with the pointer arms the kernel
     serves stride-generally."""
     return TensorDescriptor.from_tensor(t, box) if can_back_descriptor(t) else None
@@ -86,23 +86,18 @@ def rebind_bd_descriptors(nargs):
     rebind_operand_box(nargs, "B_MEMORY_MODE", "BDescriptor", (2 if nargs.get("GATE") else 1) * nargs["BLOCK_SIZE_N"], nargs["block_k"])
 
 
+def weight_values_per_element(nargs) -> int:
+    """K values one stored element of the weight ``B`` holds: 2 for packed E2M1 bytes, ``K // K_stored`` for integer
+    words (2/4/8-bit), else 1."""
+    return {torch.uint8: 2, torch.uint32: nargs["K"] // nargs["B"].shape[-1]}.get(nargs["B"].dtype, 1)
+
+
 def rebind_tiled_descriptors(nargs):
-    """Per-config pre_hook for the FP8 kernels with a tuned K tile (tensor-wide / row-wise): set the
-    A/B host-TMA boxes to ``[BM, BK]`` and ``[(2|1) * BN, BK]`` over the (rows, K) E4M3 matrices."""
+    """Per-config pre_hook for the 2D kernels with a tuned K tile (tensor-wide / row-wise FP8, weight-only): the
+    A box ``[BM, BK]`` over the (M, K) activation and the weight box over the (rows, K_stored) weight. No scale
+    boxes: these scales are affine, read through the pointer arm."""
     rebind_operand_box(nargs, "A_MEMORY_MODE", "ADescriptor", nargs["BLOCK_SIZE_M"], nargs["BLOCK_SIZE_K"])
-    rebind_operand_box(nargs, "B_MEMORY_MODE", "BDescriptor", (2 if nargs.get("GATE") else 1) * nargs["BLOCK_SIZE_N"], nargs["BLOCK_SIZE_K"])
-
-
-def rebind_weight_only_descriptors(nargs):
-    """Per-config pre_hook for the weight-only kernels — set the A/B host-TMA boxes to the tuned tile:
-    ``[BM, BK]`` over the (M, K) bf16 activation and ``[BN, BK // WEIGHT_VALUES_PER_BYTE]`` over the
-    packed (N, K_bytes) weight (bytes: uint8 = packed E2M1, two values/byte). No scale boxes — weight-only
-    scales are always affine (never swizzled), read through the pointer arm."""
-    # uint32 integer weights: K // words values per word (2/4/8-bit)
-    wvpb = {torch.uint8: 2, torch.uint32: nargs["K"] // nargs["B"].shape[-1]}.get(nargs["B"].dtype, 1)
-    bk = nargs["BLOCK_SIZE_K"]
-    rebind_operand_box(nargs, "A_MEMORY_MODE", "ADescriptor", nargs["BLOCK_SIZE_M"], bk)
-    rebind_operand_box(nargs, "B_MEMORY_MODE", "BDescriptor", (2 if nargs.get("GATE") else 1) * nargs["BLOCK_SIZE_N"], bk // wvpb)
+    rebind_batched_weight_descriptor(nargs)
 
 
 def rebind_mx_descriptors(nargs):
@@ -152,17 +147,16 @@ def batched_weight_descriptor(b: torch.Tensor, owner: torch.Tensor | None = None
     """Host TMA descriptor over a batched kernel's ``(E, rows, K_stored)`` weight stack viewed as one
     ``(E * rows, K_stored)`` matrix, so an expert is a row offset (``batched_weight_row``). Placeholder
     box, re-bound per config by ``rebind_batched_weight_descriptor``; None where the stack cannot be
-    viewed without a copy (``descriptor_box_pruner`` then keeps the pointer configs)."""
+    viewed without a copy (``descriptor_support_pruner`` then keeps the pointer configs)."""
     return weight_descriptor(b.view(-1, b.shape[-1]), [128, 64], owner) if b.is_contiguous() else None
 
 
 def rebind_batched_weight_descriptor(nargs):
     """Per-config pre_hook: the batched weight box ``[(2 if GATE else 1) * BLOCK_SIZE_N, BLOCK_SIZE_K //
     values_per_element]`` — packed fp4 bytes hold 2 values, integer words ``K // K_stored``."""
-    values_per_element = {torch.uint8: 2, torch.uint32: nargs["K"] // nargs["B"].shape[-1]}.get(nargs["B"].dtype, 1)
     rebind_operand_box(
         nargs, "B_MEMORY_MODE", "BDescriptor",
-        (2 if nargs.get("GATE") else 1) * nargs["BLOCK_SIZE_N"], nargs["BLOCK_SIZE_K"] // values_per_element,
+        (2 if nargs.get("GATE") else 1) * nargs["BLOCK_SIZE_N"], nargs["BLOCK_SIZE_K"] // weight_values_per_element(nargs),
     )
 
 
@@ -175,11 +169,8 @@ def rebind_grouped_weight_descriptor(nargs):
         nargs["BDescriptor"], int
     ):
         return
-    values_per_element = {torch.uint8: 2, torch.uint32: nargs["K"] // nargs["B"].shape[-1]}.get(nargs["B"].dtype, 1)
     nargs["BDescriptor"].block_shape = [
-        1,
-        (2 if nargs.get("GATE") else 1) * nargs["BLOCK_SIZE_N"],
-        nargs["BLOCK_SIZE_K"] // values_per_element,
+        1, (2 if nargs.get("GATE") else 1) * nargs["BLOCK_SIZE_N"], nargs["BLOCK_SIZE_K"] // weight_values_per_element(nargs),
     ]
 
 

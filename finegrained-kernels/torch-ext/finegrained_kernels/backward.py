@@ -80,7 +80,7 @@ from .pruners import (
     PATH_ANCHOR_AXES,
     block_within_dim_pruner,
     config_filter,
-    descriptor_box_pruner,
+    descriptor_support_pruner,
     dgrad_grouped_warps_pruner,
     compose_pruners,
     smem_pruner,
@@ -178,7 +178,7 @@ def _dgrad_weight_tile(
                 lambda c, a: c.kwargs["BLOCK_SIZE_K"] % max(a.get("SCALE_GROUP_K", 1), 1) == 0
             ),
             warp_spec_compile_guard_pruner(),
-            descriptor_box_pruner("BLOCK_SIZE_K"),
+            descriptor_support_pruner(),
             smem_pruner("BLOCK_SIZE_K"),
         )
     },
@@ -375,7 +375,7 @@ def dgrad_matmul_2d(
                 lambda c, a: c.kwargs["BLOCK_SIZE_K"] % max(a.get("SCALE_GROUP_K", 1), 1) == 0
             ),
             warp_spec_compile_guard_pruner(),
-            descriptor_box_pruner("BLOCK_SIZE_K"),
+            descriptor_support_pruner(),
             smem_pruner("BLOCK_SIZE_K"),
         )
     },

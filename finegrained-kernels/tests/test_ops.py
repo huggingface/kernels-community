@@ -45,8 +45,11 @@ from utils import (  # type: ignore
     dq_scale,
     DTYPE_TO_TOL,
     finegrained_kernels,
-    IS_SM89,
+    int_fp8_global,
+    int_group,
     internals,
+    is_memory_overflow,
+    IS_SM89,
     make_gate_up,
     make_static_activation_scale,
     maybe_compile,
@@ -137,8 +140,7 @@ class Problem:
     pre_quant_scale: bool = False  # AWQ input transform, shared for dense or per expert when routed
     svdquant_rank: int = 0  # dense NVFP4 residual plus BF16 low-rank correction
     dtype: torch.dtype = torch.bfloat16
-    # in the CI subset (kernels_ci); the rest run in test_op_scenarios_extended
-    ci: bool = field(default=True, compare=False)
+    ci: bool = field(default=True, compare=False)  # carries the kernels_ci mark
 
     @property
     def id(self):
@@ -460,7 +462,7 @@ def _zero_points(problem: Problem, E):
         return None
     g = torch.Generator(device=TEST_DEVICE).manual_seed(2)
     rows = 2 * problem.N if problem.gate else problem.N
-    shape = (E, rows, problem.K // (problem.int_group or problem.K))
+    shape = (E, rows, problem.K // int_group(problem, problem.K))
     return torch.randint(0, 1 << INT_BITS[problem.weights], shape, device=TEST_DEVICE, dtype=torch.uint8, generator=g)
 
 
@@ -601,7 +603,10 @@ def _fp32_intermediate(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As
     if problem.static and problem.activation_format in ("fp8", "int8"):
         act_scale = _rowwise(problem, _static_scale(problem, op, A), expert_ids)
         normalized = A_raw.float() / act_scale
-        A_quant = normalized.round().clamp(-128, 127) if problem.activation_format == "int8" else normalized.clamp(-448, 448).to(torch.float8_e4m3fn).float()
+        if problem.activation_format == "int8":
+            A_quant = normalized.round().clamp(-128, 127)
+        else:
+            A_quant = normalized.clamp(-448, 448).to(torch.float8_e4m3fn).float()
         A_dq = A_quant * act_scale
     elif problem.pre_quant_scale and problem.weights == "nvfp4" and As_global is not None:
         aq, scales = nvfp4_act_quant(A_raw, global_scale=As_global, expert_index=expert_ids)
@@ -611,7 +616,7 @@ def _fp32_intermediate(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As
     # (E, rows, K) fp32
     if problem.weights in INT_BITS:  # dequantized to the activation dtype, as the GEMM does
         W = dq_int(B, Bs, _zero_points(problem, B.shape[0]),
-                   None if problem.activation_format in ("fp8", "int8") else problem.dtype, problem.int_group or problem.K)
+                   None if problem.activation_format in ("fp8", "int8") else problem.dtype, int_group(problem, problem.K))
         if problem.activation_format == "fp8":
             global_scale = Bs_global.view(-1, 1, 1)
             W = (W / global_scale).clamp(-448, 448).to(torch.float8_e4m3fn).float() * global_scale
@@ -816,16 +821,11 @@ def _check(problem: Problem, dq_out, ref_cmp, expert_ids, op):
         atol, rtol = DTYPE_TO_TOL[problem.dtype]
         if IS_SM89:
             atol = max(atol, 1e-2 * ref_cmp[keep].abs().max().item())
-        if problem.weights.startswith("fp8_") and problem.activation_format == "bf16":
-            # FP8 weight-only against the exact FP8 * scale reference: the SCALE_MODE placements that feed the
-            # MMA a bf16-rounded operand (the scaled weight under "tile", the scaled activation under "act") sit
-            # one bf16 rounding from it at the output's scale (2D/batched/grouped on B200: 2.6e-3..3.4e-3 of
-            # max|ref|, under 2^-8 = 3.9e-3); "acc" / "post" stay exact up to accumulation order
-            atol = max(atol, 2.0 ** -8 * ref_cmp[keep].abs().max().item())
-        if problem.weights.startswith("int") and problem.activation_format is None:
-            # integer weight-only against the dequantize-to-a-float reference ((q - z) * s rounded per weight):
-            # SCALE_MODE="acc" scales the exact integer dot's fp32 partial instead, one bf16 rounding of the weight from
-            # it at the output's scale ("tile" stays bit-exact up to accumulation order)
+        fp8_weight_only = problem.weights.startswith("fp8_") and problem.activation_format == "bf16"
+        int_weight_only = problem.weights in INT_BITS and problem.activation_format is None
+        if fp8_weight_only or int_weight_only:
+            # SCALE_MODE places the weight scale on a bf16-rounded operand or on the fp32 partial, one bf16 rounding
+            # from the reference at the output's scale (B200: 2.6e-3..3.4e-3 of max|ref|, under 2^-8 = 3.9e-3)
             atol = max(atol, 2.0 ** -8 * ref_cmp[keep].abs().max().item())
         torch.testing.assert_close(
             dq_out[keep], ref_cmp[keep].to(problem.dtype).float(), atol=atol, rtol=rtol
@@ -852,7 +852,7 @@ def _check(problem: Problem, dq_out, ref_cmp, expert_ids, op):
 
 def _make_weights(problem: Problem, row, E):
     """The scenario's weights: ``(B, Bs, Bs_global)``; under gate the interleaved gate|up stack."""
-    kwargs = {"group": problem.int_group or problem.K} if problem.weights in INT_BITS else {}
+    kwargs = {"group": int_group(problem, problem.K)} if problem.weights in INT_BITS else {}
     if problem.gate and problem.weights not in INT_BITS:
         B, Bs, Bs_global = make_gate_up(row, problem.N, problem.K, E)
     else:  # INT groups run along K per row: the stack quantizes as is
@@ -861,7 +861,7 @@ def _make_weights(problem: Problem, row, E):
         Bs = Bs[..., ::2].contiguous()  # valid group-32 E4M3 payload; both FP4 halves use one scale
     if problem.weights in INT_BITS and problem.activation_format == "fp8":
         Bs = Bs.float()
-        Bs_global = dq_int(B, Bs, group=problem.int_group or problem.K).abs().amax(dim=(-2, -1)).div(448).clamp(min=1e-12)
+        Bs_global = int_fp8_global(B, Bs, int_group(problem, problem.K))
     elif problem.weights in INT_BITS and problem.activation_format == "int8":
         Bs = Bs.float()
     if problem.csf_encoding:
@@ -893,20 +893,14 @@ def _skip_unsupported(problem: Problem, op: str) -> None:
         pytest.skip("an explicit activation format / requant is MX-only for matmul_2d")
 
 
-@pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 @pytest.mark.parametrize("op", ["batched", "grouped", "matmul"])
-@pytest.mark.parametrize("problem", [p for p in PROBLEMS if p.ci], ids=lambda p: p.id)
+@pytest.mark.parametrize(
+    "problem", [pytest.param(p, id=p.id, marks=pytest.mark.kernels_ci if p.ci else ()) for p in PROBLEMS]
+)
 def test_op_scenarios(problem: Problem, op):
     """Reference (the op written in torch) vs op (the kernel): same inputs, each returning the op's
     own output format, compared once through the shared ``_dequant``."""
-    _run_scenario(problem, op)
-@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
-@pytest.mark.parametrize("op", ["batched", "grouped", "matmul"])
-@pytest.mark.parametrize("problem", [p for p in PROBLEMS if not p.ci], ids=lambda p: p.id)
-def test_op_scenarios_extended(problem: Problem, op):
-    """The scenarios outside the CI subset: variants of a format the CI cells already cover."""
-def _run_scenario(problem: Problem, op):
     _skip_unsupported(problem, op)
     gated_nvfp4_requant = problem.weights == "nvfp4" and problem.gate and problem.quantize_output
     if IS_SM89 and op == "matmul" and gated_nvfp4_requant and not (problem.swizzled or problem.per_expert_globals):
@@ -1095,8 +1089,8 @@ _SWEEP_CELLS = [
 ]
 
 
-def _is_memory_overflow(err: str) -> bool:
-    return "out of resource: shared memory" in err or "out of resource: tensor memory" in err
+# B200, Triton 3.8: 96 cold grouped configs compile in 25.9 s serially, 11.5 s on 16 threads (more stop helping)
+PRECOMPILE_WORKERS = 16
 
 
 @pytest.mark.slow
@@ -1134,7 +1128,7 @@ def test_every_admitted_config_is_correct(problem: Problem, op, tuner):
         _run_ref_vs_op(problem, op, A, expert_ids, B, Bs, Bs_global, shared=shared)
         assert admitted.get("configs"), "the spy never saw a prune pass"
         for nargs in admitted["launches"]:  # every config runs below, in each launch's specialization
-            tuner.precompile(admitted["configs"], nargs, workers=16)
+            tuner.precompile(admitted["configs"], nargs, workers=PRECOMPILE_WORKERS)
         forgiven, overflowed = [], []
         configs = admitted["configs"]
         if shard := os.environ.get("FINEGRAINED_SWEEP_SHARD"):  # "i/n": run every n-th admitted config, from the i-th
@@ -1142,7 +1136,7 @@ def test_every_admitted_config_is_correct(problem: Problem, op, tuner):
             configs = configs[index::count]
         for cfg in configs:
             known = [tuner.known_failure(cfg, nargs) for nargs in admitted["launches"]]
-            if any(k and _is_memory_overflow(k) for k in known):
+            if any(k and is_memory_overflow(k) for k in known):
                 overflowed.append(cfg)
                 continue
             tuner.configs = [cfg]
@@ -1165,7 +1159,7 @@ def test_every_admitted_config_is_correct(problem: Problem, op, tuner):
                         f"config left a STICKY device fault (the context is poisoned): "
                         f"{cfg}\n{err}\nprobe: {type(probe).__name__}: {str(probe)[:120]}"
                     ) from e
-                if _is_memory_overflow(err):
+                if is_memory_overflow(err):
                     overflowed.append(cfg)
                 else:
                     forgiven.append((cfg, err[:120]))
@@ -1474,62 +1468,13 @@ def test_int_natural_layout_refused(op):
 
 
 @pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
-@pytest.mark.parametrize("checkpoint", ["gptq", "gptq_v2", "gptq_symmetric", "awq", "modelopt_int4", "modelopt_int8", "ggml_q4_0", "ggml_q8_0"])
-def test_int_repacks(checkpoint):
+@pytest.mark.parametrize("checkpoint", ["gptq", "gptq_v2", "gptq_symmetric", "awq"])
+def test_gptq_awq_repacks(checkpoint):
     """GPTQ / AWQ int4 linears packed by their own conventions (GPTQ: values along K, zero points along N minus 1,
     0 under ``gptq_v2``; AWQ: both along N in its ``[0, 2, 4, 6, 1, 3, 5, 7]`` column order) repack to weights whose
-    dequant is ``(q - zero) * scale`` of the source values. ModelOpt stores signed values, INT4 across
-    output-channel pairs or INT8 unpacked, and both must preserve the original signed-weight reference."""
-
+    dequant is ``(q - zero) * scale`` of the source values."""
     g = torch.Generator(device=TEST_DEVICE).manual_seed(4)
     K, N, group = 512, 256, 128
-    if checkpoint.startswith(("modelopt", "ggml")):
-        ggml = checkpoint.startswith("ggml")
-        bits = 4 if checkpoint in ("modelopt_int4", "ggml_q4_0") else 8
-        group = 32 if ggml else (128 if bits == 4 else K)
-        # Cover dense 2D and stacked experts without a separate codec/metadata test matrix.
-        leading = () if bits == 4 else (2,)
-        signed = torch.randint(-(1 << (bits - 1)), 1 << (bits - 1), (*leading, N, K),
-                               device=TEST_DEVICE, dtype=torch.int8, generator=g)
-        scales = (torch.rand(*leading, N, K // group, device=TEST_DEVICE, generator=g) * 0.02 + 0.005).to(
-            torch.float16 if ggml else torch.float32
-        )
-        if ggml:
-            d = scales.half()
-            d[..., 1::2] *= -1  # canonical Q4_0 scales can be negative
-            d[..., 0] = 0
-            blocks = torch.empty(*leading, N, K // group, 2 + 4 * bits, device=TEST_DEVICE, dtype=torch.uint8)
-            blocks[..., :2] = d.contiguous().view(torch.uint8).view(*leading, N, K // group, 2)
-            values = signed.reshape(*leading, N, K // group, group)
-            if bits == 4:
-                values = values.int() + 8
-                blocks[..., 2:] = (values[..., :16] | (values[..., 16:] << 4)).to(torch.uint8)
-            else:
-                blocks[..., 2:] = values.view(torch.uint8)
-            W, Ws, Wz = repack_ggml_int(blocks, "Q4_0" if bits == 4 else "Q8_0")
-            scales = d.float()  # GGML reconstructs q*d in FP32 before casting the weight.
-        elif bits == 4:
-            qweight = ((signed[0::2].int() & 15) | ((signed[1::2].int() & 15) << 4)).to(torch.uint8)
-            W, Ws, Wz = repack_modelopt_int4(qweight, scales)
-        else:
-            W, Ws, Wz = repack_modelopt_int8(signed, scales.squeeze(-1))
-        ref = signed.to(scales.dtype) * scales.repeat_interleave(group, dim=-1)
-        assert W.dtype == torch.uint32 and Wz is None
-        assert torch.equal(dequantize_int_weight(W, Ws, K), ref)
-        A = torch.randn(8, K, device=TEST_DEVICE, dtype=torch.float16, generator=g)
-        if bits == 4:
-            out = finegrained_kernels.matmul_2d(A, W, None, Ws)
-            expected = A.float() @ ref.half().float().T
-        else:
-            expert_ids = torch.arange(8, device=TEST_DEVICE, dtype=torch.int32) % 2
-            run = torch.compile(finegrained_kernels.matmul_batched, fullgraph=True)
-            out = run(A, W, None, Ws, expert_ids=expert_ids)
-            expected = torch.bmm(ref[expert_ids.long()].half().float(), A.float().unsqueeze(-1)).squeeze(-1)
-        atol, rtol = DTYPE_TO_TOL[torch.float16]
-        # SCALE_MODE="acc" scales the exact integer dot instead of each fp16-rounded weight (``_check``)
-        atol = max(atol, 2.0 ** -8 * expected.abs().max().item())
-        torch.testing.assert_close(out.float(), expected.half().float(), atol=atol, rtol=rtol)
-        return
     q = torch.randint(0, 16, (K, N), device=TEST_DEVICE, dtype=torch.int32, generator=g)
     z = torch.randint(0, 16, (K // group, N), device=TEST_DEVICE, dtype=torch.int32, generator=g)
     if checkpoint == "gptq_symmetric":
@@ -1554,6 +1499,60 @@ def test_int_repacks(checkpoint):
     assert W.dtype == torch.uint32
     ref = (q.T - z.T.repeat_interleave(group, dim=1)).to(torch.float16) * scales.T.repeat_interleave(group, dim=1)
     assert torch.equal(dequantize_int_weight(W, Ws, K, Wz), ref)
+
+
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
+@pytest.mark.parametrize("checkpoint", ["modelopt_int4", "modelopt_int8", "ggml_q4_0", "ggml_q8_0"])
+def test_signed_int_repacks(checkpoint):
+    """ModelOpt (INT4 across output-channel pairs, INT8 unpacked) and GGML (Q4_0 / Q8_0 blocks) store signed values
+    with a symmetric scale; the repacked weights preserve the signed-weight reference and run through the ops."""
+    g = torch.Generator(device=TEST_DEVICE).manual_seed(4)
+    K, N = 512, 256
+    ggml = checkpoint.startswith("ggml")
+    bits = 4 if checkpoint in ("modelopt_int4", "ggml_q4_0") else 8
+    group = 32 if ggml else (128 if bits == 4 else K)
+    # Cover dense 2D and stacked experts without a separate codec/metadata test matrix.
+    leading = () if bits == 4 else (2,)
+    signed = torch.randint(-(1 << (bits - 1)), 1 << (bits - 1), (*leading, N, K),
+                           device=TEST_DEVICE, dtype=torch.int8, generator=g)
+    scales = (torch.rand(*leading, N, K // group, device=TEST_DEVICE, generator=g) * 0.02 + 0.005).to(
+        torch.float16 if ggml else torch.float32
+    )
+    if ggml:
+        d = scales.half()
+        d[..., 1::2] *= -1  # canonical Q4_0 scales can be negative
+        d[..., 0] = 0
+        blocks = torch.empty(*leading, N, K // group, 2 + 4 * bits, device=TEST_DEVICE, dtype=torch.uint8)
+        blocks[..., :2] = d.contiguous().view(torch.uint8).view(*leading, N, K // group, 2)
+        values = signed.reshape(*leading, N, K // group, group)
+        if bits == 4:
+            values = values.int() + 8
+            blocks[..., 2:] = (values[..., :16] | (values[..., 16:] << 4)).to(torch.uint8)
+        else:
+            blocks[..., 2:] = values.view(torch.uint8)
+        W, Ws, Wz = repack_ggml_int(blocks, "Q4_0" if bits == 4 else "Q8_0")
+        scales = d.float()  # GGML reconstructs q*d in FP32 before casting the weight.
+    elif bits == 4:
+        qweight = ((signed[0::2].int() & 15) | ((signed[1::2].int() & 15) << 4)).to(torch.uint8)
+        W, Ws, Wz = repack_modelopt_int4(qweight, scales)
+    else:
+        W, Ws, Wz = repack_modelopt_int8(signed, scales.squeeze(-1))
+    ref = signed.to(scales.dtype) * scales.repeat_interleave(group, dim=-1)
+    assert W.dtype == torch.uint32 and Wz is None
+    assert torch.equal(dequantize_int_weight(W, Ws, K), ref)
+    A = torch.randn(8, K, device=TEST_DEVICE, dtype=torch.float16, generator=g)
+    if bits == 4:
+        out = finegrained_kernels.matmul_2d(A, W, None, Ws)
+        expected = A.float() @ ref.half().float().T
+    else:
+        expert_ids = torch.arange(8, device=TEST_DEVICE, dtype=torch.int32) % 2
+        run = torch.compile(finegrained_kernels.matmul_batched, fullgraph=True)
+        out = run(A, W, None, Ws, expert_ids=expert_ids)
+        expected = torch.bmm(ref[expert_ids.long()].half().float(), A.float().unsqueeze(-1)).squeeze(-1)
+    atol, rtol = DTYPE_TO_TOL[torch.float16]
+    # SCALE_MODE="acc" scales the exact integer dot instead of each fp16-rounded weight (``_check``)
+    atol = max(atol, 2.0 ** -8 * expected.abs().max().item())
+    torch.testing.assert_close(out.float(), expected.half().float(), atol=atol, rtol=rtol)
 
 
 @pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
@@ -1617,7 +1616,7 @@ def test_grouped_packed_schedule_built_by_its_configs(weights, tuner, activation
 def test_int4_act_order(op, M):
     """Act-order GPTQ (``desc_act=True``, groups scattered across K): repacked to contiguous groups plus a K order the
     ops gather A's columns by (``b_perm``), every op matches ``A @ W_ref.T`` with the weight dequantized in A's own
-    order; an identity ``g_idx`` repacks exactly as no ``g_idx`` (three tensors, same bits)."""
+    order."""
 
     torch.manual_seed(0)
     E, N, K = (1 if op == "matmul" else 4), 256, 512
@@ -1642,6 +1641,12 @@ def test_int4_act_order(op, M):
     err = ((out.float() - ref).norm() / ref.norm()).item()
     assert err < 4e-3, f"{op} M={M}: act-order vs dequantized reference {err:.2e}"
 
+
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
+def test_gptq_identity_g_idx_repack():
+    """An identity ``g_idx`` (contiguous groups) repacks exactly as no ``g_idx``: three tensors, same bits."""
+    torch.manual_seed(0)
+    N, K = 256, 512
     q = torch.randint(0, 2**31 - 1, (K // 8, N), device=TEST_DEVICE, dtype=torch.int32)
     z = torch.randint(0, 2**31 - 1, (K // 128, N // 8), device=TEST_DEVICE, dtype=torch.int32)
     s = torch.rand(K // 128, N, device=TEST_DEVICE).to(torch.bfloat16)

@@ -67,6 +67,7 @@ def resolve_tile_inline(
 # Scatter tiles and the per-slot atomic fallback favor many small programs. Aggregated
 # counting uses larger tiles to reduce global atomic traffic further.
 _ROUTING_BLOCK_SIZE = 256
+_AGGREGATE_COUNT_BLOCK_SIZE = 1024
 
 
 @triton.jit
@@ -125,6 +126,7 @@ def _scatter_kernel(
         expert_id = tl.where(valid, expert_id, NUM_EXPERTS)
         packed = tl.sort((expert_id.to(tl.uint64) << 32) | offs.to(tl.uint64), descending=False)
         expert_id, offs = (packed >> 32).to(tl.int32), packed.to(tl.uint32)
+        # ids span 0..NUM_EXPERTS (the off-rank bucket): 2 * NUM_EXPERTS is the smallest power-of-2 bin count
         counts = tl.histogram(expert_id, 2 * NUM_EXPERTS, mask=offs < S)
         bins = tl.arange(0, 2 * NUM_EXPERTS)
         base = tl.atomic_add(Counters + bins, counts, mask=(bins <= NUM_EXPERTS) & (counts > 0), sem="relaxed")
@@ -234,6 +236,8 @@ _ONE_BLOCK_ROUTING_MAX_ROWS = 1024
 
 
 def _aggregate_routing(num_routed_tokens: int, num_experts: int) -> bool:
+    """Aggregate per block before the global atomics on large routes; the expert cap bounds the scatter's
+    per-program histogram (``2 * num_experts`` bins) at 1024."""
     return num_routed_tokens >= 4096 and num_experts <= 2 * _ROUTING_BLOCK_SIZE
 
 
@@ -248,7 +252,7 @@ def _launch_expert_start(
     expert_start = torch.empty(num_experts + 1, dtype=torch.int32, device=device)
     # Bound local histogram storage; small routes and larger expert sets keep per-slot atomics.
     aggregate = _aggregate_routing(num_routed_tokens, num_experts)
-    count_block = 1024 if aggregate else _ROUTING_BLOCK_SIZE
+    count_block = _AGGREGATE_COUNT_BLOCK_SIZE if aggregate else _ROUTING_BLOCK_SIZE
     with device_context(device):
         compile_time_only_triton_wrap(_count_kernel)[
             (triton.cdiv(num_routed_tokens, count_block),)
@@ -284,9 +288,10 @@ def _compute_grouped_scheduling(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     device = expert_ids.device
     num_routed_tokens = expert_ids.numel()  # S = num_tokens * num_top_k
+    # routing kernels index expert_ids with unit stride
     if num_routed_tokens <= _ONE_BLOCK_ROUTING_MAX_ROWS:
         # the one-block kernel casts in registers: no int32 copy launch (Qwen3-30B-A3B T=64 on B200: 2.1 us)
-        expert_ids = expert_ids.contiguous()  # routing kernels index with unit stride
+        expert_ids = expert_ids.contiguous()
         # decode: one launch instead of a memset and three (Qwen3-30B-A3B T=1 on B200: 5.5 -> ~1.5 us of routing)
         expert_start = torch.empty(num_experts + 1, dtype=torch.int32, device=device)
         perm = torch.empty(num_routed_tokens, dtype=torch.int32, device=device)
@@ -298,7 +303,7 @@ def _compute_grouped_scheduling(
                 BLOCK_SIZE=max(triton.next_power_of_2(num_routed_tokens), 16),
             )
         return perm_token, perm, expert_start
-    expert_ids = expert_ids.int().contiguous()  # routing kernels index with unit stride
+    expert_ids = expert_ids.int().contiguous()
     counters = torch.empty(num_experts + 1, dtype=torch.int32, device=device)
     expert_start = _launch_expert_start(expert_ids, num_experts, counters)
     perm = torch.empty(num_routed_tokens, dtype=torch.int32, device=device)
@@ -506,6 +511,65 @@ def resolve_grouped_tile(
     n_off = pid_n * WEIGHT_ROWS
     m_start = tl.min(in_row).to(tl.int32)
     return pid_n, expert_id, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start
+
+
+@triton.jit
+def grouped_tile_schedule(
+    Schedule, ExpertStart, start_pid, N,
+    NUM_EXPERTS_POW2: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
+    PACKED_SCHEDULE: tl.constexpr, PIPELINE: tl.constexpr, GROUP_SIZE_M: tl.constexpr,
+):
+    """The persistent grouped loop's schedule: ``(num_n_tiles, total_m_tiles, layout, prefetched)``. ``layout`` is
+    ``build_tile_layout``'s ``(exp_start, freqs, tile_start_excl, e_offs)``, or placeholders under ``PACKED_SCHEDULE``,
+    which reads the packed header instead. ``prefetched`` is the first tile's packed entry when the K loop is the
+    pipelined one (``PIPELINE == "k_loop"``), carried through the loop by ``grouped_schedule_tile``; a placeholder
+    otherwise."""
+    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
+    prefetched = (0, 0, 0)
+    if PACKED_SCHEDULE:
+        total_m_tiles = load_packed_schedule(Schedule, BLOCK_SIZE_M)
+        layout = (0, 0, 0, 0)
+        if PIPELINE == "k_loop":
+            first_m = grouped_tile_order(start_pid, total_m_tiles, num_n_tiles, GROUP_SIZE_M=GROUP_SIZE_M) // num_n_tiles
+            prefetched = prefetch_packed_entry(Schedule, first_m, total_m_tiles)
+    else:
+        exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = build_tile_layout(
+            ExpertStart, NUM_EXPERTS_POW2, BLOCK_SIZE_M
+        )
+        layout = (exp_start, freqs, tile_start_excl, e_offs)
+    return num_n_tiles, total_m_tiles, layout, prefetched
+
+
+@triton.jit
+def grouped_schedule_tile(
+    logical_tile_id, prefetched, Schedule, layout, num_n_tiles, total_m_tiles, num_programs, GatherIdx, ScatterIdx,
+    BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, GATE: tl.constexpr,
+    PACKED_SCHEDULE: tl.constexpr, PIPELINE: tl.constexpr, GROUP_SIZE_M: tl.constexpr,
+):
+    """One persistent iteration's tile: ``(pid_m, pid_n, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off,
+    m_start, prefetched)`` for logical tile ``logical_tile_id`` in ``grouped_tile_order``. Under ``PACKED_SCHEDULE`` the
+    tile-loop pipelines load their entry here (their loads already overlap the previous tile), while the K-loop one
+    consumes the entry prefetched last iteration and issues the next program's, so the dependent loads hide under this
+    tile's K loop."""
+    tile_id = grouped_tile_order(logical_tile_id, total_m_tiles, num_n_tiles, GROUP_SIZE_M=GROUP_SIZE_M)
+    if PACKED_SCHEDULE:
+        if PIPELINE == "k_loop":
+            entry = prefetched
+        else:
+            entry = prefetch_packed_entry(Schedule, tile_id // num_n_tiles, total_m_tiles)
+        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start = resolve_grouped_tile_packed(
+            tile_id, num_n_tiles, entry, GatherIdx, ScatterIdx, BLOCK_SIZE_N, BLOCK_SIZE_M, GATE,
+        )
+        if PIPELINE == "k_loop":
+            next_m = grouped_tile_order(logical_tile_id + num_programs, total_m_tiles, num_n_tiles, GROUP_SIZE_M=GROUP_SIZE_M) // num_n_tiles
+            prefetched = prefetch_packed_entry(Schedule, next_m, total_m_tiles)
+    else:
+        exp_start, freqs, tile_start_excl, e_offs = layout
+        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start = resolve_grouped_tile(
+            tile_id, num_n_tiles, exp_start, freqs, tile_start_excl, e_offs,
+            GatherIdx, ScatterIdx, BLOCK_SIZE_N, BLOCK_SIZE_M, GATE,
+        )
+    return tile_id // num_n_tiles, pid_n, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start, prefetched
 
 
 @triton.jit

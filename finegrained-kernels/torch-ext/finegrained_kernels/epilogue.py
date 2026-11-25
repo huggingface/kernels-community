@@ -20,7 +20,7 @@ from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 from .compat import compile_time_only_triton_wrap, device_context, pdl_launch_kwargs
 from .mma import MMA_N_ATOM
 from .quant import fp8_act_quant_inline, mx_act_quant_inline
-from .loading.scales import apply_global_scale
+from .loading.scales import apply_global_scale, swizzled_scale_offsets
 
 
 @triton.jit
@@ -521,13 +521,7 @@ def _epilogue_requant_mx(
         # a swapped token tile scatters its rows' scales into the swizzled slab by byte address (the
         # load_swizzled_rows_scale map): ``scale_rows`` are its rows inside their expert's 128-padded slab
         cols = pid_n * (BLOCK_SIZE_N // SCALE_GROUP_K) + tl.arange(0, BLOCK_SIZE_N // SCALE_GROUP_K)
-        cols4 = (N_COLS // SCALE_GROUP_K + 3) // 4
-        off = (
-            ((scale_rows // 128)[:, None] * cols4 + cols[None, :] // 4) * 512
-            + (scale_rows % 32)[:, None] * 16
-            + ((scale_rows % 128) // 32)[:, None] * 4
-            + cols[None, :] % 4
-        )
+        off = swizzled_scale_offsets(scale_rows // 128, scale_rows % 128, cols, (N_COLS // SCALE_GROUP_K + 3) // 4)
         tl.store(Cs + off, q_s, mask=row_mask[:, None] & (cols < N_COLS // SCALE_GROUP_K)[None, :])
     elif SWIZZLED_OUT:
         # group scales straight into the down proj's SWIZZLE_32_4_4 layout (inverse of
@@ -578,14 +572,13 @@ def add_low_rank(
                             mask=(splits[:, None] < SPLIT_K) & (rank[None, :] < RANK), other=0)
             x = tl.sum(parts, 0).to(LoraWeight.dtype.element_ty)
             correction = tl.sum(w.to(tl.float32) * x.to(tl.float32)[None, :], 1)[None, :]
-        elif BLOCK_SIZE_M < 16:
-            x = tl.load(LoraInput + out_row[:, None] * stride_li_m + rank[None, :] * stride_li_r,
-                        mask=row_mask[:, None] & (rank[None, :] < RANK), other=0)
-            correction = tl.sum(x.to(tl.float32)[:, None, :] * w.to(tl.float32)[None, :, :], 2)
         else:
             x = tl.load(LoraInput + out_row[:, None] * stride_li_m + rank[None, :] * stride_li_r,
                         mask=row_mask[:, None] & (rank[None, :] < RANK), other=0)
-            correction = tl.dot(x, tl.trans(w))
+            if BLOCK_SIZE_M < 16:
+                correction = tl.sum(x.to(tl.float32)[:, None, :] * w.to(tl.float32)[None, :, :], 2)
+            else:
+                correction = tl.dot(x, tl.trans(w))
         if SIMULATE_UNFUSED:
             # ModelOpt materializes both linear outputs before their BF16 addition.
             acc = acc.to(INTERMEDIATE_DTYPE).to(tl.float32)

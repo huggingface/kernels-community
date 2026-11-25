@@ -67,12 +67,7 @@ def decode_pdl() -> bool:
 @functools.cache
 def _pdl_capable() -> bool:
     """The launch-independent part of ``decode_pdl``, resolved once: it is asked on every launch."""
-    return (
-        DECODE_PDL
-        and get_active_device_type() == "cuda"
-        and torch.version.hip is None
-        and torch.cuda.get_device_capability() >= (9, 0)
-    )
+    return DECODE_PDL and is_nvidia() and torch.cuda.get_device_capability() >= (9, 0)
 
 
 _PDL_ON = {"PDL": True, "launch_pdl": True}
@@ -291,16 +286,24 @@ def sm_count(device_index: int) -> int:
 
 
 @functools.lru_cache(maxsize=8)
-def persistent_program_count(device_index: int, block_m: int | None = None) -> int:
+def persistent_program_count(device_index: int, block_m: int | None = None, warp_spec: bool = False) -> int:
     """Size the persistent grid, including extra programs for small SM10x tiles.
 
-    Small tiles need several programs per SM to hide memory latency. Xe uses
-    two work-groups per core regardless of the tile size.
+    Small tiles need several programs per SM to hide memory latency. A warp-specialized program hides it with its
+    own deep TMA ring instead, which fills an SM's shared memory: the extra programs would only run as serial waves,
+    each refilling the ring (DSV4 MXFP4 T=64 gate, BM16 tile loop: 1007 -> 449 us at one program per SM).
+    Xe uses two work-groups per core regardless of the tile size.
     """
     n = sm_count(device_index)
-    if block_m is not None and block_m < 64 and is_sm10x():
+    if block_m is not None and block_m < 64 and is_sm10x() and not warp_spec:
         n *= persistent_programs_per_sm(block_m)
     return n * 2 if get_active_device_type() == "xpu" else n
+
+
+def persistent_grid(device_index: int):
+    """The launch grid of a persistent grouped kernel: ``persistent_program_count`` for the tuned config's tile and
+    warp specialization."""
+    return lambda meta: (persistent_program_count(device_index, meta["BLOCK_SIZE_M"], meta.get("WARP_SPEC", False)),)
 
 
 def persistent_programs_per_sm(block_m: int) -> int:
@@ -530,7 +533,7 @@ def get_accelerator_autotuning_configs(
         # resolve is pressure-walled (dsv4 BM128/BK256 regs 244->187, +8%), so the tuner picks
         blocks = [{**b, "PACKED_SCHEDULE": ps} for b in blocks for ps in (False, True)]
 
-    # (descriptor-mode can't-win/can't-serve regions are fenced per kernel: descriptor_box_pruner,
+    # (descriptor-mode can't-win/can't-serve regions are fenced per kernel: descriptor_support_pruner,
     # matched_memory_modes_pruner, descriptor_needs_prequant_pruner)
     if a_memory_modes is not None:
         blocks = [
@@ -600,20 +603,18 @@ def get_accelerator_autotuning_configs(
     return list({str(c): c for c in configs}.values())
 
 
+def clone_config(config, *, num_warps=None, pre_hook=None, **kwargs):
+    """A copy of ``config`` with ``kwargs`` set (and optionally another warp count or pre_hook), keeping every launch
+    option."""
+    return triton.Config(
+        {**config.kwargs, **kwargs}, num_warps=num_warps or config.num_warps, num_stages=config.num_stages,
+        num_ctas=config.num_ctas, maxnreg=config.maxnreg, pre_hook=pre_hook or config.pre_hook,
+    )
+
+
 def pipeline_autotuning_configs(configs, pipelines, *, num_warps=None):
     """Expand selected persistent GEMM tiles over compiler-managed output-tile pipelines."""
-    return [
-        triton.Config(
-            dict(config.kwargs, PIPELINE=pipeline),
-            num_warps=num_warps or config.num_warps,
-            num_stages=config.num_stages,
-            num_ctas=config.num_ctas,
-            maxnreg=config.maxnreg,
-            pre_hook=config.pre_hook,
-        )
-        for config in configs
-        for pipeline in pipelines
-    ]
+    return [clone_config(config, num_warps=num_warps, PIPELINE=pipeline) for config in configs for pipeline in pipelines]
 
 
 def int_scale_mode_configs(configs):
@@ -624,14 +625,7 @@ def int_scale_mode_configs(configs):
     costs a round trip per K step (and BM128 x BN256 runs out of registers). ``int_scale_group_tile_pruner`` admits
     ``"acc"`` only where one scale group spans the K tile."""
     return [
-        triton.Config(
-            dict(config.kwargs, SCALE_MODE=mode),
-            num_warps=config.num_warps,
-            num_stages=config.num_stages,
-            num_ctas=config.num_ctas,
-            maxnreg=config.maxnreg,
-            pre_hook=config.pre_hook,
-        )
+        clone_config(config, SCALE_MODE=mode)
         for config in configs
         for mode in ("tile", "acc")
         if mode == "tile" or (config.kwargs.get("COMPUTE_MODE", "dot") == "dot" and config.kwargs["BLOCK_SIZE_M"] <= 32)
@@ -646,14 +640,7 @@ def block_fp8_scale_mode_configs(configs):
     ``"post"`` is no axis: it is the only placement where one scale block spans K, set at launch (``SCALE_POST``).
     ``block_fp8_scale_mode_pruner`` admits each mode only where its scale is constant over its operand."""
     return [
-        triton.Config(
-            dict(config.kwargs, SCALE_MODE=mode),
-            num_warps=config.num_warps,
-            num_stages=config.num_stages,
-            num_ctas=config.num_ctas,
-            maxnreg=config.maxnreg,
-            pre_hook=config.pre_hook,
-        )
+        clone_config(config, SCALE_MODE=mode)
         for config in configs
         for mode in ("tile", "acc", "act")
         if mode == "tile"
@@ -694,29 +681,10 @@ def zero_split_k_counters(pre_hook=None):
     return hook
 
 
-def split_k_autotuning_configs(splits, memory_modes=("descriptor", "pointer"), pre_hook=None, configs=None, **fixed):
-    """The decode ``dot`` tiles (BM=16, BN {16, 32, 64}, BK {128, 256, 512}) crossed with a ``SPLIT_K`` axis: K split
-    across ``splits`` programs per output tile, reduced in-kernel. Matched memory modes, warps {2, 4}, stages 3-5.
-    ``configs`` instead expands caller-selected tiles, e.g. native scaled MMA at decode."""
-    if configs is not None:
-        return [triton.Config(dict(c.kwargs, SPLIT_K=split), num_warps=c.num_warps, num_stages=c.num_stages,
-                              num_ctas=c.num_ctas, maxnreg=c.maxnreg, pre_hook=zero_split_k_counters(c.pre_hook))
-                for c in configs for split in splits]
-    modes = resolve_memory_modes(memory_modes)
-    blocks = [
-        {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk, "A_MEMORY_MODE": m, "B_MEMORY_MODE": m,
-         "SPLIT_K": sk, **fixed}
-        for m in modes
-        for bn in (16, 32, 64)
-        for bk in (128, 256, 512)
-        for sk in splits
-    ]
-    return [
-        triton.Config(b, num_warps=w, num_stages=s, pre_hook=zero_split_k_counters(pre_hook))
-        for b in blocks
-        for w in (2, 4)
-        for s in (3, 4, 5)
-    ]
+def split_k_autotuning_configs(splits, configs):
+    """``configs`` crossed with a ``SPLIT_K`` axis: K split across ``splits`` programs per output tile, reduced
+    in-kernel."""
+    return [clone_config(c, pre_hook=zero_split_k_counters(c.pre_hook), SPLIT_K=split) for c in configs for split in splits]
 
 
 def narrow_dot_autotuning_configs(
@@ -740,10 +708,6 @@ def narrow_dot_autotuning_configs(
         for w in (2, 4)
         for s in (2, 3, 4, 5, 6)
     ]
-
-
-# the installed Triton, for the pruners whose compiler-bug fences moved between releases
-TRITON_VERSION = Version(triton.__version__)
 
 
 @functools.cache

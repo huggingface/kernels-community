@@ -134,6 +134,7 @@ class BayesianAutotuner(Autotuner):
         self.runoff = overrides.get("runoff", runoff)
         self.basin_probes = overrides.get("basin_probes", basin_probes)
         self.max_refine_iters = overrides.get("max_refine_iters", max_refine_iters)
+        # the pair step's cap: 24 keeps it under a third of the default 80-trial search
         self.max_pair_trials = overrides.get("max_pair_trials", max_pair_trials)
         # Branch axes (by kwarg name) that relocate the TILE optimum — the caller's
         # declaration, since it is configuration knowledge (the tuner never hardcodes
@@ -200,20 +201,14 @@ class BayesianAutotuner(Autotuner):
         return {k: copy.copy(v) if isinstance(v, TensorDescriptor) else v for k, v in nargs.items()}
 
     def precompile(self, configs: List[Config], nargs: dict, workers: int | None = None):
-        """Compile ``configs`` for the launch ``nargs`` on a thread pool (Triton's
-        ``AsyncCompileMode``) so the serial timing loop then hits the compile cache. Each
-        config's ``pre_hook`` runs first, as at launch: descriptor boxes are part of the
-        specialization. Failures are left for the bench to record. B200, Triton 3.8, 96
-        full-precision grouped configs from a cold cache: 25.9 s serial, 11.5 s on 16 threads
-        (part of the compile holds the GIL, so more threads stop helping).
+        """Compile ``configs`` for the launch ``nargs`` on a thread pool (Triton's ``AsyncCompileMode``) so the
+        serial timing loop hits the compile cache (B200: 96 cold grouped configs, 25.9 s serial, 11.5 s on 16 threads).
 
-        Configs compile in waves of rising ``num_stages``, each config's ladder (the same config at
-        every admitted stage count) one rung per wave, and each compiled rung runs Triton's own load-time
-        resource check. A rung that overflows shared or tensor memory is memoized as a failure, so no
-        tune compiles it again. Shared memory never shrinks as stages are added (0 of 44,174 adjacent
-        pairs over the forced-config sweep's admitted lists, B200, Triton 3.8), so a shared-memory
-        overflow also memoizes every rung above it, uncompiled. The pruners' bounds are keep-side and
-        miss most of these: the compiler adds a stage or a decoded tile depending on the tile shape."""
+        - Each config's ``pre_hook`` runs first, as at launch: descriptor boxes are part of the specialization.
+        - Configs compile in waves of rising ``num_stages``; a rung that overflows shared or tensor memory at load
+          is memoized as a failure. Shared memory never shrinks with more stages, so a shared-memory overflow also
+          memoizes every rung above it, uncompiled.
+        - Other failures are left for the bench to record."""
         workers = workers or self.compile_workers
         if workers <= 1 or len(configs) <= 1:
             return
@@ -566,7 +561,7 @@ class BayesianAutotuner(Autotuner):
                 key.append(kwargs[k])
         # name-tagged, with an explicit token for absent optional tensors: a positional
         # dtype list lets a gather-only and a scatter-only launch alias to one entry,
-        # while descriptor-arm legality (descriptor_box_pruner) hangs off GatherIdx
+        # while descriptor-arm legality (descriptor_support_pruner) hangs off GatherIdx
         # presence — the aliased replay would read wrong rows without ever re-pruning
         for i in range(n_positional):
             v = args[i]
@@ -769,13 +764,10 @@ class BayesianAutotuner(Autotuner):
                 break
             bench_idx(best_i)
 
-        # Coordinate-descent refinement: try single-dim perturbations around
-        # the current best (of ``within``, the whole grid by default) until no neighbor improves.
-        # A step changes one axis, unless the pruners dropped that pairing: a deeper K tile admits fewer stages
-        # (Qwen2.5 AWQ qkv M=64: BK128 s6 has no BK512 s6, so descent stalled one step from the BK512 s3 winner,
-        # 11.1 vs 9.9 us), and swapped tiles only pair matching A/B memory modes (Qwen2.5 GPTQ qkv M=64 stalled on
-        # pointer BM32 BN64 BK512 at 16.4 us, its host-descriptor twin 11.4 us). Then the step lands on the nearest
-        # admitted config holding the new value: fewest other axes changed, then the nearest stage count.
+        # Coordinate descent from the best config (of ``within``, the whole grid by default) until no neighbor
+        # improves. Where the pruners dropped a one-axis neighbor, the step lands on the nearest admitted config with
+        # the new value (fewest other axes changed, then nearest stage count): e.g. BK512 admits fewer stages than
+        # BK128, so a strict one-axis step stalled one move from a BK512 s3 winner (Qwen2.5 AWQ qkv M=64, 11.1 vs 9.9 us).
         stage_dim = next((d for d, _ in sigs[0] if d == ("num_stages",)), None) if sigs else None
 
         def refine(within=None):
@@ -806,12 +798,9 @@ class BayesianAutotuner(Autotuner):
                     break
 
         refine()
-        # Pair step: coordinate descent stops where the winner is two coupled flips away — a narrower tile wants
-        # fewer warps (Qwen3 INT4 gate|up T=64 crowned BN=256/8 warps at 83us over BN=128/4 warps at 67us), a
-        # deeper K tile a different memory mode (GPT-OSS MXFP4 T=2048: BK=128 + pointer A at 837us vs the crowned
-        # BK=64 + descriptor A at 922us) — and each single flip measures worse. Bench the two-axis neighbors whose
-        # BOTH new values already won somewhere (ranked by the worse of their best measured times), then descend
-        # again from any winner.
+        # Pair step: descent stops where the winner is two coupled flips away and each flip alone is slower (Qwen3
+        # INT4 gate|up T=64 crowned BN=256 / 8 warps at 83 us over BN=128 / 4 warps at 67 us). Bench the two-axis
+        # neighbors whose new values both won somewhere, best first, then descend again from any winner.
         if self.max_pair_trials:
             best_by_value: Dict = defaultdict(lambda: float("inf"))
             for i, t in timings.items():
@@ -834,11 +823,9 @@ class BayesianAutotuner(Autotuner):
             if improved:
                 refine()
 
-        # Branch refinement: descend inside every other declared path branch too, from its own best. A branch is
-        # judged by the few configs the search gave it, and its guaranteed wide anchor can be its worst tile: on the
-        # Qwen2.5 AWQ qkv M=64 tune the swapped branch's anchor (BM64 BN128) took 2.7 ms, the TPE wrote SWAP_AB off
-        # and crowned a 12.0 us unswapped tile, while the swapped BM32 BN64 BK512 tile (9.85 us) sat one step from
-        # the branch's best measured config (BN128).
+        # Branch refinement: descend inside every other declared path branch from its own best, since the search
+        # judges a branch by its few configs (Qwen2.5 AWQ qkv M=64: a 2.7 ms swapped anchor got SWAP_AB written off
+        # for a 12.0 us tile while a swapped 9.85 us tile sat one step from the branch's best).
         if self.path_anchor_axes and self.max_refine_iters:
             branch_of = [tuple(c.all_kwargs().get(k) for k in self.path_anchor_axes) for c in configs]
             winner = branch_of[min(timings, key=timings.get)]
@@ -1145,7 +1132,6 @@ def _tuning_lock(cache, file_name: str):
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
             finally:
                 lock_file.close()
-
 
 
 def bayesian_autotune(

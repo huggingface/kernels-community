@@ -150,11 +150,10 @@ def is_rowwise(weight: torch.Tensor, scale: torch.Tensor) -> bool:
     ``scale`` ``(N, 1)`` for a 2D ``(N, K)`` weight, ``(E, N, 1)`` for a 3D stack (e.g. Llama 4
     FP8). The block is ``(1, K)``: the scale is constant along K, so it folds once after the
     K-loop, like a per-tensor one."""
-    if weight.dtype != torch.float8_e4m3fn or scale.dtype != torch.float32:
-        return False
-    if scale.shape != weight.shape[:-1] + (1,):
-        return False
-    return True
+    return (
+        weight.dtype == torch.float8_e4m3fn and scale.dtype == torch.float32
+        and scale.shape == weight.shape[:-1] + (1,)
+    )
 
 def per_token_activations(B: torch.Tensor, Bs: torch.Tensor | None) -> bool:
     """Whether the weights take one activation scale per token: FP8 with a K-constant scale
@@ -205,7 +204,7 @@ def validate_dense_2d_operands(A: torch.Tensor, B: torch.Tensor) -> None:
     layout without a fixed row stride raises instead of being copied, and read its row stride.
 
     B may be row-major or a transposed view of a row-major tensor. The kernels read both of B's
-    strides, and ``descriptor_box_pruner`` keeps the TMA arms — which require a unit-stride
+    strides, and ``descriptor_support_pruner`` keeps the TMA arms — which require a unit-stride
     innermost dim — off the transposed form, so a caller can contract over the other axis by
     passing ``B.t()`` (with its scale grid transposed to match) instead of materializing a copy."""
     assert A.shape[-1] == B.shape[-1], (
@@ -257,7 +256,7 @@ def tokens_per_expert_bucket(S: int, num_experts: int) -> int:
     and T=16 ran T=1's crown (81 vs 46 us)."""
     if S < num_experts:
         return (16 * S // num_experts).bit_length()  # 0..4
-    return (-(-S // num_experts)).bit_length() + 4
+    return triton.cdiv(S, num_experts).bit_length() + 4
 
 def normalize_global_scale(
     g: torch.Tensor | None, num_experts: int
@@ -380,7 +379,7 @@ def check_activation_format(activation_format: str | None, quantize_output: bool
     )
 
 
-def _validate_quantization_args(
+def validate_quantization_args(
     A, As, B, Bs, a_global_scale, b_global_scale, output_global_scale,
     b_zero, b_perm, a_pre_quant_scale, activation_format, quantize_output, activation_scale_ub,
 ):
@@ -533,12 +532,12 @@ def resolve_activation_format(activation_format: str | None, B: torch.Tensor, Bs
     routed to its own kernel by the dispatcher."""
     if activation_format == "fp8":
         assert B.dtype == torch.int8, "ordinary FP8 activations on MX weights require packed FP4 weights"
-        assert mx_scale_family(Bs, B.shape[-1] * 2) == MX_SCALE_GROUP_K, (
+        assert mx_scale_family(Bs, B.shape[-1] * NIBBLES_PER_BYTE) == MX_SCALE_GROUP_K, (
             "ModelOpt FP4/FP8 recipes use group-32 weight scales"
         )
         return "fp8"
     if Bs.dtype == torch.float8_e4m3fn:
-        assert mx_scale_family(Bs, B.shape[-1] * 2) == NVFP4_SCALE_GROUP_K, (
+        assert mx_scale_family(Bs, B.shape[-1] * NIBBLES_PER_BYTE) == NVFP4_SCALE_GROUP_K, (
             "E4M3 group-32 FP4 weights require activation_format='fp8'"
         )
         assert activation_format in (None, "nvfp4"), (
@@ -583,6 +582,6 @@ def block_fp8_weight_scale_grid(B: torch.Tensor, Bs: torch.Tensor, gate: bool = 
         scale_rows, weight_rows = Bs.shape[-2] // 2, rows // 2
     else:
         scale_rows, weight_rows = Bs.shape[-2], rows
-    block_n = block_k if ((weight_rows + block_k - 1) // block_k) == scale_rows else weight_rows // scale_rows
-    assert block_n > 0 and ((weight_rows + block_n - 1) // block_n) == scale_rows
+    block_n = block_k if triton.cdiv(weight_rows, block_k) == scale_rows else weight_rows // scale_rows
+    assert block_n > 0 and triton.cdiv(weight_rows, block_n) == scale_rows
     return Bs, block_n, block_k

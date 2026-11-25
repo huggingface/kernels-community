@@ -81,6 +81,11 @@ def mx_dot_scaled_tokens(acc, a, a_scale, w, w_scale):
     scales keep their ``[rows, K // group]`` shape on either side. ``acc`` is ``[ROWS, BM]``."""
     a_fmt: tl.constexpr = "e2m1" if a.dtype == tl.uint8 else "e4m3"
     w_fmt: tl.constexpr = "e2m1" if w.dtype == tl.uint8 else "e4m3"
+    if w_scale.dtype == tl.float8e4nv:
+        # NVFP4: the activation scales arrive as their E4M3 bytes. Type them like the weight's, or a warp-specialized
+        # loop copies the bytes to tensor memory as-is and issues the MMA without its 4X scale vector: an illegal
+        # instruction (GLM-5 NVFP4 T=64, swapped BM16, Triton 3.9)
+        a_scale = a_scale.to(tl.float8e4nv, bitcast=True)
     return tl.dot_scaled(w, w_scale, w_fmt, tl.trans(a), a_scale, a_fmt, acc)
 
 
@@ -120,9 +125,9 @@ def mx_weight_upcast(w, w_scale, BLOCK_SIZE_K: tl.constexpr, N: tl.constexpr, SC
                      OUT_DTYPE: tl.constexpr = tl.bfloat16, ROWS_MAJOR: tl.constexpr = False):
     """Upcast one MXFP4/MXFP8 weight K-tile ``[BK, N]`` to ``OUT_DTYPE`` for the weight-only path: unpack
     E2M1 -> bf16 directly (fp8 passes through a cast) and apply each ``SCALE_GROUP_K``-row K-group's
-    UE8M0 group scale. ``ROWS_MAJOR`` decodes and returns ``[N, BK]`` directly for the
-    computed MMA lhs; the default returns ``[BK, N]``. ``w_scale`` is ``[N, BK // SCALE_GROUP_K]`` (per-N-row, per-group); transposed
-    and broadcast across each group's rows to ``[BK, N]``. Unlike the ``dot`` arm (BK == group, scale
+    UE8M0 group scale. ``w_scale`` is ``[N, BK // SCALE_GROUP_K]`` (per-N-row, per-group), broadcast over each group's
+    K values. ``ROWS_MAJOR`` takes ``w`` output-rows-major and returns the ``[N, BK]`` swapped MMA lhs; the default
+    returns ``[BK, N]``. Unlike the ``dot`` arm (BK == group, scale
     folded onto the [M,N] product) this dequantizes IN the tile, so BK spans any number of groups — a
     full-BK bf16 ``tl.dot`` (the matmul_ogs format: fp4 weight, bf16 acts).
 
@@ -208,7 +213,7 @@ def mx_weight_only_scalar_swapped(
     )
 
 
-# PTX inline asm (round_f32_to_bf16_f32, the packed zero-point subtract) on NVIDIA; elsewhere plain Triton
+# ptx.py's inline asm needs an NVIDIA target; elsewhere plain Triton
 _PTX = tl.constexpr(is_nvidia())
 # Keep architecture-specific integer fast paths on the measured sm_10x target.
 SM10X = tl.constexpr(is_sm10x())
@@ -232,15 +237,29 @@ def int_word_pairs(w, BITS: tl.constexpr, K_MAJOR: tl.constexpr):
 
 
 @triton.jit
+def _pair_halves(pairs, DTYPE: tl.constexpr):
+    """uint32 lanes of two 16-bit ``DTYPE`` values as ``[..., 2]`` (low half first)."""
+    lo = (pairs & 0xFFFF).to(tl.uint16).to(DTYPE, bitcast=True)
+    hi = (pairs >> 16).to(tl.uint16).to(DTYPE, bitcast=True)
+    return tl.join(lo, hi)
+
+
+@triton.jit
+def _orient_values(v, w, VPW: tl.constexpr, K_MAJOR: tl.constexpr):
+    """The ``[R, C, pair, half]`` values of ``[R, C]`` words (``K_MAJOR``: ``[R, pair, C, half]``) in natural K order:
+    ``[R, VPW * C]`` (``K_MAJOR``: ``[VPW * R, C]``)."""
+    if K_MAJOR:
+        out = tl.trans(v, 0, 1, 3, 2).reshape(VPW * w.shape[0], w.shape[1])
+    else:
+        out = v.reshape(w.shape[0], VPW * w.shape[1])
+    return out
+
+
+@triton.jit
 def int8_words_to_int8(w, K_MAJOR: tl.constexpr):
     """Offset-binary interleaved words to signed INT8, in natural K order."""
     pairs = int_word_pairs(w ^ 0x80808080, 8, K_MAJOR)
-    v = tl.join((pairs & 0xFF).to(tl.int8), (pairs >> 16).to(tl.int8))
-    if K_MAJOR:
-        out = tl.trans(v, 0, 1, 3, 2).reshape(4 * w.shape[0], w.shape[1])
-    else:
-        out = v.reshape(w.shape[0], 4 * w.shape[1])
-    return out
+    return _orient_values(tl.join((pairs & 0xFF).to(tl.int8), (pairs >> 16).to(tl.int8)), w, 4, K_MAJOR)
 
 
 @triton.jit
@@ -284,14 +303,7 @@ def int_words_to_offset(w, zero_words, BITS: tl.constexpr, K_MAJOR: tl.constexpr
     elif zero_words is not None and _PTX:
         pairs = add_x2(pairs, zero_words, FP16 or BITS == 8)  # pair - (OFFSET + z), exact
     ODT: tl.constexpr = tl.float16 if FP16 or BITS == 8 else tl.bfloat16
-    lo = (pairs & 0xFFFF).to(tl.uint16).to(ODT, bitcast=True)
-    hi = (pairs >> 16).to(tl.uint16).to(ODT, bitcast=True)
-    v = tl.join(lo, hi)  # [.., pair, half] (K_MAJOR: [R, pair, C, half])
-    if K_MAJOR:
-        out = tl.trans(v, 0, 1, 3, 2).reshape((32 // BITS) * w.shape[0], w.shape[1])
-    else:
-        out = v.reshape(w.shape[0], (32 // BITS) * w.shape[1])
-    return out
+    return _orient_values(_pair_halves(pairs, ODT), w, 32 // BITS, K_MAJOR)
 
 
 @triton.jit
@@ -303,13 +315,21 @@ def int8_words_to_bf16(w, K_MAJOR: tl.constexpr):
     pairs = tl.join(p0, p1)
     if K_MAJOR:
         pairs = tl.trans(pairs, 0, 2, 1)
-    lo = (pairs & 0xffff).to(tl.uint16).to(tl.bfloat16, bitcast=True)
-    hi = (pairs >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True)
-    v = tl.join(lo, hi)
+    return _orient_values(_pair_halves(pairs, tl.bfloat16), w, 4, K_MAJOR)
+
+
+@triton.jit
+def _group_words(lane, WORDS_PER_GROUP: tl.constexpr, K_MAJOR: tl.constexpr):
+    """``[R, G]`` per-group lanes repeated over each group's words: ``[R, G * WORDS_PER_GROUP]`` (``K_MAJOR``: ``[G, R]``
+    to ``[G * WORDS_PER_GROUP, R]``)."""
     if K_MAJOR:
-        out = tl.trans(v, 0, 1, 3, 2).reshape(4 * w.shape[0], w.shape[1])
+        G: tl.constexpr = lane.shape[0]
+        R: tl.constexpr = lane.shape[1]
+        out = tl.broadcast_to(lane[:, None, :], (G, WORDS_PER_GROUP, R)).reshape(G * WORDS_PER_GROUP, R)
     else:
-        out = v.reshape(w.shape[0], 4 * w.shape[1])
+        R: tl.constexpr = lane.shape[0]
+        G: tl.constexpr = lane.shape[1]
+        out = tl.broadcast_to(lane[:, :, None], (R, G, WORDS_PER_GROUP)).reshape(R, G * WORDS_PER_GROUP)
     return out
 
 
@@ -317,16 +337,7 @@ def int8_words_to_bf16(w, K_MAJOR: tl.constexpr):
 def int_scale_words(w_scale, WORDS_PER_GROUP: tl.constexpr, K_MAJOR: tl.constexpr):
     """``[R, G]`` bf16/fp16 group scales to ``int_words_to_offset``'s ``[R, G * WORDS_PER_GROUP]`` scale words (``K_MAJOR``:
     ``[G, R]`` to ``[G * WORDS_PER_GROUP, R]``), the 16-bit scale ``add_mul_x2`` copies into both lanes."""
-    lane = w_scale.to(tl.uint16, bitcast=True)
-    if K_MAJOR:
-        G: tl.constexpr = w_scale.shape[0]
-        R: tl.constexpr = w_scale.shape[1]
-        out = tl.broadcast_to(lane[:, None, :], (G, WORDS_PER_GROUP, R)).reshape(G * WORDS_PER_GROUP, R)
-    else:
-        R: tl.constexpr = w_scale.shape[0]
-        G: tl.constexpr = w_scale.shape[1]
-        out = tl.broadcast_to(lane[:, :, None], (R, G, WORDS_PER_GROUP)).reshape(R, G * WORDS_PER_GROUP)
-    return out
+    return _group_words(w_scale.to(tl.uint16, bitcast=True), WORDS_PER_GROUP, K_MAJOR)
 
 
 @triton.jit
@@ -339,15 +350,7 @@ def int_zero_words(w_zero, WORDS_PER_GROUP: tl.constexpr, BITS: tl.constexpr, K_
         lane = (z | (0xC300 if BITS < 8 and not FP16 else 0xE400)).to(tl.uint16)
     else:
         lane = ((1 << BITS) - z) * 0x00010001
-    if K_MAJOR:
-        G: tl.constexpr = w_zero.shape[0]
-        R: tl.constexpr = w_zero.shape[1]
-        out = tl.broadcast_to(lane[:, None, :], (G, WORDS_PER_GROUP, R)).reshape(G * WORDS_PER_GROUP, R)
-    else:
-        R: tl.constexpr = w_zero.shape[0]
-        G: tl.constexpr = w_zero.shape[1]
-        out = tl.broadcast_to(lane[:, :, None], (R, G, WORDS_PER_GROUP)).reshape(R, G * WORDS_PER_GROUP)
-    return out
+    return _group_words(lane, WORDS_PER_GROUP, K_MAJOR)
 
 
 @triton.jit
@@ -451,14 +454,14 @@ def int4_e4m3_table(w_scale, w_zero, divisor=None):
 
 
 @triton.jit
-def int4_e4m3_lookup(w, table, WORDS_PER_GROUP: tl.constexpr, ROWS_MAJOR: tl.constexpr):
-    """Each weight word's eight nibbles through its group's ``int4_e4m3_table``: ``[R, C]`` words (``ROWS_MAJOR``
-    ``[N, BK // 8]``, else ``[BK // 8, N]``) to ``[R, C, 2]`` words of four K-ordered E4M3 bytes."""
+def int4_e4m3_lookup(w, w_scale, w_zero, SCALE_GROUP_K: tl.constexpr, divisor=None):
+    """Each weight word's eight nibbles through its group's ``int4_e4m3_table``: output-rows-major ``[N, BK // 8]``
+    words to ``[N, BK // 8, 2]`` words of four K-ordered E4M3 bytes."""
+    table = int4_e4m3_table(w_scale, w_zero, divisor)
     N: tl.constexpr = table.shape[0]
     NG: tl.constexpr = table.shape[1]
+    WORDS_PER_GROUP: tl.constexpr = SCALE_GROUP_K // 8
     table = tl.broadcast_to(table[:, :, None, :], (N, NG, WORDS_PER_GROUP, 4)).reshape(N, NG * WORDS_PER_GROUP, 4)
-    if not ROWS_MAJOR:
-        table = tl.trans(table, 1, 0, 2)
     t02, t13 = tl.split(table.reshape(table.shape[0], table.shape[1], 2, 2))  # split takes the last axis
     t0, t2 = tl.split(t02)
     t1, t3 = tl.split(t13)
@@ -467,23 +470,18 @@ def int4_e4m3_lookup(w, table, WORDS_PER_GROUP: tl.constexpr, ROWS_MAJOR: tl.con
 
 
 @triton.jit
-def e4m3_words_to_tile(words, ROWS_MAJOR: tl.constexpr):
-    """``int4_e4m3_lookup``'s ``[R, C, 2]`` words as the K-major ``[BK, N]`` E4M3 operand."""
+def e4m3_words_to_tile(words):
+    """``int4_e4m3_lookup``'s ``[N, C, 2]`` words as the K-major ``[BK, N]`` E4M3 operand."""
     R: tl.constexpr = words.shape[0]
     C: tl.constexpr = words.shape[1]
     shifts = tl.arange(0, 4) * 8
-    if ROWS_MAJOR:
-        out = ((words.reshape(R, 2 * C)[:, :, None] >> shifts[None, None, :]) & 0xFF).to(tl.uint8)
-        out = tl.trans(out.reshape(R, 8 * C))
-    else:
-        words = tl.trans(words, 0, 2, 1).reshape(2 * R, C)
-        out = tl.trans(((words[:, :, None] >> shifts[None, None, :]) & 0xFF).to(tl.uint8), 0, 2, 1)
-        out = out.reshape(8 * R, C)
+    out = ((words.reshape(R, 2 * C)[:, :, None] >> shifts[None, None, :]) & 0xFF).to(tl.uint8)
+    out = tl.trans(out.reshape(R, 8 * C))
     return out.to(tl.float8e4nv, bitcast=True)
 
 
 @triton.jit
-def e4m3_words_to_f16_tile(words, ROWS_MAJOR: tl.constexpr):
+def e4m3_words_to_f16_tile(words):
     """The same values as ``e4m3_words_to_tile`` in fp16 (exact), converted in registers as K-adjacent pairs: the
     operand of the 16-bit ``mma.sync`` that serves fp8 below the tcgen05 M. Left as E4M3, that MMA's own upcast relays
     the tile through shared memory a byte at a time (128 ``ld.shared.b8`` per thread at BM16 BN64 BK128)."""
@@ -491,29 +489,21 @@ def e4m3_words_to_f16_tile(words, ROWS_MAJOR: tl.constexpr):
     C: tl.constexpr = words.shape[1]
     p01, p23 = e4m3x4_to_f16x2(words)
     pairs = tl.join(p01, p23)  # [R, C, 2 words, 2 pairs], K order
-    lo = (pairs & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True)
-    hi = (pairs >> 16).to(tl.uint16).to(tl.float16, bitcast=True)
-    v = tl.join(lo, hi)
-    if ROWS_MAJOR:
-        out = tl.trans(v.reshape(R, 8 * C))
-    else:
-        out = tl.trans(v.reshape(R, C, 8), 0, 2, 1).reshape(8 * R, C)
-    return out
+    return tl.trans(_pair_halves(pairs, tl.float16).reshape(R, 8 * C))
 
 
 @triton.jit
-def int4_e4m3_tile(w, w_scale, w_zero, ROWS_MAJOR: tl.constexpr, SCALE_GROUP_K: tl.constexpr, divisor=None,
-                   F16: tl.constexpr = False):
+def int4_e4m3_tile(w, w_scale, w_zero, SCALE_GROUP_K: tl.constexpr, divisor=None, F16: tl.constexpr = False):
     """``int_dequant_tile`` for INT4 weights into E4M3 by table lookup, bit for bit: a group's 16 possible values come
     from ``int_dequant`` once (``int4_e4m3_table``), then every nibble is a byte permute (``int4_e4m3_lookup``), about
     two integer ops per weight instead of a per-value subtract, scale, divide, clamp and convert, which left the M=1
     W4A8 GEMV ALU-bound (ModelOpt W4A8, 6144x4096: 0.47 TB/s). ``F16`` hands the values over as fp16 pairs
-    (``e4m3_words_to_f16_tile``)."""
-    words = int4_e4m3_lookup(w, int4_e4m3_table(w_scale, w_zero, divisor), SCALE_GROUP_K // 8, ROWS_MAJOR)
+    (``e4m3_words_to_f16_tile``). Output-rows-major words only."""
+    words = int4_e4m3_lookup(w, w_scale, w_zero, SCALE_GROUP_K, divisor)
     if F16:
-        out = e4m3_words_to_f16_tile(words, ROWS_MAJOR)
+        out = e4m3_words_to_f16_tile(words)
     else:
-        out = e4m3_words_to_tile(words, ROWS_MAJOR)
+        out = e4m3_words_to_tile(words)
     return out
 
 
@@ -523,7 +513,7 @@ def int4_e4m3_scalar(acc, a, w, w_scale, w_zero, SCALE_GROUP_K: tl.constexpr, di
     table-lookup weight words (``int4_e4m3_lookup``) line up four K values a word with the activation's bytes, so
     ``e4m3_word_products`` takes both as is. At M=1 it skips the 16-row ``mma.sync`` (one real row) and its operand
     staging."""
-    words = int4_e4m3_lookup(w, int4_e4m3_table(w_scale, w_zero, divisor), SCALE_GROUP_K // 8, True)
+    words = int4_e4m3_lookup(w, w_scale, w_zero, SCALE_GROUP_K, divisor)
     return acc + tl.sum(e4m3_word_products(bytes_to_words(a), words.reshape(w.shape[0], a.shape[1] // 4)), axis=2)
 
 
@@ -538,7 +528,7 @@ def int_dequant_tile(
     groups: ``w_scale`` and ``w_zero`` (``None``: symmetric, zero point ``2 ** (BITS - 1)``) are
     ``[N, BK // SCALE_GROUP_K]``; ``w_scale`` ``None`` leaves the exact ``q - z`` for the accumulator to scale. Rows-major INT4 into E4M3 takes the table lookup (``int4_e4m3_tile``)."""
     if _PTX and BITS == 4 and OUT_DTYPE == tl.float8e4nv and ROWS_MAJOR:
-        out = int4_e4m3_tile(w, w_scale, w_zero, ROWS_MAJOR, SCALE_GROUP_K, divisor)
+        out = int4_e4m3_tile(w, w_scale, w_zero, SCALE_GROUP_K, divisor)
     else:
         out = int_offset_dequant_tile(w, w_scale, w_zero, ROWS_MAJOR, SCALE_GROUP_K, BITS, OUT_DTYPE, WHOLE_WORD, divisor)
     return out
@@ -659,10 +649,8 @@ def _dequantize_int_kernel(
     offs_k = tl.program_id(1) * BK + tl.arange(0, BK)
     if Wz is not None and Ws.dtype.element_ty == tl.float32:
         # the packed zero-point add lifts into a 16-bit float, so fp32 scales with zero points subtract per value
-        HALF: tl.constexpr = VPW // 2
-        shifts = (tl.arange(0, HALF) * BITS)[None, None, :]
-        q = tl.join((w[:, :, None] >> shifts) & ((1 << BITS) - 1), (w[:, :, None] >> (shifts + HALF * BITS)) & ((1 << BITS) - 1))
-        q = q.reshape(BLOCK_SIZE_R, BK).to(tl.int32)
+        pairs = int_word_pairs(w, BITS, False)
+        q = tl.join(pairs & 0xFFFF, pairs >> 16).reshape(BLOCK_SIZE_R, BK).to(tl.int32)
         v = int_dequant(q.reshape(BLOCK_SIZE_R, BK // TILE_GROUP, TILE_GROUP), zero.to(tl.int32)[:, :, None],
                         scale[:, :, None], Out.dtype.element_ty, divisor).reshape(BLOCK_SIZE_R, BK)
     else:
@@ -701,8 +689,6 @@ def dequantize_int_weight(
             rows, k_words, BITS=bits, SCALE_GROUP_K=group, BLOCK_SIZE_R=8, BLOCK_SIZE_W=block_w, num_warps=4,
         )
     return out
-
-
 
 
 @triton.jit
@@ -893,7 +879,7 @@ def int_weight_only_compute(
                 rhs = tl.trans(rhs)
         elif _PTX and BITS == 4 and a.dtype == tl.float8e4nv and ROWS_MAJOR:
             # below the tcgen05 M the fp8 dot is a 16-bit mma.sync: hand it fp16 operands (exact E4M3 values)
-            rhs = int4_e4m3_tile(w, w_scale, w_zero, ROWS_MAJOR, TILE_GROUP, weight_global, F16=True)
+            rhs = int4_e4m3_tile(w, w_scale, w_zero, TILE_GROUP, weight_global, F16=True)
             a = a.to(tl.float16)
         elif SCALE_MODE == "acc":
             rhs = int_dequant_tile(w, None, w_zero, ROWS_MAJOR, TILE_GROUP, BITS, a.dtype, WHOLE_WORD)
@@ -1050,7 +1036,6 @@ def plain_dot(acc, a, b, SWAP_AB: tl.constexpr = False, K_SLICES: tl.constexpr =
     return out
 
 
-
 @triton.jit
 def block_fp8_weight_only_dot(
     acc, a, b_ptrs, b_descriptor, bs_ptr, row0, n_off, k_off,
@@ -1090,6 +1075,7 @@ def block_fp8_weight_only_dot(
         )
         return acc + plain_dot(tl.zeros_like(acc), a, w, SWAP_AB, K_SLICES) * w_s
     return plain_dot(acc, a, w, SWAP_AB, K_SLICES)
+
 
 @triton.jit
 def k_slices_sum(acc, K_SLICES: tl.constexpr = 1):
@@ -1186,5 +1172,3 @@ def static_dot(acc, a, b, b_s, SWAP_AB: tl.constexpr, BLOCK_SIZE_K: tl.constexpr
     else:
         acc = tl.fma(d, b_sd[None, :], acc)
     return acc
-
-

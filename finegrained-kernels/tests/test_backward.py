@@ -35,6 +35,7 @@ from utils import (  # type: ignore
     dequantize_weight,
     finegrained_kernels,
     internals,
+    is_memory_overflow,
     make_weights,
     quant_dequant_a,
     SUPPORTS_FP8,
@@ -422,9 +423,8 @@ def test_dgrad_grouped_every_admitted_config_accumulates():
                 dX = launch()
                 torch.accelerator.synchronize()
             except Exception as e:
-                # a compiled shared/tensor memory overflow is the compiler's per-shape choice (see the forward
-                # sweep in test_ops), not a pruner gap; strict fails on anything else
-                if "out of resource: shared memory" not in str(e) and "out of resource: tensor memory" not in str(e):
+                # strict fails on anything but a compiled memory overflow (the compiler's per-shape choice)
+                if not is_memory_overflow(str(e)):
                     failed.append((config.all_kwargs(), f"{type(e).__name__}: {str(e)[:120]}"))
                 continue
             rel = _rel(dX, floor)

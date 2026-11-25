@@ -329,6 +329,7 @@ def _quant_block_k_pruner(configs, named_args, **kwargs):
     # The dense grid is cdiv(T, BLOCK_T) x K / BLOCK_K programs; keep the tiles that fill the SMs (or come closest).
     # A tile tall enough to leave most SMs idle can still win a 2-3us tune by noise: MXFP8 6144-wide T=64 crowned
     # BLOCK_T=64 BLOCK_K=256 (24 programs, 3.6us) over BLOCK_T=8 BLOCK_K=128 (384 programs, 2.3us).
+
     def programs(c):
         return triton.cdiv(args["T"], c.kwargs["BLOCK_T"]) * (k // c.kwargs["BLOCK_K"])
 
@@ -560,11 +561,7 @@ def mx_act_quant_grouped(
     y = torch.empty(
         T, K // 2 if packed else K, device=x.device, dtype=torch.uint8 if packed else FP8_DTYPE
     )
-    if swizzled:
-        cb = triton.cdiv(K // scale_group, 4)
-        scales = torch.empty(1, n_m_tiles, cb, 2, 256, device=x.device, dtype=scale_dtype)
-    else:
-        scales = torch.empty(T, K // scale_group, device=x.device, dtype=scale_dtype)
+    scales = _empty_act_scales(T, K // scale_group, swizzled, scale_dtype, x.device, n_m_tiles)
     with device_context(x.device):
         compile_time_only_triton_wrap(_mx_act_quant_kernel)[
             lambda META: (n_m_tiles, K // META["BLOCK_K"])
@@ -651,11 +648,7 @@ def mx_act_quant_routed_rows(
     # the quant stores swizzled when each row's scales fill whole 4-column blocks; otherwise
     # row-major, for the swizzle pass to pad
     store_swizzled = swizzled and K % (4 * scale_group) == 0
-    if store_swizzled:
-        cb = triton.cdiv(K // scale_group, 4)
-        scales = torch.empty(1, n_m_tiles, cb, 2, 256, device=x.device, dtype=scale_dtype)
-    else:
-        scales = torch.empty(S, K // scale_group, device=x.device, dtype=scale_dtype)
+    scales = _empty_act_scales(S, K // scale_group, store_swizzled, scale_dtype, x.device, n_m_tiles)
     per_expert = is_per_expert_global(global_scale)
     row_expert = torch.empty(S, device=x.device, dtype=torch.int32)
     scale_rows = torch.empty(S, device=x.device, dtype=torch.int32) if store_swizzled else None
@@ -718,8 +711,7 @@ def mx_act_quant_routed_scales(
     n_m_tiles = S // 128 + E
     packed = activation_format != "mxfp8"
     y = torch.empty(T, K // 2 if packed else K, device=x.device, dtype=torch.uint8 if packed else FP8_DTYPE)
-    cb = triton.cdiv(K // scale_group, 4)
-    scales = torch.empty(1, n_m_tiles, cb, 2, 256, device=x.device, dtype=scale_dtype)
+    scales = _empty_act_scales(T, K // scale_group, True, scale_dtype, x.device, n_m_tiles)
     scale_rows = torch.empty(S, device=x.device, dtype=torch.int32)  # (T, top_k)
     with device_context(x.device):
         compile_time_only_triton_wrap(_routed_row_map_kernel)[(triton.cdiv(S, ROUTED_ROW_MAP_BLOCK),)](
@@ -835,6 +827,16 @@ def row_padded_empty(rows: int, cols: int, row_multiple: int, dtype: torch.dtype
     descriptor box over the padded rows reads in bounds (the extra rows are never written)."""
     padded = triton.cdiv(rows, row_multiple) * row_multiple
     return torch.empty(padded * cols, device=device, dtype=dtype)[: rows * cols].view(rows, cols)
+
+
+def _empty_act_scales(rows: int, groups: int, swizzled: bool, dtype: torch.dtype, device,
+                      row_tiles: int | None = None) -> torch.Tensor:
+    """An empty activation group-scale buffer: the ``(1, row_tiles, cdiv(groups, 4), 2, 256)`` SWIZZLE_32_4_4 tiles
+    (``row_tiles`` ``None``: ``cdiv(rows, 128)``), or row-major ``(rows, groups)``."""
+    if swizzled:
+        tiles = triton.cdiv(rows, 128) if row_tiles is None else row_tiles
+        return torch.empty(1, tiles, triton.cdiv(groups, 4), 2, 256, device=device, dtype=dtype)
+    return torch.empty(rows, groups, device=device, dtype=dtype)
 
 
 def maybe_act_quant(x, act_quant, offline):
@@ -996,8 +998,7 @@ def svdquant_act_quant(x, lora_a, pre_quant_scale, global_scale, swizzled):
             swizzled, global_scale, pre_quant_scale=pre_quant_scale)
     else:
         values = torch.empty(M, K // 2, device=x.device, dtype=torch.int8)
-        scale_shape = (1, triton.cdiv(M, 128), triton.cdiv(K // NVFP4_SCALE_GROUP_K, 4), 2, 256) if swizzled else (M, K // NVFP4_SCALE_GROUP_K)
-        scales = torch.empty(scale_shape, device=x.device, dtype=torch.float8_e4m3fn)
+        scales = _empty_act_scales(M, K // NVFP4_SCALE_GROUP_K, swizzled, torch.float8_e4m3fn, x.device)
     split_k = min(32, max(1, triton.cdiv(256, triton.cdiv(M, 32))))
     down = torch.empty(M, rank, device=x.device, dtype=x.dtype) if M > 1 or split_k == 1 else None
     partials = torch.empty(split_k, M, rank, device=x.device, dtype=torch.float32) if split_k > 1 else None
@@ -1068,13 +1069,7 @@ def _launch_act_quant(
     values = row_padded_empty(
         T, K // 2 if packed else K, row_multiple, torch.uint8 if packed else FP8_DTYPE, x.device
     )
-    if swizzled:
-        cb = triton.cdiv(K // scale_group, 4)
-        scales = torch.empty(
-            1, triton.cdiv(T, 128), cb, 2, 256, device=x.device, dtype=scale_dtype
-        )
-    else:
-        scales = torch.empty(T, K // scale_group, device=x.device, dtype=scale_dtype)
+    scales = _empty_act_scales(T, K // scale_group, swizzled, scale_dtype, x.device)
     with device_context(x.device):
         compile_time_only_triton_wrap(_mx_act_quant_kernel)[
             lambda META: (triton.cdiv(T, META["BLOCK_T"]), K // META["BLOCK_K"])
@@ -1403,8 +1398,6 @@ def fp8_act_quant_tensor_wide(
     return y, s
 
 
-
-
 # ── int4 checkpoint repacks (load time) ──────────────────────────────────────
 
 
@@ -1491,6 +1484,14 @@ def _repack_int4(qweight, qzeros, scales, K, awq, zeros_offset, symmetric, perm=
 
 
 @triton.jit
+def _store_unit_scales(UnitScale, K, BLOCK_K: tl.constexpr, UNIT_GROUP: tl.constexpr):
+    """Row-0 programs write their column span's unit group scales (UE8M0 127, else 1.0)."""
+    if tl.program_id(0) == 0:
+        group = tl.program_id(1) * (BLOCK_K // UNIT_GROUP) + tl.arange(0, BLOCK_K // UNIT_GROUP)
+        tl.store(UnitScale + group, 127 if UnitScale.dtype.element_ty == tl.uint8 else 1.0, mask=group < K // UNIT_GROUP)
+
+
+@triton.jit
 def _permute_cols_kernel(X, Perm, Scale, QuantScale, UnitScale, Out, M, K, stride_x_m, stride_o_m, BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr, UNIT_GROUP: tl.constexpr):
     """Gather original input columns and optionally apply their AWQ scales in the same pass."""
     rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -1505,9 +1506,17 @@ def _permute_cols_kernel(X, Perm, Scale, QuantScale, UnitScale, Out, M, K, strid
         vals = quantize_calibrated_act(vals, tl.load(QuantScale), Out.dtype.element_ty)
     tl.store(Out + rows64 * stride_o_m + cols[None, :], vals, mask=mask)
     if UnitScale is not None:
-        if tl.program_id(0) == 0:
-            group = tl.program_id(1) * (BLOCK_K // UNIT_GROUP) + tl.arange(0, BLOCK_K // UNIT_GROUP)
-            tl.store(UnitScale + group, 127 if UnitScale.dtype.element_ty == tl.uint8 else 1.0, mask=group < K // UNIT_GROUP)
+        _store_unit_scales(UnitScale, K, BLOCK_K, UNIT_GROUP)
+
+
+def _check_pre_quant_scale(pre_quant_scale: torch.Tensor, x: torch.Tensor, shapes: tuple) -> None:
+    """AWQ input scales: contiguous, shaped as one of ``shapes``, on the activation's device and dtype."""
+    assert pre_quant_scale.shape in shapes and pre_quant_scale.is_contiguous(), (
+        f"pre_quant_scale must be contiguous, one of {shapes}"
+    )
+    assert pre_quant_scale.device == x.device and pre_quant_scale.dtype == x.dtype, (
+        "pre_quant_scale must match the activation device and dtype"
+    )
 
 
 def permute_act_cols(
@@ -1523,8 +1532,7 @@ def permute_act_cols(
     before permutation, rounded in the activation dtype; ``perm=None`` only applies the transform."""
     K = x.shape[-1]
     if pre_quant_scale is not None:
-        assert pre_quant_scale.shape == (K,) and pre_quant_scale.is_contiguous(), "pre_quant_scale must be contiguous (K,)"
-        assert pre_quant_scale.device == x.device and pre_quant_scale.dtype == x.dtype, "pre_quant_scale must match the activation device and dtype"
+        _check_pre_quant_scale(pre_quant_scale, x, ((K,),))
     x2 = x.reshape(-1, K)
     out = torch.empty_like(x2, dtype=(storage_dtype or quant_dtype) if quant_scale is not None else x.dtype)
     M = x2.shape[0]
@@ -1550,9 +1558,7 @@ def _permute_routed_rows_kernel(
     (grouped). An EP-sentinel row (off-rank expert) is left unwritten, as the GEMM leaves its output."""
     s = tl.program_id(0)
     if UnitScale is not None:
-        if s == 0:
-            group = tl.program_id(1) * (BLOCK_K // UNIT_GROUP) + tl.arange(0, BLOCK_K // UNIT_GROUP)
-            tl.store(UnitScale + group, 127 if UnitScale.dtype.element_ty == tl.uint8 else 1.0, mask=group < K // UNIT_GROUP)
+        _store_unit_scales(UnitScale, K, BLOCK_K, UNIT_GROUP)
     if ExpertIds is not None:
         e = tl.load(ExpertIds + s)
     else:
@@ -1594,10 +1600,7 @@ def permute_routed_rows(
         num_experts = perm.shape[0]
     stride_scale_e = 0
     if pre_quant_scale is not None:
-        assert pre_quant_scale.shape in ((K,), (1, K), (num_experts, K)) and pre_quant_scale.is_contiguous(), (
-            "pre_quant_scale must be contiguous (K,), (1, K), or (E, K)"
-        )
-        assert pre_quant_scale.device == x.device and pre_quant_scale.dtype == x.dtype, "pre_quant_scale must match the activation device and dtype"
+        _check_pre_quant_scale(pre_quant_scale, x, ((K,), (1, K), (num_experts, K)))
         stride_scale_e = K if pre_quant_scale.numel() > K else 0
     block_k = min(512, triton.next_power_of_2(K))
     num_warps = 4

@@ -457,6 +457,7 @@ def test_basin_anchors_cover_interior_and_wide_output_tiles():
         )
         for swap, bm, bn, bk, warps, stages in grid
     ]
+
     @bayesian_autotune(configs, [], path_anchor_axes=("SWAP_AB",))
     @triton.jit
     def kernel(
@@ -608,4 +609,3 @@ def test_path_tuner_force_and_graph_capture(monkeypatch):
     graph.replay()
     torch.testing.assert_close(out, _matmul_chain(y, 1))
     assert (512, "first", "second") not in captured_chain.paths.cache
-

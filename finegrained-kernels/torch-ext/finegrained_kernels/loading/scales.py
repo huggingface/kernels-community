@@ -90,6 +90,19 @@ def load_swizzled_scale(
 
 
 @triton.jit
+def swizzled_scale_offsets(blk, row, cols, cols4):
+    """SWIZZLE_32_4_4 byte offsets ``[R, C]`` of rows ``row`` (within their 128-row block ``blk``) and K-groups
+    ``cols``, in a buffer of ``cols4`` 4-group chunks a block: ``(blk*cols4 + col//4)*512 + (r%32)*16 + (r//32)*4 +
+    col%4``."""
+    return (
+        (blk[:, None] * cols4 + cols[None, :] // 4) * 512
+        + (row[:, None] % 32) * 16
+        + (row[:, None] // 32) * 4
+        + cols[None, :] % 4
+    )
+
+
+@triton.jit
 def load_swizzled_scale_tile(
     descriptor,
     ptr,
@@ -114,8 +127,7 @@ def load_swizzled_scale_tile(
       read, not reachable from the current grids.
     - Otherwise (sub-128 tile — fp8 ``scalar`` decode / small-M offline; or ``BK<128``): the block
       layout can't be TMA-sliced, so pointer-GATHER exactly this tile's rows. The swizzle is a fixed
-      permutation: logical (row ``r``, K-group ``col``) → byte
-      ``(blk*cols4 + col//4)*512 + (r%32)*16 + ((r%128)//32)*4 + col%4``. Reads only the needed
+      permutation (``swizzled_scale_offsets``). Reads only the needed
       bytes — no 128-block over-read, no un-swizzle transpose — the row-major fast path's cost with
       the swizzled layout, so ``scalar`` competes on merit instead of eating a TMA penalty."""
     # Per-expert 128-row-block count is a CEIL: a non-128-multiple ``rows`` (e.g. N=2880) still
@@ -135,13 +147,7 @@ def load_swizzled_scale_tile(
     blk = group_id * nrb + lin
     row = r % 128
     col = k_idx * SCALE_COLS + tl.arange(0, SCALE_COLS)
-    off = (
-        (blk[:, None] * cols4 + col[None, :] // 4) * 512
-        + (row[:, None] % 32) * 16
-        + (row[:, None] // 32) * 4
-        + col[None, :] % 4
-    )
-    return tl.load(ptr + off)
+    return tl.load(ptr + swizzled_scale_offsets(blk, row, col, cols4))
 
 
 @triton.jit
@@ -154,13 +160,7 @@ def load_swizzled_rows_scale(ptr, rows, row_mask, k_idx, K, SCALE_COLS: tl.const
     blk = rows // 128
     row = rows % 128
     col = k_idx * SCALE_COLS + tl.arange(0, SCALE_COLS)
-    off = (
-        (blk[:, None] * cols4 + col[None, :] // 4) * 512
-        + (row[:, None] % 32) * 16
-        + (row[:, None] // 32) * 4
-        + col[None, :] % 4
-    )
-    return tl.load(ptr + off, mask=row_mask[:, None])
+    return tl.load(ptr + swizzled_scale_offsets(blk, row, col, cols4), mask=row_mask[:, None])
 
 
 @triton.jit
@@ -453,6 +453,15 @@ def block_fp8_scaled_act(
 
 
 @triton.jit
+def expert_has_rows(ExpertStart, expert):
+    """Whether ``expert`` has routed rows in the ``ExpertStart`` offsets (``None``: every expert does, a constexpr)."""
+    if ExpertStart is None:
+        return True
+    else:
+        return tl.load(ExpertStart + expert) < tl.load(ExpertStart + expert + 1)
+
+
+@triton.jit
 def _dequant_block_fp8_weight_kernel(
     B, Bs, Out, ExpertStart,
     N: tl.constexpr, K: tl.constexpr,
@@ -463,10 +472,7 @@ def _dequant_block_fp8_weight_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     expert = tl.program_id(1).to(tl.int64)
-    active = True
-    if ExpertStart is not None:
-        active = tl.load(ExpertStart + expert) < tl.load(ExpertStart + expert + 1)
-    if active:
+    if expert_has_rows(ExpertStart, expert):
         offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         n, k = offsets // K, offsets % K
         # Full tiles avoid masked-load codegen; the final partial tile stays bounded.
@@ -510,7 +516,6 @@ def dequant_block_fp8_weight(B, Bs, dtype, *, gate=False, expert_start=None):
     return output
 
 
-
 @triton.jit
 def _dequant_mx_weight_kernel(
     B, Bs, Out, ExpertStart,
@@ -520,10 +525,7 @@ def _dequant_mx_weight_kernel(
     BLOCK_R: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
     expert = tl.program_id(2).to(tl.int64)
-    active = True
-    if ExpertStart is not None:
-        active = tl.load(ExpertStart + expert) < tl.load(ExpertStart + expert + 1)
-    if active:
+    if expert_has_rows(ExpertStart, expert):
         rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
         offs_k = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
         mask = (rows < N)[:, None] & (offs_k < K)[None, :]
@@ -661,10 +663,7 @@ def _decode_fixed_kernel(
     # Keep indices local to an expert; only the expert base needs 64-bit addressing.
     for tile in range(tl.program_id(0), E * tiles, tl.num_programs(0)):
         expert = tile // tiles
-        active = True
-        if ExpertStart is not None:
-            active = tl.load(ExpertStart + expert + 1) > tl.load(ExpertStart + expert)
-        if active:
+        if expert_has_rows(ExpertStart, expert):
             pair = (tile % tiles) * BLOCK + offsets
             row = pair // (COLS // 2)
             slab = expert.to(tl.int64) * (ROWS // 16) + row // 16
@@ -819,4 +818,3 @@ def csf_weight_scales(
     return decompress_nvfp4_csf_scales(
         scales, exceptions, exception_offsets, expert_start=expert_start
     )
-
