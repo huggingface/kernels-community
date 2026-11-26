@@ -154,6 +154,8 @@ sys.path.insert(0, os.path.join(_ROOT, "tests"))
 import finegrained_kernels as fgm  # noqa: E402  local branch
 from finegrained_kernels.bench import active_experts, do_bench, free_device_bytes, rotation_count  # noqa: E402
 from finegrained_kernels.quant import fp8_act_quant_tensor_wide  # noqa: E402
+from finegrained_kernels.loading.scales import dequant_block_fp8_weight, dequant_mx_weight  # noqa: E402  reference arms
+from finegrained_kernels.mma import dequantize_int_weight  # noqa: E402  reference arms
 from kernels import get_kernel  # noqa: E402
 
 # kernels-community IS a trusted publisher, so the check passes whenever it can reach the Hub
@@ -246,6 +248,14 @@ def _preswizzle_moe_scale(scale):
 
 from utils import INT_BITS, WEIGHTS, dq_grouped, dq_int, dq_nvfp4_two_level, make_weights  # noqa: E402  tests/utils.py registry
 from finegrained_kernels.quant import nvfp4_act_quant  # noqa: E402
+import transformers.utils.import_utils as _tf_import_utils  # noqa: E402
+
+# Bench-only: transformers 5.22 caps `kernels` below 0.18.0, which turns its hub-kernel arms (DeepGEMM, SonicMoE,
+# finegrained-fp8) into ImportErrors on this kernels 0.18.1 venv although their API is unchanged (they ran on it
+# before the cap). Widen the cap for this process; every module imported the same function object.
+_kernels_probe = _tf_import_utils.is_kernels_available
+_kernels_probe.__wrapped__.__defaults__ = (_tf_import_utils.KERNELS_MIN_VERSION, "0.19.0")
+_kernels_probe.cache_clear()
 from transformers.integrations.deepgemm import (  # noqa: E402
     deepgemm_bf16_experts_forward,
     deepgemm_fp8_fp4_experts_forward,
@@ -848,6 +858,9 @@ IMPL_COLORS = {
     # an 11th color: humming shares panels with every palette color somewhere (OKLab dE >= 36
     # from all ten, 54 from finegrained-kernels)
     "humming": "#000000",
+    # the two reference arms: greys, so the measured stacks keep the palette
+    "fg_dequant_gemm": "#999999",
+    "bf16_weights": "#cccccc",
 }
 
 
@@ -870,6 +883,8 @@ _IMPL_LABELS = {
     "flashinfer_cutlass_moe": "FlashInfer CUTLASS",
     "flashinfer_svdquant": "FlashInfer SVDQuant",
     "humming": "humming (vLLM)",
+    "fg_dequant_gemm": "finegrained-kernels dequant + BF16 GEMM",
+    "bf16_weights": "BF16 weights (ceiling)",
 }
 # transformers' BF16 experts forward is batched_mm at decode, grouped_mm from a batch up
 _TRANSFORMERS_LABELS = {"decode": "torch.bmm", "batch": "torch.nn.functional.grouped_mm",
@@ -1197,6 +1212,49 @@ def torch_weight_only_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
             down = torch.bmm(inter[:, None, :], dn_bf16.transpose(1, 2)).squeeze(1)
             return (down.view(hidden.shape[0], cfg["top_k"], -1) * w[..., None]).sum(1).to(hidden.dtype)
     return run
+
+
+def _fg_dequant(cfg, W, Ws, W_g, Wz, K, dtype, expert_start=None):
+    """The row's weight in the activation ``dtype`` (BF16 or FP16) through our own dequant kernels, the ones the
+    weight-only ops stage before their prefill GEMM: FP8 (block / tensor / rowwise) and MX / NVFP4 skip expert planes
+    with no routed rows when ``expert_start`` is given, NVFP4's per-expert global applied in the same pass; integer
+    words are dequantized whole."""
+    fmt = cfg["weights"]
+    if fmt in INT_BITS:
+        return dequantize_int_weight(W, Ws, K, Wz, dtype=dtype)
+    if fmt in _MX_WEIGHTS:
+        stacked = W.ndim == 3
+        out = dequant_mx_weight(W if stacked else W[None], Ws if stacked else Ws[None], dtype,
+                                b_global_scale=W_g, expert_start=expert_start)
+        return out if stacked else out[0]
+    return dequant_block_fp8_weight(W, Ws, dtype, expert_start=expert_start)
+
+
+def fg_dequant_gemm_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g=None, dn_g=None, _logits=None,
+                        guz=None, dnz=None, *_):
+    """Reference: dequantize the routed experts to BF16 with our dequant kernels every call, then the BF16 grouped_mm
+    experts forward. What a dequantize-then-BF16 stack costs at its best."""
+    E = cfg["E"]
+    mod = _Experts(cfg, None, None)
+    fwd = grouped_mm_experts_forward  # every regime: batched_mm gathers a weight copy per token (10x slower at decode)
+
+    def run():
+        counts = torch.histc(idx.reshape(-1).float(), bins=E, min=0, max=E - 1).to(torch.int32)
+        expert_start = torch.cat([counts.new_zeros(1), counts.cumsum(0, dtype=torch.int32)])
+        mod.gate_up_proj = _fg_dequant(cfg, gu, gus, gu_g, guz, cfg["H"], hidden.dtype, expert_start)
+        mod.down_proj = _fg_dequant(cfg, dn, dns, dn_g, dnz, cfg["I"], hidden.dtype, expert_start)
+        return fwd(mod, hidden, idx, w)
+
+    return run
+
+
+def bf16_weights_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g=None, dn_g=None, _logits=None,
+                     guz=None, dnz=None, *_):
+    """Reference ceiling: the same BF16 experts forward on weights dequantized once, outside the timed call."""
+    mod = _Experts(cfg, _fg_dequant(cfg, gu, gus, gu_g, guz, cfg["H"], hidden.dtype),
+                   _fg_dequant(cfg, dn, dns, dn_g, dnz, cfg["I"], hidden.dtype))
+    _mark_static(mod.gate_up_proj, mod.down_proj)
+    return lambda: grouped_mm_experts_forward(mod, hidden, idx, w)
 
 
 def marlin_weight_only_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
@@ -1974,7 +2032,12 @@ ARMS = {
     "fbgemm": partial(rowwise_moe_arm, fbgemm=True),
     "megablocks": megablocks_arm,
     "humming": humming_moe_arm,
+    "fg_dequant_gemm": fg_dequant_gemm_arm,
+    "bf16_weights": bf16_weights_arm,
 }
+# Reference arms on every quantized row (MoE and linear): where the quantized kernels stand against dequantizing to
+# BF16 first (our dequant kernels + the BF16 GEMM) and against BF16 weights outright.
+REFERENCE_ARMS = ("fg_dequant_gemm", "bf16_weights")
 
 
 # ── timing: one warmed process, each mode measured on the same closure ──
@@ -2053,6 +2116,22 @@ def _weight_banks(weights, active_experts=None):
     return banks
 
 
+class _Res(dict):
+    """``{mode: latency_us | None}`` (the min over samples, as every figure reads it) carrying ``q``:
+    ``{mode: (p10, p50, p90)}`` in us, the spread the summary draws around each point."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.q = {}
+
+
+def _timed(fn, count, res, mode, **kwargs):
+    """Time ``fn`` once for min / p10 / p50 / p90 per launch: the min goes in ``res[mode]``, the rest in ``res.q``."""
+    lo, p10, p50, p90 = (v * 1e3 / count for v in do_bench(fn, quantiles=[0.0, 0.1, 0.5, 0.9], **kwargs))
+    res[mode], res.q[mode] = lo, (p10, p50, p90)
+    return lo
+
+
 def bench_modes(runs, tag, reference=None):
     """{mode: latency_us | None}, plus the eager output for parity. A mode that raises
     is a red CRASH cell — the other modes still run (fresh error printed inline)."""
@@ -2061,7 +2140,7 @@ def bench_modes(runs, tag, reference=None):
         return tuple(fn() for fn in runs)
 
     count = len(runs)
-    res = {}
+    res = _Res()
     out = None
     try:
         out = run()
@@ -2071,7 +2150,7 @@ def bench_modes(runs, tag, reference=None):
             if error > 0.05:
                 print(f"      [{tag} dequant reference mismatch (rel {error:.2e}); skipping timings]", flush=True)
                 return {m: None for m in MODES}, None
-        res["eager"] = do_bench(run, return_mode="min") * 1e3 / count
+        _timed(run, count, res, "eager")
         print(f"      {tag:14s} eager      {res['eager']:9.1f}us", flush=True)
     except Exception as e:
         print(f"      [{tag} eager crashed: {type(e).__name__}: {str(e)[:90]}]", flush=True)
@@ -2079,13 +2158,18 @@ def bench_modes(runs, tag, reference=None):
     if _context_poisoned(tag, "eager"):
         return dict.fromkeys(MODES), None
     try:
-        res["cudagraph"] = do_bench(run, cudagraph=True, return_mode="min") * 1e3 / count
+        _timed(run, count, res, "cudagraph", cudagraph=True)
         print(f"      {tag:14s} cudagraph  {res['cudagraph']:9.1f}us", flush=True)
     except Exception as e:
         print(f"      [{tag} cudagraph crashed: {type(e).__name__}: {str(e)[:90]}]", flush=True)
         res["cudagraph"] = None
     if _context_poisoned(tag, "cudagraph"):
         return dict.fromkeys(MODES), None
+    if tag in REFERENCE_ARMS:
+        # the references are read as CUDA graph timings only, and max-autotuning their grouped_mm at decode trips
+        # a sticky device assert in torch's prepare_grouped_gemm_data that would take the case's later arms with it
+        res["compile"] = None
+        return res, None if out is None else out[0]
     try:
         # This wrapper is shared across every arm and regime; isolate its Dynamo guards.
         torch._dynamo.reset_code(run.__code__)
@@ -2111,7 +2195,7 @@ def bench_modes(runs, tag, reference=None):
             error = _reference_error(cout, reference)
             if error > 0.05:
                 raise RuntimeError(f"compiled dequant reference mismatch (rel {error:.2e})")
-        res["compile"] = do_bench(crun, return_mode="min") * 1e3 / count
+        _timed(crun, count, res, "compile")
         print(f"      {tag:14s} compile    {res['compile']:9.1f}us", flush=True)
     except Exception as e:
         print(f"      [{tag} compile crashed: {type(e).__name__}: {str(e)[:90]}]", flush=True)
@@ -2140,7 +2224,9 @@ def _mock_rows(row, pname, arms, rows_out):
     rng = random.Random(hash((row, pname)) & 0xFFFF)
     for regime, scale in (("decode", 100.0), ("batch", 300.0), ("prefill", 2000.0)):
         for i, name in enumerate(arms):
-            res = {m: scale * rng.uniform(0.5, 3.0) for m in MODES}
+            res = _Res({m: scale * rng.uniform(0.5, 3.0) for m in MODES})
+            res.q = {m: (v * rng.uniform(1.0, 1.03), v * rng.uniform(1.02, 1.06), v * rng.uniform(1.05, 1.2))
+                     for m, v in res.items()}
             parity = None if i == 0 else rng.choice([1e-3, 3e-2, 0.12, float("nan")])
             rows_out.append((row, pname, regime, _impl(name), res, parity))
 
@@ -2285,7 +2371,7 @@ def bench_svdquant_row(row, pname, cfg, rows_out):
     """Whole dense linear: smoothing/activation quant, BF16 down, NVFP4 GEMM plus up."""
     print(f"== [{row}] {pname}")
     if MOCK:
-        _mock_rows(row, pname, ("finegrained-kernels",) + cfg["baselines"], rows_out)
+        _mock_rows(row, pname, ("finegrained-kernels",) + cfg["baselines"] + REFERENCE_ARMS, rows_out)
         return
     N, K, rank = cfg["N"], cfg["K"], cfg["svdquant_rank"]
     torch.manual_seed(0)
@@ -2512,6 +2598,11 @@ def _attn_arms(cfg, x, weights):
         attn_arms["vllm_mm"] = _vllm_linear_arm(cfg, x, W, Ws, W_g, attn_act_scale)
     if "flashinfer_mm" in cfg["baselines"] and _fi_mm_fp4 is not None:
         attn_arms["flashinfer_mm"] = _flashinfer_linear_arm(cfg, x, W, Ws, W_g)
+    # reference arms (REFERENCE_ARMS): our dequant kernels + cuBLAS every call, and cuBLAS on BF16 weights
+    W_bf16 = _fg_dequant(cfg, W, Ws, W_g, Wz, K, x.dtype)
+    _mark_static(W_bf16)
+    attn_arms["fg_dequant_gemm"] = lambda: torch.nn.functional.linear(x, _fg_dequant(cfg, W, Ws, W_g, Wz, K, x.dtype))
+    attn_arms["bf16_weights"] = lambda: torch.nn.functional.linear(x, W_bf16)
     if "humming" in cfg["baselines"] and _humming is not None:
         try:
             attn_arms["humming"] = _humming_linear_arm(cfg, x, W, Ws, W_g, Wz, attn_act_scale)
@@ -2596,7 +2687,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
         return bench_svdquant_row(row, pname, cfg, rows_out)
     print(f"== [{row}] {pname}")
     if MOCK:
-        _mock_rows(row, pname, ("finegrained-kernels",) + cfg["baselines"], rows_out)
+        _mock_rows(row, pname, ("finegrained-kernels",) + cfg["baselines"] + REFERENCE_ARMS, rows_out)
         return
     torch._dynamo.reset()
     N, K = cfg["N"], cfg["K"]
@@ -2701,7 +2792,7 @@ suffix = ARGS.suffix if ARGS.suffix is not None else (
 )
 _CSV = os.path.join(_HERE, f"bench_moe{suffix}.csv")
 _CSV_HEADER = ("category,problem,regime,impl,mode,latency_us,parity_vs_finegrained_kernels,"
-               "cache_policy\n")
+               "cache_policy,p10_us,p50_us,p90_us\n")
 
 
 def _write_rows_csv(path, rows_out):
@@ -2710,9 +2801,11 @@ def _write_rows_csv(path, rows_out):
         for rr, p, reg, i, res, par in rows_out:
             for mode in MODES:
                 v = res.get(mode)
+                q = getattr(res, "q", {}).get(mode) if v is not None else None
+                spread = ",".join(f"{x:.2f}" for x in q) if q else ",,"
                 f.write(f'"{rr}","{p}",{reg},{i},{mode},'
                         f'{"" if v is None else f"{v:.2f}"},'
-                        f'{"" if par is None else par},{CACHE_POLICY}\n')
+                        f'{"" if par is None else par},{CACHE_POLICY},{spread}\n')
 
 
 def _load_rows_csv(path):
@@ -2731,11 +2824,11 @@ def _load_rows_csv(path):
         allowed["quantized", pn] = (
             _allowed(c)
             | {_impl(b) for b in c.get("fused_extra", ())}
-            | {"torch", "transformers@main"})
+            | {"torch", "transformers@main", *REFERENCE_ARMS})
     for pn, c in BF16_PROBLEMS.items():
         allowed["unquantized", pn] = _allowed(c) | {"megablocks"}
     for pn, c in ATTN_PROBLEMS.items():
-        allowed["linear quantized", pn] = _allowed(c) | {"torch_mm", "nvfp4_gemm"}
+        allowed["linear quantized", pn] = _allowed(c) | {"torch_mm", "nvfp4_gemm", *REFERENCE_ARMS}
     acc = {}  # (cat, problem, regime, impl) -> (res dict, parity)
     for r in csv.DictReader(open(path)):
         if r.get("cache_policy") != CACHE_POLICY:
@@ -2744,8 +2837,10 @@ def _load_rows_csv(path):
         if r["impl"] not in allowed.get((r["category"], r["problem"]), {"finegrained-kernels"}):
             continue
         key = (r["category"], r["problem"], r["regime"], r["impl"])
-        res, par = acc.setdefault(key, ({}, None))
+        res, par = acc.setdefault(key, (_Res(), None))
         res[r["mode"]] = float(r["latency_us"]) if r["latency_us"] else None
+        if r.get("p50_us"):  # CSVs written before the spread columns have none
+            res.q[r["mode"]] = tuple(float(r[c]) for c in ("p10_us", "p50_us", "p90_us"))
         if r["parity_vs_finegrained_kernels"]:
             acc[key] = (res, float(r["parity_vs_finegrained_kernels"]))
     return [(cat, p, reg, impl, res, par)
@@ -2804,7 +2899,7 @@ def _run_task(kind, pname, cfg, rows_out):
         # tall flattens every other bar in the panel. It stays on the attn row, where the two are
         # doing the same job.
         quant_arms = (("finegrained-kernels",) + cfg["baselines"] + cfg.get("fused_extra", ())
-                      + torch_arm_t)
+                      + torch_arm_t + REFERENCE_ARMS)
         # soft-imported arms drop out where their package is absent; the TRT-LLM fp8-block
         # kernel additionally drops on clamped/scaled SwiGLU rows — passing its gemm1_alpha/
         # beta/clamp_limit there still answers a different function (measured rel 4.4e-1 vs
@@ -3004,6 +3099,7 @@ def _panel_shape(row, regime):
 bar_phys = min((0.88 / m) / (n + 1.1) for n, m in map(lambda pr: _panel_shape(*pr), panels) if n)
 for (row, regime), (ax,) in zip(panels, axes):
     panel_impls = set()
+    panel_refs = set()
     missing_drawn = False
     solid_mode, overlay_mode = REGIME_MODES[regime]
     cells = [(p, i, r, par) for (rr, p, reg, i, r, par) in rows
@@ -3042,7 +3138,14 @@ for (row, regime), (ax,) in zip(panels, axes):
         ticklabels.append(fill(model, 16) + (f"\n{fill(rest, 16)}" if rest else ""))
         # bars speed-ranked within the group (fastest leftmost, crashed last),
         # centered on the group's own arm count — colors identify the impls
-        group = [(i, r) for p, i, r, _par in cells if p == pname]
+        group = [(i, r) for p, i, r, _par in cells if p == pname and i not in REFERENCE_ARMS]
+        # the reference arms are lines across the group, not bars ranked among the rivals
+        span = (len(group) / 2 + 0.25) * width
+        for ref_impl, style in (("fg_dequant_gemm", (0, (4, 2))), ("bf16_weights", (0, (1, 1.5)))):
+            ref = next((r.get(solid_mode) for p, i, r, _par in cells if p == pname and i == ref_impl), None)
+            if ref is not None:
+                ax.hlines(ref, gi - span, gi + span, colors="#6b6a66", linestyles=[style], linewidth=1.1, zorder=4)
+                panel_refs.add(ref_impl)
         def _drawn(res):
             """The value this impl will actually show: its solid mode, else — on decode —
             its eager number. An impl that cannot be graph-captured still HAS a latency,
@@ -3102,6 +3205,9 @@ for (row, regime), (ax,) in zip(panels, axes):
         handles.append(mpatches.Patch(facecolor="none", edgecolor="black", hatch="..", label="eager (no cudagraph)"))
     if missing_drawn:
         handles.append(Line2D([], [], color="red", marker="x", linestyle="none", label="unavailable"))
+    for ref_impl, style in (("fg_dequant_gemm", (0, (4, 2))), ("bf16_weights", (0, (1, 1.5)))):
+        if ref_impl in panel_refs:
+            handles.append(Line2D([], [], color="#6b6a66", linestyle=style, linewidth=1.1, label=_impl_label(ref_impl)))
     ax.legend(handles=handles, loc="upper left", bbox_to_anchor=(1.005, 1.0), fontsize=8,
               frameon=False, borderaxespad=0.0)
 cache_note = "cold weights (>2xL2)" if DEVICE == "cuda" else "backend cache defaults"
@@ -3115,15 +3221,17 @@ print(f"wrote {out_png}" + ("" if REPLOT else f" + bench_moe{suffix}.csv"))
 
 
 def _plot_summary(csv_path, out_path):
-    """The whole run on one page: finegrained-kernels' speedup over the fastest rival (best rival time / ours, > 1:
-    ours is faster) per problem, one panel per regime, CUDA graph filled and torch.compile hollow (eager is left out:
-    decode runs in a CUDA graph), on a log axis around the 1x parity line. A loss is labeled with the rival that wins
-    it; speedups past the axis are pinned to its edge and labeled with their value."""
+    """The whole run on one page, every latency relative to the same model on BF16 weights (1x, the line; its own
+    p10-p90 the band around it). Per problem and regime: ours (filled), the fastest rival (ring, named where it beats
+    us) and dequantize + BF16 (grey tick), each a median with its p10-p90 whisker, CUDA graph timings. Left is
+    faster. BF16 MoE rows have no quantization, so their reference is torch grouped_mm on the same BF16 weights."""
     import csv
     import math
     import re
 
-    ours = "finegrained-kernels"
+    ours, dequant = "finegrained-kernels", "fg_dequant_gemm"
+    references = {"unquantized": "transformers"}  # every quantized category: "bf16_weights"
+    not_rivals = {ours, dequant, "bf16_weights"}
     rival_names = {
         "trtllm": "TRT-LLM", "vllm": "vLLM fused_moe", "vllm_mm": "vLLM CUTLASS", "vllm_marlin": "vLLM Marlin",
         "vllm_exllama": "vLLM ExLlama", "marlin": "Marlin W8A16", "torch_mm": "torch scaled_mm",
@@ -3133,28 +3241,37 @@ def _plot_summary(csv_path, out_path):
         "flashinfer_cutlass_moe": "FlashInfer CUTLASS", "flashinfer_svdquant": "FlashInfer SVDQuant",
         "humming": "humming", "sonicmoe": "SonicMoE", "deepgemm": "DeepGEMM", "deepgemm_bf16": "DeepGEMM",
         "megablocks": "MegaBlocks", "fbgemm": "FBGEMM", "triton_kernels": "triton_kernels",
+        "flashinfer_mm": "FlashInfer", "nvfp4_gemm": "nvfp4-gemm",
     }
-    categories = {"linear quantized": "Quantized linear", "quantized": "Quantized MoE", "unquantized": "BF16 MoE"}
-    cells, order = {}, {}
+    categories = {"linear quantized": "Quantized linear", "linear weight-only": "Weight-only linear",
+                  "quantized": "Quantized MoE", "quantized weight-only": "Weight-only MoE", "unquantized": "BF16 MoE"}
+    spread, order = {}, {}  # (problem, regime) -> {impl: (p10, p50, p90)}
     with open(csv_path) as f:
         for r in csv.DictReader(f):
-            if r["mode"] == "eager" or not r["latency_us"] or r["impl"].endswith("unfused"):
+            if r["mode"] != "cudagraph" or not r["latency_us"] or r["impl"].endswith("unfused"):
                 continue
+            lat = float(r["latency_us"])
+            q = tuple(float(r[c]) for c in ("p10_us", "p50_us", "p90_us")) if r.get("p50_us") else (lat, lat, lat)
             order.setdefault(r["problem"], r["category"])
-            cells.setdefault((r["problem"], r["regime"], r["mode"]), {})[r["impl"]] = float(r["latency_us"])
+            spread.setdefault((r["problem"], r["regime"]), {})[r["impl"]] = q
 
-    def speedup(problem, regime, mode):
-        times = cells.get((problem, regime, mode), {})
-        rivals = {k: v for k, v in times.items() if k != ours}
-        if ours not in times or not rivals:
+    def cell(problem, regime):
+        """``(ours, best rival name, rival, dequant, reference)`` spreads, each ``(p10, p50, p90)`` over the reference
+        median, or None where ours or the reference is missing."""
+        times = spread.get((problem, regime), {})
+        reference = references.get(order[problem], "bf16_weights")
+        ref = times.get(reference)
+        if ours not in times or ref is None:
             return None
-        rival, best = min(rivals.items(), key=lambda kv: kv[1])
-        return best / times[ours], rival_names.get(rival, rival)
+        norm = lambda q: None if q is None else tuple(v / ref[1] for v in q)  # noqa: E731
+        rivals = {k: v for k, v in times.items() if k not in not_rivals and k != reference}
+        rival = min(rivals, key=lambda k: rivals[k][1]) if rivals else None
+        return (norm(times[ours]), rival_names.get(rival, rival), norm(rivals.get(rival)), norm(times.get(dequant)),
+                norm(ref))
 
     regimes = (("decode", "decode (1 token)"), ("batch", "batch (64 tokens)"), ("prefill", "prefill (8192 tokens)"))
-    modes = (("cudagraph", "CUDA graph", "#2a78d6", -0.14), ("compile", "torch.compile", "#2a78d6", 0.14))
     problems = [p for p in sorted(order, key=lambda p: (list(categories).index(order[p]) if order[p] in categories else 9, p))
-                if any(speedup(p, r, m) for r, _ in regimes for m, *_ in modes)]
+                if any(cell(p, r) for r, _ in regimes)]
     rows, y, headers = {}, 0, []
     for i, problem in enumerate(problems):
         if i == 0 or order[problem] != order[problems[i - 1]]:
@@ -3162,7 +3279,7 @@ def _plot_summary(csv_path, out_path):
             y += 1
         rows[problem] = y
         y += 1
-    lo, hi = math.log2(0.5), math.log2(4)
+    lo, hi = math.log2(1 / 8), math.log2(8)
 
     def short(problem):  # "model · recipe": no org, no shape, no boilerplate
         name = problem.split("/", 1)[-1] if "/" in problem.split(" ", 1)[0] else problem
@@ -3172,49 +3289,76 @@ def _plot_summary(csv_path, out_path):
         label = f"{model} · {recipe}" if recipe else model
         return label if len(label) <= 52 else label[:51] + "…"
 
-    fig_s, axes = plt.subplots(1, 3, figsize=(17, 0.34 * y + 1.6), sharey=True)
-    wins = total = 0
+    def clip(v):
+        return min(max(math.log2(v), lo), hi)
+
+    ink, muted, grid = "#0b0b0b", "#6b6a66", "#ecebe7"
+    ours_c, rival_c, dequant_c = IMPL_COLORS[ours], "#3d3c39", "#9a9893"
+    fig_s, axes = plt.subplots(1, 3, figsize=(17, 0.34 * y + 1.8), sharey=True)
+    counts = {"rival": [0, 0], "dequant": [0, 0], "bf16": [0, 0]}
     for ax_s, (regime, regime_title) in zip(axes, regimes):
-        ax_s.axvspan(lo - 0.25, 0, color="#f7e9e7", zorder=0)  # the loss side
-        ax_s.axvline(0, color="#52514e", linewidth=1, zorder=1)
         for problem, row in rows.items():
-            ax_s.axhline(row, color="#ecebe7", linewidth=0.6, zorder=0)
-            for mode, _, color, dy in modes:
-                hit = speedup(problem, regime, mode)
-                if hit is None:
-                    continue
-                ratio, rival = hit
-                total += 1
-                wins += ratio > 1
-                x = min(max(math.log2(ratio), lo), hi)
-                filled = mode == "cudagraph"
-                ax_s.scatter(x, row + dy, marker="o", s=30, zorder=3, linewidth=1.3,
-                             facecolor=color if filled else "#fcfcfb", edgecolor=color)
-                if not lo <= math.log2(ratio) <= hi:
-                    ax_s.annotate(f"{ratio:.1f}x", (x, row + dy), xytext=(-5 if x > 0 else 5, 0), textcoords="offset points",
-                                  ha="right" if x > 0 else "left", va="center", fontsize=6.5, color="#52514e")
-                elif ratio < 0.98:
-                    ax_s.annotate(f"{ratio:.2f}x {rival}", (x, row + dy), xytext=(-6, 0), textcoords="offset points",
-                                  ha="right", va="center", fontsize=6.5, color="#0b0b0b")
-        ticks = [0.5, 0.71, 1, 1.41, 2, 4]
-        ax_s.set_xticks([math.log2(t) for t in ticks], [f"{t:g}x" for t in ticks], fontsize=8)
-        ax_s.set_xlim(lo - 0.25, hi + 0.1)
-        ax_s.set_title(regime_title, fontsize=10)
+            ax_s.axhline(row, color=grid, linewidth=0.6, zorder=0)
+            hit = cell(problem, regime)
+            if hit is None:
+                continue
+            mine, rival_name, rival, deq, ref = hit
+            # the reference's own spread: a tie inside it is a tie, not a win or a loss
+            ax_s.fill_betweenx([row - 0.42, row + 0.42], clip(ref[0]), clip(ref[2]), color="#e4e2dc", zorder=1, linewidth=0)
+            counts["bf16"][0] += mine[1] < ref[0]
+            counts["bf16"][1] += 1
+            if deq is not None:
+                ax_s.plot([clip(deq[0]), clip(deq[2])], [row, row], color=dequant_c, linewidth=1, zorder=2)
+                ax_s.scatter(clip(deq[1]), row, marker="|", s=110, color=dequant_c, linewidth=1.8, zorder=3)
+                counts["dequant"][0] += mine[1] < deq[1]
+                counts["dequant"][1] += 1
+            if rival is not None:
+                ax_s.plot([clip(rival[0]), clip(rival[2])], [row - 0.18] * 2, color=rival_c, linewidth=0.9, zorder=2)
+                ax_s.scatter(clip(rival[1]), row - 0.18, marker="o", s=34, facecolor="#fcfcfb", edgecolor=rival_c,
+                             linewidth=1.3, zorder=4)
+                counts["rival"][0] += mine[1] < rival[1]
+                counts["rival"][1] += 1
+                if rival[1] < mine[1]:  # name a rival only where it wins; near the left edge, on its right
+                    left_third = clip(rival[1]) < lo + (hi - lo) / 3
+                    ax_s.annotate(rival_name, (clip(rival[2] if left_third else rival[0]), row - 0.18),
+                                  xytext=(6 if left_third else -6, 0), textcoords="offset points",
+                                  ha="left" if left_third else "right", va="center", fontsize=6.5, color=muted)
+            ax_s.plot([clip(mine[0]), clip(mine[2])], [row + 0.18] * 2, color=ours_c, linewidth=1.2, zorder=2)
+            ax_s.scatter(clip(mine[1]), row + 0.18, marker="o", s=40, color=ours_c, edgecolor="#fcfcfb",
+                         linewidth=0.8, zorder=5)
+            if not lo <= math.log2(mine[1]) <= hi:
+                ax_s.annotate(f"{mine[1]:.1f}x", (clip(mine[1]), row + 0.18), xytext=(5 if mine[1] < 1 else -5, 0),
+                              textcoords="offset points", ha="left" if mine[1] < 1 else "right", va="center",
+                              fontsize=6.5, color=ink)
+        ax_s.axvline(0, color="#52514e", linewidth=1, zorder=1)
+        ticks = [1 / 8, 1 / 4, 1 / 2, 1, 2, 4, 8]
+        ax_s.set_xticks([math.log2(t) for t in ticks], ["⅛x", "¼x", "½x", "1x", "2x", "4x", "8x"], fontsize=8)
+        ax_s.set_xlim(lo - 0.15, hi + 0.15)
+        ax_s.set_title(regime_title, fontsize=10, color=ink)
         for side in ("top", "right", "left"):
             ax_s.spines[side].set_visible(False)
         ax_s.tick_params(axis="y", length=0)
-    axes[1].set_xlabel("speedup over the fastest rival (best rival time / ours); right of the line we win", fontsize=8.5)
+    axes[1].set_xlabel("latency relative to the same model on BF16 weights (log); left of the line is faster than BF16",
+                       fontsize=8.5, color=ink)
     axes[0].set_yticks(list(rows.values()), [short(p) for p in rows], fontsize=8)
     for row, text in headers:
         axes[0].annotate(text, (0, row), xycoords=("axes fraction", "data"), xytext=(-8, 0), textcoords="offset points",
-                         ha="right", va="center", fontsize=9.5, fontweight="bold", color="#0b0b0b")
+                         ha="right", va="center", fontsize=9.5, fontweight="bold", color=ink)
     axes[0].set_ylim(y - 0.5, -0.8)
-    handles = [plt.Line2D([], [], marker="o", linestyle="", markersize=6, markeredgewidth=1.3, color=c,
-                          markerfacecolor=c if m == "cudagraph" else "#fcfcfb", label=title)
-               for m, title, c, _ in modes]
-    fig_s.legend(handles=handles, loc="upper center", ncol=2, frameon=False, fontsize=9, bbox_to_anchor=(0.57, 0.995))
-    fig_s.suptitle(f"finegrained-kernels vs the fastest rival ({device_name}, cold weights): faster in {wins} of {total} cells",
-                   fontsize=11, y=1.02)
+    handles = [
+        plt.Line2D([], [], marker="o", color=ours_c, markersize=6.5, linewidth=1.2, label="finegrained-kernels"),
+        plt.Line2D([], [], marker="o", color=rival_c, markerfacecolor="#fcfcfb", markersize=6, linewidth=0.9,
+                   label="fastest rival (named where it wins)"),
+        plt.Line2D([], [], marker="|", color=dequant_c, markersize=10, markeredgewidth=1.8, linewidth=1,
+                   label="our dequant + BF16 GEMM"),
+        mpatches.Patch(color="#e4e2dc", label="BF16 weights, p10-p90"),
+    ]
+    fig_s.legend(handles=handles, loc="upper center", ncol=4, frameon=False, fontsize=9, bbox_to_anchor=(0.57, 0.995))
+    tally = " · ".join(f"faster than {name} in {w}/{n}" for name, (w, n) in
+                       (("the fastest rival", counts["rival"]), ("dequant + BF16", counts["dequant"]),
+                        ("BF16 weights", counts["bf16"])))
+    fig_s.suptitle(f"finegrained-kernels against BF16 weights, dequantize + BF16 and the fastest rival ({device_name})\n"
+                   f"cold weights, CUDA graph, median with p10-p90 · {tally}", fontsize=10.5, y=1.045, color=ink)
     fig_s.tight_layout()
     fig_s.savefig(out_path, dpi=130, bbox_inches="tight")
     print(f"wrote {out_path}")
