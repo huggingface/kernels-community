@@ -381,8 +381,10 @@ def _flash_attn_backward_fake(
     if dv is None:
         dv = torch.empty_like(v)
     batch_size, seqlen_q, num_heads, _ = q.shape
+    # The XPU kernel returns softmax_d unpadded, CUDA pads seqlen_q to a multiple of 128.
+    seqlen_q_softmax_d = seqlen_q if q.device.type == "xpu" else round_multiple(seqlen_q, 128)
     softmax_d = torch.empty(
-        (batch_size, num_heads, round_multiple(seqlen_q, 128)),
+        (batch_size, num_heads, seqlen_q_softmax_d),
         device=q.device,
         dtype=torch.float32,
     )
