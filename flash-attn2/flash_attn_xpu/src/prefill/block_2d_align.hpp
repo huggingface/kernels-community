@@ -9,14 +9,13 @@
 
 #include <cstdint>
 
+#include "../decode/splitkv_decode.hpp"  // FLASH_XPU_FMHA_NS
 #include "cutlass/cutlass.h"
 #include "cute/tensor.hpp"
 
 namespace cutlass::fmha::collective {
-// Arch-tagged inline namespace: gives these definitions a mangled name
-// distinct from the other Xe architecture's identically named copies,
-// while leaving name lookup (cutlass::fmha::...) unchanged.
-inline namespace flash_xpu_prefill_xe2 {
+// Per-arch mangled names, see splitkv_decode.hpp.
+inline namespace FLASH_XPU_FMHA_NS {
 
 // Xe LSC block-2D loads/stores require a 64-byte aligned surface base
 // address. The attention kernels hand each work-group a per-head 2D slice of
@@ -62,5 +61,5 @@ make_shifted_identity_tensor(Shape const& shape, int x_shift) {
   }
 }
 
-}  // namespace flash_xpu_prefill_xe2
+}  // namespace FLASH_XPU_FMHA_NS
 }  // namespace cutlass::fmha::collective

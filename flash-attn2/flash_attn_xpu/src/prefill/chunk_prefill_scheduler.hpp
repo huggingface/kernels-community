@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Adapted from vllm-xpu-kernels
- * csrc/xpu/attn/xe_2/collective/chunk_prefill_scheduler.hpp.
+ * csrc/xpu/attn/xe_3/collective/chunk_prefill_scheduler.hpp.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
@@ -36,16 +36,16 @@
 
 #pragma once
 
+#include "../decode/splitkv_decode.hpp"  // FLASH_XPU_FMHA_NS
 #include "cutlass/cutlass.h"
 #include "cutlass/fast_math.h"
 #include "cutlass/kernel_hardware_info.h"
 
 namespace cutlass::fmha::kernel {
-// Arch-tagged inline namespace: gives these definitions a mangled name
-// distinct from the other Xe architecture's identically named copies,
-// while leaving name lookup (cutlass::fmha::...) unchanged.
-inline namespace flash_xpu_prefill_xe2 {
+// Per-arch mangled names, see splitkv_decode.hpp.
+inline namespace FLASH_XPU_FMHA_NS {
 
+template <bool Causal>
 struct XeFHMAIndividualTileScheduler {
   struct Params {
     dim3 grid;
@@ -65,10 +65,18 @@ struct XeFHMAIndividualTileScheduler {
       TileShape const& tile_shape) {
     using namespace cute;
 
-    dim3 grid(
-        size(ceil_div(shape.head_size_vo, get<1>(tile_shape))),  // V
-        size(ceil_div(shape.seq_len_qo, get<0>(tile_shape))),    // Q
-        size(shape.batch * shape.num_heads_q));  // (h,b) -- split later
+    dim3 grid;
+    if constexpr (Causal) {
+      grid = dim3(
+          size(ceil_div(shape.head_size_vo, get<1>(tile_shape))),  // V
+          size(shape.batch * shape.num_heads_q),    // (h, b)
+          size(ceil_div(shape.seq_len_qo, get<0>(tile_shape))));  // Q
+    } else {
+      grid = dim3(
+          size(ceil_div(shape.head_size_vo, get<1>(tile_shape))),  // V
+          size(ceil_div(shape.seq_len_qo, get<0>(tile_shape))),    // Q
+          size(shape.batch * shape.num_heads_q));  // (h,b) -- split later
+    }
     return Params{grid, {shape.num_heads_q}};
   }
 
@@ -83,10 +91,22 @@ struct XeFHMAIndividualTileScheduler {
   CUTLASS_DEVICE
   auto get_block_coord() {
     using namespace cute;
-    int idx_b = BlockIdxZ();
-    int head;
-    params.divmod_num_heads(idx_b, head, idx_b);
-    return make_coord(BlockIdxY(), BlockIdxX(), head, idx_b);
+
+    int head, idx_b;
+    if constexpr (Causal) {
+      // Causal: (V, (h,b), Q)
+      idx_b = BlockIdxY();
+      params.divmod_num_heads(idx_b, head, idx_b);
+      // Reverse Q dispach order for causal
+      int q_tile = params.grid.z - 1 - BlockIdxZ();
+      return make_coord(q_tile, BlockIdxX(), head, idx_b);
+    }
+    else {
+      // Non-causal: (V, Q, (h,b))
+      idx_b = BlockIdxZ();
+      params.divmod_num_heads(idx_b, head, idx_b);
+      return make_coord(BlockIdxY(), BlockIdxX(), head, idx_b);
+    }
   }
 
   CUTLASS_DEVICE
@@ -272,6 +292,6 @@ struct XeReduceSplitKTileScheduler {
   }
 };
 
-}  // namespace flash_xpu_prefill_xe2
+}  // inline namespace FLASH_XPU_FMHA_NS
 
 }  // namespace cutlass::fmha::kernel

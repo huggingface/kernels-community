@@ -2,9 +2,6 @@
  * Copyright (C) 2025 - 2026 Intel Corporation, All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * Adapted from vllm-xpu-kernels
- * csrc/xpu/attn/xe_2/kernel/chunk_prefill_kernel.hpp.
- *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
  *
@@ -33,10 +30,12 @@
  *
  **************************************************************************************************/
 
+// Adapted from vllm-xpu-kernels csrc/xpu/attn/xe_2 and xe_3
+// kernel/chunk_prefill_kernel.hpp. The collectives are shared with the paged
+// decode kernel (src/decode).
 #pragma once
 
-#pragma once
-
+#include "../decode/splitkv_decode.hpp"  // FLASH_XPU_FMHA_NS
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/gemm.h"
@@ -49,10 +48,8 @@
 #include "../lse_pad.hpp"
 
 namespace cutlass::fmha::kernel {
-// Arch-tagged inline namespace: gives these definitions a mangled name
-// distinct from the other Xe architecture's identically named copies,
-// while leaving name lookup (cutlass::fmha::...) unchanged.
-inline namespace flash_xpu_prefill_xe2 {
+// Per-arch mangled names, see splitkv_decode.hpp.
+inline namespace FLASH_XPU_FMHA_NS {
 
 using namespace cute;
 
@@ -74,7 +71,8 @@ template <
     class CollectiveMainloop_,
     class CollectiveEpilogue_,
     class TileScheduler_,
-    bool SoftmaxLSE_ = false>
+    bool SoftmaxLSE_ = false,
+    bool LargeSurface_ = false>
 class XeFMHAFwdKernel {
  public:
   //
@@ -107,6 +105,7 @@ class XeFMHAFwdKernel {
 
   using FragA = typename CollectiveMainloop::FragA;
   using FragARow = typename CollectiveMainloop::FragARow;
+  using FragSPartialRow = typename CollectiveMainloop::FragSPartialRow;
 
   // Tile scheduler derived types
   using TileScheduler = TileScheduler_;
@@ -127,6 +126,10 @@ class XeFMHAFwdKernel {
   static constexpr bool LocalMask = CollectiveMainloop::LocalMask;
   static constexpr bool Sink = CollectiveEpilogue::Sink;
   static constexpr bool SoftmaxLSE = SoftmaxLSE_;
+  // Split paged K/V taller than kXeMaxSurfaceRows into sub-surfaces.
+  static constexpr bool LargeSurface = LargeSurface_;
+  static_assert(
+      !LargeSurface || PagedKV, "LargeSurface only applies to paged K/V");
   using ElementSink = typename CollectiveEpilogue::ElementSink;
 
   // Kernel level shared memory storage
@@ -139,8 +142,6 @@ class XeFMHAFwdKernel {
 
   static constexpr int SharedStorageSize =
       is_empty_v<SharedStorage> ? size_t(0) : sizeof(SharedStorage);
-
-  static constexpr int kXeMaxSurfaceRows = 1 << 24;
 
   // Device side arguments
   struct KernelArguments {
@@ -163,10 +164,8 @@ class XeFMHAFwdKernel {
 
     // per-batch mask: true = prefill, false = decode; nullptr = process all
     const bool* is_prefill;
-    // Per-sequence mask: nonzero = causal, zero = bidirectional. When absent,
-    // all sequences follow the compile-time CausalMask setting.
-    const int* dynamic_causal;
-    // kc: batches with fewer queries are left to the split-KV decode kernel.
+
+    // kc: skip batches with fewer queries (left to the split-KV decode).
     int min_seqlen_q;
   };
   using KernelParams = KernelArguments;
@@ -197,7 +196,9 @@ class XeFMHAFwdKernel {
         CollectiveMainloop::to_underlying_arguments(args.mainloop, workspace),
         CollectiveEpilogue::to_underlying_arguments(args.epilogue, workspace),
         TileScheduler::to_underlying_arguments(
-            args.kernel.shape, args.hw_info, TileShapeO{})};
+            args.kernel.shape,
+            args.hw_info,
+            TileShapeO{})};
   }
 
   static bool can_implement(Arguments const& args) {
@@ -291,29 +292,22 @@ class XeFMHAFwdKernel {
 
       auto sequence_length_shape = get_sequence_length_shape(s, idx_b);
       auto [seq_len_qo, seq_len_kv] = sequence_length_shape;
-      if (seq_len_qo < p.min_seqlen_q) continue;
       if (blk_q * get<0>(TileShapeQK{}) >= seq_len_qo) continue;
+      if (seq_len_qo < p.min_seqlen_q) continue;
 
       auto full_tile_offset = seq_len_kv - seq_len_qo;
       int seq_coord =
           cute::min(seq_len_qo, (blk_q * get<0>(TileShapeQK{}) + q_offset_sg));
 
-      const bool seq_is_causal = CausalMask && (p.dynamic_causal == nullptr ||
-                                                p.dynamic_causal[idx_b] != 0);
-
       // calc sg level seq_len_kv
-      const int sg_causal_seq_len =
-          cute::min(seq_len_kv, full_tile_offset + seq_coord + q_sg_tile);
-      // Dynamic causal batches pass a symmetric local window, so a causal
-      // sequence must also stop at the causal bound to skip fully masked
-      // KV blocks to the right of the diagonal.
       const int sg_seq_len =
           LocalMask ? cute::min(
-                          seq_is_causal ? sg_causal_seq_len : seq_len_kv,
+                          seq_len_kv,
                           full_tile_offset + seq_coord + q_sg_tile +
                               params.mainloop.local_right)
-          : seq_is_causal ? sg_causal_seq_len
-                          : seq_len_kv;
+          : CausalMask
+              ? cute::min(seq_len_kv, full_tile_offset + seq_coord + q_sg_tile)
+              : seq_len_kv;
       const int sg_k_block0 =
           LocalMask
               ? cute::max(
@@ -323,8 +317,12 @@ class XeFMHAFwdKernel {
               : 0;
       const int sg_k_blocks = cute::ceil_div(sg_seq_len, get<1>(TileShapeQK{}));
       const int sg_k_blocks_causal =
-          seq_is_causal ? (seq_coord + full_tile_offset) / get<1>(TileShapeQK{})
-                        : sg_k_blocks;
+          CausalMask ? (seq_coord + full_tile_offset) / get<1>(TileShapeQK{})
+                     : 0;
+      // Local mask "safe" block bounds: K blocks in [l_safe, r_safe] lie fully
+      // within the local window, so the per-element local masking can be
+      // skipped for them. Only tiles with K < l_safe (need left mask) or
+      // K > r_safe (need right mask) require the masking pass.
       const int sg_k_block_local_l_safe =
           LocalMask ? cute::ceil_div(
                           cute::max(
@@ -367,9 +365,9 @@ class XeFMHAFwdKernel {
                                           wg, sg_seq_len, sycl::maximum<int>{})
                                     : sg_seq_len;
       const int k_blocks_causal =
-          seq_is_causal ? sycl::reduce_over_group(
-                              wg, sg_k_blocks_causal, sycl::minimum<int>{})
-                        : k_blocks;
+          CausalMask ? sycl::reduce_over_group(
+                           wg, sg_k_blocks_causal, sycl::minimum<int>{})
+                     : 0;
       const int k_block_local_l_safe =
           LocalMask ? sycl::reduce_over_group(
                           wg, sg_k_block_local_l_safe, sycl::maximum<int>{})
@@ -379,29 +377,31 @@ class XeFMHAFwdKernel {
                           wg, sg_k_block_local_r_safe, sycl::minimum<int>{})
                     : 0;
 
-      int offset_q = 0, offset_k = 0, offset_v = 0, offset_o = 0;
+      // 64-bit: stride * cumulative_length exceeds 2^31 for large batches.
+      int64_t offset_q = 0, offset_k = 0, offset_v = 0, offset_o = 0;
       if constexpr (is_var_len) {
         auto qo_cumulative = s.seq_len_qo.cumulative_length;
         auto kv_cumulative = s.seq_len_kv.cumulative_length;
         // Use actual seq strides for offset computation
-        offset_q = get<0>(p.dQ) * qo_cumulative[idx_b];
-        offset_k = PagedKV ? 0 : get<0>(p.dK) * kv_cumulative[idx_b];
-        offset_v = PagedKV ? 0 : get<1>(p.dV) * kv_cumulative[idx_b];
-        offset_o = get<0>(p.dO) * qo_cumulative[idx_b];
+        offset_q = int64_t(get<0>(p.dQ)) * qo_cumulative[idx_b];
+        offset_k =
+            PagedKV ? 0 : int64_t(get<0>(p.dK)) * kv_cumulative[idx_b];
+        offset_v =
+            PagedKV ? 0 : int64_t(get<1>(p.dV)) * kv_cumulative[idx_b];
+        offset_o = int64_t(get<0>(p.dO)) * qo_cumulative[idx_b];
       }
 
-      auto batch_dim_qo = is_var_len ? 1 : s.batch;
-      auto batch_dim_kv = (PagedKV || is_var_len) ? 1 : s.batch;
+      auto batch_dim = is_var_len ? 1 : s.batch;
       auto total_seqlen_kv =
           PagedKV ? params.mainloop.total_seqlen_kv : seq_len_kv;
       auto shape_Q =
-          make_shape(seq_len_qo, s.head_size_qk, s.num_heads_q, batch_dim_qo);
+          make_shape(seq_len_qo, s.head_size_qk, s.num_heads_q, batch_dim);
       auto shape_K = make_shape(
-          total_seqlen_kv, s.head_size_qk, s.num_heads_kv, batch_dim_kv);
+          total_seqlen_kv, s.head_size_qk, s.num_heads_kv, batch_dim);
       auto shape_V = make_shape(
-          s.head_size_vo, total_seqlen_kv, s.num_heads_kv, batch_dim_kv);
+          s.head_size_vo, total_seqlen_kv, s.num_heads_kv, batch_dim);
       auto shape_O =
-          make_shape(seq_len_qo, s.head_size_vo, s.num_heads_q, batch_dim_qo);
+          make_shape(seq_len_qo, s.head_size_vo, s.num_heads_q, batch_dim);
 
       auto dcQ = const_cast<ElementQ*>(p.Q + offset_q);
       auto dcK = const_cast<ElementK*>(p.K + offset_k);
@@ -420,50 +420,42 @@ class XeFMHAFwdKernel {
 
       // O accumulator types
       FragA tArA;
-      FragARow tA_max, tA_sum;
+      FragARow tA_max;
+      FragSPartialRow tA_sum_partial;
 
       // Main loop
-      int l_coord_qo = is_var_len ? 0 : idx_b;
-      int l_coord_kv = (PagedKV || is_var_len) ? 0 : idx_b;
+      int l_coord = is_var_len ? 0 : idx_b;
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
-      bool has_large_surface = kXeMaxSurfaceRows < total_seqlen_kv;
-      if (has_large_surface) {
-        mainloop.template operator()<true>(
-            Q(_, _, head_q, l_coord_qo),
-            K(_, _, head, l_coord_kv),
-            V(_, _, head, l_coord_kv),
-            tArA,
-            tA_max,
-            tA_sum,
-            blk_qv,
-            idx_b,
-            k_block0,
-            k_blocks,
-            k_blocks_causal,
-            thr_id,
-            seq_len,
-            full_tile_offset,
-            k_block_local_l_safe,
-            k_block_local_r_safe);
-      } else {
-        mainloop.template operator()<false>(
-            Q(_, _, head_q, l_coord_qo),
-            K(_, _, head, l_coord_kv),
-            V(_, _, head, l_coord_kv),
-            tArA,
-            tA_max,
-            tA_sum,
-            blk_qv,
-            idx_b,
-            k_block0,
-            k_blocks,
-            k_blocks_causal,
-            thr_id,
-            seq_len,
-            full_tile_offset,
-            k_block_local_l_safe,
-            k_block_local_r_safe);
-      }
+      mainloop.template operator()<LargeSurface>(
+          Q(_, _, head_q, l_coord),
+          K(_, _, head, l_coord),
+          V(_, _, head, l_coord),
+          tArA,
+          tA_max,
+          tA_sum_partial,
+          blk_qv,
+          idx_b,
+          k_block0,
+          k_blocks,
+          k_blocks_causal,
+          thr_id,
+          seq_len,
+          full_tile_offset,
+          k_block_local_l_safe,
+          k_block_local_r_safe);
+
+      // With LSE, collapse the per-lane partial row sums (Xe3 mainloop) once
+      // and hand the reduced sums to the epilogue instead of reducing them
+      // twice.
+      constexpr bool kSumReduced =
+          SoftmaxLSE || !CollectiveMainloop::kPartialRowSum;
+      auto tA_sum = [&] {
+        if constexpr (SoftmaxLSE && CollectiveMainloop::kPartialRowSum)
+          return reduce<0, ReduceMode::Horizontal>(
+              tA_sum_partial, sycl::plus<void>{});
+        else
+          return tA_sum_partial;
+      }();
 
       // return softmax_lse
       if constexpr (SoftmaxLSE) {
@@ -476,49 +468,39 @@ class XeFMHAFwdKernel {
         if (get<1>(blk_qv) == 0) {
           using ElementA = typename FragA::value_type;
           constexpr float kLn2 = 0.6931471805599453f;
-          constexpr double kLog2e = 1.4426950408889634074;
           int q_tile_start = blk_q * get<0>(TileShapeQK{});
           int qo_cumul = 0;
           if constexpr (is_var_len) {
             qo_cumul = s.seq_len_qo.cumulative_length[idx_b];
           }
 
-          // The query tile is split across SGPerWG subgroups, q_sg_tile rows
-          // each (q_sg_tile = TileShapeQK[0] / SubgroupLayoutQK[0]); subgroup g
-          // owns global tile rows [g*q_sg_tile, (g+1)*q_sg_tile). After the
-          // key reduction the per-row softmax stats (tA_max/tA_sum) are laid
-          // out so that a subgroup's logical row r lives in lane (r % sg_size),
-          // register (r / sg_size). To write every query row exactly once we
-          // recover (lane, register) -> row and let each work-item write the
-          // rows it actually owns.
-          //
-          // When q_sg_tile < sg_size (e.g. head_size=192 packs 8 rows over 16
-          // lanes) the upper lanes hold no real row: their stat slots are
-          // uninitialised, so they MUST be masked out. Writing them would
-          // clobber valid rows (their default-recovered row index collapses to
-          // the subgroup's first row), which previously produced -inf at the
-          // first query row of every sequence.
+          // Same row ownership as the XE2 kernel: after the key reduction a
+          // subgroup's logical row r lives in lane (r % sg_size), register
+          // (r / sg_size), so every work-item writes the rows it owns. Only
+          // lane 0 used to write, which stored one row in sg_size and left the
+          // rest of the LSE uninitialized. Lanes past q_sg_tile hold no row.
           int lane_id = thr_id % intel::sg_size;
-          int sg_row_base = q_tile_start + sub_group_id * q_sg_tile;
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < tA_sum.size(); i++) {
             int row_in_sg = lane_id + intel::sg_size * i;
             if (row_in_sg >= q_sg_tile) continue;
-            int q_in_batch = sg_row_base + row_in_sg;
-            if (q_in_batch >= seq_len_qo) continue;
-            ElementA sum_val = tA_sum(i);
-            // Include sink contribution for LSE computation
-            if constexpr (Sink) {
-              ElementSink s_head = p.ptr_S[head_q];
-              sum_val += sycl::native::exp2(
-                  static_cast<ElementA>(s_head * kLog2e) - tA_max(i));
+            int q_in_batch = q_tile_start + q_offset_sg + row_in_sg;
+            if (q_in_batch < seq_len_qo) {
+              ElementA sum_val = tA_sum(i);
+              // Include sink contribution for LSE computation
+              if constexpr (Sink) {
+                constexpr double kLog2e = 1.4426950408889634074;
+                ElementSink s_head = p.ptr_S[head_q];
+                sum_val += sycl::native::exp2(
+                    static_cast<ElementA>(s_head * kLog2e) - tA_max(i));
+              }
+              float lse = static_cast<float>(tA_max(i)) * kLn2 +
+                          sycl::log(static_cast<float>(sum_val));
+              int global_q = qo_cumul + q_in_batch;
+              // softmax_lse is (num_heads_q, total_seqlen_q); write directly
+              // in that layout so no transpose/copy is needed by callers.
+              p.softmax_lse[head_q * p.lse_stride + global_q] = lse;
             }
-            float lse = static_cast<float>(tA_max(i)) * kLn2 +
-                        sycl::log(static_cast<float>(sum_val));
-            int global_q = qo_cumul + q_in_batch;
-            // softmax_lse is (num_heads_q, total_seqlen_q); write directly
-            // in that layout so no transpose/copy is needed by callers.
-            p.softmax_lse[head_q * p.lse_stride + global_q] = lse;
           }
         }
       }
@@ -533,8 +515,8 @@ class XeFMHAFwdKernel {
       CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
       if constexpr (Sink) {
         ElementSink s_head = p.ptr_S[head_q];
-        epilogue(
-            O(_, _, head_q, l_coord_qo),
+        epilogue.template operator()<kSumReduced>(
+            O(_, _, head_q, l_coord),
             tArA,
             tA_max,
             tA_sum,
@@ -542,8 +524,8 @@ class XeFMHAFwdKernel {
             s_head,
             thr_id);
       } else {
-        epilogue(
-            O(_, _, head_q, l_coord_qo),
+        epilogue.template operator()<kSumReduced>(
+            O(_, _, head_q, l_coord),
             tArA,
             tA_max,
             tA_sum,
@@ -555,6 +537,6 @@ class XeFMHAFwdKernel {
   }
 };
 
-}  // namespace flash_xpu_prefill_xe2
+}  // inline namespace FLASH_XPU_FMHA_NS
 
 }  // namespace cutlass::fmha::kernel

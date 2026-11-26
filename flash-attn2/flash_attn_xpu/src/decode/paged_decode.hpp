@@ -3,7 +3,8 @@
  * SPDX-License-Identifier: BSD-3-Clause
  **************************************************************************************************/
 // Paged decode launcher. Adapted from vllm-xpu-kernels:
-//   csrc/xpu/attn/xe_3/paged_decode.hpp  (DecodeKernelLauncher, PagedDecodeConfig)
+//   csrc/xpu/attn/xe_2 and xe_3 paged_decode.hpp (DecodeKernelLauncher,
+//   PagedDecodeConfig)
 //   csrc/xpu/attn/fmha_utils.hpp         (decode_policy_qpacked_head)
 // fp16/bf16 only. Changes: the zero-size workspace is a null pointer
 // (FMHAKernel/ReduceSplitK need none), softmax_lse takes a row stride, KV
@@ -28,21 +29,21 @@
 
 #include "splitkv_decode.hpp"
 
-#include "../prefill/xe3/chunk_prefill_scheduler.hpp"
-#include "../prefill/xe3/chunk_prefill_epilogue.hpp"
+#include "../prefill/chunk_prefill_scheduler.hpp"
+#include "../prefill/chunk_prefill_epilogue.hpp"
 #include "paged_decode_kernel.hpp"
 #include "paged_decode_tuning.h"
 #include "grf_mode.hpp"
 
-#ifndef FLASH_XPU_GRF_SIZE
-  #define FLASH_XPU_GRF_SIZE 256
-#endif
-
 namespace flash_xpu_splitkv::paged {
-inline namespace FLASH_XPU_XE3_NS {
+inline namespace FLASH_XPU_FMHA_NS {
 using namespace cute;
 
 using paged_decode_args_t = flash_xpu_splitkv::paged_decode_args_t;
+
+// Pages that are a multiple of 64 (kv_tile 64) and packed speculative decode
+// are Xe3 only; on Xe2 those run the split-KV kernel.
+inline constexpr bool kXe3Decode = FLASH_XPU_SPLITKV_TARGET_ARCH >= 35;
 
 // ---------------------------------------------------------------------------
 // fmha_utils.hpp: decode policies
@@ -609,23 +610,32 @@ void dispatch_local(sycl::queue& queue, const paged_decode_args_t& args) {
     dispatch_local_tile<QGroup, Element, HeadDim, _16>(queue, args);
   } else if (args.block_size == 32) {
     dispatch_local_tile<QGroup, Element, HeadDim, _32>(queue, args);
-  } else {
+  } else if constexpr (kXe3Decode) {
     dispatch_local_tile<QGroup, Element, HeadDim, _64>(queue, args);
   }
 }
 
 template <typename Element, int HeadDim>
 void paged_decode(sycl::queue& queue, const paged_decode_args_t& args) {
-  TORCH_CHECK(
-      args.block_size == 16 || args.block_size == 32 ||
-          (args.block_size > 0 && args.block_size % 64 == 0),
-      "paged decode: page size must be 16, 32 or a multiple of 64");
+  if constexpr (kXe3Decode) {
+    TORCH_CHECK(
+        args.block_size == 16 || args.block_size == 32 ||
+            (args.block_size > 0 && args.block_size % 64 == 0),
+        "paged decode: page size must be 16, 32 or a multiple of 64");
+  } else {
+    TORCH_CHECK(
+        args.block_size == 16 || args.block_size == 32,
+        "Xe2 paged decode: page size must be 16 or 32");
+    TORCH_CHECK(
+        args.spec_q_len == 1,
+        "Xe2 paged decode: packed speculative decode is not supported");
+  }
   // paged_decode_xe3.cpp: head sizes above 128 use the 8-row tile (the
   // 16-row reduction needs 64 KB SLM at head_dim 256 and hangs), except
   // head_dim 256 with GQA ratio 9..16 and a page size that is a multiple of
   // 64, which uses decode_policy_q16_h256_p64.
   const int group = args.num_heads_q / args.num_heads_k;
-  if constexpr (HeadDim == 256) {
+  if constexpr (HeadDim == 256 && kXe3Decode) {
     if (group > 8 && group <= 16 && args.block_size % 64 == 0) {
       dispatch_local<_16, Element, HeadDim>(queue, args);
       return;
@@ -640,13 +650,14 @@ void paged_decode(sycl::queue& queue, const paged_decode_args_t& args) {
   }
 }
 
-}  // namespace FLASH_XPU_XE3_NS
+}  // namespace FLASH_XPU_FMHA_NS
 }  // namespace flash_xpu_splitkv::paged
 
-#define FLASH_XPU_PAGED_DECODE_INSTANTIATE(HD, NAME, ELEMENT)                \
+#define FLASH_XPU_PAGED_DECODE_INSTANTIATE(ARCH, HD, NAME, ELEMENT)          \
+  static_assert(ARCH == FLASH_XPU_SPLITKV_TARGET_ARCH, "wrong device image"); \
   namespace flash_xpu_splitkv {                                              \
   template <>                                                                \
-  void paged_decode_##NAME<FLASH_XPU_SPLITKV_TARGET_ARCH, HD>(               \
+  void paged_decode_##NAME<ARCH, HD>(                                        \
       sycl::queue & q, const paged_decode_args_t& a) {                       \
     paged::paged_decode<ELEMENT, HD>(q, a);                                  \
   }                                                                          \

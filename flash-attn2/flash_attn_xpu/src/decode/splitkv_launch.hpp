@@ -134,10 +134,11 @@ struct SplitKVConfig {
 }  // namespace flash_xpu_splitkv
 
 // One dtype per translation unit keeps per-TU compile memory bounded.
-#define FLASH_XPU_SPLITKV_INSTANTIATE(HD, NAME, ELEMENT)                      \
+#define FLASH_XPU_SPLITKV_INSTANTIATE(ARCH, HD, NAME, ELEMENT)                \
+  static_assert(ARCH == FLASH_XPU_SPLITKV_TARGET_ARCH, "wrong device image"); \
   namespace flash_xpu_splitkv {                                               \
   template <>                                                                 \
-  void splitkv_decode_##NAME<FLASH_XPU_SPLITKV_TARGET_ARCH, HD>(              \
+  void splitkv_decode_##NAME<ARCH, HD>(                                       \
       sycl::queue & q, const decode_args_t& a) {                              \
     SplitKVConfig<ELEMENT, HD>::dispatch(q, a);                               \
   }                                                                           \

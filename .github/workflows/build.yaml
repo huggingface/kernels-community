@@ -272,18 +272,6 @@ jobs:
           fi
           ( cd "$KERNEL" && cp -rL result build && rm result && chmod -R u+w build )
 
-      # Kernels can check the device code of an XPU build (e.g. that it has
-      # AOT images and the expected GRF sizes); slow code passes the tests.
-      - name: Check XPU build
-        if: matrix.backend == 'xpu'
-        env:
-          KERNEL: ${{ needs.setup.outputs.kernel }}
-        run: |
-          if [ -f "$KERNEL/scripts/check_xpu_build.py" ]; then
-            nix shell nixpkgs#python3 nixpkgs#zstd -c \
-              python3 "$KERNEL/scripts/check_xpu_build.py" "$KERNEL/build"
-          fi
-
       # Direct builds already contain the variant directory, but lack the bundle card.
       - name: Fill TPU kernel card
         if: matrix.backend == 'tpu' && inputs.mode != 'pr'

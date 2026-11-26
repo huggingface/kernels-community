@@ -2,13 +2,13 @@
  * Copyright (C) 2026 Intel Corporation, All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  **************************************************************************************************/
-// Host-side interface of the Xe2 chunk-prefill kernel (src/prefill, adapted
-// from vllm-xpu-kernels csrc/xpu/attn/xe_2).
+// Host-side interface of the chunk-prefill kernel (src/prefill, adapted from
+// vllm-xpu-kernels csrc/xpu/attn/xe_2 and xe_3).
 #pragma once
 
 #include <sycl/sycl.hpp>
 
-namespace flash_xpu_prefill::xe2 {
+namespace flash_xpu_prefill {
 
 struct chunk_prefill_args_t {
   void* query;
@@ -22,6 +22,7 @@ struct chunk_prefill_args_t {
   int max_keys;
   int total_seqlen_q;
   int total_seqlen_k;
+  void* q_scale;  // Xe35 only
   void* k_scale;
   void* v_scale;
   float sm_scale;
@@ -61,23 +62,47 @@ struct chunk_prefill_args_t {
   // per-batch mask: true = prefill, false = decode; nullptr = process all
   void* is_prefill = nullptr;
   int page_stride_elements = 0;
-  // Per-sequence mask: nonzero = causal, zero = bidirectional.
-  const int* dynamic_causal = nullptr;
   // kc: skip batches with fewer queries (left to the split-KV decode kernel).
   int min_seqlen_q = 0;
 };
 
-// Launches the varlen chunk-prefill kernel for head size HD (fp16 when !Bf16),
-// paged or contiguous K/V. Returns false without launching when the flag /
-// page-size combination is not instantiated; the caller then uses its own
-// kernel. One instantiation per flash_chunk_prefill_hdim*_*.cpp file.
-template <int HD, bool Bf16, bool Paged>
+// Launches the varlen chunk-prefill kernel of architecture Arch (20: Xe2,
+// 35: Xe35, CRI image) for head size HD (fp16 when !Bf16), paged or
+// contiguous K/V. Returns false without launching when the flag / page-size
+// combination is not instantiated; the caller then uses its own kernel. One
+// instantiation per file under src/instantiations/<arch>/chunk_prefill/.
+template <int Arch, int HD, bool Bf16, bool Paged>
 bool chunk_prefill_impl(sycl::queue& queue, const chunk_prefill_args_t& args);
 
-template <int HD, bool Bf16>
-bool chunk_prefill(sycl::queue& queue, const chunk_prefill_args_t& args) {
-  return args.is_paged ? chunk_prefill_impl<HD, Bf16, true>(queue, args)
-                       : chunk_prefill_impl<HD, Bf16, false>(queue, args);
+// Paged K/V for every head size; contiguous K/V for head size 128, and for 64
+// and 256 on Xe35.
+template <int Arch, int HD, bool Bf16>
+bool chunk_prefill_hd(sycl::queue& queue, const chunk_prefill_args_t& args) {
+  if (args.is_paged)
+    return chunk_prefill_impl<Arch, HD, Bf16, true>(queue, args);
+  if constexpr (HD == 128 || (Arch >= 35 && (HD == 64 || HD == 256)))
+    return chunk_prefill_impl<Arch, HD, Bf16, false>(queue, args);
+  return false;
 }
 
-}  // namespace flash_xpu_prefill::xe2
+template <int Arch>
+bool chunk_prefill(sycl::queue& queue, const chunk_prefill_args_t& args,
+                   bool bf16) {
+  switch (args.head_size) {
+#define FLASH_XPU_CHUNK_PREFILL_CASE(HD)                     \
+  case HD:                                                   \
+    return bf16 ? chunk_prefill_hd<Arch, HD, true>(queue, args) \
+                : chunk_prefill_hd<Arch, HD, false>(queue, args);
+    FLASH_XPU_CHUNK_PREFILL_CASE(64)
+    FLASH_XPU_CHUNK_PREFILL_CASE(96)
+    FLASH_XPU_CHUNK_PREFILL_CASE(128)
+    FLASH_XPU_CHUNK_PREFILL_CASE(192)
+    FLASH_XPU_CHUNK_PREFILL_CASE(256)
+    FLASH_XPU_CHUNK_PREFILL_CASE(512)
+#undef FLASH_XPU_CHUNK_PREFILL_CASE
+    default:
+      return false;
+  }
+}
+
+}  // namespace flash_xpu_prefill

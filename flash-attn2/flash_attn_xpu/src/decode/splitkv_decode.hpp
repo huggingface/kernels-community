@@ -11,26 +11,25 @@
 
 #include <sycl/sycl.hpp>
 
-// The device headers are compiled once per architecture (see
-// splitkv_decode_fp16) and sycl-tla expands them differently each time;
-// separate inline namespaces keep the linker from merging symbols that share
-// a name but not a body.
-// Test the value, not defined(): <sycl/sycl.hpp> defines every
-// __SYCL_TARGET_* macro it does not see as 0 (as sycl-tla's cutlass.h does).
+// The device headers are compiled once per architecture; separate inline
+// namespaces keep the linker from merging same-named symbols with different
+// bodies. <sycl/sycl.hpp> defines unseen __SYCL_TARGET_* macros as 0, so test
+// the value, not defined().
 #if __SYCL_TARGET_INTEL_GPU_CRI__
 #define FLASH_XPU_SPLITKV_TARGET_NS xe35
 #define FLASH_XPU_SPLITKV_TARGET_ARCH 35
-#define FLASH_XPU_XE3_NS xe3_xe35
-// The Xe35 paged-decode and chunk-prefill kernels run with 512 GRF, as
-// vllm-xpu-kernels builds its XE3 kernels (add_xe3_kernel_library); see
-// grf_mode.hpp.
+#define FLASH_XPU_FMHA_NS xe3_xe35
+// 512 GRF, as vllm-xpu-kernels builds its XE3 kernels (see grf_mode.hpp).
 #ifndef FLASH_XPU_GRF_SIZE
 #define FLASH_XPU_GRF_SIZE 512
 #endif
 #else
 #define FLASH_XPU_SPLITKV_TARGET_NS xe20
 #define FLASH_XPU_SPLITKV_TARGET_ARCH 20
-#define FLASH_XPU_XE3_NS xe3_xe20
+#define FLASH_XPU_FMHA_NS flash_xpu_prefill_xe2
+#endif
+#ifndef FLASH_XPU_GRF_SIZE
+#define FLASH_XPU_GRF_SIZE 256
 #endif
 
 namespace flash_xpu_splitkv {
@@ -109,11 +108,8 @@ struct decode_args_t {
   int min_tiles_per_split = 1;
 };
 
-// Head-dim buckets with a compiled kernel. The runtime head size may be any
-// multiple of 8 up to the bucket.
-// The kernels are built twice: Arch 20 for pvc/bmg, and Arch 35 from the
-// CRI-only translation units (-D__SYCL_TARGET_INTEL_GPU_CRI__), where
-// sycl-tla emits the Xe35 block loads (cache hints, wider transposed loads).
+// Head-dim buckets with a compiled kernel (runtime head size: any multiple of
+// 8 up to the bucket). Arch 20 = Xe2 image, Arch 35 = CRI image.
 template <int Arch, int HeadDim>
 void splitkv_decode_fp16(sycl::queue& queue, const decode_args_t& args);
 template <int Arch, int HeadDim>
@@ -160,10 +156,9 @@ struct append_args_t {
 
 void splitkv_append_kv(sycl::queue& queue, const append_args_t& args);
 
-// Paged decode, fp16/bf16, adapted from vllm-xpu-kernels: Xe35 (CRI) from
-// csrc/xpu/attn/xe_3 (src/decode/paged_decode.hpp), Xe2 (BMG) from
-// csrc/xpu/attn/xe_2 (src/decode/xe2/paged_decode.hpp). Same fields as
-// vllm-xpu-kernels' paged_decode_args_t, plus lse_row_stride.
+// Paged decode, fp16/bf16, adapted from vllm-xpu-kernels csrc/xpu/attn/xe_2
+// and xe_3 (src/decode/paged_decode.hpp). Same fields as vllm-xpu-kernels'
+// paged_decode_args_t, plus lse_row_stride.
 struct paged_decode_args_t {
   void* query;
   void* key;

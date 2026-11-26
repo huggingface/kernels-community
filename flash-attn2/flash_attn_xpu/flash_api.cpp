@@ -16,7 +16,6 @@
 #include "src/decode/splitkv_decode.hpp"
 #include "src/decode/paged_decode_tuning.h"
 #include "src/prefill/chunk_prefill_args.hpp"
-#include "src/prefill/xe3/chunk_prefill_args.hpp"
 
 namespace FLASH_NAMESPACE {
 
@@ -47,21 +46,10 @@ inline at::Tensor ensure_contiguous(const at::Tensor& tensor) {
 // Split-KV decode (up to kMaxQueries queries per batch). Used when the inputs
 // are supported and the plan below expects it to beat the generic forward
 // kernels.
-// FLASH_ATTN_XPU_DISABLE_SPLITKV_DECODE=1 forces the generic kernels,
-// FLASH_ATTN_XPU_DECODE_NUM_SPLITS=N forces split-KV with N splits.
 // ---------------------------------------------------------------------------
 namespace splitkv {
 
 using flash_xpu_splitkv::decode_args_t;
-
-inline int env_int(const char* name, int dflt) {
-    const char* s = std::getenv(name);
-    return (s != nullptr && *s != '\0') ? std::atoi(s) : dflt;
-}
-
-inline bool disabled() {
-    return env_int("FLASH_ATTN_XPU_DISABLE_SPLITKV_DECODE", 0) != 0;
-}
 
 inline int head_bucket(int d) {
     for (int b : {64, 96, 128, 192, 256, 512}) {
@@ -87,6 +75,11 @@ inline int xe_core_count(sycl::queue& queue) {
     if (cores <= 0) cores = 20;
     cache[key] = cores;
     return cores;
+}
+
+// Xe35 (CRI) and newer report IP version 35.x and run the CRI image.
+inline bool is_xe35(const at::Tensor& t) {
+    return std::atoi(at::xpu::getDeviceProperties(t.device().index())->version.c_str()) >= 35;
 }
 
 // Split-count plan for contiguous KV, measured against the generic kernel on
@@ -145,33 +138,33 @@ inline int floor_log2(int x) {
     return r;
 }
 
-// Paged KV: the split count of vllm-xpu-kernels (csrc/flash_attn/flash_api.cpp
-// get_num_splits, 64-key tiles with 4 subgroups per work-group), whose
-// decode kernel is the same as this one, plus that kernel's single-split
-// rule below 32 KV tiles.
-inline int paged_num_splits(int xe_cores, int batch, int num_heads_q,
-                            int num_heads_kv, int kv_tiles) {
-    if (kv_tiles < 32) return 1;
+// vllm-xpu-kernels get_num_splits (csrc/flash_attn/flash_api.cpp, 16-bit
+// Q/KV) for a policy with sg_per_wg subgroups per work-group.
+inline int vllm_num_splits(int xe_cores, int batch, int num_heads_q,
+                           int num_heads_kv, int kv_tiles, int sg_per_wg,
+                           int policy_split_cap) {
+    const int slots = xe_cores * 4 / sg_per_wg;
     const int wgs = std::max(1, batch * num_heads_kv);
-    if (wgs >= xe_cores && kv_tiles < 64) return 1;
-    int splits = std::max((4 * xe_cores + wgs - 1) / wgs, kv_tiles / 12);
+    if (wgs >= slots && kv_tiles < 64) return 1;
+    int splits = std::max({1, (4 * slots + wgs - 1) / wgs, kv_tiles / 12});
     splits = std::min(
         splits, std::max(2, 128 * xe_cores / std::max(1, batch * num_heads_q)));
-    return std::max(1, std::min({splits, kv_tiles / 4, 32}));
+    return std::max(1, std::min({splits, std::max(1, kv_tiles / 4), 32,
+                                 policy_split_cap}));
 }
 
 // Number of KV splits for a decode batch (>= 1), or 0 for the generic kernel.
 inline int plan_num_splits(sycl::queue& queue, int batch, int num_heads_q,
                            int num_heads_kv, int head_size, int max_seqlen_k,
                            bool paged) {
-    int env = env_int("FLASH_ATTN_XPU_DECODE_NUM_SPLITS", 0);
-    if (env > 0) return std::min(env, flash_xpu_splitkv::kMaxSplits);
-
     const int kv_tiles = (max_seqlen_k + flash_xpu_splitkv::kKVTile - 1) /
                          flash_xpu_splitkv::kKVTile;
+    // Paged KV: vllm's split count for its 64-key policy (same decode
+    // kernel), and one split below 32 KV tiles.
     if (paged) {
-        return paged_num_splits(xe_core_count(queue), batch, num_heads_q,
-                                num_heads_kv, kv_tiles);
+        return kv_tiles < 32 ? 1
+            : vllm_num_splits(xe_core_count(queue), batch, num_heads_q,
+                              num_heads_kv, kv_tiles, 4, 64);
     }
     const int wgs = std::max(1, batch * num_heads_kv);
     const int w = std::clamp(
@@ -239,7 +232,6 @@ inline bool multi_query_mask(bool is_causal, int window_size_left,
 // paged decode kernel takes them (see small_page).
 inline bool supported(const at::Tensor& q, const at::Tensor& k,
                       const at::Tensor& v, bool paged) {
-    if (disabled()) return false;
     auto dt = q.scalar_type();
     if (dt != at::kHalf && dt != at::kBFloat16) return false;
     if (k.scalar_type() != dt || v.scalar_type() != dt) return false;
@@ -309,9 +301,7 @@ inline void run(sycl::queue& queue, const at::Tensor& q, int rows,
         args.lse_accum = lse_accum.data_ptr<float>();
     }
     args.min_tiles_per_split = 4;
-    // Xe35 (CRI) and newer report IP version 35.x and run the CRI image.
-    const char* ip = at::xpu::getDeviceProperties(q.device().index())->version.c_str();
-    if (std::atoi(ip) >= 35) {
+    if (is_xe35(q)) {
         launch<35>(queue, q.scalar_type(), args.head_size, args);
     } else {
         launch<20>(queue, q.scalar_type(), args.head_size, args);
@@ -320,17 +310,11 @@ inline void run(sycl::queue& queue, const at::Tensor& q, int rows,
 
 // ---------------------------------------------------------------------------
 // Paged single-query decode on Xe35 (CRI) and newer, and on Xe2 for pages of
-// 16 or 32 rows: the paged decode kernels (src/decode/paged_decode.hpp,
-// src/decode/xe2/paged_decode.hpp, adapted from vllm-xpu-kernels), launched
-// the way vllm-xpu-kernels' mha_varlen_fwd does.
-// FLASH_ATTN_XPU_DISABLE_PAGED_DECODE=1 keeps the kernel above.
+// 16 or 32 rows: the paged decode kernel (src/decode/paged_decode.hpp,
+// adapted from vllm-xpu-kernels), launched the way vllm's mha_varlen_fwd does.
 // ---------------------------------------------------------------------------
 
-inline bool is_xe35(const at::Tensor& t) {
-    return std::atoi(at::xpu::getDeviceProperties(t.device().index())->version.c_str()) >= 35;
-}
-
-// vllm-xpu-kernels csrc/flash_attn/flash_api.cpp get_num_splits (16-bit Q/KV).
+// vllm-xpu-kernels get_num_splits for the paged decode kernel.
 inline int paged_decode_num_splits(sycl::queue& queue, int batch_size,
                                    int num_heads_q, int num_heads_kv,
                                    int max_seqlen_k, int block_size,
@@ -367,26 +351,14 @@ inline int paged_decode_num_splits(sycl::queue& queue, int batch_size,
     }
 
     if (kv_tiles < 16) return 1;
-    int num_wg_slots = num_xe_cores * 4 / sg_per_wg;
-    int wgs_per_split = batch_size * num_heads_kv;
-    if (wgs_per_split >= num_wg_slots && kv_tiles < 64) return 1;
-    int splits_par =
-        std::max(1, (4 * num_wg_slots + wgs_per_split - 1) / wgs_per_split);
-    int splits_bw = std::max(1, kv_tiles / 12);
-    int splits = std::max(splits_par, splits_bw);
-    int red_work = std::max(1, batch_size * num_heads_q);
-    int red_cap = std::max(2, 128 * num_xe_cores / red_work);
-    splits = std::min(splits, red_cap);
-    int max_splits_tiles = std::max(1, kv_tiles / 4);
-    return std::max(
-        1, std::min({splits, max_splits_tiles, 32, policy_split_cap}));
+    return vllm_num_splits(num_xe_cores, batch_size, num_heads_q, num_heads_kv,
+                           kv_tiles, sg_per_wg, policy_split_cap);
 }
 
 // Inputs as checked by supported(q, k, v, /*paged=*/true), plus the head
 // sizes the paged decode kernel is built for. Xe35 runs every page size; Xe2
 // only pages smaller than the split-KV kernel's KV tile (16 or 32 rows).
 inline bool paged_decode_supported(const at::Tensor& q, const at::Tensor& k) {
-    if (env_int("FLASH_ATTN_XPU_DISABLE_PAGED_DECODE", 0) != 0) return false;
     switch (q.size(-1)) {
         case 64: case 96: case 128: case 192: case 256: case 512: break;
         default: return false;
@@ -425,9 +397,7 @@ inline bool run_paged_decode(sycl::queue& queue, const at::Tensor& q, int tokens
     const int effective_seqlen_k =
         is_local ? std::min(max_seqlen_k, eff_window_left + 1) : max_seqlen_k;
 
-    const int env = env_int("FLASH_ATTN_XPU_DECODE_NUM_SPLITS", 0);
-    int num_kv_splits = env > 0 ? env
-        : forced_splits > 0 ? forced_splits
+    int num_kv_splits = forced_splits > 0 ? forced_splits
         : paged_decode_num_splits(queue, batch, num_heads_q, num_heads_kv,
                                   effective_seqlen_k, block_size, head_size,
                                   std::max(k.stride(1), v.stride(1)) * k.element_size());
@@ -520,18 +490,11 @@ inline bool run_paged_decode(sycl::queue& queue, const at::Tensor& q, int tokens
             TORCH_CHECK(false, "paged decode: unsupported head size ", head_size);
     }
 #undef PAGED_DECODE_CASE
-    // Known gap, same as vllm-xpu-kernels: on Xe35 with one KV split, rows of
-    // a sequence without keys (seqused_k == 0) keep whatever O / softmax_lse
-    // held, instead of flash-attn2's O = 0 / LSE = -inf. Callers (vllm,
-    // transformers continuous batching) drop those rows. Xe2 and the
-    // multi-split path still write O = 0 / LSE = -inf.
-    // - In-kernel write: ocloc 26.22 miscompiles the fp16 hd256 page-32
-    //   variant (DEVICE_LOST even when the branch is not taken).
-    // - Host-side fill here: correct, but ~11-14 small kernels, ~14 us per
-    //   call (B8 decode 18.6 -> 33 us), so it was dropped.
-    // TODO(ocloc>=26.40): write O = 0 / LSE = -inf for these rows in the
-    // kernel again (26.40 compiles it fine). Needs only a newer ocloc in the
-    // kernel-builder toolchain, no torch / DPC++ upgrade.
+    // As in vllm-xpu-kernels, on Xe35 with one KV split the rows of a sequence
+    // without keys are left unwritten (not O = 0 / LSE = -inf); callers drop
+    // them. Writing them in the kernel makes ocloc 26.22 miscompile the fp16
+    // hd256 page-32 variant.
+    // TODO(ocloc>=26.40): write O = 0 / LSE = -inf for these rows again.
     return true;
 }
 
@@ -1147,15 +1110,9 @@ mha_varlen_fwd(
                 -1, /*forced_splits=*/0, softmax_lse,
                 /*lse_stride=*/total_q, /*lse_row_stride=*/1);
             if (done) {
-                // Padded queries (rows >= cu_seqlens_q[batch]) get LSE 0. Done
-                // here, as vllm-xpu-kernels masks padding outside the kernel:
-                // the same zeroing inside the paged decode kernel makes ocloc
-                // 26.22 miscompile the Xe35 hd256 page-32 variant (hangs /
-                // DEVICE_LOST even when not executed; fine with ocloc 26.40).
-                // Costs two small extra kernels per call (compare +
-                // masked_fill, ~1.5-2 us; B1 varlen decode 6.9 -> 8.4 us).
-                // TODO(ocloc>=26.40): zero these rows in the kernel again
-                // and drop this mask (see run_paged_decode).
+                // Padded queries (rows >= cu_seqlens_q[batch]) get LSE 0, on
+                // the host as in vllm-xpu-kernels (see run_paged_decode).
+                // TODO(ocloc>=26.40): zero these rows in the kernel instead.
                 at::Tensor pad = splitkv::arange_int(cu_q, total_q)
                                      .narrow(0, 0, total_q)
                                      .ge(cu_q.narrow(0, batch_size, 1));
@@ -1204,8 +1161,8 @@ mha_varlen_fwd(
     k_padded = ensure_contiguous(k_padded);
     v_padded = ensure_contiguous(v_padded);
 
-    // Chunk-prefill kernel (adapted from vllm-xpu-kernels): src/prefill (Xe2)
-    // and src/prefill/xe3 (Xe35, CRI image). On Xe2, head sizes 64 and 256
+    // Chunk-prefill kernel (src/prefill, adapted from vllm-xpu-kernels; the
+    // Xe35 build is in the CRI image). On Xe2, head sizes 64 and 256
     // take it only for pages of 16 or 32 rows, which the kernel below lacks;
     // head sizes 96, 192 and 512 only for such pages on both.
     constexpr int64_t kInt32Max = std::numeric_limits<int>::max();
@@ -1223,7 +1180,6 @@ mha_varlen_fwd(
         !(alibi_slopes_.has_value() && alibi_slopes_->defined()) &&
         !(seqused_k.has_value() && seqused_k->defined()) &&
         !(leftpad_k_.has_value() && leftpad_k_->defined()) &&
-        splitkv::env_int("FLASH_ATTN_XPU_DISABLE_CHUNK_PREFILL", 0) == 0 &&
         cu_seqlens_q.scalar_type() == at::kInt &&
         cu_seqlens_k.scalar_type() == at::kInt &&
         q_padded.numel() <= kInt32Max && out_padded.numel() <= kInt32Max &&
@@ -1275,123 +1231,58 @@ mha_varlen_fwd(
             ? (cu_seqlens_k.slice(0, 1) - cu_seqlens_k.slice(0, 0, -1)).contiguous()
             : cu_seqlens_k.contiguous();
         at::Tensor block_table;
-        auto fill = [&](auto& a) {
-            a.query = q_padded.data_ptr();
-            a.key = k_padded.data_ptr();
-            a.value = v_padded.data_ptr();
-            a.out = out_padded.data_ptr();
-            a.cu_seqlens_q = cu_q.data_ptr();
-            a.cu_seqlens_k = cu_k.data_ptr();
-            a.max_queries = max_seqlen_q;
-            a.max_keys = max_seqlen_k;
-            a.total_seqlen_q = total_q;
-            a.total_seqlen_k = total_k;
-            a.sm_scale = softmax_scale;
-            a.batch_size = batch_size;
-            a.num_heads_q = num_heads;
-            a.num_heads_k = k_padded.size(-2);
-            a.head_size = head_size_og;
-            a.is_varlen = true;
-            a.is_paged = is_paged;
-            a.is_causal = is_causal;
-            a.min_seqlen_q = skv_mixed ? 2 : 0;
-            a.softmax_lse = softmax_lse.data_ptr<float>();
-            a.lse_stride = total_q;
-            a.q_stride_seq = q_padded.stride(0);
-            a.q_stride_heads = q_padded.stride(1);
-            a.o_stride_seq = out_padded.stride(0);
-            a.o_stride_heads = out_padded.stride(1);
-            if (is_paged) {
-                // K/V: [num_blocks, block_size, num_heads_kv, head_size]
-                block_table = block_table_->contiguous();
-                a.block_table = block_table.data_ptr();
-                a.max_blocks_per_seq = block_table.size(1);
-                a.block_size = k_padded.size(1);
-                a.k_stride_seq = k_padded.stride(1);
-                a.k_stride_heads = k_padded.stride(2);
-                a.v_stride_seq = v_padded.stride(1);
-                a.v_stride_heads = v_padded.stride(2);
-                a.page_stride_elements = k_padded.stride(0) / k_padded.stride(1);
-                // 2D load surface: up to the last row of the last page.
-                a.total_seqlen_k = std::max<int64_t>(
-                    int64_t(k_padded.size(0)) * a.block_size,
-                    (int64_t(k_padded.size(0)) - 1) * a.page_stride_elements +
-                        a.block_size);
-            } else {
-                a.k_stride_seq = k_padded.stride(0);
-                a.k_stride_heads = k_padded.stride(1);
-                a.v_stride_seq = v_padded.stride(0);
-                a.v_stride_heads = v_padded.stride(1);
-            }
-        };
-        const bool bf16 = q_dtype == torch::kBFloat16;
-        if (xe35) {
-            namespace vp = flash_xpu_prefill::xe3;
-            vp::chunk_prefill_args_t a{};
-            fill(a);
-            switch (head_size_og) {
-                case 64:
-                    chunk_prefill_done = bf16 ? vp::chunk_prefill<64, true>(queue, a)
-                                              : vp::chunk_prefill<64, false>(queue, a);
-                    break;
-                case 256:
-                    chunk_prefill_done = bf16 ? vp::chunk_prefill<256, true>(queue, a)
-                                              : vp::chunk_prefill<256, false>(queue, a);
-                    break;
-                case 96:
-                    chunk_prefill_done =
-                        bf16 ? vp::chunk_prefill_impl<96, true, true>(queue, a)
-                             : vp::chunk_prefill_impl<96, false, true>(queue, a);
-                    break;
-                case 192:
-                    chunk_prefill_done =
-                        bf16 ? vp::chunk_prefill_impl<192, true, true>(queue, a)
-                             : vp::chunk_prefill_impl<192, false, true>(queue, a);
-                    break;
-                case 512:
-                    chunk_prefill_done =
-                        bf16 ? vp::chunk_prefill_impl<512, true, true>(queue, a)
-                             : vp::chunk_prefill_impl<512, false, true>(queue, a);
-                    break;
-                default:
-                    chunk_prefill_done = bf16 ? vp::chunk_prefill<128, true>(queue, a)
-                                              : vp::chunk_prefill<128, false>(queue, a);
-            }
+        flash_xpu_prefill::chunk_prefill_args_t a{};
+        a.query = q_padded.data_ptr();
+        a.key = k_padded.data_ptr();
+        a.value = v_padded.data_ptr();
+        a.out = out_padded.data_ptr();
+        a.cu_seqlens_q = cu_q.data_ptr();
+        a.cu_seqlens_k = cu_k.data_ptr();
+        a.max_queries = max_seqlen_q;
+        a.max_keys = max_seqlen_k;
+        a.total_seqlen_q = total_q;
+        a.total_seqlen_k = total_k;
+        a.sm_scale = softmax_scale;
+        a.batch_size = batch_size;
+        a.num_heads_q = num_heads;
+        a.num_heads_k = k_padded.size(-2);
+        a.head_size = head_size_og;
+        a.is_varlen = true;
+        a.is_paged = is_paged;
+        a.is_causal = is_causal;
+        a.min_seqlen_q = skv_mixed ? 2 : 0;
+        a.softmax_lse = softmax_lse.data_ptr<float>();
+        a.lse_stride = total_q;
+        a.q_stride_seq = q_padded.stride(0);
+        a.q_stride_heads = q_padded.stride(1);
+        a.o_stride_seq = out_padded.stride(0);
+        a.o_stride_heads = out_padded.stride(1);
+        if (is_paged) {
+            // K/V: [num_blocks, block_size, num_heads_kv, head_size]
+            block_table = block_table_->contiguous();
+            a.block_table = block_table.data_ptr();
+            a.max_blocks_per_seq = block_table.size(1);
+            a.block_size = k_padded.size(1);
+            a.k_stride_seq = k_padded.stride(1);
+            a.k_stride_heads = k_padded.stride(2);
+            a.v_stride_seq = v_padded.stride(1);
+            a.v_stride_heads = v_padded.stride(2);
+            a.page_stride_elements = k_padded.stride(0) / k_padded.stride(1);
+            // 2D load surface: up to the last row of the last page.
+            a.total_seqlen_k = std::max<int64_t>(
+                int64_t(k_padded.size(0)) * a.block_size,
+                (int64_t(k_padded.size(0)) - 1) * a.page_stride_elements +
+                    a.block_size);
         } else {
-            namespace vp = flash_xpu_prefill::xe2;
-            vp::chunk_prefill_args_t a{};
-            fill(a);
-            switch (head_size_og) {
-                case 64:
-                    chunk_prefill_done =
-                        bf16 ? vp::chunk_prefill_impl<64, true, true>(queue, a)
-                             : vp::chunk_prefill_impl<64, false, true>(queue, a);
-                    break;
-                case 256:
-                    chunk_prefill_done =
-                        bf16 ? vp::chunk_prefill_impl<256, true, true>(queue, a)
-                             : vp::chunk_prefill_impl<256, false, true>(queue, a);
-                    break;
-                case 96:
-                    chunk_prefill_done =
-                        bf16 ? vp::chunk_prefill_impl<96, true, true>(queue, a)
-                             : vp::chunk_prefill_impl<96, false, true>(queue, a);
-                    break;
-                case 192:
-                    chunk_prefill_done =
-                        bf16 ? vp::chunk_prefill_impl<192, true, true>(queue, a)
-                             : vp::chunk_prefill_impl<192, false, true>(queue, a);
-                    break;
-                case 512:
-                    chunk_prefill_done =
-                        bf16 ? vp::chunk_prefill_impl<512, true, true>(queue, a)
-                             : vp::chunk_prefill_impl<512, false, true>(queue, a);
-                    break;
-                default:
-                    chunk_prefill_done = bf16 ? vp::chunk_prefill<128, true>(queue, a)
-                                              : vp::chunk_prefill<128, false>(queue, a);
-            }
+            a.k_stride_seq = k_padded.stride(0);
+            a.k_stride_heads = k_padded.stride(1);
+            a.v_stride_seq = v_padded.stride(0);
+            a.v_stride_heads = v_padded.stride(1);
         }
+        const bool bf16 = q_dtype == torch::kBFloat16;
+        chunk_prefill_done =
+            xe35 ? flash_xpu_prefill::chunk_prefill<35>(queue, a, bf16)
+                 : flash_xpu_prefill::chunk_prefill<20>(queue, a, bf16);
         if (!chunk_prefill_done) softmax_lse.zero_();
     }
 

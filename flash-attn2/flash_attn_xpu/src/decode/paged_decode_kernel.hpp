@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Adapted from vllm-xpu-kernels
- * csrc/xpu/attn/xe_3/kernel/paged_decode_kernel.hpp.
+ * csrc/xpu/attn/xe_2 and xe_3 kernel/paged_decode_kernel.hpp.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
@@ -35,7 +35,7 @@
 
 #pragma once
 
-#include "splitkv_decode.hpp"  // FLASH_XPU_XE3_NS
+#include "splitkv_decode.hpp"  // FLASH_XPU_FMHA_NS
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/gemm.h"
@@ -43,15 +43,13 @@
 
 #include "cute/util/type_traits.hpp"
 #include "../collective/fmha_fusion.hpp"
-#include "../prefill/xe3/chunk_prefill_mainloop.hpp"
-#include "../prefill/xe3/chunk_prefill_epilogue.hpp"
+#include "../prefill/chunk_prefill_mainloop.hpp"
+#include "../prefill/chunk_prefill_epilogue.hpp"
 #include "paged_decode_tuning.h"
 
 namespace cutlass::fmha::kernel {
-// Arch-tagged inline namespace: gives these definitions a mangled name
-// distinct from the other Xe architecture's identically named copies,
-// while leaving name lookup (cutlass::fmha::...) unchanged.
-inline namespace FLASH_XPU_XE3_NS {
+// Per-arch mangled names, see splitkv_decode.hpp.
+inline namespace FLASH_XPU_FMHA_NS {
 
 using namespace cute;
 
@@ -438,13 +436,31 @@ class XeFMHAFwdSplitKVKernel {
       }
 
       if (num_effective_kv_blocks <= 0) {
-        // Sequence without keys (seqused_k == 0). Skipped as in
-        // vllm-xpu-kernels: with several splits ReduceSplitK still writes
-        // O = 0 / LSE = -inf, with one split the rows of O and LSE are left
-        // undefined. Writing them here makes ocloc 26.22 miscompile the
-        // fp16 hd256 page-32 variant (DEVICE_LOST), and the host-side fill
-        // cost ~14 us per decode call. See run_paged_decode in flash_api.cpp.
-        // TODO(ocloc>=26.40): write O = 0 / LSE = -inf here again.
+        // Sequence without keys: O = 0, LSE = -inf (ReduceSplitK does this
+        // with several splits). Xe3 skips them like vllm-xpu-kernels, see
+        // run_paged_decode in flash_api.cpp.
+        // TODO(ocloc>=26.40): write them on Xe3 too.
+        if constexpr (FLASH_XPU_SPLITKV_TARGET_ARCH < 35) {
+          if (seq_len <= 0 && num_kv_splits <= 1) {
+            const int q0 = blk_q * get<0>(TileShapeO{});
+            const int v0 = blk_v * get<1>(TileShapeO{});
+            const int rows =
+                cute::min(int(get<0>(TileShapeO{})), head_group_q - q0);
+            const int cols =
+                cute::min(int(get<1>(TileShapeO{})), s.head_size_vo - v0);
+            ElementO* o_tile = p.Oaccum + offset_o +
+                               (head_q_start + q0) * s.head_size_vo + v0;
+            constexpr int kThreads = SGPerWG::value * intel::sg_size;
+            for (int i = thr_id; i < rows * cols; i += kThreads)
+              o_tile[(i / cols) * s.head_size_vo + i % cols] = ElementO(0);
+            if (p.softmax_lse != nullptr && blk_v == 0) {
+              for (int r = thr_id; r < rows; r += kThreads)
+                p.softmax_lse[(head_q_start + q0 + r) * p.lse_stride +
+                              offset_lse] =
+                    -cutlass::platform::numeric_limits<float>::infinity();
+            }
+          }
+        }
         continue;
       }
 
@@ -1039,6 +1055,6 @@ class ReduceSplitK {
   }
 };
 
-}  // namespace FLASH_XPU_XE3_NS
+}  // namespace FLASH_XPU_FMHA_NS
 
 }  // namespace cutlass::fmha::kernel

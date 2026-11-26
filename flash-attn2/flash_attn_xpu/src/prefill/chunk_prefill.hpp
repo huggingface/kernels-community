@@ -2,9 +2,14 @@
  * Copyright (C) 2025 - 2026 Intel Corporation, All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  **************************************************************************************************/
-// Adapted from vllm-xpu-kernels csrc/xpu/attn/xe_2/chunk_prefill.hpp
-// (KernelLauncher, FMHAConfig, cutlass_chunk_prefill_impl).
+// Adapted from vllm-xpu-kernels csrc/xpu/attn/xe_2 and xe_3 chunk_prefill.hpp
+// (KernelLauncher, FMHAConfig) with the tile policies of
+// csrc/xpu/attn/fmha_utils.hpp and chunk_policy_dispatch_shapes of
+// xe_3/chunk_prefill_common.hpp.
 #pragma once
+
+#include "../decode/splitkv_decode.hpp"
+#include "chunk_prefill_args.hpp"
 
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
@@ -14,34 +19,156 @@
 
 #include "cutlass/util/device_memory.h"
 
-#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
-
-#ifndef FLASH_XPU_GRF_SIZE
-  #define FLASH_XPU_GRF_SIZE 256
-#endif
+#include "../decode/grf_mode.hpp"
 
 #include "chunk_prefill_scheduler.hpp"
 #include "chunk_prefill_epilogue.hpp"
 #include "chunk_prefill_kernel.hpp"
 
-#include "fmha_utils.hpp"
-#include "chunk_prefill_args.hpp"
-
-// Everything below belongs to this architecture alone.
-//
-// XE2 and XE3 are built into separate shared libraries but instantiate kernel
-// templates with the same names from divergent sources (for example
-// chunk_prefill_args_t differs between the two). At global namespace those
-// instantiations mangle identically and are emitted as weak, default-visibility
-// symbols, so the dynamic loader binds every reference to whichever library it
-// resolves first -- an XE3 caller then runs XE2 code and reads the argument
-// struct with the wrong layout, silently corrupting the KV cache strides.
-//
-// Keeping each architecture in its own namespace makes the mangled names
-// disjoint, so the two libraries can never cross-bind. Do not move any of these
-// declarations back to global namespace.
-namespace flash_xpu_prefill::xe2 {
+namespace flash_xpu_prefill {
+// The Xe2 and CRI libraries instantiate these templates from different
+// sources; the arch-tagged namespace keeps their mangled names from
+// cross-binding at load time.
+inline namespace FLASH_XPU_FMHA_NS {
 using namespace cute;
+
+// fmha_utils.hpp tile policies. *_b16: 16-row KV tile for paged block sizes
+// the standard tile does not divide. Head 128/256/512 differ per arch.
+struct chunk_policy_head64 {
+  using ShapeQK = Shape<_128, _32, _32>;
+  using ShapePV = Shape<_128, _32, _32>;
+  using ShapeOut = Shape<_128, _64>;
+  using SubgroupLayoutQK = Layout<Shape<_8, _1, _1>>;
+};
+
+struct chunk_policy_head64_b16 {
+  using ShapeQK = Shape<_128, _16, _32>;
+  using ShapePV = Shape<_128, _32, _16>;
+  using ShapeOut = Shape<_128, _64>;
+  using SubgroupLayoutQK = Layout<Shape<_8, _1, _1>>;
+};
+
+#if FLASH_XPU_SPLITKV_TARGET_ARCH >= 35
+struct chunk_policy_head128 {
+  using ShapeQK = Shape<_512, _64, _64>;
+  using ShapePV = Shape<_512, _64, _64>;
+  using ShapeOut = Shape<_512, _128>;
+  using SubgroupLayoutQK = Layout<Shape<_32, _1, _1>>;
+
+  using ShapeQK_Causal = Shape<_256, _64, _64>;
+  using ShapePV_Causal = Shape<_256, _64, _64>;
+  using ShapeOut_Causal = Shape<_256, _128>;
+  using SubgroupLayoutQK_Causal = Layout<Shape<_16, _1, _1>>;
+};
+
+struct chunk_policy_head256 {
+  using ShapeQK = Shape<_512, _16, _64>;
+  using ShapePV = Shape<_512, _64, _16>;
+  using ShapeOut = Shape<_512, _256>;
+  using SubgroupLayoutQK = Layout<Shape<_32, _1, _1>>;
+
+  using ShapeQK_Causal = Shape<_128, _16, _64>;
+  using ShapePV_Causal = Shape<_128, _64, _16>;
+  using ShapeOut_Causal = Shape<_128, _256>;
+  using SubgroupLayoutQK_Causal = Layout<Shape<_8, _1, _1>>;
+};
+
+// The Xe3 mainloop reduces Q*K over get<1>(ShapeOut) columns only (DTiles),
+// so ShapeOut must span the full head; vllm's <_256, _256> drops half of D.
+using ShapeOut512 = Shape<_256, _512>;
+#else
+struct chunk_policy_head128 {
+  using ShapeQK = Shape<_256, _32, _32>;
+  using ShapePV = Shape<_256, _32, _32>;
+  using ShapeOut = Shape<_256, _128>;
+  using SubgroupLayoutQK = Layout<Shape<_16, _1, _1>>;
+};
+
+struct chunk_policy_head256 {
+  using ShapeQK = Shape<_256, _32, _32>;
+  using ShapePV = Shape<_256, _32, _32>;
+  using ShapeOut = Shape<_256, _256>;
+  using SubgroupLayoutQK = Layout<Shape<_32, _1, _1>>;
+};
+
+using ShapeOut512 = Shape<_256, _256>;
+#endif
+
+struct chunk_policy_head128_b16 {
+  using ShapeQK = Shape<_256, _16, _32>;
+  using ShapePV = Shape<_256, _32, _16>;
+  using ShapeOut = Shape<_256, _128>;
+  using SubgroupLayoutQK = Layout<Shape<_16, _1, _1>>;
+};
+
+struct chunk_policy_head256_b16 {
+  using ShapeQK = Shape<_256, _16, _32>;
+  using ShapePV = Shape<_256, _32, _16>;
+  using ShapeOut = Shape<_256, _256>;
+  using SubgroupLayoutQK = Layout<Shape<_32, _1, _1>>;
+};
+
+struct chunk_policy_head96 {
+  using ShapeQK = Shape<_128, _32, _32>;
+  using ShapePV = Shape<_128, _32, _32>;
+  using ShapeOut = Shape<_128, _96>;
+  using SubgroupLayoutQK = Layout<Shape<_8, _1, _1>>;
+};
+
+struct chunk_policy_head96_b16 {
+  using ShapeQK = Shape<_128, _16, _32>;
+  using ShapePV = Shape<_128, _32, _16>;
+  using ShapeOut = Shape<_128, _96>;
+  using SubgroupLayoutQK = Layout<Shape<_8, _1, _1>>;
+};
+
+struct chunk_policy_head192 {
+  using ShapeQK = Shape<_256, _32, _32>;
+  using ShapePV = Shape<_256, _32, _32>;
+  using ShapeOut = Shape<_256, _192>;
+  using SubgroupLayoutQK = Layout<Shape<_32, _1, _1>>;
+};
+
+struct chunk_policy_head192_b16 {
+  using ShapeQK = Shape<_256, _16, _32>;
+  using ShapePV = Shape<_256, _32, _16>;
+  using ShapeOut = Shape<_256, _192>;
+  using SubgroupLayoutQK = Layout<Shape<_32, _1, _1>>;
+};
+
+struct chunk_policy_head512 {
+  using ShapeQK = Shape<_256, _32, _32>;
+  using ShapePV = Shape<_256, _32, _32>;
+  using ShapeOut = ShapeOut512;
+  using SubgroupLayoutQK = Layout<Shape<_32, _1, _1>>;
+};
+
+struct chunk_policy_head512_b16 {
+  using ShapeQK = Shape<_256, _16, _32>;
+  using ShapePV = Shape<_256, _32, _16>;
+  using ShapeOut = ShapeOut512;
+  using SubgroupLayoutQK = Layout<Shape<_32, _1, _1>>;
+};
+
+// chunk_prefill_common.hpp
+template <typename Policy, bool Causal, typename = void>
+struct chunk_policy_dispatch_shapes {
+  using ShapeQK = typename Policy::ShapeQK;
+  using ShapePV = typename Policy::ShapePV;
+  using ShapeOut = typename Policy::ShapeOut;
+  using SubgroupLayoutQK = typename Policy::SubgroupLayoutQK;
+};
+
+template <typename Policy>
+struct chunk_policy_dispatch_shapes<
+    Policy,
+    true,
+    cute::void_t<typename Policy::ShapeQK_Causal>> {
+  using ShapeQK = typename Policy::ShapeQK_Causal;
+  using ShapePV = typename Policy::ShapePV_Causal;
+  using ShapeOut = typename Policy::ShapeOut_Causal;
+  using SubgroupLayoutQK = typename Policy::SubgroupLayoutQK_Causal;
+};
 
 template <class FMHAKernel, bool isVarLen>
 struct KernelLauncher {
@@ -142,11 +269,13 @@ struct KernelLauncher {
          args.softmax_lse,
          args.lse_stride,
          static_cast<const bool*>(args.is_prefill),
-         args.dynamic_causal,
          args.min_seqlen_q},
         {args.sm_scale,
          args.k_scale,
          args.v_scale,
+#if FLASH_XPU_SPLITKV_TARGET_ARCH >= 35
+         args.q_scale,
+#endif
          static_cast<int*>(args.block_table),
          args.block_size,
          args.max_blocks_per_seq,
@@ -176,7 +305,6 @@ struct KernelLauncher {
 
   static void run(sycl::queue& queue, typename FMHAKernel::Params params) {
     namespace syclex = sycl::ext::oneapi::experimental;
-    namespace intelex = sycl::ext::intel::experimental;
 
     dim3 const block = FMHAKernel::get_block_shape();
     dim3 const grid = FMHAKernel::get_grid_shape(params);
@@ -193,8 +321,8 @@ struct KernelLauncher {
         syclex::work_group_scratch_size(smem_size),
     };
     compat::experimental::kernel_properties kernel_props{
-        syclex::sub_group_size<cute::intel::sg_size>,
-        intelex::grf_size<FLASH_XPU_GRF_SIZE>};
+        flash_xpu_grf::with_grf<FLASH_XPU_GRF_SIZE>(
+            syclex::sub_group_size<cute::intel::sg_size>)};
     compat::experimental::launch_policy policy{
         sycl_grid, sycl_block, launch_props, kernel_props};
     compat::experimental::launch<cutlass::device_kernel<FMHAKernel>>(
@@ -242,7 +370,6 @@ struct FMHAConfig {
   template <class Scheduler>
   static void run(sycl::queue& queue, const chunk_prefill_args_t& args) {
     constexpr bool VarLen = true;
-    // constexpr bool Paged = true;
     cutlass::KernelHardwareInfo hw_info;
 
     using ProblemShapeType = cutlass::fmha::kernel::FMHAProblemShape<VarLen>;
@@ -259,8 +386,7 @@ struct FMHAConfig {
     static_assert(
         get<0>(TileShapeOutput{}) == get<0>(TileShapePV{}),
         "Output tile and P*V tile have different sizes in Q dimension");
-    constexpr int VTiles =
-        ceil_div(get<1>(TileShapeOutput{}), get<1>(TileShapePV{}));
+    constexpr int VTiles = get<1>(TileShapeOutput{}) / get<1>(TileShapePV{});
 
     auto make_dummy_tensor = [&](auto val, auto stride) {
       return make_tensor(
@@ -305,6 +431,22 @@ struct FMHAConfig {
         Scheduler,
         SoftmaxLSE>;
 
+    // K/V taller than one 2D block-load surface needs the sub-surface variant.
+    if constexpr (Paged) {
+      if (args.total_seqlen_k > cutlass::fmha::collective::kXeMaxSurfaceRows) {
+        using LargeSurfaceKernel = cutlass::fmha::kernel::XeFMHAFwdKernel<
+            ProblemShapeType,
+            CollectiveMainloop,
+            CollectiveEpilogue,
+            Scheduler,
+            SoftmaxLSE,
+            true>;
+        KernelLauncher<LargeSurfaceKernel, VarLen> launcher;
+        launcher.run(queue, args, hw_info);
+        return;
+      }
+    }
+
     KernelLauncher<FMHAKernel, VarLen> launcher;
 
     launcher.run(queue, args, hw_info);
@@ -312,148 +454,25 @@ struct FMHAConfig {
 
   static void
   kernel_dispatch(sycl::queue& queue, const chunk_prefill_args_t& args) {
-    return run<cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(
+    constexpr bool kReverse =
+        Causal && cutlass::fmha::collective::kReverseCausalGrid;
+    return run<cutlass::fmha::kernel::XeFHMAIndividualTileScheduler<kReverse>>(
         queue, args);
   }
 };
 
-// Hidden visibility prevents these per-arch template instantiations from being
-// exported and interposed across the XE2/XE3 kernel shared libraries (which
-// both define symbols with identical mangled names). Without this, the XE3
-// wrapper would bind to the XE2 instantiation at load time (XE2 is linked
-// first) and launch a kernel built for the wrong architecture.
-template <
-    typename chunk_policy,
-    bool Paged,
-    bool Causal,
-    bool Local,
-    bool Sink,
-    bool SoftmaxLSE>
-__attribute__((visibility("hidden"))) void policy_dispatch_impl(
-    sycl::queue& queue,
-    CutlassQKType& cuQKType,
-    const chunk_prefill_args_t& args) {
-  const int PipelineStages = 2;
-  if (cuQKType.q_type == CutlassDType::half) {
-    if (cuQKType.k_type == CutlassDType::half) {
-      return FMHAConfig<
-          typename chunk_policy::ShapeQK,
-          typename chunk_policy::ShapePV,
-          typename chunk_policy::ShapeOut,
-          typename chunk_policy::SubgroupLayoutQK,
-          void,
-          PipelineStages,
-          Paged,
-          Causal,
-          Local,
-          Sink,
-          SoftmaxLSE,
-          half_t,
-          half_t,
-          half_t,
-          half_t>::kernel_dispatch(queue, args);
-    } else if (cuQKType.k_type == CutlassDType::float8_e4m3) {
-      return FMHAConfig<
-          typename chunk_policy::ShapeQK,
-          typename chunk_policy::ShapePV,
-          typename chunk_policy::ShapeOut,
-          typename chunk_policy::SubgroupLayoutQK,
-          void,
-          PipelineStages,
-          Paged,
-          Causal,
-          Local,
-          Sink,
-          SoftmaxLSE,
-          half_t,
-          float_e4m3_t,
-          float_e4m3_t,
-          half_t>::kernel_dispatch(queue, args);
-    } else if (cuQKType.k_type == CutlassDType::float8_e5m2) {
-      return FMHAConfig<
-          typename chunk_policy::ShapeQK,
-          typename chunk_policy::ShapePV,
-          typename chunk_policy::ShapeOut,
-          typename chunk_policy::SubgroupLayoutQK,
-          void,
-          PipelineStages,
-          Paged,
-          Causal,
-          Local,
-          Sink,
-          SoftmaxLSE,
-          half_t,
-          float_e5m2_t,
-          float_e5m2_t,
-          half_t>::kernel_dispatch(queue, args);
-    }
-  } else {
-    if (cuQKType.k_type == CutlassDType::bfloat16) {
-      return FMHAConfig<
-          typename chunk_policy::ShapeQK,
-          typename chunk_policy::ShapePV,
-          typename chunk_policy::ShapeOut,
-          typename chunk_policy::SubgroupLayoutQK,
-          void,
-          PipelineStages,
-          Paged,
-          Causal,
-          Local,
-          Sink,
-          SoftmaxLSE,
-          bfloat16_t,
-          bfloat16_t,
-          bfloat16_t,
-          bfloat16_t>::kernel_dispatch(queue, args);
-    } else if (cuQKType.k_type == CutlassDType::float8_e4m3) {
-      return FMHAConfig<
-          typename chunk_policy::ShapeQK,
-          typename chunk_policy::ShapePV,
-          typename chunk_policy::ShapeOut,
-          typename chunk_policy::SubgroupLayoutQK,
-          void,
-          PipelineStages,
-          Paged,
-          Causal,
-          Local,
-          Sink,
-          SoftmaxLSE,
-          bfloat16_t,
-          float_e4m3_t,
-          float_e4m3_t,
-          bfloat16_t>::kernel_dispatch(queue, args);
-    } else if (cuQKType.k_type == CutlassDType::float8_e5m2) {
-      return FMHAConfig<
-          typename chunk_policy::ShapeQK,
-          typename chunk_policy::ShapePV,
-          typename chunk_policy::ShapeOut,
-          typename chunk_policy::SubgroupLayoutQK,
-          void,
-          PipelineStages,
-          Paged,
-          Causal,
-          Local,
-          Sink,
-          SoftmaxLSE,
-          bfloat16_t,
-          float_e5m2_t,
-          float_e5m2_t,
-          bfloat16_t>::kernel_dispatch(queue, args);
-    }
-  }
-}
-
 // kc entry: half/bf16 only (no fp8 K/V), Sink off. Mirrors vllm-xpu-kernels'
-// cutlass_chunk_prefill_impl policy choice: *_b16 tiles for paged block sizes
-// that are neither 32 nor a multiple of 64.
+// policy_dispatch_impl (causal-specific tile shapes) and
+// cutlass_chunk_prefill_impl.
 template <typename Policy, typename T, bool Paged, bool Causal, bool Local,
           bool LSE>
 void kc_launch(sycl::queue& queue, const chunk_prefill_args_t& args) {
+  using S = chunk_policy_dispatch_shapes<Policy, Causal>;
   FMHAConfig<
-      typename Policy::ShapeQK,
-      typename Policy::ShapePV,
-      typename Policy::ShapeOut,
-      typename Policy::SubgroupLayoutQK,
+      typename S::ShapeQK,
+      typename S::ShapePV,
+      typename S::ShapeOut,
+      typename S::SubgroupLayoutQK,
       void,
       2,
       Paged,
@@ -486,15 +505,32 @@ void kc_dispatch_flags(sycl::queue& queue, const chunk_prefill_args_t& args) {
   }
 }
 
+// The paged policy must have a KV tile that divides block_size. vllm-xpu-kernels
+// sends every block_size != 16 to the standard policy, but on Xe3 head128 that
+// tile is 64 rows: with block_size 32, get_paged_idx gets tiles_per_page =
+// page_stride_tiles = 0 and reads the wrong pages. Xe2 keeps vllm's choice of
+// the standard tile only for block_size 32 or a multiple of 64.
 template <typename Policy, typename PolicyB16, typename T, bool Paged>
 bool kc_chunk_prefill(sycl::queue& queue, const chunk_prefill_args_t& args) {
   if (args.is_local && args.softmax_lse != nullptr) return false;
   if constexpr (Paged) {
-    if (args.block_size <= 0 || args.block_size % 16 != 0) return false;
-    if (args.block_size != 32 && args.block_size % 64 != 0) {
+    auto kv_tile = [&](auto policy) {
+      using P = decltype(policy);
+      return args.is_causal
+          ? int(get<1>(typename chunk_policy_dispatch_shapes<P, true>::ShapeQK{}))
+          : int(get<1>(typename chunk_policy_dispatch_shapes<P, false>::ShapeQK{}));
+    };
+    const int bs = args.block_size;
+    if (bs <= 0) return false;
+    const bool std_ok = bs % kv_tile(Policy{}) == 0 &&
+                        (FLASH_XPU_SPLITKV_TARGET_ARCH >= 35 || bs == 32 ||
+                         bs % 64 == 0);
+    if (std_ok) {
+      kc_dispatch_flags<Policy, T, true>(queue, args);
+    } else if (bs % kv_tile(PolicyB16{}) == 0) {
       kc_dispatch_flags<PolicyB16, T, true>(queue, args);
     } else {
-      kc_dispatch_flags<Policy, T, true>(queue, args);
+      return false;
     }
   } else {
     kc_dispatch_flags<Policy, T, false>(queue, args);
@@ -503,10 +539,10 @@ bool kc_chunk_prefill(sycl::queue& queue, const chunk_prefill_args_t& args) {
 }
 
 template <int HD> struct kc_policy;
-#define FLASH_XPU_PREFILL_POLICY(HD)                      \
-  template <> struct kc_policy<HD> {                      \
-    using std_t = chunk_policy_head##HD;                  \
-    using b16_t = chunk_policy_head##HD##_b16;            \
+#define FLASH_XPU_PREFILL_POLICY(HD)           \
+  template <> struct kc_policy<HD> {           \
+    using std_t = chunk_policy_head##HD;       \
+    using b16_t = chunk_policy_head##HD##_b16; \
   };
 FLASH_XPU_PREFILL_POLICY(64)
 FLASH_XPU_PREFILL_POLICY(96)
@@ -516,11 +552,14 @@ FLASH_XPU_PREFILL_POLICY(256)
 FLASH_XPU_PREFILL_POLICY(512)
 #undef FLASH_XPU_PREFILL_POLICY
 
-template <int HD, bool Bf16, bool Paged>
+}  // namespace FLASH_XPU_FMHA_NS
+
+template <int Arch, int HD, bool Bf16, bool Paged>
 bool chunk_prefill_impl(sycl::queue& queue, const chunk_prefill_args_t& args) {
-  using T = cute::conditional_t<Bf16, bfloat16_t, half_t>;
+  static_assert(Arch == FLASH_XPU_SPLITKV_TARGET_ARCH, "wrong device image");
+  using T = cute::conditional_t<Bf16, cute::bfloat16_t, cute::half_t>;
   return kc_chunk_prefill<typename kc_policy<HD>::std_t,
                           typename kc_policy<HD>::b16_t, T, Paged>(queue, args);
 }
 
-}  // namespace flash_xpu_prefill::xe2
+}  // namespace flash_xpu_prefill
