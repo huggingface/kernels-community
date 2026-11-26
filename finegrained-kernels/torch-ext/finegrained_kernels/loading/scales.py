@@ -518,7 +518,7 @@ def dequant_block_fp8_weight(B, Bs, dtype, *, gate=False, expert_start=None):
 
 @triton.jit
 def _dequant_mx_weight_kernel(
-    B, Bs, Out, ExpertStart,
+    B, Bs, BsGlobal, Out, ExpertStart,
     N, K,
     stride_b_e, stride_b_n, stride_bs_e, stride_bs_n,
     PACKED: tl.constexpr, SCALE_GROUP_K: tl.constexpr,
@@ -538,17 +538,21 @@ def _dequant_mx_weight_kernel(
             w = tl.load(row_ptrs + offs_k[None, :], mask=mask, other=0.0).to(tl.float32)
         scale = tl.load(
             Bs + expert * stride_bs_e + rows[:, None].to(tl.int64) * stride_bs_n + (offs_k // SCALE_GROUP_K)[None, :],
-            mask=mask, other=0,
+            mask=mask, other=0.0,  # a float fill casts to UE8M0 bytes and to E4M3 scales (an int one cannot)
         )
+        value = w * decode_group_scale(scale)
+        if BsGlobal is not None:  # NVFP4's second-level scale, one per expert
+            value = value * tl.load(BsGlobal + expert)
         out = Out + expert * N * K + rows[:, None].to(tl.int64) * K + offs_k[None, :]
-        tl.store(out, (w * decode_group_scale(scale)).to(Out.dtype.element_ty), mask=mask)
+        tl.store(out, value.to(Out.dtype.element_ty), mask=mask)
 
 
-def dequant_mx_weight(B, Bs, dtype, *, expert_start=None):
+def dequant_mx_weight(B, Bs, dtype, *, b_global_scale=None, expert_start=None):
     """Materialize MXFP4 / MXFP8 / NVFP4 weights (``(E, N, K // 2)`` packed E2M1 or ``(E, N, K)`` E4M3, with
-    ``(E, N, K // group)`` UE8M0 or E4M3 group scales) for one prefill GEMM, each value times its group scale,
-    rounded once. An E2M1 or E4M3 value times a UE8M0 scale is exact in BF16. As with
-    ``dequant_block_fp8_weight``, planes of experts with no routed rows are allocated but left untouched."""
+    ``(E, N, K // group)`` UE8M0 or E4M3 group scales) for one prefill GEMM, each value times its group scale, and
+    NVFP4's fp32 ``b_global_scale`` (one per expert) when given, rounded once. An E2M1 or E4M3 value times a UE8M0 scale
+    is exact in BF16. As with ``dequant_block_fp8_weight``, planes of experts with no routed rows are allocated but
+    left untouched."""
     assert dtype in (torch.bfloat16, torch.float16) and B.ndim == 3 and Bs.ndim == 3
     packed = B.dtype in (torch.int8, torch.uint8)
     E, N, K_b = B.shape
@@ -561,7 +565,9 @@ def dequant_mx_weight(B, Bs, dtype, *, expert_start=None):
         compile_time_only_triton_wrap(_dequant_mx_weight_kernel)[
             (triton.cdiv(N, block_r), triton.cdiv(K, block_k), E)
         ](
-            B.view(torch.uint8) if packed else B, Bs, output, expert_start, N, K,
+            B.view(torch.uint8) if packed else B, Bs,
+            None if b_global_scale is None else b_global_scale.reshape(-1).float().contiguous(),
+            output, expert_start, N, K,
             B.stride(0), B.stride(1), Bs.stride(0), Bs.stride(1),
             PACKED=packed, SCALE_GROUP_K=group, BLOCK_R=block_r, BLOCK_K=block_k,
         )

@@ -81,6 +81,8 @@ class PathAutotuner:
             return self.forced
         key = key + offered
         if torch.compiler.is_compiling():  # a traced caller (e.g. a MoE forward): the tuned decision or the default
+            if any(isinstance(k, torch.SymInt) for k in key):  # a dynamic dim has no tuned decision (nor a hash)
+                return offered[0]
             return self.cache.get(key, offered[0])
         pinned = self._pinned.get()
         if pinned in offered:  # the decision being timed; another decision of the call resolves as usual

@@ -1556,6 +1556,33 @@ def test_signed_int_repacks(checkpoint):
 
 
 @pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
+@pytest.mark.parametrize("weights", ["mxfp8", "mxfp4", "nvfp4"])
+def test_dequant_mx_weight_matches_reference(weights):
+    """The offline-dequant path's MX weight materialization (``dequant_mx_weight``) against the independent dequant, for
+    UE8M0 (MX) and E4M3 (NVFP4, with its per-expert global) group scales: one rounding, so bit-exact in BF16."""
+    torch.manual_seed(0)
+    B, Bs, G = WEIGHTS[weights]["make"](128, 256, 2)
+    G = G if weights == "nvfp4" else None
+    out = internals.scales.dequant_mx_weight(B, Bs, torch.bfloat16, b_global_scale=G)
+    ref = WEIGHTS[weights]["dequant"](B, Bs, G) if G is not None else WEIGHTS[weights]["dequant"](B, Bs)
+    torch.testing.assert_close(out, ref.reshape(out.shape).to(torch.bfloat16), rtol=0, atol=0)
+
+
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
+def test_path_choice_with_dynamic_shapes():
+    """A path-tuned op traced with dynamic shapes keys its decision on a symbolic M, which has no tuned decision (nor a
+    hash): the trace takes the default path instead of failing (an INT4 linear compiled across decode and batch)."""
+    torch.manual_seed(0)
+    N, K = 256, 512
+    B, Bs, _ = WEIGHTS["int4"]["make"](N, K, 1)
+    B, Bs = B[0], Bs[0]
+    run = torch.compile(finegrained_kernels.matmul_2d, fullgraph=True, dynamic=True)
+    for M in (1, 64):
+        A = torch.randn(M, K, device=TEST_DEVICE, dtype=torch.bfloat16)
+        torch.testing.assert_close(run(A, B, None, Bs), finegrained_kernels.matmul_2d(A, B, None, Bs))
+
+
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 @pytest.mark.parametrize(
     "weights,tuner,activation_format",
     [
