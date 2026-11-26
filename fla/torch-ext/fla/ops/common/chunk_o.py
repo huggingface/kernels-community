@@ -160,6 +160,7 @@ def chunk_fwd_kernel_o(
     'USE_G_GAMMA': lambda args: args['g_gamma'] is not None,
     'USE_DW': lambda args: args['dw'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+    'IS_FP32': lambda args: args['q'].dtype == torch.float32,
 })
 @fla_cache_autotune(
     configs=[
@@ -202,6 +203,7 @@ def chunk_bwd_kernel_dqkwg(
     USE_DW: tl.constexpr,
     STATE_V_FIRST: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    IS_FP32: tl.constexpr,
 ):
     scale = scale.to(tl.float32)
     i_k, i_t = unflatten_program_id(tl.cdiv(K, BK))
@@ -309,12 +311,21 @@ def chunk_bwd_kernel_dqkwg(
         b_dg_last += tl.sum(b_dk * b_k)
 
         b_ds = tl.where(m_A, b_ds * exp2(b_g[:, None] - b_g[None, :]), 0) * scale
+        if IS_FP32:
+            # Under strong decay, dg is a small difference of large terms. Taken from dq and dk after the dots below,
+            # it loses most of its precision with TF32 dots. Take the intra-chunk part as row sums minus column sums
+            # of the same matrix instead, so that its diagonal cancels exactly.
+            # See https://github.com/fla-org/flash-linear-attention/issues/1802 and the upstream fix in
+            # https://github.com/fla-org/flash-linear-attention/pull/1822
+            b_ds2 = b_ds * tl.dot(b_q, tl.trans(b_k))
+            b_dg = tl.sum(b_dq * b_q, axis=1) - tl.sum(b_dk * b_k, axis=1)
+            b_dg += tl.sum(b_ds2, axis=1) - tl.sum(b_ds2, axis=0)
         b_ds = b_ds.to(b_k.dtype)
         # [BT, BK]
         b_dq = tl.dot(b_ds, b_k, b_dq)
         b_dk = tl.dot(tl.trans(b_ds), b_q, b_dk)
-
-        b_dg = tl.sum(b_dq * b_q, axis=1) - tl.sum(b_dk * b_k, axis=1)
+        if not IS_FP32:
+            b_dg = tl.sum(b_dq * b_q, axis=1) - tl.sum(b_dk * b_k, axis=1)
 
         p_dg = dg + o_t * HV
         # reverse cumsum runs in a separate kernel to avoid a Triton compiler issue.

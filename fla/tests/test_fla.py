@@ -209,6 +209,39 @@ def naive_chunk_kda(
 
 
 @pytest.mark.kernels_ci
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_gated_delta_rule_dg_strong_decay():
+    # TF32 dots used to break dg in fp32 under strong decay (fla-org/flash-linear-attention#1802)
+    torch.manual_seed(42)
+
+    B, T, H, D = 2, 128, 4, 64
+    q, k = (F.normalize(torch.randn(B, T, H, D, device="cuda"), dim=-1) for _ in range(2))
+    v, do = (torch.randn(B, T, H, D, device="cuda") for _ in range(2))
+    # As strong as in Gated DeltaNet layers, where exp(A_log) goes up to 16. With the logsigmoid decay of the
+    # other tests, the dg error was only 3e-3 before the fix.
+    g = -16 * F.softplus(torch.randn(B, T, H, device="cuda"))
+    beta = torch.rand(B, T, H, device="cuda")
+
+    def recurrence(q, k, v, g, beta):
+        state = q.new_zeros(B, H, D, D)
+        outputs = []
+        for t in range(T):
+            state = state * g[:, t].exp()[..., None, None]
+            error = v[:, t] - torch.einsum("bhkv,bhk->bhv", state, k[:, t])
+            state = state + torch.einsum("bhk,bhv->bhkv", k[:, t], beta[:, t, :, None] * error)
+            outputs.append(torch.einsum("bhkv,bhk->bhv", state, q[:, t]) * D**-0.5)
+        return torch.stack(outputs, dim=1)
+
+    dgs = []
+    for fn, dtype in ((recurrence, torch.float64), (lambda *x: fla.chunk_gated_delta_rule(*x)[0], torch.float32)):
+        g_leaf = g.to(dtype).requires_grad_()
+        (fn(q.to(dtype), k.to(dtype), v.to(dtype), g_leaf, beta.to(dtype)) * do.to(dtype)).sum().backward()
+        dgs.append(g_leaf.grad.double())
+    ref, dg = dgs
+    assert (dg - ref).norm() / ref.norm() < 1e-2
+
+
+@pytest.mark.kernels_ci
 def test_gated_delta_rule():
     if not torch.cuda.is_available():
          pytest.skip("only sanity checking cuda for now")
