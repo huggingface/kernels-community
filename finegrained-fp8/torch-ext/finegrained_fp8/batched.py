@@ -35,6 +35,8 @@ from .utils import (
     get_accelerator_autotuning_configs,
     get_mxfp_autotuning_configs,
     grf_config_pruner,
+    tile_config_pruner,
+    chain_config_pruners,
     is_mxfp,
     is_tensor_wide,
     e2m1_as_uint8,
@@ -237,7 +239,10 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     # single accumulator + single expert weight tile; prunes dot/dot_scaled/scalar configs
     # whose per-thread register footprint spills past the large-GRF recompile
     prune_configs_by={
-        "early_config_prune": grf_config_pruner(n_accumulators=1, n_weight_tiles=1)
+        "early_config_prune": chain_config_pruners(
+            grf_config_pruner(n_accumulators=1, n_weight_tiles=1),
+            tile_config_pruner(),
+        )
     },
 )
 @triton.jit
@@ -553,6 +558,8 @@ def _mxfp_dynamic_matmul_batched(
     assert K % MX_SCALE_GROUP_K == 0, (
         f"K (={K}) must be a multiple of {MX_SCALE_GROUP_K}"
     )
+    # No N mask in the kernel: tile_config_pruner keeps only BLOCK_SIZE_N dividing N.
+    assert N % 32 == 0, f"N (={N}) must be a multiple of 32, the smallest BLOCK_SIZE_N"
     assert Bs.shape == (num_experts, N, K // MX_SCALE_GROUP_K), (
         f"Bs shape {tuple(Bs.shape)} != ({num_experts}, {N}, {K // MX_SCALE_GROUP_K})"
     )
