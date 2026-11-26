@@ -75,7 +75,8 @@ def test_block_within_dim_pruner_vetoes_and_raises():
 def test_single_trip_dot_scaled_configs_are_pruned():
     """The hub-v4 crash class: a dot_scaled config whose K-loop is a single trip
     (BLOCK_SIZE_K >= contraction dim) trips the sm_10x accumulator-init miscompile — v4
-    benched such configs during tuning and died with sticky device traps."""
+    benched such configs during tuning and died with sticky device traps. Fixed in Triton 3.9,
+    where the fence lifts."""
     prune = mx_config_pruner("K")
     cfgs = [
         triton.Config(
@@ -92,7 +93,8 @@ def test_single_trip_dot_scaled_configs_are_pruned():
     ]
     kept = prune(cfgs, {"K": 256})
     # BK=256 == K -> single trip
-    assert {c.kwargs["BLOCK_SIZE_K"] for c in kept} == {128}
+    fenced = not internals.compat.is_triton_greater_or_equal("3.9")
+    assert {c.kwargs["BLOCK_SIZE_K"] for c in kept} == ({128} if fenced else {128, 256})
 
 
 @pytest.mark.kernels_ci
