@@ -1270,6 +1270,12 @@ def split_k_reduce(acc, Partials, TileCounters, tile, num_tiles, BM: tl.constexp
         block_ms=(16, 32, 64, 128), block_ns=(64, 128), pre_hook=rebind_tiled_descriptors, WARP_SPEC=False,
         SWAP_AB=True,
     )
+    # the same tiles warp-specialized, host TMA on both operands: the loads run in their own partition beside the
+    # decode and the MMA (Qwen2.5 AWQ INT4 qkv 4608x3584 M=64, B200, cold weights, graph: 12.9 -> 9.5us)
+    + narrow_dot_autotuning_configs(
+        memory_modes=("descriptor",), block_ms=(16, 32, 64, 128), block_ns=(64, 128),
+        pre_hook=rebind_tiled_descriptors, WARP_SPEC=True, SWAP_AB=True,
+    )
     + narrow_scalar_autotuning_configs(block_ms=(1, 2, 4))),
     # the width and the scale group decide which tiles fit and compile: part of the key
     ["N", "K", "m_bit_length", "GATE", "INT_BITS", "SCALE_GROUP_K", "ACT_QUANT"],

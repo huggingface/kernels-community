@@ -95,7 +95,8 @@ def _mx_grouped_configs():
     ] if is_sm10x() else []
     for config in configs:
         config.kwargs["SWAP_AB"] = False
-    # BK=512 halves the swapped tile's K steps: GLM-5.2 NVFP4 T=64 (E256 H6144 I2048) 762 -> 713 us at 2 stages
+    # BK=512 halves the swapped tile's K steps: GLM-5.2 NVFP4 T=64 (E256 H6144 I2048) 762 -> 713 us at 2 stages.
+    # No warp-specialized swapped tile: they fail TritonGPU lowering (PassManager::run failed, Triton 3.9).
     swapped = [
         triton.Config(
             dict(BLOCK_SIZE_M=bm, BLOCK_SIZE_N=bn, BLOCK_SIZE_K=bk, COMPUTE_MODE="dot_scaled", WARP_SPEC=False,
@@ -156,8 +157,7 @@ def _block_dynamic_fp8_grouped_configs():
         configs.extend(
             clone_config(c, SWAP_AB=True)
             for c in list(configs)
-            if c.kwargs["BLOCK_SIZE_M"] in (16, 32, 64) and not c.kwargs["WARP_SPEC"] and c.num_warps == 4
-            and c.kwargs["PIPELINE"] == "k_loop"
+            if c.kwargs["BLOCK_SIZE_M"] in (16, 32, 64) and c.kwargs["PIPELINE"] == "k_loop"
         )
     return configs
 
@@ -552,6 +552,7 @@ def _tensor_grouped_configs():
         # Swapped small-token tiles put the weight rows on the MMA M side, for experts averaging a few routed rows
         # (grouped_swap_scope_pruner), as in the INT grid. Mistral-4 FP8 static MoE: T=512 737 -> 616 us, T=256
         # 585 -> 561 us; the gate|up tile wants BK=256 (BN=128, 3 stages: a further 482 -> 473 us at T=64).
+        # No warp-specialized swapped tile: they fail TritonGPU lowering (PassManager::run failed, Triton 3.9).
         for bm in (16, 32):
             for bn in (64, 128):
                 for bk, stages in ((128, 3), (128, 4), (256, 2), (256, 3)):
@@ -1260,16 +1261,18 @@ def _int_grouped_configs():
                     ))
         # Swapped small-token tiles put the weight rows on the MMA M side: Qwen3 AWQ INT4 zp T=64
         # (E128 H2048 I768 top8) 122 -> 104 us at BM16 BN128 3 stages, bit-identical to the unswapped crown.
+        # A host-TMA activation also warp-specializes (4 or 8 warps), as in the INT 2D grid.
         for bm in (16, 32):
             for bn in (64, 128):
                 for stages in (3, 4):
-                    for a_mode in ("pointer", "host_descriptor"):
-                        configs.append(triton.Config(
-                            dict(BLOCK_SIZE_M=bm, BLOCK_SIZE_N=bn, BLOCK_SIZE_K=128, WARP_SPEC=False, GROUP_SIZE_M=1,
+                    for a_mode, ws, warps in (("pointer", False, 4), ("host_descriptor", False, 4),
+                                              ("host_descriptor", True, 4), ("host_descriptor", True, 8)):
+                        configs.extend(triton.Config(
+                            dict(BLOCK_SIZE_M=bm, BLOCK_SIZE_N=bn, BLOCK_SIZE_K=128, WARP_SPEC=ws, GROUP_SIZE_M=group,
                                  A_MEMORY_MODE=a_mode, B_MEMORY_MODE="host_descriptor", PACKED_SCHEDULE=False,
                                  PROGRAMS_PER_SM=persistent_programs_per_sm(bm), SWAP_AB=True),
-                            num_warps=4, num_stages=stages, pre_hook=grouped_pre_hook,
-                        ))
+                            num_warps=warps, num_stages=stages, pre_hook=grouped_pre_hook,
+                        ) for group in (1, 8))
     for config in configs:
         config.kwargs["PIPELINE"] = "k_loop"
     # Tile overlap and flattening are separate choices: GLU register pressure can favor preserving the K loop.
@@ -1716,8 +1719,7 @@ def _block_fp8_weight_only_grouped_configs():
     configs.extend(
         clone_config(c, SWAP_AB=True)
         for c in list(configs)
-        if c.kwargs["BLOCK_SIZE_M"] <= 32 and not c.kwargs["WARP_SPEC"] and c.num_warps == 4
-        and c.kwargs["BLOCK_SIZE_N"] in (64, 128) and c.kwargs["BLOCK_SIZE_K"] in (128, 256)
+        if c.kwargs["BLOCK_SIZE_M"] <= 32 and c.kwargs["BLOCK_SIZE_N"] in (64, 128) and c.kwargs["BLOCK_SIZE_K"] in (128, 256)
     )
     # Stage decoded weights on the MMA lhs and overlap consecutive output tiles.
     if is_sm10x():

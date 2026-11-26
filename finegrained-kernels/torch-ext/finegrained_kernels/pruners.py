@@ -1000,7 +1000,8 @@ def packed_schedule_scope_pruner(min_bm: int = 128):
     bf16 forced pairs +10.7% at BM128 vs −12.5% at BM64/BN256 and a wash at BM32,
     2026-08-06; both tuned crowns chose BM128). Everywhere else the inline resolve's free
     ALU beats the packed arm's per-tile dependent loads, so those rows are tune-budget
-    dilution (the axis would double the grid; this keeps it +25%)."""
+    dilution (the axis would double the grid; this keeps it +25%). Swapped tiles, whose BLOCK_SIZE_M is the token side,
+    do not lower with it in the MX, tensor and INT grouped kernels (Triton 3.9: every forced one a CompilationError)."""
 
     def ok(c, args):
         if not c.kwargs.get("PACKED_SCHEDULE"):
