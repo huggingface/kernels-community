@@ -244,7 +244,7 @@ def rebind_dgrad_descriptors(nargs):
     natural contiguous windows in the FORWARD-oriented operands, which is why dgrad can take a
     descriptor at all: a transposed view has no unit-stride innermost dim (see
     ``maybe_descriptor``). Scales stay affine on the pointer arm, as weight-only does."""
-    wvpb = 2 if nargs["B"].dtype == torch.uint8 else 1
+    wvpb = weight_values_per_element(nargs)  # packed E2M1 bytes or integer words
     rebind_operand_box(
         nargs, "A_MEMORY_MODE", "ADescriptor", nargs["BLOCK_SIZE_M"], nargs["BLOCK_SIZE_N"]
     )
@@ -259,7 +259,7 @@ def rebind_dgrad_grouped_descriptors(nargs):
     1-row box) and ``[BM, BN]`` otherwise — ScatterIdx is the gather map here, since dgrad reads
     dY at the forward's SCATTER destination. The weight box is ``[1, BN, BK_bytes]`` over
     (E, N, K_bytes): the expert leads, so this descriptor takes THREE offsets."""
-    wvpb = 2 if nargs["B"].dtype == torch.uint8 else 1
+    wvpb = weight_values_per_element(nargs)  # packed E2M1 bytes or integer words
     gathering = nargs.get("ScatterIdx") is not None
     rebind_operand_box(
         nargs, "A_MEMORY_MODE", "ADescriptor",

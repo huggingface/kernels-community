@@ -53,6 +53,7 @@ dgrad_matmul_grouped = internals.backward.dgrad_matmul_grouped
 glu_backward = internals.backward.glu_backward
 apply_glu = internals.epilogue.apply_glu
 dgrad_matmul_grouped_kernel = internals.backward.dgrad_matmul_grouped_kernel
+dgrad_matmul_2d_kernel = internals.backward.dgrad_matmul_2d_kernel
 
 
 pytestmark = pytest.mark.skipif(not SUPPORTS_FP8, reason="FP8 kernels require SM89+")
@@ -567,7 +568,12 @@ def test_dgrad_grouped_every_admitted_config_accumulates():
             num_input_rows=T, routed_idx=routed_idx,
         )
 
-    tuner = dgrad_matmul_grouped_kernel
+    _assert_every_admitted_config(dgrad_matmul_grouped_kernel, launch, floor, "break top-k accumulation")
+
+
+def _assert_every_admitted_config(tuner, launch, floor, what):
+    """Force-run every config the pruners admit for ``launch`` and hard-check each against ``floor``. The tuner benches
+    configs by speed, so an arm that is wrong only on some launch gets crowned whenever it wins a near-tied tune."""
     admitted = {}
     original_prune, original_configs = tuner.early_config_prune, tuner.configs
 
@@ -589,22 +595,45 @@ def test_dgrad_grouped_every_admitted_config_accumulates():
             tuner.configs = [config]
             tuner.cache.clear()
             try:
-                dX = launch()
+                out = launch()
                 torch.accelerator.synchronize()
             except Exception as e:
                 # strict fails on anything but a compiled memory overflow (the compiler's per-shape choice)
                 if not is_memory_overflow(str(e)):
                     failed.append((config.all_kwargs(), f"{type(e).__name__}: {str(e)[:120]}"))
                 continue
-            rel = _rel(dX, floor)
+            rel = _rel(out, floor)
             if rel > 5e-3:
                 wrong.append((rel, config.all_kwargs()))
     finally:
         tuner.configs = original_configs
         tuner.cache.clear()
-    assert not wrong, f"{len(wrong)} config(s) break top-k accumulation, e.g. {wrong[0]}"
+    assert not wrong, f"{len(wrong)} config(s) {what}, e.g. {wrong[0]}"
     # strict (the test default, see conftest): the pruners admitted a config that cannot run
     assert not failed or tuner.max_failures != 0, f"{len(failed)} admitted config(s) failed to run, e.g. {failed[0]}"
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("rows", [1, 16, 64, 512])  # swapped / split decode, the split edge, grouped prefill order
+@pytest.mark.parametrize("weights", ["fp8_128x128", "mxfp4", "int4"])
+def test_dgrad_2d_every_admitted_config_is_correct(weights, rows):
+    """Every admitted 2D dgrad config against the quantization floor: block, group-32 and integer scale grids across the
+    decode (swapped, reduction-split) and prefill (grouped tile order) bands."""
+    torch.manual_seed(0)
+    Nw, Kw = 512, 768
+    B, Bs, _ = WEIGHTS[weights]["make"](Nw, Kw, 1)
+    B, Bs = B[0], Bs[0]
+    if B.dtype == torch.uint32:  # integer words go in as stored, like the op's backward (``_int_dgrad_2d``)
+        W, Ws, group, row_div, int_bits = B, Bs, Kw // Bs.shape[-1], 1, 32 // (Kw // B.shape[-1])
+    else:
+        (W, Ws, group, row_div), int_bits = internals.backward._dgrad_operands(B, Bs), 0
+    dY = torch.randn(rows, Nw, device=TEST_DEVICE, dtype=torch.bfloat16)
+    floor = dY.float() @ WEIGHTS[weights]["dequant"](B, Bs)
+    _assert_every_admitted_config(
+        dgrad_matmul_2d_kernel,
+        lambda: dgrad_matmul_2d(dY, W, Ws, group, row_div, output_dtype=torch.float32, int_bits=int_bits),
+        floor, "are wrong",
+    )
 
 
 # ── fused MoE, end to end ────────────────────────────────────────────────────────

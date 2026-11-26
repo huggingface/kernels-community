@@ -1743,6 +1743,22 @@ def descriptor_needs_prequant_pruner():
     )
 
 
+def warp_spec_small_act_box_pruner(row_tile: str = "BLOCK_SIZE_M", col_tile: str = "BLOCK_SIZE_N", min_box_bytes: int = 128):
+    """Miscompile gate: warp specialization with a host-TMA activation box under ``min_box_bytes`` traps the device
+    (sticky CUDA 716 "misaligned address"). Charted on B200 / Triton 3.9 on the 2D dgrad, one fresh process per
+    config (swapped, BM 1-16, BN 32/64/128, BK 64/128, stages 2-5, both weight memory modes, INT4 and MXFP4):
+    - every ``[1, 32]`` bf16 box (64 B) traps;
+    - the same tile with a pointer activation, or without warp specialization, runs correct;
+    - every box of 128 B or more runs correct."""
+
+    def ok(c, args):
+        if not c.kwargs.get("WARP_SPEC") or c.kwargs.get("A_MEMORY_MODE", "pointer") == "pointer":
+            return True
+        return config_dim(c, args, row_tile) * config_dim(c, args, col_tile) * args["A"].element_size() >= min_box_bytes
+
+    return config_filter(ok, when=lambda args: get_active_device_type() == "cuda")
+
+
 def descriptor_support_pruner():
     """Fence descriptor strides and gather support. Triton splits logical tiles into
     legal physical TMA boxes; the logical tile may exceed 256 elements per dimension.

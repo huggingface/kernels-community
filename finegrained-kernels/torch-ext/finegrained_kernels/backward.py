@@ -90,6 +90,7 @@ from .pruners import (
     int_split_k_pruner,
     smem_pruner,
     warp_spec_compile_guard_pruner,
+    warp_spec_small_act_box_pruner,
 )
 from .formats import global_scale_stride, normalize_global_scale, ue8m0_as_uint8
 from .swizzle import unswizzle_mx_scales
@@ -231,6 +232,7 @@ def _dgrad_2d_configs():
             ),
             int_split_k_pruner("M", DGRAD_SPLIT_MAX_M, dim="N", tile="BLOCK_SIZE_N"),
             warp_spec_compile_guard_pruner(),
+            warp_spec_small_act_box_pruner(),
             descriptor_support_pruner(),
             smem_pruner("BLOCK_SIZE_K"),
         )
