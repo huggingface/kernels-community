@@ -63,7 +63,7 @@ Every (row, problem, regime, impl) cell runs in THREE modes:
 CUDA modes rotate banks (MoE: rerouted experts of one stack; dense: weight copies) whose active weights exceed twice L2.
 Elapsed latency is normalized per invocation; cache eviction is never timed.
 
-Regimes: decode T=1 and prefill T=8192 (routed through top_k experts; attn row: M=T).
+Regimes: decode T=1 and prefill T=8192 (routed through top_k experts; linear rows: M=T).
 
 --smoke: fast everything-compiles pass — FINEGRAINED_AUTOTUNE_CONFIG=fast (unless one is already set)
 and a 256-token prefill.
@@ -86,6 +86,7 @@ import json
 import os
 import random
 import re
+import statistics
 import subprocess
 import threading
 import sys
@@ -731,8 +732,8 @@ print(f"[bench] {DEVICE} has {_TOTAL_VRAM / 1024**3:.1f} GiB -> "
       f"{'small' if SMALL_GEOMETRY else 'full'} roster "
       f"({len(MOE_PROBLEMS)} quantized + {len(BF16_PROBLEMS)} bf16 rows)")
 
-ATTN_PROBLEMS = {
-    "deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096)": dict(
+LINEAR_PROBLEMS = {
+    "deepseek-ai/DeepSeek-V4 qkv FP8 W8A8 ue8m0 (N=12288 K=4096)": dict(
         # DeepSeek-V4's attention deploys block-FP8 W8A8 with UE8M0 (power-of-two) scales
         # (only the EXPERTS are mixed W4A8) — routes through the tcgen05 dot_scaled arm.
         # K=4096 is on the 128 grid, so DeepGEMM FP8 runs it.
@@ -740,39 +741,39 @@ ATTN_PROBLEMS = {
         block=[128, 128], baselines=("deepgemm", "vllm_mm", "humming"),
     ),
     # GPT-OSS deploys MXFP4 in experts; dense GPTQ/AWQ examples follow below.
-    "nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144)": dict(
+    "nvidia/GLM-5.2-NVFP4 qkv W4A4 (N=18432 K=6144)": dict(
         N=18432, K=6144, weights="nvfp4", activation_format=None,
         # vLLM's CUTLASS FP4 GEMM and FlashInfer's mm_fp4 (CUTLASS backend), each quantizing the
         # BF16 weight with its own NVFP4 quantizer (FlashInfer's trtllm backend wants pre-shuffled weights)
         block=None, baselines=("vllm_mm", "flashinfer_mm"),
     ),
-    "deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168)": dict(
+    "deepseek-ai/DeepSeek-V3 qkv FP8 W8A8 fp32 128x128 (N=21504 K=7168)": dict(
         # DeepSeek-V3 deploys fp32 block scales everywhere (software rescale, not dot_scaled).
         # No deepgemm baseline, for the same reason the V3 MoE row has none: its SM100 path can
         # only consume UE8M0, so the linear rounds each fp32 block scale to a power of two — up to
         # 2x per block, measured 0.53 relative vs every other arm (0.001 on the UE8M0 row below).
         # That is a different computation, so timing it here would compare unlike work; the honest
-        # UE8M0 deepgemm comparison is the DeepSeek-V4 attn row.
+        # UE8M0 deepgemm comparison is the DeepSeek-V4 qkv row.
         N=21504, K=7168, weights="fp8_128x128", activation_format=None,
         # vLLM's CUTLASS block-FP8 GEMM reads the fp32 block scales as they are
         block=[128, 128], baselines=("vllm_mm", "humming"),
     ),
-    # the dense half of the same per-tensor STATIC export as the Mistral-4 MoE row: its attn
+    # the dense half of the same per-tensor STATIC export as the Mistral-4 MoE row: its qkv
     # linears carry per-tensor weights and a calibrated activation scale, on the 2D op. N is the
     # fused qkv width from the model config (32 q heads + 32 kv heads, all 128-wide, hidden 4096).
     # DeepGEMM's fp8 arms are block-scaled, but torch's TensorWise scaled_mm is exactly this quantization granularity, so `torch_mm` bars
     # it. The local arm ROUTES to that same cuBLAS call, so the two are expected to coincide —
     # their diverging is the regression signal.
-    "mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096)": dict(
+    "mistralai/Mistral-4 qkv FP8 per-tensor W8A8 static (N=12288 K=4096)": dict(
         N=12288, K=4096, weights="fp8_tensor", activation_format=None,
         block=None, baselines=("vllm_mm", "humming"), static=True,  # vLLM: cutlass_scaled_mm, per-tensor scales
     ),
-    "MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144)": dict(
+    "MiniMaxAI/MiniMax-M3 qkv MXFP8 W8A8 (N=18432 K=6144)": dict(
         N=18432, K=6144, weights="mxfp8", activation_format=None,
         # DeepGEMM FP8 is 128-block, not group-32 MX; FlashInfer's mm_mxfp8 (CUTLASS) is
         block=None, baselines=("flashinfer_mm", "humming"),
     ),
-    "meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120)": dict(
+    "meta-llama/Llama-4-Scout-17B-16E-Instruct qkv FP8 rowwise (N=7168 K=5120)": dict(
         # Scout uses GQA: (40 query heads + 2 * 8 KV heads) * head_dim 128.
         N=7168, K=5120, weights="fp8_rowwise", activation_format="fp8",
         block=None, baselines=("fbgemm", "vllm_mm", "humming"), weight_std=0.02, activation_scale_ub=1200.0,
@@ -859,8 +860,8 @@ IMPL_COLORS = {
     # from all ten, 54 from finegrained-kernels)
     "humming": "#000000",
     # the two reference arms: greys, so the measured stacks keep the palette
-    "fg_dequant_gemm": "#999999",
-    "bf16_weights": "#cccccc",
+    "runtime_dequant": "#999999",
+    "loadtime_dequant": "#cccccc",
 }
 
 
@@ -883,8 +884,8 @@ _IMPL_LABELS = {
     "flashinfer_cutlass_moe": "FlashInfer CUTLASS",
     "flashinfer_svdquant": "FlashInfer SVDQuant",
     "humming": "humming (vLLM)",
-    "fg_dequant_gemm": "finegrained-kernels dequant + BF16 GEMM",
-    "bf16_weights": "BF16 weights (ceiling)",
+    "runtime_dequant": "runtime dequant + BF16 GEMM",
+    "loadtime_dequant": "loadtime dequant + BF16 GEMM",
 }
 # transformers' BF16 experts forward is batched_mm at decode, grouped_mm from a batch up
 _TRANSFORMERS_LABELS = {"decode": "torch.bmm", "batch": "torch.nn.functional.grouped_mm",
@@ -1214,7 +1215,7 @@ def torch_weight_only_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
     return run
 
 
-def _fg_dequant(cfg, W, Ws, W_g, Wz, K, dtype, expert_start=None):
+def _fg_dequant(cfg, W, Ws, W_g, Wz, K, dtype, expert_start=None, gate=False):
     """The row's weight in the activation ``dtype`` (BF16 or FP16) through our own dequant kernels, the ones the
     weight-only ops stage before their prefill GEMM: FP8 (block / tensor / rowwise) and MX / NVFP4 skip expert planes
     with no routed rows when ``expert_start`` is given, NVFP4's per-expert global applied in the same pass; integer
@@ -1227,34 +1228,46 @@ def _fg_dequant(cfg, W, Ws, W_g, Wz, K, dtype, expert_start=None):
         out = dequant_mx_weight(W if stacked else W[None], Ws if stacked else Ws[None], dtype,
                                 b_global_scale=W_g, expert_start=expert_start)
         return out if stacked else out[0]
-    return dequant_block_fp8_weight(W, Ws, dtype, expert_start=expert_start)
+    return dequant_block_fp8_weight(W, Ws, dtype, gate=gate, expert_start=expert_start)
 
 
-def fg_dequant_gemm_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g=None, dn_g=None, _logits=None,
+def _bf16_moe_forward(cfg, grouped, hidden, idx, w):
+    """Our fused BF16 MoE forward over interleaved gate|up weights handed in at call time: the GEMM both reference
+    arms run (the same op and flags as the finegrained-kernels arm on a BF16 row)."""
+    fn = fgm.moe_fused_grouped if grouped else fgm.moe_fused_batched
+    kw = dict(act_fn=cfg["act"], swiglu_alpha=cfg["swiglu_alpha"], swiglu_limit=cfg["swiglu_limit"],
+              activation_format=None, simulate_unfused=True)
+    return lambda gu16, dn16: fn(hidden, idx, w, gu16, dn16, None, None, **kw)
+
+
+def runtime_dequant_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g=None, dn_g=None, _logits=None,
                         guz=None, dnz=None, *_):
-    """Reference: dequantize the routed experts to BF16 with our dequant kernels every call, then the BF16 grouped_mm
-    experts forward. What a dequantize-then-BF16 stack costs at its best."""
+    """Reference: dequantize the routed experts with our dequant kernels every call (straight into the interleaved
+    gate|up layout), then our fused BF16 MoE. What a dequantize-at-runtime stack costs at its best."""
     E = cfg["E"]
-    mod = _Experts(cfg, None, None)
-    fwd = grouped_mm_experts_forward  # every regime: batched_mm gathers a weight copy per token (10x slower at decode)
+    gu_i, gus_i = _interleave_gate_up(gu, gus)  # once: the layout our fused kernels read
+    guz_i = _interleave_rows(guz)
+    _mark_static(gu_i, gus_i, guz_i)
+    forward = _bf16_moe_forward(cfg, grouped, hidden, idx, w)
 
     def run():
         counts = torch.histc(idx.reshape(-1).float(), bins=E, min=0, max=E - 1).to(torch.int32)
         expert_start = torch.cat([counts.new_zeros(1), counts.cumsum(0, dtype=torch.int32)])
-        mod.gate_up_proj = _fg_dequant(cfg, gu, gus, gu_g, guz, cfg["H"], hidden.dtype, expert_start)
-        mod.down_proj = _fg_dequant(cfg, dn, dns, dn_g, dnz, cfg["I"], hidden.dtype, expert_start)
-        return fwd(mod, hidden, idx, w)
+        return forward(_fg_dequant(cfg, gu_i, gus_i, gu_g, guz_i, cfg["H"], hidden.dtype, expert_start, gate=True),
+                       _fg_dequant(cfg, dn, dns, dn_g, dnz, cfg["I"], hidden.dtype, expert_start))
 
     return run
 
 
-def bf16_weights_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g=None, dn_g=None, _logits=None,
-                     guz=None, dnz=None, *_):
-    """Reference ceiling: the same BF16 experts forward on weights dequantized once, outside the timed call."""
-    mod = _Experts(cfg, _fg_dequant(cfg, gu, gus, gu_g, guz, cfg["H"], hidden.dtype),
-                   _fg_dequant(cfg, dn, dns, dn_g, dnz, cfg["I"], hidden.dtype))
-    _mark_static(mod.gate_up_proj, mod.down_proj)
-    return lambda: grouped_mm_experts_forward(mod, hidden, idx, w)
+def loadtime_dequant_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g=None, dn_g=None, _logits=None,
+                         guz=None, dnz=None, *_):
+    """Reference: the weights dequantized once at load (outside the timed call), then our fused BF16 MoE."""
+    gu_i, gus_i = _interleave_gate_up(gu, gus)
+    gu16 = _fg_dequant(cfg, gu_i, gus_i, gu_g, _interleave_rows(guz), cfg["H"], hidden.dtype, gate=True)
+    dn16 = _fg_dequant(cfg, dn, dns, dn_g, dnz, cfg["I"], hidden.dtype)
+    _mark_static(gu16, dn16)
+    forward = _bf16_moe_forward(cfg, grouped, hidden, idx, w)
+    return lambda: forward(gu16, dn16)
 
 
 def marlin_weight_only_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
@@ -2032,12 +2045,12 @@ ARMS = {
     "fbgemm": partial(rowwise_moe_arm, fbgemm=True),
     "megablocks": megablocks_arm,
     "humming": humming_moe_arm,
-    "fg_dequant_gemm": fg_dequant_gemm_arm,
-    "bf16_weights": bf16_weights_arm,
+    "runtime_dequant": runtime_dequant_arm,
+    "loadtime_dequant": loadtime_dequant_arm,
 }
-# Reference arms on every quantized row (MoE and linear): where the quantized kernels stand against dequantizing to
-# BF16 first (our dequant kernels + the BF16 GEMM) and against BF16 weights outright.
-REFERENCE_ARMS = ("fg_dequant_gemm", "bf16_weights")
+# Reference arms on every quantized row (MoE and linear), both through our own dequant and fused BF16 kernels: the
+# weights dequantized every call (runtime) or once at load (loadtime, the BF16 ceiling).
+REFERENCE_ARMS = ("runtime_dequant", "loadtime_dequant")
 
 
 # ── timing: one warmed process, each mode measured on the same closure ──
@@ -2123,13 +2136,45 @@ class _Res(dict):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.q = {}
+        self.timers = {}  # mode -> (fn, count, do_bench kwargs): re-timed by _round_robin
+        self.rounds = {}  # mode -> [(min, p10, p50, p90), ...] one per timing round
 
 
 def _timed(fn, count, res, mode, **kwargs):
-    """Time ``fn`` once for min / p10 / p50 / p90 per launch: the min goes in ``res[mode]``, the rest in ``res.q``."""
-    lo, p10, p50, p90 = (v * 1e3 / count for v in do_bench(fn, quantiles=[0.0, 0.1, 0.5, 0.9], **kwargs))
-    res[mode], res.q[mode] = lo, (p10, p50, p90)
-    return lo
+    """Time ``fn`` once for min / p10 / p50 / p90 per launch: the min goes in ``res[mode]``, the rest in ``res.q``;
+    the callable is kept for the later round-robin rounds."""
+    sample = tuple(v * 1e3 / count for v in do_bench(fn, quantiles=[0.0, 0.1, 0.5, 0.9], **kwargs))
+    res.timers[mode] = (fn, count, kwargs)
+    res.rounds.setdefault(mode, []).append(sample)
+    res[mode], res.q[mode] = sample[0], sample[1:]
+    return sample[0]
+
+
+# Timing rounds per cell. Arms timed one after another each meet the L2 / clock state the previous one left (ours,
+# timed first, paid ~1 us at decode against an identical cuBLAS call), so the rounds after the first visit every
+# arm in turn: a cell's min is the lowest over rounds, its p10 / p50 / p90 the median over rounds.
+ROUNDS = 3
+
+
+def _round_robin(results):
+    """Re-time every arm of one cell ``ROUNDS - 1`` more times, interleaved across arms, and fold the rounds into
+    each result. An arm that fails in a later round keeps what it measured before."""
+    live = [r for r in results if isinstance(r, _Res) and r.timers]
+    for _ in range(ROUNDS - 1):
+        for res in live:
+            for mode, (fn, count, kwargs) in list(res.timers.items()):
+                try:
+                    sample = tuple(v * 1e3 / count for v in do_bench(fn, quantiles=[0.0, 0.1, 0.5, 0.9], **kwargs))
+                except Exception as e:
+                    print(f"      [round-robin {mode} failed: {type(e).__name__}: {str(e)[:80]}]", flush=True)
+                    res.timers.pop(mode)
+                    continue
+                res.rounds[mode].append(sample)
+    for res in live:
+        for mode, rounds in res.rounds.items():
+            res[mode] = min(r[0] for r in rounds)
+            res.q[mode] = tuple(statistics.median(r[i] for r in rounds) for i in (1, 2, 3))
+        res.timers.clear()  # release the callables (and the weights they hold)
 
 
 def bench_modes(runs, tag, reference=None):
@@ -2333,6 +2378,7 @@ def bench_problem_row(row, pname, cfg, arms, weights, rows_out):
                       f"  finegrained-kernels-speedup {sp}", flush=True)
             rows_out.append((row, pname, regime, _impl(name), res, parity))
             del runs
+        _round_robin([r[4] for r in rows_out if r[:3] == (row, pname, regime)])
         del banks, inputs
     print()
 
@@ -2403,10 +2449,11 @@ def bench_svdquant_row(row, pname, cfg, rows_out):
             res, out = bench_modes(runs, name, reference)
             parity = rel_diff(out[:reference.shape[0]], reference) if out is not None else None
             rows_out.append((row, pname, regime, name, res, parity))
+        _round_robin([r[4] for r in rows_out if r[:3] == (row, pname, regime)])
         del banks, inputs, bank_arms
 
 
-def _attn_arms(cfg, x, weights):
+def _linear_arms(cfg, x, weights):
     N, K, block = cfg["N"], cfg["K"], cfg["block"]
     W, Ws, W_g, Wz = weights
     marlin = None
@@ -2428,7 +2475,7 @@ def _attn_arms(cfg, x, weights):
             _mark_static(*exllama)
     dg_block = tuple(block) if block else None
     # deployment layout for the LOCAL arm only (every baseline reads the raw row-major scale):
-    # dense attn weights ship pre-swizzled like the MoE arms, so the 2D op benches the tcgen05
+    # dense linear weights ship pre-swizzled like the MoE arms, so the 2D op benches the tcgen05
     # fast path (weight-only formats stay affine — no swizzled read)
     Ws_fgm = Ws
     if (PRESWIZZLE and DEVICE == "cuda" and cfg["weights"] in _MX_WEIGHTS
@@ -2448,12 +2495,12 @@ def _attn_arms(cfg, x, weights):
             flex_ctx=triton_kernels_hub.matmul_ogs.FlexCtx(
                 rhs_data=triton_kernels_hub.matmul_ogs.InFlexData()))
         tk_ogs = triton_kernels_hub.matmul_ogs.matmul_ogs
-    # torch.nn.functional.scaled_mm (cuBLAS) reference on the MX-family attn rows (mxfp8 /
+    # torch.nn.functional.scaled_mm (cuBLAS) reference on the MX-family linear rows (mxfp8 /
     # nvfp4) — the same layouts scaled_grouped_mm consumes: torchao-blocked SWIZZLE_32_4_4
     # scales, weight scale blocked once offline, act quant + its blocking inside the timed call
     # (they change per call, the local arm's inline-quant rule). NVFP4 is two-level (block e4m3
     # + TensorWise fp32 globals; dynamic acts ride identity).
-    # Per-tensor static FP8 gets a TensorWise bar. No torch bar on the BLOCK-FP8 attn
+    # Per-tensor static FP8 gets a TensorWise bar. No torch bar on the BLOCK-FP8 linear
     # rows: torch HAS the DeepSeek scheme (BlockWise1x128 + 128x128) but its CUDA impl is
     # Hopper-only, and RowWise is a different quantization granularity (measured ~20 relative) —
     # timing unlike work on a shared axis is worse than an absent bar.
@@ -2538,46 +2585,46 @@ def _attn_arms(cfg, x, weights):
         _mark_static(layer.weight, layer.weight_scale, layer.workspace)
     # a STATIC row's calibrated activation scale replaces the inline quant: one value, since a
     # dense module is one quantized module (the MoE's per-expert form has no dense analogue)
-    attn_act_scale = (
+    linear_act_scale = (
         (x.float().abs().amax() / (127.0 if _activation_format(cfg) == "int8" else 448.0)).clamp(min=1e-12).reshape(1)
         if cfg.get("static") else None
     )
-    if attn_act_scale is not None:
-        _mark_static(attn_act_scale)
+    if linear_act_scale is not None:
+        _mark_static(linear_act_scale)
     # act is inline-quantized (As=None) unless the row is static; Ws is the weight scale (Bs); activation_format is the
     # activation precision (None follows the weight format).
-    attn_arms = {
+    linear_arms = {
         "finegrained-kernels": lambda: fgm.matmul_2d(
-            x, W, attn_act_scale, Ws_fgm, activation_format=_activation_format(cfg), output_dtype=x.dtype,
+            x, W, linear_act_scale, Ws_fgm, activation_format=_activation_format(cfg), output_dtype=x.dtype,
             activation_scale_ub=cfg.get("activation_scale_ub"),
             b_global_scale=W_g, b_zero=Wz),
     }
     if exllama is not None:
-        attn_arms["vllm_exllama"] = lambda: gptq_gemm(x, *exllama, True, False, exllama_bits)
+        linear_arms["vllm_exllama"] = lambda: gptq_gemm(x, *exllama, True, False, exllama_bits)
     if marlin is not None:
-        attn_arms["vllm_marlin"] = lambda: apply_gptq_marlin_linear(
+        linear_arms["vllm_marlin"] = lambda: apply_gptq_marlin_linear(
             x, marlin[0], marlin[1], marlin[2], marlin_empty, marlin_empty,
             marlin_workspace, marlin_kind, N, K, True)
     if "torch_weight_only" in cfg["baselines"]:
-        attn_arms["torch_weight_only"] = lambda: torch.nn.functional.linear(
+        linear_arms["torch_weight_only"] = lambda: torch.nn.functional.linear(
             x, dequantize_fp8_weight(W, Ws, block)
         )
     if "marlin" in cfg["baselines"] and fused_marlin_moe is not None:
-        attn_arms["marlin"] = lambda: apply_fp8_marlin_linear(
+        linear_arms["marlin"] = lambda: apply_fp8_marlin_linear(
             x, layer.weight, layer.weight_scale, layer.workspace, N, K, None
         )
     if torch_mm is not None:
-        attn_arms["torch_mm"] = lambda: torch_mm(x, attn_act_scale)
+        linear_arms["torch_mm"] = lambda: torch_mm(x, linear_act_scale)
     if cfg["weights"] == "fp8_rowwise":
         if "fbgemm" in cfg["baselines"] and _fbgemm_rowwise is not None:
-            attn_arms["fbgemm"] = lambda: fbgemm_mm(x)
+            linear_arms["fbgemm"] = lambda: fbgemm_mm(x)
         if "vllm_mm" in cfg["baselines"] and vllm_fused_experts is not None:
-            attn_arms["vllm_mm"] = lambda: vllm_mm(x)
+            linear_arms["vllm_mm"] = lambda: vllm_mm(x)
     if "deepgemm" in cfg["baselines"]:
-        attn_arms["deepgemm"] = lambda: deepgemm_fp8_fp4_linear(
+        linear_arms["deepgemm"] = lambda: deepgemm_fp8_fp4_linear(
             x, W, Ws, block_size=dg_block, output_dtype=torch.bfloat16)
     if "triton_kernels" in cfg["baselines"]:
-        attn_arms["triton_kernels"] = lambda: tk_ogs(
+        linear_arms["triton_kernels"] = lambda: tk_ogs(
             x, tw, None, None, precision_config=tk_pc)
     # The dense GEMM is where transformers' NVFP4 path actually lives, so this is the
     # apples-to-apples cell: same weight, its packer, its kernel. Packing is offline (the
@@ -2593,26 +2640,26 @@ def _attn_arms(cfg, x, weights):
         )[0].to(torch.bfloat16)
         _pw = _nvfp4_gemm.pack(_w_bf16, device=x.device)
         _mark_static(_pw.qweight, _pw.sf, _pw.global_scale, _pw.sf_rowmajor)
-        attn_arms["nvfp4_gemm"] = lambda: _nvfp4_gemm.gemm(_pw, x)
+        linear_arms["nvfp4_gemm"] = lambda: _nvfp4_gemm.gemm(_pw, x)
     if "vllm_mm" in cfg["baselines"] and vllm_fused_experts is not None and cfg["weights"] != "fp8_rowwise":
-        attn_arms["vllm_mm"] = _vllm_linear_arm(cfg, x, W, Ws, W_g, attn_act_scale)
+        linear_arms["vllm_mm"] = _vllm_linear_arm(cfg, x, W, Ws, W_g, linear_act_scale)
     if "flashinfer_mm" in cfg["baselines"] and _fi_mm_fp4 is not None:
-        attn_arms["flashinfer_mm"] = _flashinfer_linear_arm(cfg, x, W, Ws, W_g)
-    # reference arms (REFERENCE_ARMS): our dequant kernels + cuBLAS every call, and cuBLAS on BF16 weights
+        linear_arms["flashinfer_mm"] = _flashinfer_linear_arm(cfg, x, W, Ws, W_g)
+    # reference arms (REFERENCE_ARMS) through our dequant kernels and our BF16 GEMM: every call, or once at load
     W_bf16 = _fg_dequant(cfg, W, Ws, W_g, Wz, K, x.dtype)
     _mark_static(W_bf16)
-    attn_arms["fg_dequant_gemm"] = lambda: torch.nn.functional.linear(x, _fg_dequant(cfg, W, Ws, W_g, Wz, K, x.dtype))
-    attn_arms["bf16_weights"] = lambda: torch.nn.functional.linear(x, W_bf16)
+    linear_arms["runtime_dequant"] = lambda: fgm.matmul_2d(x, _fg_dequant(cfg, W, Ws, W_g, Wz, K, x.dtype), None, None)
+    linear_arms["loadtime_dequant"] = lambda: fgm.matmul_2d(x, W_bf16, None, None)
     if "humming" in cfg["baselines"] and _humming is not None:
         try:
-            attn_arms["humming"] = _humming_linear_arm(cfg, x, W, Ws, W_g, Wz, attn_act_scale)
+            linear_arms["humming"] = _humming_linear_arm(cfg, x, W, Ws, W_g, Wz, linear_act_scale)
         except Exception as e:
             print(f"      [humming setup failed: {type(e).__name__}: {str(e)[:90]}]", flush=True)
 
             def _humming_setup_failed(err=e):  # a crash cell, like a MoE arm whose setup raises
                 raise err
-            attn_arms["humming"] = _humming_setup_failed
-    return attn_arms
+            linear_arms["humming"] = _humming_setup_failed
+    return linear_arms
 
 
 _FP4_RANGE = 448.0 * 6.0  # NVFP4 global: e4m3 block-scale max * e2m1 max
@@ -2680,8 +2727,8 @@ def _flashinfer_linear_arm(cfg, x, W, Ws, W_g):
     return run
 
 
-def bench_attn_row(row, pname, cfg, rows_out):
-    """One attn linear per model, in its deployment format (same weights across
+def bench_linear_row(row, pname, cfg, rows_out):
+    """One linear per model, in its deployment format (same weights across
     impls; the finegrained-kernels arm's ``activation_format`` follows the model — GPT-OSS runs W4A4)."""
     if cfg.get("svdquant_rank"):
         return bench_svdquant_row(row, pname, cfg, rows_out)
@@ -2726,7 +2773,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
         inputs = [x] + [x.clone() for _ in banks[1:]]
         # activations too: a model produces them inside its graph, so cudagraph trees would otherwise copy them in per call
         _mark_static(*inputs)
-        bank_arms = [_attn_arms(cfg, hidden, bank) for bank, hidden in zip(banks, inputs)]
+        bank_arms = [_linear_arms(cfg, hidden, bank) for bank, hidden in zip(banks, inputs)]
         reference = bank_arms[0]["torch_weight_only"]() if "torch_weight_only" in bank_arms[0] else None
         if ONLY_ARMS is not None:
             bank_arms = [{k: v for k, v in arms.items() if k in ONLY_ARMS} for arms in bank_arms]
@@ -2766,6 +2813,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
                 print(f"      {name:14s} parity-vs-finegrained-kernels {parity:.1e}"
                       f"  finegrained-kernels-speedup {sp}", flush=True)
             rows_out.append((row, pname, regime, name, res, parity))
+        _round_robin([r[4] for r in rows_out if r[:3] == (row, pname, regime)])
         del runs, bank_arms, banks, inputs
     print()
 
@@ -2827,7 +2875,7 @@ def _load_rows_csv(path):
             | {"torch", "transformers@main", *REFERENCE_ARMS})
     for pn, c in BF16_PROBLEMS.items():
         allowed["unquantized", pn] = _allowed(c) | {"megablocks"}
-    for pn, c in ATTN_PROBLEMS.items():
+    for pn, c in LINEAR_PROBLEMS.items():
         allowed["linear quantized", pn] = _allowed(c) | {"torch_mm", "nvfp4_gemm", *REFERENCE_ARMS}
     acc = {}  # (cat, problem, regime, impl) -> (res dict, parity)
     for r in csv.DictReader(open(path)):
@@ -2860,7 +2908,7 @@ def _run_task(kind, pname, cfg, rows_out):
                 _megablocks = get_kernel("kernels-community/megablocks", version=1, trust_remote_code=TRUSTED)
             except Exception:
                 pass
-        if kind == "attn" and cfg["weights"] == "nvfp4" and not cfg.get("svdquant_rank") and _nvfp4_gemm is None:
+        if kind == "linear" and cfg["weights"] == "nvfp4" and not cfg.get("svdquant_rank") and _nvfp4_gemm is None:
             try:
                 _nvfp4_gemm = _hub_kernel("nvfp4")
             except Exception:
@@ -2896,7 +2944,7 @@ def _run_task(kind, pname, cfg, rows_out):
         # nvfp4-gemm is NOT enlisted on the MoE rows. That integration has no MoE kernel, so the
         # only way to run it here is a dense GEMM per expert — 8.8ms against our 47us, which is a
         # statement about the missing kernel rather than a comparison of kernels, and one bar that
-        # tall flattens every other bar in the panel. It stays on the attn row, where the two are
+        # tall flattens every other bar in the panel. It stays on the linear row, where the two are
         # doing the same job.
         quant_arms = (("finegrained-kernels",) + cfg["baselines"] + cfg.get("fused_extra", ())
                       + torch_arm_t + REFERENCE_ARMS)
@@ -2947,19 +2995,20 @@ def _run_task(kind, pname, cfg, rows_out):
             arms = tuple(a for a in arms if a in ONLY_ARMS)
         if arms:
             bench_problem_row("unquantized", pname, cfg, arms, weights, rows_out)
-    else:  # attn
-        bench_attn_row("linear quantized", pname, cfg, rows_out)
+    else:  # linear
+        bench_linear_row("linear quantized", pname, cfg, rows_out)
 
 
 # flat, deterministic task list (one entry per problem × row-group), filtered by the CLI substrings
 TASKS = ([("moe", p, c) for p, c in MOE_PROBLEMS.items()
           if wanted("quantized", p)]
          + [("bf16", p, c) for p, c in BF16_PROBLEMS.items() if wanted("unquantized", p)]
-         + [("attn", p, c) for p, c in ATTN_PROBLEMS.items() if wanted("linear quantized", p)])
+         + [("linear", p, c) for p, c in LINEAR_PROBLEMS.items() if wanted("linear quantized", p)])
 if ONLY_ARMS is not None:  # only the rows that enlist a requested arm
     TASKS = [t for t in TASKS if set(ONLY_ARMS) & ({"finegrained-kernels"} | set(t[2].get("baselines", ()))
                                                    | set(t[2].get("fused_extra", ()))
-                                                   | ({"torch"} if t[0] == "moe" and _torch_arm_enlisted(t[2]) else set()))]
+                                                   | ({"torch"} if t[0] == "moe" and _torch_arm_enlisted(t[2]) else set())
+                                                   | (set(REFERENCE_ARMS) if t[0] in ("moe", "linear") else set()))]
 
 rows = []
 if REPLOT:
@@ -3112,7 +3161,7 @@ for (row, regime), (ax,) in zip(panels, axes):
     # ONE fixed model order across every row (was per-panel support-sort, which
     # reordered models between rows and read as confusing). Roughly most-supported
     # first, finegrained-kernels-only (GPT-OSS, GLM-NVFP4) last; keyed on the base model so the
-    # quantized/attn (GLM-5.2-NVFP4) and unquantized (GLM-5.2) rows line up.
+    # quantized/linear (GLM-5.2-NVFP4) and unquantized (GLM-5.2) rows line up.
     def _model_rank(p):
         name = p.split("/")[-1]
         for i, m in enumerate(CANONICAL_MODEL_ORDER):
@@ -3134,14 +3183,14 @@ for (row, regime), (ax,) in zip(panels, axes):
         if short.startswith("unknown model "):  # a synthetic shape, no published checkpoint
             model, rest = "synthetic", short.removeprefix("unknown model ")
         model = model.split("/")[-1]
-        rest = rest.removeprefix("attn ").removesuffix(" qkv-shaped")
+        rest = rest.removesuffix(" qkv-shaped")
         ticklabels.append(fill(model, 16) + (f"\n{fill(rest, 16)}" if rest else ""))
         # bars speed-ranked within the group (fastest leftmost, crashed last),
         # centered on the group's own arm count — colors identify the impls
         group = [(i, r) for p, i, r, _par in cells if p == pname and i not in REFERENCE_ARMS]
         # the reference arms are lines across the group, not bars ranked among the rivals
         span = (len(group) / 2 + 0.25) * width
-        for ref_impl, style in (("fg_dequant_gemm", (0, (4, 2))), ("bf16_weights", (0, (1, 1.5)))):
+        for ref_impl, style in (("runtime_dequant", (0, (4, 2))), ("loadtime_dequant", (0, (1, 1.5)))):
             ref = next((r.get(solid_mode) for p, i, r, _par in cells if p == pname and i == ref_impl), None)
             if ref is not None:
                 ax.hlines(ref, gi - span, gi + span, colors="#6b6a66", linestyles=[style], linewidth=1.1, zorder=4)
@@ -3205,7 +3254,7 @@ for (row, regime), (ax,) in zip(panels, axes):
         handles.append(mpatches.Patch(facecolor="none", edgecolor="black", hatch="..", label="eager (no cudagraph)"))
     if missing_drawn:
         handles.append(Line2D([], [], color="red", marker="x", linestyle="none", label="unavailable"))
-    for ref_impl, style in (("fg_dequant_gemm", (0, (4, 2))), ("bf16_weights", (0, (1, 1.5)))):
+    for ref_impl, style in (("runtime_dequant", (0, (4, 2))), ("loadtime_dequant", (0, (1, 1.5)))):
         if ref_impl in panel_refs:
             handles.append(Line2D([], [], color="#6b6a66", linestyle=style, linewidth=1.1, label=_impl_label(ref_impl)))
     ax.legend(handles=handles, loc="upper left", bbox_to_anchor=(1.005, 1.0), fontsize=8,
@@ -3220,18 +3269,23 @@ fig.savefig(out_png, dpi=120)
 print(f"wrote {out_png}" + ("" if REPLOT else f" + bench_moe{suffix}.csv"))
 
 
-def _plot_summary(csv_path, out_path):
-    """The whole run on one page, every latency relative to the same model on BF16 weights (1x, the line; its own
-    p10-p90 the band around it). Per problem and regime: ours (filled), the fastest rival (ring, named where it beats
-    us) and dequantize + BF16 (grey tick), each a median with its p10-p90 whisker, CUDA graph timings. Left is
-    faster. BF16 MoE rows have no quantization, so their reference is torch grouped_mm on the same BF16 weights."""
+# A comparison closer than this is a tie in the figures: medians from separate processes (rivals run in their own
+# venv) differ by a few percent run to run, more than the in-run p10-p90 shows.
+TIE_BAND = 0.03
+
+
+def _plot_summary(csv_path, out_path, reference, quantized, reference_label):
+    """One question per page: every implementation's speedup over ONE reference (the 1x line; right is faster), for
+    the quantized rows against loadtime or runtime dequant + BF16 GEMM, or for the BF16 MoE rows against torch
+    grouped_mm. Per row and regime: ours (filled, with its p10-p90) and the fastest rival (ring), joined by a bar
+    that is green where we win, red where the rival wins beyond the noise (named, with its lead), grey for a tie.
+    Medians of CUDA graph timings."""
     import csv
     import math
     import re
 
-    ours, dequant = "finegrained-kernels", "fg_dequant_gemm"
-    references = {"unquantized": "transformers"}  # every quantized category: "bf16_weights"
-    not_rivals = {ours, dequant, "bf16_weights"}
+    ours = "finegrained-kernels"
+    not_rivals = {ours, "runtime_dequant", "loadtime_dequant", reference}
     rival_names = {
         "trtllm": "TRT-LLM", "vllm": "vLLM fused_moe", "vllm_mm": "vLLM CUTLASS", "vllm_marlin": "vLLM Marlin",
         "vllm_exllama": "vLLM ExLlama", "marlin": "Marlin W8A16", "torch_mm": "torch scaled_mm",
@@ -3250,24 +3304,27 @@ def _plot_summary(csv_path, out_path):
         for r in csv.DictReader(f):
             if r["mode"] != "cudagraph" or not r["latency_us"] or r["impl"].endswith("unfused"):
                 continue
+            if (r["category"] != "unquantized") != quantized:
+                continue
             lat = float(r["latency_us"])
             q = tuple(float(r[c]) for c in ("p10_us", "p50_us", "p90_us")) if r.get("p50_us") else (lat, lat, lat)
             order.setdefault(r["problem"], r["category"])
             spread.setdefault((r["problem"], r["regime"]), {})[r["impl"]] = q
 
     def cell(problem, regime):
-        """``(ours, best rival name, rival, dequant, reference)`` spreads, each ``(p10, p50, p90)`` over the reference
-        median, or None where ours or the reference is missing."""
+        """Speedups over the reference median (> 1 is faster), each as (at p90, median, at p10): ours, the fastest
+        rival's name and speedups, and whether ours and the rival tie; None without ours or the reference."""
         times = spread.get((problem, regime), {})
-        reference = references.get(order[problem], "bf16_weights")
         ref = times.get(reference)
         if ours not in times or ref is None:
             return None
-        norm = lambda q: None if q is None else tuple(v / ref[1] for v in q)  # noqa: E731
-        rivals = {k: v for k, v in times.items() if k not in not_rivals and k != reference}
+        mine = times[ours]
+        rivals = {k: v for k, v in times.items() if k not in not_rivals}
         rival = min(rivals, key=lambda k: rivals[k][1]) if rivals else None
-        return (norm(times[ours]), rival_names.get(rival, rival), norm(rivals.get(rival)), norm(times.get(dequant)),
-                norm(ref))
+        tie = rival is not None and (not (mine[2] < rivals[rival][0] or rivals[rival][2] < mine[0])
+                                     or abs(rivals[rival][1] / mine[1] - 1) < TIE_BAND)
+        return (tuple(ref[1] / v for v in reversed(mine)), rival_names.get(rival, rival),
+                tuple(ref[1] / v for v in reversed(rivals[rival])) if rival else None, tie)
 
     regimes = (("decode", "decode (1 token)"), ("batch", "batch (64 tokens)"), ("prefill", "prefill (8192 tokens)"))
     problems = [p for p in sorted(order, key=lambda p: (list(categories).index(order[p]) if order[p] in categories else 9, p))
@@ -3279,7 +3336,12 @@ def _plot_summary(csv_path, out_path):
             y += 1
         rows[problem] = y
         y += 1
-    lo, hi = math.log2(1 / 8), math.log2(8)
+    if not rows:
+        return
+    speeds = [v for p in rows for r, _ in regimes if (c := cell(p, r)) for v in (c[0][1], c[2] and c[2][1]) if v]
+    lo = math.floor(math.log2(max(min(speeds), 1 / 64)))
+    hi = math.ceil(math.log2(min(max(speeds), 64)))
+    lo, hi = min(lo, -1), max(hi, 1)
 
     def short(problem):  # "model · recipe": no org, no shape, no boilerplate
         name = problem.split("/", 1)[-1] if "/" in problem.split(" ", 1)[0] else problem
@@ -3289,80 +3351,221 @@ def _plot_summary(csv_path, out_path):
         label = f"{model} · {recipe}" if recipe else model
         return label if len(label) <= 52 else label[:51] + "…"
 
-    def clip(v):
+    def x(v):
         return min(max(math.log2(v), lo), hi)
 
-    ink, muted, grid = "#0b0b0b", "#6b6a66", "#ecebe7"
-    ours_c, rival_c, dequant_c = IMPL_COLORS[ours], "#3d3c39", "#9a9893"
-    fig_s, axes = plt.subplots(1, 3, figsize=(17, 0.34 * y + 1.8), sharey=True)
-    counts = {"rival": [0, 0], "dequant": [0, 0], "bf16": [0, 0]}
+    def halo(ax, q, row, color):
+        """A Gaussian around the median, its two halves fitted to p10 and p90 (z = 1.28) on the log axis."""
+        sd_lo, sd_hi = ((abs(x(q[1]) - x(e)) / 1.2816) or 1e-3 for e in (q[0], q[2]))
+        xs = [x(q[1]) + t / 40 * 3 * (sd_lo if t < 0 else sd_hi) for t in range(-40, 41)]
+        hs = [0.36 * math.exp(-0.5 * (t / 40 * 3) ** 2) for t in range(-40, 41)]
+        ax.fill_between(xs, [row - h for h in hs], [row + h for h in hs], color=color, alpha=0.28, linewidth=0,
+                        zorder=3)
+
+    ink, guide = "#0b0b0b", "#e6e4de"
+    ours_c, win_c, loss_c, tie_c = IMPL_COLORS[ours], "#9fd4a6", "#f0a8a0", "#d9d7d0"
+    fig_s, axes = plt.subplots(1, 3, figsize=(17, 0.36 * y + 1.9), sharey=True)
+    counts = {"ref": [0, 0], "rival": [0, 0, 0]}  # ref: faster, total; rival: faster, tie, slower
     for ax_s, (regime, regime_title) in zip(axes, regimes):
-        for problem, row in rows.items():
-            ax_s.axhline(row, color=grid, linewidth=0.6, zorder=0)
-            hit = cell(problem, regime)
-            if hit is None:
+        for k, (problem, row) in enumerate(rows.items()):
+            ax_s.axhline(row, color=guide, linewidth=0.6, zorder=0)
+            c = cell(problem, regime)
+            if c is None:
                 continue
-            mine, rival_name, rival, deq, ref = hit
-            # the reference's own spread: a tie inside it is a tie, not a win or a loss
-            ax_s.fill_betweenx([row - 0.42, row + 0.42], clip(ref[0]), clip(ref[2]), color="#e4e2dc", zorder=1, linewidth=0)
-            counts["bf16"][0] += mine[1] < ref[0]
-            counts["bf16"][1] += 1
-            if deq is not None:
-                ax_s.plot([clip(deq[0]), clip(deq[2])], [row, row], color=dequant_c, linewidth=1, zorder=2)
-                ax_s.scatter(clip(deq[1]), row, marker="|", s=110, color=dequant_c, linewidth=1.8, zorder=3)
-                counts["dequant"][0] += mine[1] < deq[1]
-                counts["dequant"][1] += 1
+            mine, rival_name, rival, tie = c
+            counts["ref"][0] += mine[1] > 1
+            counts["ref"][1] += 1
             if rival is not None:
-                ax_s.plot([clip(rival[0]), clip(rival[2])], [row - 0.18] * 2, color=rival_c, linewidth=0.9, zorder=2)
-                ax_s.scatter(clip(rival[1]), row - 0.18, marker="o", s=34, facecolor="#fcfcfb", edgecolor=rival_c,
-                             linewidth=1.3, zorder=4)
-                counts["rival"][0] += mine[1] < rival[1]
-                counts["rival"][1] += 1
-                if rival[1] < mine[1]:  # name a rival only where it wins; near the left edge, on its right
-                    left_third = clip(rival[1]) < lo + (hi - lo) / 3
-                    ax_s.annotate(rival_name, (clip(rival[2] if left_third else rival[0]), row - 0.18),
-                                  xytext=(6 if left_third else -6, 0), textcoords="offset points",
-                                  ha="left" if left_third else "right", va="center", fontsize=6.5, color=muted)
-            ax_s.plot([clip(mine[0]), clip(mine[2])], [row + 0.18] * 2, color=ours_c, linewidth=1.2, zorder=2)
-            ax_s.scatter(clip(mine[1]), row + 0.18, marker="o", s=40, color=ours_c, edgecolor="#fcfcfb",
-                         linewidth=0.8, zorder=5)
-            if not lo <= math.log2(mine[1]) <= hi:
-                ax_s.annotate(f"{mine[1]:.1f}x", (clip(mine[1]), row + 0.18), xytext=(5 if mine[1] < 1 else -5, 0),
-                              textcoords="offset points", ha="left" if mine[1] < 1 else "right", va="center",
-                              fontsize=6.5, color=ink)
-        ax_s.axvline(0, color="#52514e", linewidth=1, zorder=1)
-        ticks = [1 / 8, 1 / 4, 1 / 2, 1, 2, 4, 8]
-        ax_s.set_xticks([math.log2(t) for t in ticks], ["⅛x", "¼x", "½x", "1x", "2x", "4x", "8x"], fontsize=8)
-        ax_s.set_xlim(lo - 0.15, hi + 0.15)
-        ax_s.set_title(regime_title, fontsize=10, color=ink)
+                won = mine[1] >= rival[1]
+                counts["rival"][1 if tie else (0 if won else 2)] += 1
+                halo(ax_s, rival, row, "#3d3c39")
+                ax_s.plot([x(rival[1]), x(mine[1])], [row, row], color=tie_c if tie else (win_c if won else loss_c),
+                          linewidth=4, solid_capstyle="round", zorder=2)
+                ax_s.scatter(x(rival[1]), row, marker="o", s=34, facecolor="#fcfcfb", edgecolor="#3d3c39", linewidth=1.2,
+                             zorder=4)
+                if not won and not tie:
+                    ax_s.annotate(f"{rival_name} {rival[1] / mine[1]:.2f}x", (x(rival[1]), row), xytext=(7, 0),
+                                  textcoords="offset points", ha="left", va="center", fontsize=7, color="#a1352b")
+            halo(ax_s, mine, row, ours_c)
+            ax_s.scatter(x(mine[1]), row, marker="o", s=44, color=ours_c, edgecolor="#fcfcfb", linewidth=0.8, zorder=5)
+        ax_s.axvline(0, color="#52514e", linewidth=1.1, zorder=1)
+        ticks = [2.0 ** e for e in range(lo, hi + 1)]
+        ax_s.set_xticks([math.log2(t) for t in ticks], [f"{t:g}x" if t >= 1 else f"1/{1 / t:g}x" for t in ticks],
+                        fontsize=8.5)
+        ax_s.set_xlim(lo - 0.2, hi + 0.2)
+        ax_s.set_title(regime_title, fontsize=10.5, color=ink)
         for side in ("top", "right", "left"):
             ax_s.spines[side].set_visible(False)
         ax_s.tick_params(axis="y", length=0)
-    axes[1].set_xlabel("latency relative to the same model on BF16 weights (log); left of the line is faster than BF16",
-                       fontsize=8.5, color=ink)
-    axes[0].set_yticks(list(rows.values()), [short(p) for p in rows], fontsize=8)
+    axes[1].set_xlabel(f"speedup over {reference_label} (log; right of the 1x line is faster)", fontsize=9, color=ink)
+    axes[0].set_yticks(list(rows.values()), [short(p) for p in rows], fontsize=8.5)
     for row, text in headers:
         axes[0].annotate(text, (0, row), xycoords=("axes fraction", "data"), xytext=(-8, 0), textcoords="offset points",
-                         ha="right", va="center", fontsize=9.5, fontweight="bold", color=ink)
+                         ha="right", va="center", fontsize=10, fontweight="bold", color=ink)
     axes[0].set_ylim(y - 0.5, -0.8)
     handles = [
-        plt.Line2D([], [], marker="o", color=ours_c, markersize=6.5, linewidth=1.2, label="finegrained-kernels"),
-        plt.Line2D([], [], marker="o", color=rival_c, markerfacecolor="#fcfcfb", markersize=6, linewidth=0.9,
-                   label="fastest rival (named where it wins)"),
-        plt.Line2D([], [], marker="|", color=dequant_c, markersize=10, markeredgewidth=1.8, linewidth=1,
-                   label="our dequant + BF16 GEMM"),
-        mpatches.Patch(color="#e4e2dc", label="BF16 weights, p10-p90"),
+        plt.Line2D([], [], color="#52514e", linewidth=1.1, label=f"1x = {reference_label}"),
+        plt.Line2D([], [], marker="o", color=ours_c, markersize=7, linestyle="", label="finegrained-kernels"),
+        plt.Line2D([], [], marker="o", color="#3d3c39", markerfacecolor="#fcfcfb", markersize=6.5, linestyle="",
+                   label="fastest rival"),
+        plt.Line2D([], [], color=win_c, linewidth=4, label="we are faster"),
+        plt.Line2D([], [], color=tie_c, linewidth=4, label="tie (within 3% or p10-p90 overlap)"),
+        mpatches.Patch(color="#3d3c39", alpha=0.28, linewidth=0, label="timing spread (Gaussian fit to p10-p90)"),
+        plt.Line2D([], [], color=loss_c, linewidth=4, label="rival is faster (named, with its lead)"),
     ]
-    fig_s.legend(handles=handles, loc="upper center", ncol=4, frameon=False, fontsize=9, bbox_to_anchor=(0.57, 0.995))
-    tally = " · ".join(f"faster than {name} in {w}/{n}" for name, (w, n) in
-                       (("the fastest rival", counts["rival"]), ("dequant + BF16", counts["dequant"]),
-                        ("BF16 weights", counts["bf16"])))
-    fig_s.suptitle(f"finegrained-kernels against BF16 weights, dequantize + BF16 and the fastest rival ({device_name})\n"
-                   f"cold weights, CUDA graph, median with p10-p90 · {tally}", fontsize=10.5, y=1.045, color=ink)
+    fig_s.legend(handles=handles, loc="upper center", ncol=4, frameon=False, fontsize=9, bbox_to_anchor=(0.57, 1.0))
+    f, t_, s_ = counts["rival"]
+    what = "quantized kernels" if quantized else "BF16 MoE"
+    fig_s.suptitle(
+        f"finegrained-kernels {what} on {device_name}, speedup over {reference_label} (cold weights, CUDA graph)\n"
+        f"faster than {reference_label} in {counts['ref'][0]} of {counts['ref'][1]} · vs the fastest rival: faster in "
+        f"{f}, tied in {t_}, slower in {s_}", fontsize=11, y=1.0 + 0.75 / fig_s.get_figheight(), color=ink)
     fig_s.tight_layout()
     fig_s.savefig(out_path, dpi=130, bbox_inches="tight")
     print(f"wrote {out_path}")
 
 
-_plot_summary(os.path.join(_HERE, f"bench_moe{suffix}.csv") if not REPLOT else _CSV,
-              os.path.join(_HERE, f"bench_moe{suffix}_summary.png"))
+def _plot_table(csv_path, out_path):
+    """The whole run as one table: rows are the problems (grouped by category), and three panels of decode / batch /
+    prefill columns give our speedup over the fastest rival, over loadtime and over runtime dequant + BF16 GEMM (other
+    median / ours, > 1 is faster), from CUDA graph timings. Blue is faster and orange slower; a cell whose p10-p90
+    overlaps the other's is a tie (grey). A lost rival cell names the rival. BF16 MoE rows have only the rival
+    panel."""
+    import csv
+    import math
+    import re
+
+    import matplotlib.colors as mcolors
+
+    ours, dequant = "finegrained-kernels", "runtime_dequant"
+    not_rivals = {ours, dequant, "loadtime_dequant"}
+    rival_names = {
+        "trtllm": "TRT-LLM", "vllm": "vLLM fused_moe", "vllm_mm": "vLLM CUTLASS", "vllm_marlin": "vLLM Marlin",
+        "vllm_exllama": "vLLM ExLlama", "marlin": "Marlin", "torch_mm": "torch scaled_mm",
+        "torch": "torch scaled_grouped_mm", "torch_rowwise": "torch scaled_mm", "torch_weight_only": "torch dequant",
+        "transformers": "torch grouped_mm", "transformers@main": "transformers@main",
+        "flashinfer_mxint4": "FlashInfer", "flashinfer_cutlass_moe": "FlashInfer", "flashinfer_svdquant": "FlashInfer",
+        "humming": "humming", "sonicmoe": "SonicMoE", "deepgemm": "DeepGEMM", "deepgemm_bf16": "DeepGEMM",
+        "megablocks": "MegaBlocks", "fbgemm": "FBGEMM", "triton_kernels": "triton_kernels",
+        "flashinfer_mm": "FlashInfer", "nvfp4_gemm": "nvfp4-gemm",
+    }
+    categories = {"linear quantized": "Quantized linear", "linear weight-only": "Weight-only linear",
+                  "quantized": "Quantized MoE", "quantized weight-only": "Weight-only MoE", "unquantized": "BF16 MoE"}
+    spread, order = {}, {}  # (problem, regime) -> {impl: (p10, p50, p90)}
+    with open(csv_path) as f:
+        for r in csv.DictReader(f):
+            if r["mode"] != "cudagraph" or not r["latency_us"] or r["impl"].endswith("unfused"):
+                continue
+            lat = float(r["latency_us"])
+            q = tuple(float(r[c]) for c in ("p10_us", "p50_us", "p90_us")) if r.get("p50_us") else (lat, lat, lat)
+            order.setdefault(r["problem"], r["category"])
+            spread.setdefault((r["problem"], r["regime"]), {})[r["impl"]] = q
+
+    def versus(mine, other):
+        """(speedup, tie): other median / ours, and whether it is a tie (ranges overlap, or within TIE_BAND)."""
+        speed = other[1] / mine[1]
+        return speed, not (mine[2] < other[0] or other[2] < mine[0]) or abs(speed - 1) < TIE_BAND
+
+    def cells(problem, regime):
+        """{panel: (speedup, tie, rival name or None)} for the panels that have a comparison."""
+        times = spread.get((problem, regime), {})
+        if ours not in times:
+            return {}
+        mine, out = times[ours], {}
+        reference = "loadtime_dequant"  # BF16 MoE rows have none: their own arm is the BF16 kernel
+        rivals = {k: v for k, v in times.items() if k not in not_rivals}
+        if rivals:
+            rival = min(rivals, key=lambda k: rivals[k][1])
+            out["rival"] = (*versus(mine, rivals[rival]), rival_names.get(rival, rival))
+        if reference in times:
+            out["bf16"] = (*versus(mine, times[reference]), None)
+        if dequant in times:
+            out["dequant"] = (*versus(mine, times[dequant]), None)
+        return out
+
+    regimes = (("decode", "decode"), ("batch", "batch 64"), ("prefill", "prefill 8k"))
+    panels = (("rival", "vs the fastest rival"), ("bf16", "vs loadtime dequant + BF16 GEMM"),
+              ("dequant", "vs runtime dequant + BF16 GEMM"))
+    problems = [p for p in sorted(order, key=lambda p: (list(categories).index(order[p]) if order[p] in categories else 9, p))
+                if any(cells(p, r) for r, _ in regimes)]
+    rows, y, headers = {}, 0, []
+    for i, problem in enumerate(problems):
+        if i == 0 or order[problem] != order[problems[i - 1]]:
+            headers.append((y, categories.get(order[problem], order[problem])))
+            y += 1
+        rows[problem] = y
+        y += 1
+
+    def short(problem):  # "model · recipe": no org, no shape, no boilerplate
+        name = problem.split("/", 1)[-1] if "/" in problem.split(" ", 1)[0] else problem
+        name = re.sub(r"\s*\((?:N=|E\d)[^)]*\)", "", name)
+        name = name.replace("unknown model ", "").replace("-Instruct", "").replace("qkv-shaped", "qkv")
+        model, _, recipe = name.partition(" ")
+        label = f"{model} · {recipe}" if recipe else model
+        return label if len(label) <= 50 else label[:49] + "…"
+
+    # diverging: orange (slower) - neutral - blue (faster), on log2 speedup clipped to [1/4, 4]
+    cmap = mcolors.LinearSegmentedColormap.from_list(
+        "fgk", ["#b33a07", "#eb9b6a", "#f2f1ec", "#b9d3f0", "#1f63c6"])
+    ink, muted, tie_c = "#0b0b0b", "#6b6a66", "#e6e5e0"
+    ncol = len(panels) * len(regimes)
+    gap = 0.35  # between panels
+    xs = {(pi, ri): pi * (len(regimes) + gap) + ri for pi in range(len(panels)) for ri in range(len(regimes))}
+    fig, ax = plt.subplots(figsize=(4.2 + 1.25 * ncol, 0.33 * y + 1.6))
+    tally = {key: [0, 0] for key, _ in panels}
+    for problem, row in rows.items():
+        for ri, (regime, _) in enumerate(regimes):
+            hit = cells(problem, regime)
+            for pi, (key, _) in enumerate(panels):
+                cx = xs[(pi, ri)]
+                if key not in hit:
+                    ax.text(cx, row, "–", ha="center", va="center", fontsize=8, color="#b4b2ab")
+                    continue
+                speed, tie, rival = hit[key]
+                tally[key][0] += speed > 1 and not tie
+                tally[key][1] += 1
+                face = tie_c if tie else cmap((max(min(math.log2(speed), 2), -2) + 2) / 4)
+                ax.add_patch(plt.Rectangle((cx - 0.48, row - 0.46), 0.96, 0.92, facecolor=face, edgecolor="none"))
+                dark = not tie and (math.log2(speed) > 1.1 or math.log2(speed) < -0.6)
+                label = f"{speed:.2f}x" if speed < 10 else f"{speed:.0f}x"
+                if key == "rival" and speed < 1 and not tie:
+                    ax.text(cx, row - 0.13, label, ha="center", va="center", fontsize=8, color="#fcfcfb" if dark else ink,
+                            fontweight="bold")
+                    ax.text(cx, row + 0.24, rival, ha="center", va="center", fontsize=5.8, color="#fcfcfb" if dark else ink)
+                else:
+                    ax.text(cx, row, label, ha="center", va="center", fontsize=8, color="#fcfcfb" if dark else ink,
+                            fontweight="bold" if not tie else "normal")
+    for pi, (key, title) in enumerate(panels):
+        left, right = xs[(pi, 0)], xs[(pi, len(regimes) - 1)]
+        w, n = tally[key]
+        ax.text((left + right) / 2, -1.55, title, ha="center", va="bottom", fontsize=10.5, fontweight="bold", color=ink)
+        ax.text((left + right) / 2, -1.12, f"faster in {w} of {n}", ha="center", va="bottom", fontsize=8.5, color=muted)
+        for ri, (_, rt) in enumerate(regimes):
+            ax.text(xs[(pi, ri)], -0.62, rt, ha="center", va="bottom", fontsize=8.5, color=ink)
+    for row, text in headers:
+        ax.text(-0.62, row, text, ha="right", va="center", fontsize=9.5, fontweight="bold", color=ink)
+        ax.axhline(row - 0.5, color="#d7d5ce", linewidth=0.8)
+    for problem, row in rows.items():
+        ax.text(-0.62, row, short(problem), ha="right", va="center", fontsize=8.3, color=ink)
+    ax.set_xlim(-0.55, xs[(len(panels) - 1, len(regimes) - 1)] + 0.55)
+    ax.set_ylim(y - 0.5, -1.7)
+    ax.axis("off")
+    legend = [mpatches.Patch(color=cmap(1.0), label="we are faster"), mpatches.Patch(color=tie_c, label="tie (within 3% or p10-p90 overlap)"),
+              mpatches.Patch(color=cmap(0.0), label="we are slower (rival named)")]
+    fig.legend(handles=legend, loc="lower center", ncol=3, frameon=False, fontsize=9, bbox_to_anchor=(0.6, -0.01))
+    fig.suptitle(f"finegrained-kernels speedup (other / ours, median CUDA graph latency, cold weights) on {device_name}",
+                 fontsize=11.5, y=1.0, color=ink)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=140, bbox_inches="tight")
+    print(f"wrote {out_path}")
+
+
+_SUMMARY_CSV = os.path.join(_HERE, f"bench_moe{suffix}.csv") if not REPLOT else _CSV
+for _name, _ref, _quantized, _label in (
+    ("loadtime", "loadtime_dequant", True, "loadtime dequant + BF16 GEMM"),
+    ("runtime", "runtime_dequant", True, "runtime dequant + BF16 GEMM"),
+    ("bf16", "transformers", False, "torch grouped_mm"),
+):
+    _plot_summary(_SUMMARY_CSV, os.path.join(_HERE, f"bench_moe{suffix}_summary_{_name}.png"), _ref, _quantized, _label)
+_plot_table(os.path.join(_HERE, f"bench_moe{suffix}.csv") if not REPLOT else _CSV,
+            os.path.join(_HERE, f"bench_moe{suffix}_table.png"))
