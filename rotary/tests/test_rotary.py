@@ -9,13 +9,15 @@ rotary = kernels.get_kernel("kernels-community/rotary", version=2)
 def apply_rotary_torch(x1: torch.Tensor, x2: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, conj: bool = False):
     assert x1.shape == x2.shape, "x1 and x2 must have the same shape"
 
+    dtype = x1.dtype
+    x1, x2, cos, sin = (t.float() for t in (x1, x2, cos, sin))
     if not conj:
         out1 = x1 * cos - x2 * sin
         out2 = x1 * sin + x2 * cos
     else:
         out1 = x1 * cos + x2 * sin
         out2 = -x1 * sin + x2 * cos
-    return out1, out2
+    return out1.to(dtype), out2.to(dtype)
 
 
 def apply_rotary_torch_wrapper(q, k, cos, sin, conj: bool = False):
@@ -58,20 +60,17 @@ def apply_rotary_kernel_wrapper(q, k, cos, sin, conj: bool = False):
 @pytest.mark.parametrize("headdim, rotary_dim", [(64, 32), (128, 64), (64, 30)])
 @pytest.mark.parametrize("qk_dim", [3, 4])
 @pytest.mark.parametrize(
-    "dtype, atol, rtol",
+    "dtype",
     [
-        (torch.float32, 1e-5, 1e-5),
+        torch.float32,
         pytest.param(
             torch.bfloat16,
-            1e-1,
-            1e-5,
             marks=pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU"),
         ),
     ],
 )
 @pytest.mark.parametrize("conj", [False, True])
-@pytest.mark.flaky(max_runs=2, min_passes=1)
-def test_rotary_equivalence(batch_size, nheads, seqlen, headdim, rotary_dim, qk_dim, dtype, atol, rtol, conj):
+def test_rotary_equivalence(batch_size, nheads, seqlen, headdim, rotary_dim, qk_dim, dtype, conj):
     device = infer_device()
     if device is None:
         pytest.skip("No suitable device found for testing")
@@ -95,20 +94,8 @@ def test_rotary_equivalence(batch_size, nheads, seqlen, headdim, rotary_dim, qk_
     apply_rotary_kernel_wrapper(q_kernel, k_kernel, cos, sin, conj)
 
     # verify the rotation results of Q and K are consistent
-    try:
-        assert torch.allclose(q_torch_out, q_kernel, atol=atol, rtol=rtol), "Rotary transformation results for Q do not match"
-    except AssertionError:
-        diff_q = torch.abs(q_torch_out - q_kernel)
-        max_diff_q = torch.max(diff_q)
-        print(f"Max difference for Q: {max_diff_q}")
-        raise
-    try:
-        assert torch.allclose(k_torch_out, k_kernel, atol=atol, rtol=rtol), "Rotary transformation results for K do not match"
-    except AssertionError:
-        diff_k = torch.abs(k_torch_out - k_kernel)
-        max_diff_k = torch.max(diff_k)
-        print(f"Max difference for K: {max_diff_k}")
-        raise
+    torch.testing.assert_close(q_kernel, q_torch_out)
+    torch.testing.assert_close(k_kernel, k_torch_out)
 
     # verify the non-rotated part of Q and K remains unchanged
     if (2 * rotary_dim) < headdim:
@@ -123,18 +110,16 @@ def test_rotary_equivalence(batch_size, nheads, seqlen, headdim, rotary_dim, qk_
 @pytest.mark.kernels_ci
 @pytest.mark.parametrize("entry_point", ["function", "layer"])
 @pytest.mark.parametrize(
-    "dtype, atol, rtol",
+    "dtype",
     [
-        (torch.float32, 1e-5, 1e-5),
+        torch.float32,
         pytest.param(
             torch.bfloat16,
-            1e-1,
-            1e-5,
             marks=pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU"),
         ),
     ],
 )
-def test_apply_rotary_transformers_backward(entry_point, dtype, atol, rtol):
+def test_apply_rotary_transformers_backward(entry_point, dtype):
     device = infer_device()
     if device is None:
         pytest.skip("No suitable device found for testing")
@@ -163,7 +148,7 @@ def test_apply_rotary_transformers_backward(entry_point, dtype, atol, rtol):
     q_kernel_out, k_kernel_out = apply_rotary_kernel(q_kernel, k_kernel, cos, sin, unsqueeze_dim=1)
     torch.autograd.backward((q_kernel_out, k_kernel_out), (grad_q, grad_k))
 
-    torch.testing.assert_close(q_kernel_out, q_torch_out, atol=atol, rtol=rtol)
-    torch.testing.assert_close(k_kernel_out, k_torch_out, atol=atol, rtol=rtol)
-    torch.testing.assert_close(q_kernel.grad, q_torch.grad, atol=atol, rtol=rtol)
-    torch.testing.assert_close(k_kernel.grad, k_torch.grad, atol=atol, rtol=rtol)
+    torch.testing.assert_close(q_kernel_out, q_torch_out)
+    torch.testing.assert_close(k_kernel_out, k_torch_out)
+    torch.testing.assert_close(q_kernel.grad, q_torch.grad)
+    torch.testing.assert_close(k_kernel.grad, k_torch.grad)
