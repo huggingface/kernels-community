@@ -167,14 +167,8 @@ def two_mm_kernel_configs_wrapper():
             }
             return configs.get((B, seq_len, dim), (64, 64, 32, 2, 8))  # default fallback
 
-        def two_mm_kernel_configs():
-            # This function is kept for compatibility but will be overridden for H100
-            return [
-                triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=8),
-                triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
-                triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=8),
-            ]
-        
+        return get_optimal_two_mm_config_h100
+
     elif torch.cuda.get_device_capability()[0] == 10 and False:
         def get_optimal_two_mm_config(B, seq_len, dim):
             configs = {
@@ -410,37 +404,37 @@ def two_mm_kernel_wrapper():
             num_tiles = num_pid_m * num_pid_n
 
             # Create on-device TMA descriptors
-            a_desc = tl._experimental_make_tensor_descriptor(
+            a_desc = tl.make_tensor_descriptor(
                 a_ptr,
                 shape=[M, K],
                 strides=[stride_a2, stride_a3],
                 block_shape=[BLOCK_M, BLOCK_K],
             )
-            b1_desc = tl._experimental_make_tensor_descriptor(
+            b1_desc = tl.make_tensor_descriptor(
                 b1_ptr,
                 shape=[N, K],
                 strides=[stride_bn, stride_bk],
                 block_shape=[BLOCK_N, BLOCK_K],
             )
-            b2_desc = tl._experimental_make_tensor_descriptor(
+            b2_desc = tl.make_tensor_descriptor(
                 b2_ptr,
                 shape=[N, K],
                 strides=[stride_bn, stride_bk],
                 block_shape=[BLOCK_N, BLOCK_K],
             )
-            b3_desc = tl._experimental_make_tensor_descriptor(
+            b3_desc = tl.make_tensor_descriptor(
                 b3_ptr,
                 shape=[N, K],
                 strides=[stride_bn, stride_bk],
                 block_shape=[BLOCK_N, BLOCK_K],
             )
-            b4_desc = tl._experimental_make_tensor_descriptor(
+            b4_desc = tl.make_tensor_descriptor(
                 b4_ptr,
                 shape=[N, K],
                 strides=[stride_bn, stride_bk],
                 block_shape=[BLOCK_N, BLOCK_K],
             )
-            b5_desc = tl._experimental_make_tensor_descriptor(
+            b5_desc = tl.make_tensor_descriptor(
                 b5_ptr,
                 shape=[N, K],
                 strides=[stride_bn, stride_bk],
@@ -625,25 +619,8 @@ def two_mm(A, left_proj, right_proj, left_gate, right_gate, out_gate, mask):
     C_strides = C1.stride()  # (stride_0, stride_1, stride_2, stride_3)
     D_strides = D.stride()   # (stride_0, stride_1, stride_2, stride_3)
 
-    # Use optimal configuration for B200/H100 or fallback to autotuning for other GPUs
-    if torch.cuda.get_device_capability()[0] == 10:
-        # Get optimal configuration for B200
-        BLOCK_M, BLOCK_N, BLOCK_K, num_stages, num_warps = (two_mm_kernel_configs_wrapper())(B, seq_len, K)
-        grid_size = min(NUM_SMS, triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N))
-
-        two_mm_kernel_wrapper()[(grid_size,)](
-            A_2d, left_proj, right_proj, left_gate, right_gate, out_gate,
-            C1, C2, D, mask,
-            M, N, K,
-            *A_strides,  # 4D strides for A
-            left_proj.stride(1), left_proj.stride(0),  # B matrices [N, K] shape strides
-            *C_strides,  # 4D strides for C
-            seq_len,
-            *D_strides,  # 4D strides for D
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, GROUP_SIZE_M=8, NUM_SMS=NUM_SMS,
-            num_stages=num_stages, num_warps=num_warps
-        )
-    elif torch.cuda.get_device_capability()[0] == 9:
+    # Use the tuned configuration on H100, autotune on other GPUs
+    if torch.cuda.get_device_capability()[0] == 9:
         # Get optimal configuration for H100
         BLOCK_M, BLOCK_N, BLOCK_K, num_stages, num_warps = (two_mm_kernel_configs_wrapper())(B, seq_len, K)
         grid_size = min(NUM_SMS, triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N))
