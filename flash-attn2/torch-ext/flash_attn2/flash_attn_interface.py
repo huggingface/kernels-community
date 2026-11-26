@@ -499,9 +499,13 @@ def _flash_attn_varlen_backward_fake(
         dk = torch.empty_like(k)
     if dv is None:
         dv = torch.empty_like(v)
-    softmax_d = torch.empty(
-        (num_heads, total_q + 128 * batch_size), device=q.device, dtype=torch.float32
-    )
+    # The XPU kernel returns a padded (batch, heads, max_seqlen_q) softmax_d, CUDA a packed one with
+    # 128 slots of padding per sequence.
+    if q.device.type == "xpu":
+        softmax_d_shape = (batch_size, num_heads, max_seqlen_q)
+    else:
+        softmax_d_shape = (num_heads, total_q + 128 * batch_size)
+    softmax_d = torch.empty(softmax_d_shape, device=q.device, dtype=torch.float32)
 
     return softmax_d
 
