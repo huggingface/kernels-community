@@ -28,13 +28,39 @@ from triton.runtime.autotuner import get_cache_invalidating_env_vars, get_cache_
 
 from .autotune_config import load_autotune_config
 from .bayesian_autotuner import _TUNER_SOURCE_HASH, _tuning_lock
-from .bench import do_bench
+from .bench import do_bench, free_device_bytes, rotation_count
 from .compat import launches_skipped
 
 logger = logging.getLogger(__name__)
 
 # The timing and lock implementations alongside this file's own.
 _PATH_TUNER_SOURCE_HASH = hashlib.sha256(Path(__file__).read_bytes() + _TUNER_SOURCE_HASH.encode()).hexdigest()
+
+
+def _cold_banks(args, kwargs, min_bytes=1 << 20):
+    """The call's arguments plus fresh copies of its large tensors (weights, and activations at prefill), enough
+    that one pass over them reads more than twice L2 (``rotation_count``), within half the free memory: a path is
+    timed reading its operands from memory, as a model step does, not from the L2 a replayed single call leaves
+    warm. A call whose operands already exceed that (a MoE weight stack) is timed as it is."""
+    tensors = {id(t): t for t in (*args, *kwargs.values())
+               if isinstance(t, torch.Tensor) and t.is_cuda and t.untyped_storage().nbytes() >= min_bytes}
+    if not tensors:
+        return [(args, kwargs)]
+    nbytes = sum(t.untyped_storage().nbytes() for t in tensors.values())
+    device = next(iter(tensors.values())).device
+    count = min(rotation_count(nbytes, device), max(1, free_device_bytes(device) // 2 // nbytes + 1))
+    banks = [(args, kwargs)]
+    for _ in range(count - 1):
+        copies = {key: t.clone() for key, t in tensors.items()}
+        swap = lambda v: copies.get(id(v), v) if isinstance(v, torch.Tensor) else v  # noqa: E731
+        banks.append((tuple(swap(a) for a in args), {k: swap(v) for k, v in kwargs.items()}))
+    return banks
+
+
+def _run_banks(run, path, banks):
+    """One timed step: ``path`` over every bank of operands in turn."""
+    for args, kwargs in banks:
+        run(path, args, kwargs)
 
 
 class PathAutotuner:
@@ -127,13 +153,16 @@ class PathAutotuner:
             if best is not None:
                 return best
             timings = {}
+            banks = _cold_banks(args, kwargs)
             for path in offered:
                 self._run(path, args, kwargs)  # tunes the path's own kernels before it is timed
                 # graph replay: eager timing at decode sizes measures host dispatch, not the path (FP8 rowwise
-                # N=7168 K=5120 M=1, B200: cuBLAS 62 vs Triton 102us eager, 11.8 vs 8.7us replayed)
+                # N=7168 K=5120 M=1, B200: cuBLAS 62 vs Triton 102us eager, 11.8 vs 8.7us replayed), over cold
+                # copies of the operands, as a model reads its weights (a 50 MB FP8 weight sits in L2 when one
+                # call is replayed: Mistral-4 qkv M=1 timed Triton 9.4 vs cuBLAS 11.6us warm, 15.1 vs 14.0 cold)
                 timings[path] = do_bench(
-                    functools.partial(self._run, path, args, kwargs), quantiles=(0.5,), cudagraph=True, rep=100
-                )
+                    functools.partial(_run_banks, self._run, path, banks), quantiles=(0.5,), cudagraph=True, rep=100
+                ) / len(banks)
             best = min(timings, key=timings.get)
             logger.info("[autotune] %s %s: %s -> %s", self.name, key,
                         {p: f"{t * 1e3:.1f}us" for p, t in timings.items()}, best)
