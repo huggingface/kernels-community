@@ -44,4 +44,8 @@ class apply_rotary_transformers(nn.Module):
         half_dim = q.shape[-1] // 2
         cos = cos.unsqueeze(unsqueeze_dim)[..., :half_dim]
         sin = sin.unsqueeze(unsqueeze_dim)[..., :half_dim]
+        # The kernel needs one dtype. Under autocast, q and k can be in half
+        # precision while cos and sin are float32: promote like `q * cos` does.
+        dtype = torch.promote_types(q.dtype, cos.dtype)
+        q, k, cos, sin = q.to(dtype), k.to(dtype), cos.to(dtype), sin.to(dtype)
         return _ApplyRotary.apply(q, cos, sin), _ApplyRotary.apply(k, cos, sin)
