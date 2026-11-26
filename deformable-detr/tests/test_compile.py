@@ -49,8 +49,9 @@ def run_and_grad(fn, inputs):
 )
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=str)
 @torch._dynamo.config.patch(error_on_recompile=True)
-# The layer computes bfloat16 inputs in float32: without this, Inductor feeds it the
-# float32 intermediates of the fused ops, where eager rounds them to bfloat16 first.
+# Make Inductor round to bfloat16 like eager does. Otherwise it skips rounding
+# `sampling_loc.sigmoid()` before the layer converts it to float32, so compiled
+# and eager sample at slightly different locations.
 @torch._inductor.config.patch(emulate_precision_casts=True)
 def test_layer_compile(deformable_detr, dtype, channels):
     module = deformable_detr.layers.MultiScaleDeformableAttention()
