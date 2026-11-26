@@ -20,7 +20,6 @@
 
       pythonCheckInputs =
         ps: with ps; [
-          einops
           huggingface-hub
           transformers
         ];

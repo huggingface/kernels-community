@@ -8,10 +8,11 @@ import torch
 import torch.nn.functional as F
 import pytest
 
-from einops import rearrange
 
 
 mamba_ssm = kernels.get_kernel("kernels-community/mamba-ssm", version=6)
+einops = kernels.get_kernel("kernels-community/einops", version=1)
+rearrange = einops.rearrange
 
 selective_scan_fn = mamba_ssm.ops.selective_scan_interface.selective_scan_fn
 selective_scan_ref = mamba_ssm.ops.selective_scan_interface.selective_scan_ref

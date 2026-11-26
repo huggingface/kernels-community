@@ -5,10 +5,12 @@ import torch.nn.functional as F
 
 import pytest
 
-from einops import rearrange, repeat
 
 
 mamba_ssm = kernels.get_kernel("kernels-community/mamba-ssm", version=6)
+einops = kernels.get_kernel("kernels-community/einops", version=1)
+rearrange = einops.rearrange
+repeat = einops.repeat
 
 MambaLMHeadModel = mamba_ssm.models.mixer_seq_simple.MambaLMHeadModel
 MambaConfig = mamba_ssm.models.config_mamba.MambaConfig

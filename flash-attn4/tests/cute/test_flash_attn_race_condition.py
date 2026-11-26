@@ -7,7 +7,6 @@ import os
 import pytest
 import torch
 
-from einops import rearrange, repeat
 
 try:
     from flash_attn.layers.rotary import apply_rotary_emb
@@ -17,6 +16,9 @@ except ImportError:
 import kernels
 
 flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=2)
+einops = kernels.get_kernel("kernels-community/einops", version=1)
+rearrange = einops.rearrange
+repeat = einops.repeat
 
 attention_ref = flash_attn4.testing.attention_ref
 generate_qkv = flash_attn4.testing.generate_qkv
