@@ -105,7 +105,9 @@ def test_layer_compile_autocast(deformable_detr):
     # Under autocast the layer receives a bfloat16 value from a linear layer
     # but float32 sampling locations and attention weights.
     module = deformable_detr.layers.MultiScaleDeformableAttention()
-    proj = torch.nn.Linear(32, 32, device="cuda")
+    # No bias: in bfloat16 a compiled linear with a bias does not round like
+    # eager, and the layer would get different values in the two runs.
+    proj = torch.nn.Linear(32, 32, bias=False, device="cuda")
     value, shapes, level_start_index, sampling_loc, attn_weight = make_inputs(
         requires_grad=True
     )
