@@ -2396,6 +2396,20 @@ def _svdquant_arms(x, weights, act_global):
         x, W, Bs=Ws_local, a_global_scale=act_global, b_global_scale=Wg,
         a_pre_quant_scale=smooth, svdquant_lora_a=lora_a, svdquant_lora_b=lora_b,
         simulate_unfused=True)}
+    # References (REFERENCE_ARMS) on our BF16 GEMM: y = (x * smooth) @ (W + B @ A).T. At load the smoothing and the
+    # low-rank branch fold into one BF16 weight; at runtime our NVFP4 dequant runs per call and the branch stays apart.
+    cfg = {"weights": "nvfp4"}
+    K = x.shape[1]
+    W_eff = ((_fg_dequant(cfg, W, Ws, Wg, None, K, x.dtype).float() + lora_b.float() @ lora_a.float())
+             * smooth.float()).to(x.dtype)
+    _mark_static(W_eff)
+    runs["loadtime_dequant"] = lambda: fgm.matmul_2d(x, W_eff, None, None)
+
+    def runtime_dequant():
+        xs = x * smooth
+        return fgm.matmul_2d(xs, _fg_dequant(cfg, W, Ws, Wg, None, K, x.dtype), None, None) + (xs @ lora_a.T) @ lora_b.T
+
+    runs["runtime_dequant"] = runtime_dequant
     if (flashinfer_svdquant_linear is not None and torch.version.cuda is not None
             and torch.cuda.get_device_capability()[0] == 10):
         # FlashInfer's public chain pre-folds these transforms once at load time.
@@ -2444,9 +2458,11 @@ def bench_svdquant_row(row, pname, cfg, rows_out):
         down = (xs.float() @ lora_a.float().T).bfloat16()
         correction = (down.float() @ lora_b.float().T).bfloat16()
         reference = residual.bfloat16() + correction
+        # the reference arms keep BF16 activations, so they check against the unquantized product
+        bf16_reference = (xs.float() @ (dq_nvfp4_two_level(W, Ws, Wg)[0] + lora_b.float() @ lora_a.float()).T).bfloat16()
         for name in bank_arms[0]:
             runs = [arms[name] for arms in bank_arms]
-            res, out = bench_modes(runs, name, reference)
+            res, out = bench_modes(runs, name, bf16_reference if name in REFERENCE_ARMS else reference)
             parity = rel_diff(out[:reference.shape[0]], reference) if out is not None else None
             rows_out.append((row, pname, regime, name, res, parity))
         _round_robin([r[4] for r in rows_out if r[:3] == (row, pname, regime)])
