@@ -1,0 +1,19 @@
+recipe version=1
+
+// The input is the upstream tree, see `source.kdl`.
+
+prune keep="einops/tests/**"
+delete in="einops/tests/run_tests.py"
+
+// The helpers become a plain module next to the tests.
+move from="einops/tests/__init__.py" to="common.py"
+move from="einops/tests" to="."
+
+remap_module in="**/test_*.py" from="einops.tests.test_ops" to="test_ops"
+remap_module in="**/test_*.py" from="einops.tests" to="common"
+replace in="**/test_other.py" count=1 find="from . import parse_backends_to_test" with="from common import parse_backends_to_test"
+
+// Use the SDK through `get_kernel`.
+kernelize_imports in="**/*.py" package="einops" kernel="kernels-sdk/einops" version=1
+
+overlay from="overlay"

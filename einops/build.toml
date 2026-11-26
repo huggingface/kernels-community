@@ -1,0 +1,13 @@
+[general]
+name = "einops"
+version = 1
+edition = 6
+license = "MIT"
+upstream = "https://github.com/arogozhnikov/einops"
+backends = ["cpu", "cuda", "rocm", "xpu"]
+
+[general.hub]
+repo-id = "kernels-sdk/einops"
+
+[torch]
+src = []
