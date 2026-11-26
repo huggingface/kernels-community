@@ -1,7 +1,7 @@
 """Numerical parity tests for the AITER Triton RoPE kernel.
 
 Verifies that `apply_rotary_transformers` matches a pure-PyTorch NEOX-style
-RoPE reference within fp16 tolerance.
+RoPE reference in FP16 and BF16.
 """
 
 import inspect
@@ -9,7 +9,6 @@ import inspect
 import kernels
 import pytest
 import torch
-
 
 aiter_rope = kernels.get_kernel("amd/aiter-rope", version=3)
 
@@ -57,12 +56,17 @@ def _apply_rotary_pos_emb_ref(x, cos, sin):
 
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA/ROCm device")
-def test_apply_rotary_transformers_per_row_positions():
+@pytest.mark.parametrize(
+    ("dtype", "tolerance"),
+    [(torch.float16, 5e-3), (torch.bfloat16, 0.0)],
+    ids=["fp16", "bf16"],
+)
+def test_apply_rotary_transformers_per_row_positions(dtype, tolerance):
     # Left padding gives every batch row its own positions, so cos / sin differ per row.
     torch.manual_seed(0)
-    B, H, S, D = 3, 8, 32, 64
-    q = torch.randn(B, H, S, D, device="cuda", dtype=torch.float16)
-    k = torch.randn(B, 2, S, D, device="cuda", dtype=torch.float16)
+    B, H, S, D = 3, 8, 37, 64  # Exercise a partial sequence block.
+    q = torch.randn(B, H, S, D, device="cuda", dtype=dtype)
+    k = torch.randn(B, 2, S, D, device="cuda", dtype=dtype)
     # Full head_dim cos / sin, built like transformers' rotary embeddings.
     inv_freq = 1.0 / (10000 ** (torch.arange(0, D, 2, device="cuda").float() / D))
     positions = torch.stack(
@@ -70,7 +74,7 @@ def test_apply_rotary_transformers_per_row_positions():
     )
     freqs = positions[..., None].float() * inv_freq
     emb = torch.cat((freqs, freqs), dim=-1)
-    cos, sin = emb.cos().half(), emb.sin().half()
+    cos, sin = emb.cos().to(dtype), emb.sin().to(dtype)
 
     # Reference: transformers' `apply_rotary_pos_emb` on full head_dim cos / sin.
     q_ref, k_ref = (
@@ -82,8 +86,8 @@ def test_apply_rotary_transformers_per_row_positions():
         aiter_rope.layers.apply_rotary_transformers(),
     ):
         q_out, k_out = fn(q, k, cos, sin)
-        torch.testing.assert_close(q_out, q_ref, atol=5e-3, rtol=5e-3)
-        torch.testing.assert_close(k_out, k_ref, atol=5e-3, rtol=5e-3)
+        torch.testing.assert_close(q_out, q_ref, atol=tolerance, rtol=tolerance)
+        torch.testing.assert_close(k_out, k_ref, atol=tolerance, rtol=tolerance)
 
 
 @pytest.mark.kernels_ci
