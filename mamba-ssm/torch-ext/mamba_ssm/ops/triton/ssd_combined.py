@@ -438,7 +438,8 @@ def _chunk_scan_chunk_state_bwd_dx_kernel(
             tl.store(dD_ptrs, dD, mask=offs_n < hdim)
         else:
             dD = tl.sum(dout_res * x)
-            tl.store(dD_ptr, dD)
+            # A head can span several BLOCK_SIZE_N blocks, which all add to the same slot
+            tl.atomic_add(dD_ptr, dD)
     ddt = tl.sum(acc * x, axis=1)
     ddt_ptrs = ddt_ptr + offs_m * stride_ddt_csize
     tl.atomic_add(ddt_ptrs, ddt, mask=offs_m < chunk_size)
