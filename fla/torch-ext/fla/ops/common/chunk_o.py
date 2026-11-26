@@ -315,6 +315,8 @@ def chunk_bwd_kernel_dqkwg(
             # Under strong decay, dg is a small difference of large terms. Taken from dq and dk after the dots below,
             # it loses most of its precision with TF32 dots. Take the intra-chunk part as row sums minus column sums
             # of the same matrix instead, so that its diagonal cancels exactly.
+            # See https://github.com/fla-org/flash-linear-attention/issues/1802 and the upstream fix in
+            # https://github.com/fla-org/flash-linear-attention/pull/1822
             b_ds2 = b_ds * tl.dot(b_q, tl.trans(b_k))
             b_dg = tl.sum(b_dq * b_q, axis=1) - tl.sum(b_dk * b_k, axis=1)
             b_dg += tl.sum(b_ds2, axis=1) - tl.sum(b_ds2, axis=0)
