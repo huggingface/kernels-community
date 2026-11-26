@@ -378,6 +378,27 @@ PROBLEMS = [
         weight_scale_dtype=torch.float8_e8m0fnu,
         contiguous=False,
     ),
+    # N below the largest BLOCK_SIZE_N (gate_up and down of a tiny MoE test model)
+    Problem(
+        S=64,
+        E=8,
+        N=64,
+        K=32,
+        TOP_K=2,
+        scale_layout="block",
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_scale_dtype=torch.float8_e8m0fnu,
+    ),
+    Problem(
+        S=64,
+        E=8,
+        N=32,
+        K=32,
+        TOP_K=2,
+        scale_layout="block",
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_scale_dtype=torch.float8_e8m0fnu,
+    ),
 ]
 
 

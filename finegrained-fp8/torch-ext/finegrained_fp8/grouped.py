@@ -32,6 +32,7 @@ from .utils import (
     get_mxfp_autotuning_configs,
     smem_config_pruner,
     grf_config_pruner,
+    tile_config_pruner,
     chain_config_pruners,
     is_mxfp,
     is_tensor_wide,
@@ -320,6 +321,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
         "early_config_prune": chain_config_pruners(
             smem_config_pruner(act_bytes=2, n_weight_tiles=1, reduction_dim="K"),
             grf_config_pruner(n_accumulators=1, n_weight_tiles=1),
+            tile_config_pruner(),
         )
     },
 )
@@ -668,6 +670,8 @@ def _mxfp_dynamic_matmul_grouped(
     assert K % MX_SCALE_GROUP_K == 0, (
         f"K (={K}) must be a multiple of {MX_SCALE_GROUP_K}"
     )
+    # No N mask in the kernel: tile_config_pruner keeps only BLOCK_SIZE_N dividing N.
+    assert N % 32 == 0, f"N (={N}) must be a multiple of 32, the smallest BLOCK_SIZE_N"
     assert Bs.shape == (num_experts, N, K // MX_SCALE_GROUP_K), (
         f"Bs shape {tuple(Bs.shape)} != ({num_experts}, {N}, {K // MX_SCALE_GROUP_K})"
     )

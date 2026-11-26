@@ -546,6 +546,28 @@ def grf_config_pruner(
     return prune
 
 
+def tile_config_pruner(n_dim: str = "N", k_dim: str = "K"):
+    """Build an ``early_config_prune`` that drops configs whose ``BLOCK_SIZE_N`` does not divide
+    the output dim ``n_dim`` or whose ``BLOCK_SIZE_K`` does not divide the reduction dim ``k_dim``.
+    The grouped/batched MX kernels load and store whole tiles without N/K masks, so a partial last
+    tile reads past ``A``/``B`` and writes past ``C``: wrong outputs, and while autotuning, writes
+    that corrupt neighbouring buffers (e.g. the tile layout the final launch then uses) or fault
+    with an illegal memory access. Never returns empty — keeps the smallest tile as a fallback
+    (launchers assert ``N`` and ``K`` are multiples of 32, the smallest tile)."""
+
+    def prune(configs, named_args, **kwargs):
+        all_args = {**named_args, **kwargs}
+        n, k = all_args[n_dim], all_args[k_dim]
+
+        def tile(c):
+            return c.kwargs["BLOCK_SIZE_N"], c.kwargs["BLOCK_SIZE_K"]
+
+        kept = [c for c in configs if n % tile(c)[0] == 0 and k % tile(c)[1] == 0]
+        return kept or [min(configs, key=tile)]
+
+    return prune
+
+
 def chain_config_pruners(*pruners):
     """Compose several ``early_config_prune`` callables into one. Triton's ``prune_configs_by``
     takes a single ``early_config_prune``, so apply each pruner in turn, feeding the survivors of
