@@ -49,6 +49,10 @@ def run_and_grad(fn, inputs):
 )
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=str)
 @torch._dynamo.config.patch(error_on_recompile=True)
+# Make Inductor round to bfloat16 like eager does. Otherwise it skips rounding
+# `sampling_loc.sigmoid()` before the layer converts it to float32, so compiled
+# and eager sample at slightly different locations.
+@torch._inductor.config.patch(emulate_precision_casts=True)
 def test_layer_compile(deformable_detr, dtype, channels):
     module = deformable_detr.layers.MultiScaleDeformableAttention()
     value, shapes, level_start_index, sampling_loc, attn_weight = make_inputs(
@@ -101,7 +105,9 @@ def test_layer_compile_autocast(deformable_detr):
     # Under autocast the layer receives a bfloat16 value from a linear layer
     # but float32 sampling locations and attention weights.
     module = deformable_detr.layers.MultiScaleDeformableAttention()
-    proj = torch.nn.Linear(32, 32, device="cuda")
+    # No bias: in bfloat16 a compiled linear with a bias does not round like
+    # eager, and the layer would get different values in the two runs.
+    proj = torch.nn.Linear(32, 32, bias=False, device="cuda")
     value, shapes, level_start_index, sampling_loc, attn_weight = make_inputs(
         requires_grad=True
     )
