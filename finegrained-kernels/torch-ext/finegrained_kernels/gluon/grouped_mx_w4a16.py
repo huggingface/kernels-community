@@ -31,9 +31,8 @@ from ..epilogue import glu
 from ..bayesian_autotuner import bayesian_autotune
 from ..formats import (e2m1_as_uint8, gate_out_cols, resolve_output_dtype, routed_rows, tokens_per_expert_bucket,
                        ue8m0_as_uint8)
-from ..scheduling import packed_schedule_buffer
 from .common import (TOKEN_TILES, gather_rows, grouped_pre_hook, load_token_tile, schedule_item, smem_fit_pruner,
-                     token_tile_descriptor)
+                     token_tile_descriptor, token_tile_schedule, token_tile_schedules)
 
 BLOCK_N = 128  # weight rows per item
 BLOCK_K = 128  # K values per step: both projections' decoded bf16 tiles fit the tensor-memory ring
@@ -214,13 +213,14 @@ def _stage_bytes(kwargs, gate):
     prune_configs_by={"early_config_prune": smem_fit_pruner(_stage_bytes)},
 )
 @gluon.jit
-def mx_w4a16_grouped_kernel(w_desc, x_desc, S, Y, Bias, GatherIdx, ScatterIdx, Schedule, ExpertStart, N, K, stride_s_e,
+def mx_w4a16_grouped_kernel(w_desc, x_desc, S, Y, Bias, GatherIdx, ScatterIdx, Schedules, schedule_stride, N, K, stride_s_e,
                             stride_s_n, stride_y_t, stride_bias_e, tokens_per_expert_bit_length, BN: gl.constexpr,
                             BT: gl.constexpr, BK: gl.constexpr,
                             NS: gl.constexpr, NBUF: gl.constexpr, GATE: gl.constexpr, ACT_FN: gl.constexpr,
                             SWIGLU_ALPHA: gl.constexpr, SWIGLU_LIMIT: gl.constexpr, SIMULATE_UNFUSED: gl.constexpr,
                             DEC_REGS: gl.constexpr,
                             num_warps: gl.constexpr):
+    Schedule = token_tile_schedule(Schedules, schedule_stride, BT)
     NB = gl.cdiv(N, BN)
     n_items = gl.load(Schedule) * NB
     k_tiles = gl.cdiv(K, BK)
@@ -278,10 +278,10 @@ def mx_w4a16_grouped_gluon(x, B, Bs, expert_start, Y, N, gate, act_fn, swiglu_al
                      else (words, [1, BLOCK_N, BLOCK_K // 8]))
     w_desc = TensorDescriptor.from_tensor(w_view, w_box, gl.NVMMASharedLayout.get_default_for(w_box, gl.int32))
     x_desc = token_tile_descriptor(x, min(TOKEN_TILES), BLOCK_K, gather_idx is not None)  # rebound per config
-    schedule = packed_schedule_buffer(S, E, x.device, min(TOKEN_TILES))  # filled per config
+    schedules, schedule_stride = token_tile_schedules(expert_start, S)
     with device_context(x.device):
         compile_time_only_triton_wrap(mx_w4a16_grouped_kernel)[(sm_count(x.device.index),)](
-            w_desc, x_desc, Bs, Y, bias, gather_idx, scatter_idx, schedule, expert_start, N, K, Bs.stride(0),
+            w_desc, x_desc, Bs, Y, bias, gather_idx, scatter_idx, schedules, schedule_stride, N, K, Bs.stride(0),
             Bs.stride(1), Y.stride(0), bias.stride(0) if bias is not None else 0, tokens_per_expert_bucket(S, E),
             BN=BLOCK_N, BK=BLOCK_K, GATE=gate, ACT_FN=act_fn, SWIGLU_ALPHA=swiglu_alpha, SWIGLU_LIMIT=swiglu_limit,
             SIMULATE_UNFUSED=simulate_unfused,

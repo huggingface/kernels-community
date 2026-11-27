@@ -36,9 +36,8 @@ from ..loading.scales import decode_group_scale
 from ..pruners import require_moe_dims_aligned
 from ..quant import fp8_act_quant_block_dynamic, fp8_act_quant_inline
 from ..bayesian_autotuner import bayesian_autotune
-from ..scheduling import packed_schedule_buffer
 from .common import (TOKEN_TILES, gather_rows, grouped_pre_hook, load_token_tile, schedule_item, smem_fit_pruner,
-                     token_tile_descriptor)
+                     token_tile_descriptor, token_tile_schedule, token_tile_schedules)
 
 BLOCK_N = 128  # weight rows per item (the 128-row scale block)
 BLOCK_K = 128  # one scale block per K step
@@ -203,7 +202,7 @@ def _stage_bytes(kwargs, gate):
     prune_configs_by={"early_config_prune": smem_fit_pruner(_stage_bytes)},
 )
 @gluon.jit
-def block_fp8_grouped_kernel(w_desc, a_desc, As, Bs, C, Cs, GatherIdx, ScatterIdx, Schedule, ExpertStart, N, K,
+def block_fp8_grouped_kernel(w_desc, a_desc, As, Bs, C, Cs, GatherIdx, ScatterIdx, Schedules, schedule_stride, N, K,
                              stride_as_m, stride_bs_e, stride_bs_n, stride_c_m, stride_cs_m,
                              tokens_per_expert_bit_length, BN: gl.constexpr, BT: gl.constexpr,
                              BK: gl.constexpr, BKL: gl.constexpr, NS: gl.constexpr, NBUF: gl.constexpr,
@@ -211,6 +210,7 @@ def block_fp8_grouped_kernel(w_desc, a_desc, As, Bs, C, Cs, GatherIdx, ScatterId
                              ACT_FN: gl.constexpr, SWIGLU_ALPHA: gl.constexpr, SWIGLU_LIMIT: gl.constexpr,
                              SIMULATE_UNFUSED: gl.constexpr, INTERMEDIATE_DTYPE: gl.constexpr, REQUANT: gl.constexpr,
                              RESCALE_REGS: gl.constexpr, num_warps: gl.constexpr):
+    Schedule = token_tile_schedule(Schedules, schedule_stride, BT)
     NB = gl.cdiv(N, BN)
     n_items = gl.load(Schedule) * NB
     k_tiles = gl.cdiv(K, BK)
@@ -263,10 +263,10 @@ def block_fp8_grouped_gluon(A, As, B, Bs, expert_start, C, Cs, N, gate, act_fn, 
     w_layout = gl.NVMMASharedLayout.get_default_for(w_box, gl.float8e4nv)
     w_desc = TensorDescriptor.from_tensor(w_view, w_box, w_layout)
     a_desc = token_tile_descriptor(A, min(TOKEN_TILES), BLOCK_K, gather_idx is not None)  # rebound per config
-    schedule = packed_schedule_buffer(S, E, A.device, min(TOKEN_TILES))  # filled per config
+    schedules, schedule_stride = token_tile_schedules(expert_start, S)
     with device_context(A.device):
         compile_time_only_triton_wrap(block_fp8_grouped_kernel)[(sm_count(A.device.index),)](
-            w_desc, a_desc, As, Bs, C, Cs, gather_idx, scatter_idx, schedule, expert_start, N, K, As.stride(0),
+            w_desc, a_desc, As, Bs, C, Cs, gather_idx, scatter_idx, schedules, schedule_stride, N, K, As.stride(0),
             Bs.stride(0), Bs.stride(1), C.stride(0), Cs.stride(0) if Cs is not None else 0,
             tokens_per_expert_bucket(S, E), BN=BLOCK_N, BK=BLOCK_K, GATE=gate, ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha, SWIGLU_LIMIT=swiglu_limit, SIMULATE_UNFUSED=simulate_unfused,

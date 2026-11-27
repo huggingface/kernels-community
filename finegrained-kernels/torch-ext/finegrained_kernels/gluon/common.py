@@ -6,10 +6,21 @@ from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.nvidia.blackwell import tma
 from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
-from ..scheduling import fill_packed_schedule_rows
+from ..scheduling import fill_packed_schedule_rows, packed_schedule_buffer
 
 _GL_DTYPES = {torch.float8_e4m3fn: gl.float8e4nv, torch.bfloat16: gl.bfloat16, torch.float16: gl.float16,
               torch.int32: gl.int32}
+
+
+def token_tile_schedules(expert_start: torch.Tensor, num_routed_rows: int) -> tuple[torch.Tensor, int]:
+    """The packed schedule of every tuned token tile, one row each (``TOKEN_TILES`` order), and the row stride: the
+    kernels pick theirs by ``BT`` (``token_tile_schedule``)."""
+    num_experts = expert_start.shape[0] - 1
+    rows = packed_schedule_buffer(num_routed_rows, num_experts, expert_start.device, min(TOKEN_TILES)).numel()
+    schedules = torch.empty(len(TOKEN_TILES), rows, dtype=torch.int32, device=expert_start.device)
+    for row, bt in enumerate(TOKEN_TILES):
+        fill_packed_schedule_rows(expert_start, schedules[row], bt)
+    return schedules, rows
 
 
 def token_tile_descriptor(A: torch.Tensor, block_t: int, block_k: int, gather: bool) -> TensorDescriptor:
@@ -17,6 +28,12 @@ def token_tile_descriptor(A: torch.Tensor, block_t: int, block_k: int, gather: b
     (laid out as the full tile) that ``tma.async_gather`` repeats over a tile's gathered rows."""
     layout = gl.NVMMASharedLayout.get_default_for([block_t, block_k], _GL_DTYPES[A.dtype])
     return TensorDescriptor.from_tensor(A, [1 if gather else block_t, block_k], layout)
+
+
+@gluon.jit
+def token_tile_schedule(Schedules, schedule_stride, BT: gl.constexpr):
+    """The packed schedule of ``BT``-row tiles in ``token_tile_schedules``' buffer (``TOKEN_TILES`` = 16, 32)."""
+    return Schedules + (BT // 16 - 1) * schedule_stride
 
 
 @gluon.jit
@@ -54,14 +71,13 @@ SMEM_BUDGET = 216 * 1024
 
 def grouped_pre_hook(desc_name: str, weight_desc_name: str | None = None, weight_values_per_element: int = 1,
                      k_key: str = "BK", token_box_k: bool = True):
-    """Per config, as at launch: the packed schedule of the config's ``BT``-row tiles (into ``Schedule``, sized for the
-    smallest tile) and the token tile's box over ``desc_name``. A config that tunes the K width of a load (``k_key``)
+    """Per config, as at launch: the token tile's box over ``desc_name`` for the config's ``BT``. Host-only (the
+    tuner runs it on its precompile threads, on private descriptor copies). A config that tunes the K width of a load (``k_key``)
     also gets it on that box and on the weight box over ``weight_desc_name``, whose elements pack
     ``weight_values_per_element`` values along K; ``token_box_k=False`` keeps the token box's K, for a kernel that
     loads one token tile per K step of a wider weight load."""
     def hook(nargs):
         bt = nargs["BT"]
-        fill_packed_schedule_rows(nargs["ExpertStart"], nargs["Schedule"], bt)
         desc = nargs[desc_name]
         block_k = nargs.get(k_key, desc.block_shape[-1])
         token_k = block_k if token_box_k else desc.block_shape[-1]

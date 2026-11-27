@@ -61,6 +61,14 @@ from triton.runtime.autotuner import (
 
 from .autotune_config import load_autotune_config
 from .bench import do_bench
+from .compat import is_triton_greater_or_equal
+
+if is_triton_greater_or_equal("3.9"):  # the Gluon kernels' host descriptors (their pre-hooks rebind boxes too)
+    from triton.experimental.gluon.nvidia.hopper import TensorDescriptor as GluonTensorDescriptor
+
+    HOST_TMA_DESCRIPTORS = (TensorDescriptor, GluonTensorDescriptor)
+else:
+    HOST_TMA_DESCRIPTORS = (TensorDescriptor,)
 
 logger = logging.getLogger(__name__)
 
@@ -198,7 +206,7 @@ class BayesianAutotuner(Autotuner):
         """``nargs`` with private copies of its host-TMA descriptors: a config's ``pre_hook``
         rebinds a box in place, and a pointer config leaves the (unused) box as found, yet the box
         is part of the compile key, so each precompiled config must start from the launch's own."""
-        return {k: copy.copy(v) if isinstance(v, TensorDescriptor) else v for k, v in nargs.items()}
+        return {k: copy.copy(v) if isinstance(v, HOST_TMA_DESCRIPTORS) else v for k, v in nargs.items()}
 
     def precompile(self, configs: List[Config], nargs: dict, workers: int | None = None):
         """Compile ``configs`` for the launch ``nargs`` on a thread pool (Triton's ``AsyncCompileMode``) so the
