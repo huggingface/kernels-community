@@ -42,6 +42,14 @@ AUTHORIZED_TEAMS = (("huggingface", "transformers"), ("huggingface", "eric-hf-te
 # What team membership alone unlocks. Deliberately narrow -- merging and
 # releasing require `write`/`admin` on this repo.
 TEAM_AUTHORIZED_COMMANDS = {"build", "build-and-stage", "security", "security-and-build"}
+# Commands that build or merge the PR's code. Unless the PR author is trusted,
+# they require a review from the commenter on the exact head commit, so commits
+# pushed after that review never reach the build or the merge.
+REVIEW_GATED_COMMANDS = {"build", "build-and-stage", "security-and-build", "merge-and-upload"}
+TRUSTED_AUTHOR_PERMISSIONS = {"admin", "write"}
+# Dismissed and pending reviews do not count.
+SUBMITTED_REVIEW_STATES = {"APPROVED", "COMMENTED", "CHANGES_REQUESTED"}
+REVIEW_PAGE_SIZE = 100
 MAX_COMMENT_LENGTH = 1024
 RUN_LOOKUP_ATTEMPTS = 10
 RUN_LOOKUP_SLEEP_SECONDS = 2
@@ -380,12 +388,94 @@ def get_pull_request(api_base: str, token: str, issue_number: int):
     return json.loads(body)
 
 
-def merge_pull_request(api_base: str, token: str, issue_number: int):
+def merge_pull_request(api_base: str, token: str, issue_number: int, head_sha: str):
+    # `sha` makes GitHub refuse the merge if the head moved since it was checked.
     url = f"{api_base}/pulls/{issue_number}/merge"
     _, body = github_api_request(
-        url, token, method="PUT", data={"merge_method": "squash"}
+        url,
+        token,
+        method="PUT",
+        data={"merge_method": "squash", "sha": head_sha},
     )
     return json.loads(body)
+
+
+def list_pull_request_reviews(api_base: str, token: str, issue_number: int):
+    reviews = []
+    page = 1
+    while True:
+        url = (
+            f"{api_base}/pulls/{issue_number}/reviews"
+            f"?per_page={REVIEW_PAGE_SIZE}&page={page}"
+        )
+        _, body = github_api_request(url, token, method="GET")
+        batch = json.loads(body)
+        reviews.extend(batch)
+        if len(batch) < REVIEW_PAGE_SIZE:
+            return reviews
+        page += 1
+
+
+def has_review_on_commit(reviews: list[dict], username: str, commit_sha: str):
+    """True when `username` submitted a review on exactly `commit_sha`."""
+    return any(
+        (review.get("user") or {}).get("login") == username
+        and review.get("state") in SUBMITTED_REVIEW_STATES
+        and review.get("commit_id") == commit_sha
+        for review in reviews
+    )
+
+
+def pr_author_is_trusted(api_base: str, token: str, pr_author: str):
+    """True when the PR author could run or push this code anyway.
+
+    Every failure path returns False, so lookup errors only ever require a review.
+    """
+    if not pr_author:
+        return False
+    try:
+        if get_user_permission(api_base, token, pr_author) in TRUSTED_AUTHOR_PERMISSIONS:
+            return True
+    except urllib.error.HTTPError as e:
+        print(
+            f"Permission lookup for PR author {pr_author} failed (HTTP {e.code}).",
+            file=sys.stderr,
+        )
+    team_token = os.environ.get("TEAM_READ_TOKEN", "")
+    return bool(team_token) and is_authorized_team_member(pr_author, team_token)
+
+
+def review_gate_error(
+    api_base: str,
+    token: str,
+    command: str,
+    commenter: str,
+    pull_request: dict,
+    issue_number: int,
+):
+    """Return why `command` must not run on the current head, or None if it may."""
+    if command not in REVIEW_GATED_COMMANDS:
+        return None
+    pr_author = (pull_request.get("user") or {}).get("login", "")
+    if pr_author_is_trusted(api_base, token, pr_author):
+        return None
+    head_sha = (pull_request.get("head") or {}).get("sha") or ""
+    try:
+        reviews = list_pull_request_reviews(api_base, token, issue_number)
+    except urllib.error.HTTPError as e:
+        print(
+            f"Failed to list reviews for PR #{issue_number} (HTTP {e.code}).",
+            file=sys.stderr,
+        )
+        return f"Could not verify PR reviews, so `/kernel-bot {command}` was not run."
+    if head_sha and has_review_on_commit(reviews, commenter, head_sha):
+        return None
+    return (
+        f"`/kernel-bot {command}` was not run: `{commenter}` has no review on the "
+        f"current head commit `{head_sha[:12]}`. Commits may have been pushed after "
+        "your last review. Review the latest changes (a comment-only review is "
+        "enough), then run the command again."
+    )
 
 
 def list_workflow_runs(
@@ -919,6 +1009,12 @@ def main(*, dry_run: bool = False):
             )
             return 1
         pr_head_sha = pull_request.get("head", {}).get("sha")
+        gate_error = review_gate_error(
+            api_base, token, command, ctx["commenter"], pull_request, issue_number
+        )
+        if gate_error:
+            try_post_issue_comment(api_base, token, issue_number, gate_error)
+            return 0
 
     if command == "security":
         # Security-only: dispatch the audit and return early.
@@ -1105,7 +1201,9 @@ def main(*, dry_run: bool = False):
             return 0
         else:
             try:
-                merge_response = merge_pull_request(api_base, token, issue_number)
+                merge_response = merge_pull_request(
+                    api_base, token, issue_number, pr_head_sha
+                )
             except urllib.error.HTTPError as e:
                 err_text = e.read().decode("utf-8", errors="replace")
                 print(
