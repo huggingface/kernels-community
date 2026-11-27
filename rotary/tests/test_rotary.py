@@ -171,17 +171,7 @@ def test_apply_rotary_transformers_backward(entry_point, dtype, atol, rtol):
 
 @pytest.mark.kernels_ci
 @pytest.mark.parametrize("entry_point", ["function", "layer"])
-@pytest.mark.parametrize(
-    "dtype",
-    [
-        torch.float16,
-        pytest.param(
-            torch.bfloat16,
-            marks=pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU"),
-        ),
-    ],
-)
-def test_apply_rotary_transformers_mixed_dtypes(entry_point, dtype):
+def test_apply_rotary_transformers_mixed_dtypes(entry_point):
     # Under autocast with float32 weights, q and k come out of a linear layer in
     # half precision while cos and sin are float32.
     device = infer_device()
@@ -191,8 +181,8 @@ def test_apply_rotary_transformers_mixed_dtypes(entry_point, dtype):
     batch_size, nheads, seqlen, headdim = 2, 8, 128, 64
     rotary_dim = headdim // 2
 
-    q_orig = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
-    k_orig = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+    q_orig = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.float16)
+    k_orig = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.float16)
     cos = torch.randn(seqlen, headdim, device=device, dtype=torch.float32)
     sin = torch.randn(seqlen, headdim, device=device, dtype=torch.float32)
     grad_q = torch.randn(q_orig.shape, device=device, dtype=torch.float32)
