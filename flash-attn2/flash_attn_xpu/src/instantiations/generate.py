@@ -9,13 +9,21 @@
 #
 # <arch> is the device IP version: xe20 = Xe2 (BMG), [kernel.flash_attn_xpu];
 # xe35 = Xe3P (CRI),
-# [kernel.flash_attn_xpu_cri]. Run from anywhere; prints the build.toml lists.
+# [kernel.flash_attn_xpu_cri]. Run from anywhere. The default mode writes the
+# files, deletes obsolete ones and prints the build.toml lists; --check only
+# verifies that the files and the build.toml lists match this script.
 #
-#   python3 flash_attn_xpu/src/instantiations/generate.py
+#   python3 flash_attn_xpu/src/instantiations/generate.py [--check]
 
+import argparse
+import sys
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+KERNEL_DIR = ROOT.parents[2]
+BUILD_TOML = KERNEL_DIR / "build.toml"
+SECTIONS = {"xe20": "flash_attn_xpu", "xe35": "flash_attn_xpu_cri"}
 DTYPES = {"fp16": "cute::half_t", "bf16": "cute::bfloat16_t"}
 ARCHS = {"xe20": 20, "xe35": 35}
 
@@ -144,17 +152,80 @@ def kernel_files(arch_dir, arch):
     return files
 
 
-def main():
+def expected_files():
+    out = {}
     for arch_dir, arch in ARCHS.items():
         files = kernel_files(arch_dir, arch)
         if arch_dir == "xe20":
             files = fmha_files() + files
+        out[arch_dir] = {ROOT / arch_dir / name: text for name, text in files}
+    return out
+
+
+def rel(path):
+    return path.relative_to(KERNEL_DIR).as_posix()
+
+
+def obsolete_files(expected):
+    wanted = {path for files in expected.values() for path in files}
+    return sorted(p for p in ROOT.rglob("*.cpp") if p not in wanted)
+
+
+def check(expected):
+    errors = []
+    for files in expected.values():
+        for path, text in files.items():
+            if not path.is_file():
+                errors.append(f"missing file: {rel(path)}")
+            elif path.read_text() != text:
+                errors.append(f"out-of-date file: {rel(path)}")
+    errors += [f"obsolete file: {rel(p)}" for p in obsolete_files(expected)]
+
+    kernels = tomllib.loads(BUILD_TOML.read_text())["kernel"]
+    prefix = rel(ROOT) + "/"
+    for arch_dir, files in expected.items():
+        section = f"[kernel.{SECTIONS[arch_dir]}]"
+        listed = [s for s in kernels[SECTIONS[arch_dir]]["src"]
+                  if s.startswith(prefix)]
+        wanted = {rel(p) for p in files}
+        errors += [f"build.toml {section} missing: {s}"
+                   for s in sorted(wanted - set(listed))]
+        errors += [f"build.toml {section} not generated: {s}"
+                   for s in sorted(set(listed) - wanted)]
+        errors += [f"build.toml {section} duplicate: {s}"
+                   for s in sorted({s for s in listed if listed.count(s) > 1})]
+    return errors
+
+
+def generate(expected):
+    for arch_dir, files in expected.items():
         print(f"# {arch_dir}: {len(files)} files")
-        for name, text in files:
-            path = ROOT / arch_dir / name
+        for path, text in files.items():
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text)
-            print(f'    "{path.relative_to(ROOT.parents[2]).as_posix()}",')
+            print(f'    "{rel(path)}",')
+    for path in obsolete_files(expected):
+        path.unlink()
+        print(f"# removed obsolete {rel(path)}")
+    for path in sorted(ROOT.rglob("*"), reverse=True):
+        if path.is_dir() and not any(path.iterdir()):
+            path.rmdir()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--check", action="store_true",
+                        help="verify generated files and build.toml, write nothing")
+    args = parser.parse_args()
+
+    expected = expected_files()
+    if not args.check:
+        generate(expected)
+    errors = check(expected)
+    for error in errors:
+        print(error, file=sys.stderr)
+    if errors:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
