@@ -3,8 +3,8 @@ name: Test CI scripts
 # Unit tests for the CI helpers in .github/scripts and scripts/check_public_api.py.
 # The tests need no GPU, kernel builds, or network and run on a plain CPU runner.
 #
-# External checker dependencies are stubbed; pytest is the only test dependency, so
-# uv provisions both the interpreter and pytest in one ephemeral env (no
+# External checker dependencies are stubbed; the tests use pytest and PyYAML.
+# uv provisions the interpreter and test dependencies in one ephemeral env (no
 # setup-python step, no requirements file to keep in sync).
 #
 # pytest MUST run from the repository root: the tests resolve
@@ -80,7 +80,7 @@ jobs:
       # nothing else pins it (Dependabot only tracks github-actions in this repo).
       - name: Run tests
         run: |
-          uv run --no-project --python 3.11 --with 'pytest>=8,<9' \
+          uv run --no-project --python 3.11 --with 'pytest>=8,<9' --with 'pyyaml>=6,<7' \
             pytest .github/scripts scripts/test_check_public_api.py scripts/test_kernel_status_snapshot.py -v
 
       - name: Test kernel-status CLI

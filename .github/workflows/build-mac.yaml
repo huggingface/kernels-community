@@ -48,7 +48,7 @@ on:
         type: string
         default: ""
       head_sha:
-        description: "PR head SHA for posting commit statuses (empty = no status)"
+        description: "PR commit SHA to build (required with pr_number); also used for statuses"
         required: false
         type: string
         default: ""
@@ -102,6 +102,17 @@ jobs:
               ;;
           esac
 
+      - name: Validate PR revision
+        if: inputs.pr_number != ''
+        shell: bash
+        env:
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          if [[ ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid head_sha input: PR builds require a full commit SHA"
+            exit 1
+          fi
+
       # Post a running commit status so the PR shows the build is in progress.
       - name: Set running status
         if: inputs.head_sha != ''
@@ -131,16 +142,20 @@ jobs:
               ;;
           esac
 
-      # When building for a PR, check out the PR head; otherwise use default branch.
+      # Use the dispatched PR commit, or the workflow commit for a release.
       - name: Checkout PR branch
         if: inputs.pr_number != ''
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: refs/pull/${{ inputs.pr_number }}/head
+          ref: ${{ inputs.head_sha }}
           fetch-depth: 0
+          persist-credentials: false
       - name: Checkout default branch
         if: inputs.pr_number == ''
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       # Ensure the kernel directory exists and has the required config files.
       - name: Validate kernel directory
@@ -193,11 +208,15 @@ jobs:
         if: inputs.pr_number != ''
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: refs/pull/${{ inputs.pr_number }}/head
+          ref: ${{ inputs.head_sha }}
           fetch-depth: 0
+          persist-credentials: false
       - name: Checkout default branch
         if: inputs.pr_number == ''
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       # Nix toolchain + binary cache setup.
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
@@ -325,11 +344,15 @@ jobs:
         if: inputs.pr_number != ''
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: refs/pull/${{ inputs.pr_number }}/head
+          ref: ${{ inputs.head_sha }}
           fetch-depth: 0
+          persist-credentials: false
       - name: Checkout default branch
         if: inputs.pr_number == ''
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
         with:
@@ -450,7 +473,8 @@ jobs:
         if: env.REPORT_HUB_UPLOAD == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.pr_number != '' && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Download Hub upload summaries
         if: env.REPORT_HUB_UPLOAD == 'true'
@@ -498,12 +522,11 @@ jobs:
             '') echo "ref=HEAD" >> "$GITHUB_OUTPUT"; exit 0 ;;
             *[!0-9]*) echo "Invalid pr_number input: must be numeric"; exit 1 ;;
           esac
-          # Prefer the dispatched head SHA, the PR ref may have moved during the build.
-          case "$HEAD_SHA" in
-            '') git fetch --depth=1 origin "refs/pull/$PR_NUMBER/head" ;;
-            *[!0-9a-f]*) echo "Invalid head_sha input: must be a hex SHA"; exit 1 ;;
-            *) git fetch --depth=1 origin "$HEAD_SHA" ;;
-          esac
+          if [[ ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid head_sha input: PR builds require a full commit SHA"
+            exit 1
+          fi
+          git fetch --depth=1 origin "$HEAD_SHA"
           echo "ref=FETCH_HEAD" >> "$GITHUB_OUTPUT"
 
       - name: Download Hub upload summaries
