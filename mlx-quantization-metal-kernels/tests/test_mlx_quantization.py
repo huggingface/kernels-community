@@ -195,6 +195,25 @@ def test_quantized_matmul_matches_mlx(mode, dtype, transpose, M, N, K):
     assert_same(ours, theirs)
 
 
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("M", [33, 300])
+@pytest.mark.parametrize("transpose", [True, False])
+@pytest.mark.parametrize("mode", ["affine", "mxfp4", "nvfp4"])
+def test_quantized_matmul_matches_dequantized_matmul(mode, transpose, M, dtype):
+    """#1332: the NAX qmm kernels were ~1.1 off in half and bfloat."""
+    N = K = 1024
+    group_size, bits = gs_bits(mode)
+    torch.manual_seed(0)
+    wq, s, *rest = mq.quantize(torch.randn(K, N, device="mps").to(dtype), group_size, bits, mode)
+    b = rest[0] if rest else None
+    w = mq.dequantize(wq, s, b, group_size, bits, mode, dtype=dtype).float()
+    x = torch.randn(M, K, dtype=dtype, device="mps")
+    ref = x.float() @ (w.T if transpose else w)
+    out = mq.quantized_matmul(x, wq, s, b, transpose, group_size, bits, mode)
+    assert (out.float() - ref).norm() / ref.norm() < 2e-2
+
+
 @needs_mlx
 @pytest.mark.parametrize("group_size,bits", AFFINE)
 @pytest.mark.parametrize("M", [1, 5, 64])
@@ -294,6 +313,22 @@ def test_gather_qmm_nvfp4_global_scale_matches_mlx():
         mq.gather_qmm(x, wq, s, rhs_indices=rhs, mode="nvfp4", global_scale=g),
         mx.gather_qmm(to_mx(x), wq_m, s_m, rhs_indices=mx_indices(rhs), mode="nvfp4", global_scale=to_mx(g)),
     )
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("rows", [63, 64, 512])
+def test_sorted_gather_qmm_matches_dequantized_matmul(rows, dtype):
+    """#1332: sorted gather_qmm (gather_qmm_rhs_nax from 4 rows per expert) was ~1.1 off in half and bfloat."""
+    E, N, K, group_size = 16, 512, 1024, 64
+    torch.manual_seed(0)
+    wq, s, b = mq.quantize(torch.randn(E, N, K, device="mps").to(dtype), group_size, 4)
+    w = mq.dequantize(wq, s, b, group_size, 4).float()
+    x = torch.randn(rows, 1, K, dtype=dtype, device="mps")
+    rhs = torch.randint(0, E, (rows,), device="mps").sort().values
+    ref = torch.einsum("sk,snk->sn", x[:, 0].float(), w[rhs])
+    out = mq.gather_qmm(x, wq, s, b, rhs_indices=rhs, group_size=group_size, bits=4, sorted_indices=True)
+    assert (out[:, 0].float() - ref).norm() / ref.norm() < 2e-2
 
 
 # --- which kernels run --------------------------------------------------------------------------

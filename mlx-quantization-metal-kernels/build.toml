@@ -24,6 +24,7 @@ include = [
 ]
 src = [
     "mlx_metal/common.h",
+    "mlx_metal/nax_deployment_target.h",
     "mlx_metal/mlx_dispatch.mm",
     "mlx_metal/mlx_quantization.cpp",
     "mlx_metal/mlx_fp_quantized.metal",

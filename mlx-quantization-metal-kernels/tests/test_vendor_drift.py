@@ -257,3 +257,13 @@ def test_math_mode_matches_upstream_build():
     assert len(wrappers) == len(list(KERNELS.glob("*.metal.h")))
     for w in wrappers:
         assert "#pragma METAL fp math_mode(safe)" in w.read_text(), w.name
+
+
+def test_nax_deployment_target_matches_upstream_build():
+    """#1332: MLX builds NAX for macOS 26.2+, so the NAX wrappers raise the target the headers see."""
+    assert "CMAKE_OSX_DEPLOYMENT_TARGET VERSION_GREATER_EQUAL 26.2" in (KERNELS / "CMakeLists.txt").read_text()
+    wrappers = sorted((ROOT / "mlx_metal").glob("*_nax.metal"))
+    assert len(wrappers) == len(list(KERNELS.glob("*_nax.metal.h")))
+    for w in wrappers:
+        assert '#include "nax_deployment_target.h"' in w.read_text(), w.name
+    assert "260200" in (ROOT / "mlx_metal/nax_deployment_target.h").read_text()
