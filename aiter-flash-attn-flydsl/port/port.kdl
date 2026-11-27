@@ -1,0 +1,103 @@
+recipe version=1
+
+// Pin the exact clean AITER tree this recipe transforms.
+source \
+    repo="https://github.com/ROCm/aiter.git" \
+    commit="c1096fa40a907cf83cf95d6d87c4fad5823e7054"
+
+// Only the gfx1201 attention and FP8 quantization kernels are carried over.
+// The high-level attention wrapper (`fmha.py`) is a hand-extracted subset of
+// upstream's `fmha_kernels.py` (which also contains gfx942/gfx950/gfx1250
+// dispatch) and lives in the overlay.
+prune keep="LICENSE,aiter/ops/flydsl/fp8_quant.py,aiter/ops/flydsl/kernels/{buffer_ops,kernels_common,layout_utils,tensor_shim,fp8_quant_gfx1201}.py,aiter/ops/flydsl/kernels/fmha_gfx1201/*.py"
+
+move \
+    from="aiter/ops/flydsl/kernels" \
+    to="torch-ext/aiter_flash_attn_flydsl/_kernels"
+
+move \
+    from="aiter/ops/flydsl/fp8_quant.py" \
+    to="torch-ext/aiter_flash_attn_flydsl/fp8_quant.py"
+
+ensure_init under="torch-ext/aiter_flash_attn_flydsl/_kernels" changes=2
+
+// Intra-package imports must be relative under the Hub-generated module name.
+remap_module \
+    in="torch-ext/aiter_flash_attn_flydsl/_kernels/**" \
+    from="aiter.ops.flydsl.kernels" \
+    to="aiter_flash_attn_flydsl._kernels" \
+    changes=4
+
+relativize_imports \
+    in="torch-ext/aiter_flash_attn_flydsl/_kernels/**" \
+    package_root="torch-ext/aiter_flash_attn_flydsl" \
+    changes=4
+
+replace in="torch-ext/aiter_flash_attn_flydsl/fp8_quant.py" count=1 \
+    find="from .kernels.fp8_quant_gfx1201 import (" \
+    with="from ._setup import check_runtime_setup\nfrom ._kernels.fp8_quant_gfx1201 import ("
+
+// `check_e8m0` is unused here and depends on `aiter.utility`.
+replace in="torch-ext/aiter_flash_attn_flydsl/_kernels/tensor_shim.py" count=1 with="" find=#"""
+def check_e8m0(
+    scale: torch.Tensor, name: str, owner: str, shape: tuple[int, ...] | None = None
+) -> None:
+    """Validate an e8m0 scale operand: e8m0/uint8 storage, contiguous, and
+    ``shape`` when given. ``owner`` prefixes the error, e.g. "FlyDSL gfx950 bmm"."""
+    from aiter.utility import dtypes
+
+    if shape is not None and tuple(scale.shape) != shape:
+        raise RuntimeError(
+            f"[{owner}] {name} must have shape {shape}, got {tuple(scale.shape)}"
+        )
+    if scale.dtype not in (dtypes.fp8_e8m0, torch.uint8):
+        raise RuntimeError(f"[{owner}] {name} must be e8m0/uint8, got {scale.dtype}")
+    if not scale.is_contiguous():
+        raise RuntimeError(f"[{owner}] {name} must be contiguous")
+
+
+"""#
+
+// Local changes to the FP8 quantization entry point: verify the toolchain
+// before the first compilation, and keep the inputs alive on the launch stream.
+replace in="torch-ext/aiter_flash_attn_flydsl/fp8_quant.py" count=1 with=#"""
+        raise ValueError(f"flydsl_fp8_quant requires gfx1201, got {arch!r}")
+    check_runtime_setup()
+"""# find=#"""
+        raise ValueError(f"flydsl_fp8_quant requires gfx1201, got {arch!r}")
+"""#
+
+replace in="torch-ext/aiter_flash_attn_flydsl/fp8_quant.py" count=1 with=#"""
+    _validate_quant_buffer_byte_extent(
+        q, k, v, head_dim=head_dim, native_head_dim=padded_dim
+    )
+    launch_stream = torch.cuda.current_stream(q.device)
+    for tensor in (q, k, v):
+        tensor.record_stream(launch_stream)
+"""# find=#"""
+    _validate_quant_buffer_byte_extent(
+        q, k, v, head_dim=head_dim, native_head_dim=padded_dim
+    )
+"""#
+
+overlay from="overlay"
+
+kernelize_imports \
+    in="torch-ext/aiter_flash_attn_flydsl/**" \
+    package="flydsl" \
+    kernel="kernels-sdk/flydsl" \
+    dependency=#true \
+    changes=46
+
+manifest \
+    name="aiter-flash-attn-flydsl" \
+    version=1 \
+    edition=6 \
+    license="MIT" \
+    upstream="https://github.com/ROCm/aiter.git" \
+    source="https://github.com/huggingface/kernels-community/tree/main/aiter-flash-attn-flydsl" \
+    backends="rocm" \
+    kernel_depends="kernels-sdk/flydsl@1" \
+    repo_id="kernels-community/aiter-flash-attn-flydsl" \
+    noarch=#true \
+    rocm_archs="gfx1201"

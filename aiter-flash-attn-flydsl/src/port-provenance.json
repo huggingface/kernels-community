@@ -1,0 +1,12 @@
+{
+  "format": 1,
+  "recipe": "sha256:e213f122c236f7b91ae05d9e429d5f0a4d6dc401e3fbec1f460b25a57997a9cb",
+  "runner": "kernel-port 0.1.0",
+  "sources": {
+    "upstream": {
+      "repo": "https://github.com/ROCm/aiter.git",
+      "commit": "c1096fa40a907cf83cf95d6d87c4fad5823e7054"
+    }
+  },
+  "tree": "sha256:7cb96ab1062926244674e3cb26fde7ac1e3fa8c8cce7d218203e2dff28f35a89"
+}

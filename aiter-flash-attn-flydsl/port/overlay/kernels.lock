@@ -1,0 +1,12 @@
+[
+  {
+    "dependency": {
+      "repo-id": "kernels-sdk/flydsl",
+      "version": 1
+    },
+    "lock": {
+      "commit": "e04bcbcef038065153120141d351328601467011",
+      "hash": "sha256-3G2QyAPgL8edng0vPaxJm+Obvv7xX4aswqrnDIvw+b8="
+    }
+  }
+]
