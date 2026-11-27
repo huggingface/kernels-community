@@ -86,7 +86,7 @@ def _rms_norm_kernel(
     ``Inv[row] = rsqrt(mean + eps)`` and, under ``WRITE_ROWS``, a second pass writing
     ``x * factor * inv`` (the row is L2-resident by then). ``input_scaled_rms_norm`` squares the
     SCALED values, the other forms the raw ones — the one place the three differ."""
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)  # row * stride_x_m passes 2**31 on large routed-row counts
     x_row = X + row * stride_x_m
     square_sum = tl.zeros((), tl.float32)
     for h in range(0, tl.cdiv(H, BLOCK_H)):

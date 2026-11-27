@@ -6,8 +6,8 @@ tags:
 
 # finegrained-kernels
 
-Triton GEMM + MoE kernels for fine-grained quantization — block/tensor FP8, MXFP8, MXFP4, and
-two-level NVFP4 weights, with fused gate|up GLU epilogues, fused intermediate requantization, and
+Triton GEMM + MoE kernels for fine-grained quantization — block/tensor/row-wise FP8, MXFP8, MXFP4,
+two-level NVFP4, and INT2/INT4/INT8 weights, with fused gate|up GLU epilogues, fused intermediate requantization, and
 expert routing — developed as part of the HuggingFace Transformers FP8 + MoE optimization effort.
 
 All tuning and validation is on NVIDIA Blackwell (SM100 / B200), whose tcgen05 scaled-MMA the MX
@@ -18,9 +18,11 @@ unvalidated.
 
 ![MoE bench: finegrained-kernels vs references on B200](https://huggingface.co/datasets/IlyasMoutawwakil/benchmarks/resolve/main/finegrained-kernels/cold-weight-timing/bench_moe.png)
 
-Real model shapes on an NVIDIA B200, against upstream `finegrained-fp8`, DeepGEMM, vLLM's fused
-MoE, FlashInfer's TRT-LLM routed-MoE kernels, transformers `grouped_mm`/`batched_mm`, SonicMoE,
-OpenAI `triton_kernels`, and `torch.scaled_grouped_mm`.
+Real model shapes on an NVIDIA B200, against `transformers@main` (its `finegrained-fp8` hub kernel
+integration), DeepGEMM, vLLM (`fused_moe`, CUTLASS, Marlin, ExLlama, humming), FlashInfer (TRT-LLM
+routed MoE, CUTLASS MoE, dense FP4/MXFP8 GEMMs, SVDQuant), FBGEMM, transformers
+`grouped_mm`/`batched_mm`, SonicMoE, OpenAI `triton_kernels`, megablocks, nvfp4-gemm and
+`torch.nn.functional.scaled_(grouped_)mm`.
 Decode is cudagraph-captured, prefill eager; a red ✕ marks a configuration that raised. Every
 baseline's output is parity-checked against the finegrained-kernels anchor in the same run. See
 [`bench/README.md`](bench/README.md) to reproduce.
@@ -62,7 +64,7 @@ matmul_grouped(A, B, As, Bs, *, expert_start, gather_idx=None, scatter_idx=None,
   (see the format matrix below).
 - `activation_format` is the activations' quantization, in the same vocabulary as transformers'
   `FineGrainedConfig`: `None` (default) = the weights' own format, `"bf16"` = weight-only (W4A16 /
-  W8A16), or an explicit `"fp8"` / `"mxfp8"` / `"mxfp4"` / `"nvfp4"` (`"mxfp8"` on MXFP4 weights =
+  W8A16), or an explicit `"fp8"` / `"int8"` / `"mxfp8"` / `"mxfp4"` / `"nvfp4"` (`"mxfp8"` on MXFP4 weights =
   the W4A8 chain). The weight format is never named — it is read off `B`/`Bs`.
 - `gate=True, act_fn="silu", swiglu_alpha=..., swiglu_limit=...` fuses the gate|up GLU: `B` holds
   the interleaved `(2N, K)` gate|up rows (see the layout contract below) and the op returns the
@@ -77,6 +79,8 @@ matmul_grouped(A, B, As, Bs, *, expert_start, gather_idx=None, scatter_idx=None,
   gate|up stack whose halves a checkpoint calibrated separately carries one global per half; the
   loader merges those into one per expert (the up half's folds into the down projection's global,
   SwiGLU being linear in it) rather than the ops taking a second layout.
+- Weight-only FP8 (`activation_format="bf16"`) also accepts coarse block scales and one scale
+  per tensor/expert, with unquantized activations. Coarse FP8 entrypoints are inference-only.
 - Routing: `matmul_batched` reads one expert id per row (`expert_ids`, EP sentinels
   `>= num_experts` skipped). Its `A` holds either one row per routed row or one row per token, as
   the gate|up reads the unexpanded hidden: routed row `s` reads row `s // top_k`, with
@@ -90,9 +94,96 @@ matmul_grouped(A, B, As, Bs, *, expert_start, gather_idx=None, scatter_idx=None,
 | full precision | bf16 / fp16 | `None` | — |
 | block FP8 (128×128) | `float8_e4m3fn` | fp32 or UE8M0 `(⌈N/128⌉, K/128)` (the block is derived from the K dim, so K must divide) | — |
 | tensor FP8 | `float8_e4m3fn` | one scalar | — |
+| row-wise FP8 | `float8_e4m3fn` | fp32 `(N, 1)`, one per output row | — |
 | MXFP8 | `float8_e4m3fn` | UE8M0 `(N, K/32)` (raw `uint8` accepted) | — |
 | MXFP4 | packed E2M1 (`int8`, 2/byte) | UE8M0 `(N, K/32)` | — |
 | NVFP4 | packed E2M1 (`int8`, 2/byte) | E4M3 `(N, K/16)` | fp32 global(s) |
+| INT2 / INT4 / INT8 | interleaved `uint32` words (`32 / bits` values/word) | bf16 / fp16 / fp32 `(N, K/group)` | — |
+
+Integer weights run weight-only on raw bf16/fp16 activations unless a ModelOpt recipe below quantizes the
+activations. Per checkpoint recipe:
+
+| Checkpoint recipe | Weight helper | `activation_format` | `As` | `b_global_scale` |
+| --- | --- | --- | --- | --- |
+| naturally packed integer words | `interleave_int_words` | raw (`None`) | — | — |
+| GPTQ v1 / v2, including act-order | `repack_gptq_int4` (also returns `b_perm` when K is reordered) | raw | — | — |
+| AWQ GEMM | `repack_awq_int4` | raw | — | — |
+| ModelOpt INT4 (signed, `uint8` `(N/2, K)`, two output channels per byte) | `repack_modelopt_int4` | raw | — | — |
+| ModelOpt INT8 (signed `int8` `(N, K)`, one scale per output channel) | `repack_modelopt_int8` | raw | — | — |
+| ModelOpt `W4A8_AWQ` (symmetric INT4, original group scales) | `repack_modelopt_int4` | `"fp8"` | `input_scale` | `weight_scale_2` |
+| ModelOpt INT8 SmoothQuant (symmetric per-channel INT8) | `repack_modelopt_int8` | `"int8"` | `input_scale` | — |
+| ModelOpt `W4A8_MXFP4_FP8` (group-32 FP4) | — | `"fp8"` | `input_scale` | — |
+| ModelOpt `W4A8_NVFP4_FP8` (group-32 FP4, E4M3 block scales) | — | `"fp8"` | `input_scale` | `weight_scale_2` |
+| ModelOpt `NVFP4_SVD` (SVDQuant, dense only) | — | NVFP4 (default) | — (`a_global_scale=input_scale`) | `weight_scale_2` |
+| GGML `Q4_0` / `Q8_0` | `repack_ggml_int` | raw | — | — |
+
+Integer weights:
+
+- `b_zero` (optional) is shaped like `Bs`; the default zero point is `2 ** (bits - 1)`.
+- Dequantization rounds `(q - zero) * scale` in the scale dtype, then casts each weight to the activation
+  dtype before multiplication, including per-channel scales (`group=K`, one scale per output row).
+- Group widths and K tiles must divide one another; K must contain whole groups.
+- Natural `int32` checkpoint words are rejected, so the two word layouts cannot be confused.
+- The ModelOpt repacks also accept expert stacks and return `(weight, scale, None)`.
+- `repack_ggml_int(payload, "Q4_0" | "Q8_0")` reads canonical little-endian `uint8` GGML blocks
+  `(..., N, K/32, 18 | 34)` and returns FP32 group scales. Q8_0 is also a ModelOpt GGML recipe; Q4_0 follows
+  upstream GGML. A GGUF loader supplies the payload and its logical shape (no container parsing). IQ codebooks,
+  Q4_1 affine minima and Q5 formats are unsupported.
+- Fused integer MoE blocks require matching widths, group recipes and zero-point presence across gate/up and
+  down. Both projections may use per-channel scales despite their different K; scale dtypes and calibrated
+  values may differ between projections.
+
+AWQ `pre_quant_scale`:
+
+- Pass it as `a_pre_quant_scale` to an integer GEMM, or fuse it upstream. It multiplies the raw input columns
+  before any act-order permutation, rounded in the activation dtype.
+- Dense scales are contiguous `(K,)`; routed scales are shared `(K,)` / `(1, K)` or per expert `(E, K)`, on the
+  activation's device and in its dtype.
+- MoE forwards accept `gate_up_proj_pre_quant_scale` and `down_proj_pre_quant_scale`, the down's optionally per
+  expert. A fused gate/up stack uses one input transform for both halves, as after ModelOpt's resmoothing.
+- It also applies on the MX/FP4 activation-quantized paths, including NVFP4 AWQ.
+
+ModelOpt activation-quantized recipes:
+
+- `W4A8_AWQ` reconstructs the weight, rounds it to E4M3 against `weight_scale_2`, and restores both calibrated
+  factors before the FP32 bias/GLU.
+- INT8 SmoothQuant accumulates the dot in INT32, then applies the per-channel weight scales and the input scale
+  in FP32.
+- Both take raw activations and keep the intermediate unquantized between projections; the down's own
+  calibration and optional input transform apply before its quantization.
+- `W4A8_MXFP4_FP8` / `W4A8_NVFP4_FP8` differ from group-16 NVFP4 W4A4 (NVFP4 here: E4M3 block scales plus a
+  separate `weight_scale_2`). The FP8 activations keep one calibrated scale per tensor/expert, not re-quantized
+  per block as MXFP8. The MX loops consume unit activation group scales; affine NVFP4 prefill reuses the
+  weight-upcast GEMM, storing FP8-rounded inputs exactly in BF16. Both restore calibration in the FP32 epilogue.
+
+ModelOpt `NVFP4_SVD` (SVDQuant) runs on dense `matmul_2d` with the BF16 `svdquant_lora_a` `(rank, K)`,
+`svdquant_lora_b` `(N, rank)` and input `pre_quant_scale`:
+
+```python
+out = matmul_2d(
+    x, weight.view(torch.int8), Bs=weight_scale,
+    a_global_scale=input_scale, b_global_scale=weight_scale_2,
+    a_pre_quant_scale=pre_quant_scale,
+    svdquant_lora_a=lora_a, svdquant_lora_b=lora_b,
+    simulate_unfused=True,
+)
+```
+
+- Smoothing, NVFP4 activation quantization and the BF16 low-rank down projection normally share one pass;
+  large rank-32 prefill on SM10x quantizes separately from the down projection. Both smooth the input without
+  an extra activation buffer.
+- The up projection is fused into the GEMM epilogue before GLU/requant. All dot products accumulate in FP32.
+- `simulate_unfused=True` matches the BF16 materialization points of ModelOpt's two linear branches and their
+  addition; the default keeps FP32 for the final sum.
+- Factors use the checkpoint's orientation, without pre-folding smoothing or global scales into them. Weight
+  scales may be affine or pre-swizzled at load time.
+- Gate/up weights and their up-factor rows use the usual interleaved order; independent gate/up down factors
+  can be concatenated with matching zero-padded up factors. Fused gate/up also requires shared smoothing and
+  global scales.
+- Supported: dense BF16 inference, ranks divisible by 32, K divisible by 64. Not implemented: routed SVDQuant
+  MoE and Nunchaku's INT4/packed checkpoint layouts.
+- `python bench/bench_moe.py SVDQuant` compares the complete linear on Gemma-4-31B up/down shapes against
+  FlashInfer, including smoothing, activation quantization and the correction projections.
 
 ### Gate|up layout contract
 
@@ -173,7 +264,141 @@ the rows. `rms_norm_rows` exposes the standalone kernel.
 `nvfp4_quantize_two_level(weight)` returns `(packed_e2m1, e4m3_block_scales, fp32_global)` — the
 canonical two-level NVFP4 weight quant (`global = amax / (6·448)`). The `*_act_quant` helpers are
 the offline activation quants the ops use internally, exposed for pre-quantized (`As`) pipelines;
-`fp8_act_quant_block_dynamic` / `fp8_act_quant_tensor_wide` are their block-FP8 siblings.
+`fp8_act_quant_block_dynamic` / `fp8_act_quant_tensor_wide` are their block-FP8 siblings;
+`fp8_act_quant_tensor_wide(x, K, amax_upper_bound=...)` is the per-token quant of the tensor-wide and
+row-wise formats, the optional bound capping each row's amax.
+
+## Optimization coverage
+
+Which optimizations each kernel can use, grouped by what they improve. Rows are the kernels per family (the recipes they serve are in the format matrix above); a cell is what the kernel's tuning grid, constexprs and pruners allow. Where a cell is 🟠, the fencing pruner's docstring says where and why.
+
+🟢 available (a tuner axis or config; 🟢* always on) · 🟠 fenced or partial: pruned in some regime · 🔴 not implemented where it would plausibly apply · ⚪ not applicable (⚪† deliberately absent, measured not to win)
+
+Where a kernel has alternative launch paths (prefill dequantization or staging against the in-loop conversion, a cuBLAS route against the Triton kernel), the path tuner (`path_autotune`) times the valid ones per shape bucket and keeps the fastest, cached like a kernel config; there are no fixed size thresholds. A 🟠 there means the path is only valid for some recipes (e.g. no fused GLU or bias). The INT 2D cuBLAS route is the prefill dequantization into cuBLAS; its static activation scale is quantized inline (on load) or offline (one pass first), also as timed. The 2D MX and static FP8 activation quantization (inline on load or one offline pass) is timed the same way.
+
+#### Scheduling and launch
+
+How work is spread over the GPU and how launches overlap.
+
+| Family | Kernel | warp spec. | persistent | small-tile grid | tile order | packed schedule | PDL |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 2D | block FP8 (dynamic act) | 🟠 | ⚪† | ⚪ | 🟢 | ⚪ | 🟢* |
+| 2D | block FP8 (static act) | 🟠 | ⚪† | ⚪ | 🟢 | ⚪ | 🟢* |
+| 2D | tensor / row-wise FP8 | 🟠 | 🟢 | ⚪ | 🟢 | ⚪ | 🟢* |
+| 2D | MXFP8 / MXFP4 / NVFP4 | 🟢 | 🟠 | ⚪ | 🟢 | ⚪ | 🟢* |
+| 2D | MX weight-only (W4A16 / W8A16) | 🟢 | ⚪† | ⚪ | 🟢 | ⚪ | 🟢* |
+| 2D | FP8 weight-only | 🟢 | ⚪† | ⚪ | 🟢 | ⚪ | 🟢* |
+| 2D | INT2/4/8 (GPTQ, AWQ, SmoothQuant) | 🟠 | ⚪† | ⚪ | 🟢 | ⚪ | 🟢* |
+| 2D | BF16 / FP16 | 🟢 | ⚪† | ⚪ | 🟢 | ⚪ | 🟢* |
+| batched | block FP8 (dynamic act) | ⚪† | ⚪ | ⚪ | ⚪ | ⚪ | 🟢* |
+| batched | block FP8 (static act) | ⚪† | ⚪ | ⚪ | ⚪ | ⚪ | 🟢* |
+| batched | tensor / row-wise FP8 | ⚪† | ⚪ | ⚪ | ⚪ | ⚪ | 🟢* |
+| batched | MXFP8 / MXFP4 / NVFP4 | ⚪† | ⚪ | ⚪ | ⚪ | ⚪ | 🟢* |
+| batched | MX weight-only (W4A16 / W8A16) | ⚪† | ⚪ | ⚪ | ⚪ | ⚪ | 🟢* |
+| batched | FP8 weight-only | ⚪† | ⚪ | ⚪ | ⚪ | ⚪ | 🟢* |
+| batched | INT2/4/8 (GPTQ, AWQ, SmoothQuant) | ⚪† | ⚪ | ⚪ | ⚪ | ⚪ | 🟢* |
+| batched | BF16 / FP16 | ⚪† | ⚪ | ⚪ | ⚪ | ⚪ | 🟢* |
+| grouped | block FP8 (dynamic act) | 🟠 | 🟢* | 🟢* | 🟠 | 🟠 | ⚪ |
+| grouped | block FP8 (static act) | 🟠 | 🟢* | 🟢* | 🟠 | 🟠 | ⚪ |
+| grouped | tensor / row-wise FP8 | 🟠 | 🟢* | 🟢* | 🟠 | 🟠 | ⚪ |
+| grouped | MXFP8 / MXFP4 / NVFP4 | 🟠 | 🟢* | 🟢* | 🟠 | 🟠 | ⚪ |
+| grouped | MX weight-only (W4A16 / W8A16) | 🟠 | 🟢* | 🟢* | 🟠 | 🟠 | ⚪ |
+| grouped | FP8 weight-only | 🟠 | 🟢* | 🟢* | 🟠 | 🟠 | ⚪ |
+| grouped | INT2/4/8 (GPTQ, AWQ, SmoothQuant) | 🟠 | 🟢* | 🟢 | 🟠 | 🟠 | ⚪ |
+| grouped | BF16 / FP16 | 🟢 | 🟢* | 🟢* | 🟠 | 🟠 | ⚪ |
+
+#### Memory and data movement
+
+How operands and scales are read.
+
+| Family | Kernel | TMA A | TMA B | TMA gather | row padding | swizzled scales | prefill dequant |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 2D | block FP8 (dynamic act) | 🟠 | 🟠 | ⚪ | 🟢* | ⚪ | ⚪ |
+| 2D | block FP8 (static act) | 🟠 | 🟠 | ⚪ | 🔴 | ⚪ | ⚪ |
+| 2D | tensor / row-wise FP8 | 🟠 | 🟠 | ⚪ | 🟢* | ⚪ | ⚪ |
+| 2D | MXFP8 / MXFP4 / NVFP4 | 🟢 | 🟢 | ⚪ | 🟢* | 🟠 | ⚪ |
+| 2D | MX weight-only (W4A16 / W8A16) | 🟢 | 🟢 | ⚪ | ⚪ | ⚪ | 🔴 |
+| 2D | FP8 weight-only | 🟢 | 🟢 | ⚪ | ⚪ | ⚪ | 🟢 |
+| 2D | INT2/4/8 (GPTQ, AWQ, SmoothQuant) | 🟠 | 🟢 | ⚪ | ⚪ | ⚪ | 🟠 |
+| 2D | BF16 / FP16 | 🟠 | 🟠 | ⚪ | ⚪ | ⚪ | ⚪ |
+| batched | block FP8 (dynamic act) | ⚪ | 🟢 | ⚪ | ⚪ | ⚪ | ⚪ |
+| batched | block FP8 (static act) | ⚪ | 🟢 | ⚪ | ⚪ | ⚪ | ⚪ |
+| batched | tensor / row-wise FP8 | ⚪ | 🟢 | ⚪ | ⚪ | ⚪ | ⚪ |
+| batched | MXFP8 / MXFP4 / NVFP4 | ⚪ | 🟢 | ⚪ | ⚪ | 🟠 | ⚪ |
+| batched | MX weight-only (W4A16 / W8A16) | ⚪ | 🟢 | ⚪ | ⚪ | ⚪ | ⚪ |
+| batched | FP8 weight-only | ⚪ | 🟢 | ⚪ | ⚪ | ⚪ | ⚪ |
+| batched | INT2/4/8 (GPTQ, AWQ, SmoothQuant) | ⚪ | 🟢 | ⚪ | ⚪ | ⚪ | ⚪ |
+| batched | BF16 / FP16 | ⚪ | 🟢 | ⚪ | ⚪ | ⚪ | ⚪ |
+| grouped | block FP8 (dynamic act) | 🟢 | 🟢 | 🟠 | ⚪ | ⚪ | ⚪ |
+| grouped | block FP8 (static act) | 🟢 | 🟢 | 🟠 | ⚪ | ⚪ | ⚪ |
+| grouped | tensor / row-wise FP8 | 🟢 | 🟢 | 🟠 | ⚪ | ⚪ | ⚪ |
+| grouped | MXFP8 / MXFP4 / NVFP4 | 🟢 | 🟢 | 🟠 | ⚪ | 🟠 | ⚪ |
+| grouped | MX weight-only (W4A16 / W8A16) | 🟢 | 🟢 | 🟠 | ⚪ | ⚪ | 🟠 |
+| grouped | FP8 weight-only | 🟢 | 🟢 | 🟠 | ⚪ | ⚪ | 🟢 |
+| grouped | INT2/4/8 (GPTQ, AWQ, SmoothQuant) | 🟢 | 🟢 | 🟠 | ⚪ | ⚪ | 🟢 |
+| grouped | BF16 / FP16 | 🟢 | 🟢 | 🟠 | ⚪ | ⚪ | ⚪ |
+
+#### Compute
+
+How much of the MMA each tile uses. *Scale off weight tile*: a coarse weight scale lands on the K step's partial, the activation tile or the output instead of every decoded weight value (the FP8 and integer weight-only `SCALE_MODE` axes; the W8A8 recipes always scale the partial or the output).
+
+| Family | Kernel | native scaled MMA | swap-AB decode | scalar GEMV | split-K | tile pipeline | weight on MMA lhs | cuBLAS route | scale off weight tile |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 2D | block FP8 (dynamic act) | 🟠 | ⚪† | 🔴 | 🟢 | 🟠 | ⚪ | 🟠 | 🟢* |
+| 2D | block FP8 (static act) | ⚪ | 🔴 | 🔴 | ⚪† | ⚪ | ⚪ | 🔴 | 🟢* |
+| 2D | tensor / row-wise FP8 | ⚪ | 🟠 | 🔴 | ⚪† | 🟢 | ⚪ | 🟠 | 🟢* |
+| 2D | MXFP8 / MXFP4 / NVFP4 | 🟠 | 🟠 | 🟠 | 🟢 | 🟢 | ⚪ | 🟠 | ⚪ |
+| 2D | MX weight-only (W4A16 / W8A16) | 🟠 | 🔴 | 🔴 | 🔴 | ⚪ | 🟢 | 🔴 | ⚪ |
+| 2D | FP8 weight-only | ⚪ | 🟠 | 🔴 | ⚪† | ⚪ | 🔴 | 🟠 | 🟠 |
+| 2D | INT2/4/8 (GPTQ, AWQ, SmoothQuant) | ⚪ | 🟠 | 🟠 | 🟠 | ⚪ | 🔴 | 🟠 | 🟠 |
+| 2D | BF16 / FP16 | ⚪ | 🟠 | ⚪ | ⚪ | ⚪ | ⚪ | 🟠 | ⚪ |
+| batched | block FP8 (dynamic act) | 🔴 | 🟠 | 🔴 | ⚪† | ⚪ | ⚪ | ⚪ | 🟢* |
+| batched | block FP8 (static act) | ⚪ | 🟠 | 🔴 | ⚪† | ⚪ | ⚪ | ⚪ | 🟢* |
+| batched | tensor / row-wise FP8 | ⚪ | 🟠 | 🔴 | ⚪† | ⚪ | ⚪ | ⚪ | 🟢* |
+| batched | MXFP8 / MXFP4 / NVFP4 | 🟠 | 🟠 | 🟢 | ⚪† | ⚪ | ⚪ | ⚪ | ⚪ |
+| batched | MX weight-only (W4A16 / W8A16) | 🟠 | 🟠 | 🟢 | 🔴 | ⚪ | ⚪ | ⚪ | ⚪ |
+| batched | FP8 weight-only | ⚪ | 🟢 | 🔴 | ⚪ | ⚪ | ⚪ | ⚪ | 🟠 |
+| batched | INT2/4/8 (GPTQ, AWQ, SmoothQuant) | ⚪ | 🟠 | 🟢 | ⚪† | ⚪ | ⚪ | ⚪ | 🟠 |
+| batched | BF16 / FP16 | ⚪ | 🟢 | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ | ⚪ |
+| grouped | block FP8 (dynamic act) | 🟠 | 🟢 | ⚪ | ⚪ | 🟢 | ⚪ | ⚪ | 🟢* |
+| grouped | block FP8 (static act) | ⚪ | ⚪ | ⚪ | ⚪ | 🟢 | ⚪ | ⚪ | 🟢* |
+| grouped | tensor / row-wise FP8 | ⚪ | ⚪ | ⚪ | ⚪ | 🟢 | 🟢 | ⚪ | 🟢* |
+| grouped | MXFP8 / MXFP4 / NVFP4 | 🟠 | ⚪ | ⚪ | ⚪ | 🟢 | 🟢 | ⚪† | ⚪ |
+| grouped | MX weight-only (W4A16 / W8A16) | 🟠 | ⚪ | 🟠 | ⚪ | 🟢 | 🟢 | ⚪ | ⚪ |
+| grouped | FP8 weight-only | ⚪ | 🟢 | ⚪ | ⚪ | 🟢 | 🟢 | ⚪ | 🟠 |
+| grouped | INT2/4/8 (GPTQ, AWQ, SmoothQuant) | ⚪ | ⚪ | 🟠 | ⚪ | 🟢 | 🟢 | ⚪ | 🟠 |
+| grouped | BF16 / FP16 | ⚪ | ⚪ | ⚪ | ⚪ | 🟢 | 🟢 | ⚪ | ⚪ |
+
+#### Fusion
+
+Work done without an extra pass or launch.
+
+| Family | Kernel | act quant | fused GLU | unstacked gate | raw gate\|up | fused requant |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2D | block FP8 (dynamic act) | 🟢* | 🟢 | ⚪ | 🟢 | 🔴 |
+| 2D | block FP8 (static act) | 🟢 | 🟢 | ⚪ | 🟢 | 🔴 |
+| 2D | tensor / row-wise FP8 | 🟢* | 🟢 | ⚪ | 🟢 | ⚪ |
+| 2D | MXFP8 / MXFP4 / NVFP4 | 🟢 | 🟢 | ⚪ | 🟢 | 🟠 |
+| 2D | MX weight-only (W4A16 / W8A16) | ⚪ | 🟢 | ⚪ | 🟢 | ⚪ |
+| 2D | FP8 weight-only | ⚪ | 🟢 | ⚪ | 🟢 | ⚪ |
+| 2D | INT2/4/8 (GPTQ, AWQ, SmoothQuant) | 🟢 | 🟢 | ⚪ | 🟢 | ⚪ |
+| 2D | BF16 / FP16 | ⚪ | 🟢 | ⚪ | 🟢 | ⚪ |
+| batched | block FP8 (dynamic act) | 🟢* | 🟢 | 🟢 | 🟢 | 🟢 |
+| batched | block FP8 (static act) | 🟢 | 🟢 | 🔴 | 🟢 | 🟢 |
+| batched | tensor / row-wise FP8 | 🟢 | 🟢 | 🔴 | 🟢 | ⚪ |
+| batched | MXFP8 / MXFP4 / NVFP4 | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 |
+| batched | MX weight-only (W4A16 / W8A16) | ⚪ | 🟢 | 🟢* | 🟢 | ⚪ |
+| batched | FP8 weight-only | ⚪ | 🟢 | 🔴 | 🟢 | ⚪ |
+| batched | INT2/4/8 (GPTQ, AWQ, SmoothQuant) | 🟢* | 🟢 | 🟢* | 🟢 | ⚪ |
+| batched | BF16 / FP16 | ⚪ | 🟢 | 🔴 | 🟢 | ⚪ |
+| grouped | block FP8 (dynamic act) | 🟢* | 🟢 | ⚪ | 🟢 | 🟢 |
+| grouped | block FP8 (static act) | 🟢 | 🟢 | ⚪ | 🟢 | 🟢 |
+| grouped | tensor / row-wise FP8 | 🟢 | 🟢 | ⚪ | 🟢 | ⚪ |
+| grouped | MXFP8 / MXFP4 / NVFP4 | 🟢* | 🟢 | ⚪ | 🟢 | 🟢 |
+| grouped | MX weight-only (W4A16 / W8A16) | ⚪ | 🟢 | ⚪ | 🟢 | ⚪ |
+| grouped | FP8 weight-only | ⚪ | 🟢 | ⚪ | 🟢 | ⚪ |
+| grouped | INT2/4/8 (GPTQ, AWQ, SmoothQuant) | 🟢* | 🟢 | ⚪ | 🟢 | ⚪ |
+| grouped | BF16 / FP16 | ⚪ | 🟢 | ⚪ | 🟢 | ⚪ |
 
 CSF-compressed NVFP4 weight scales (a checkpoint's losslessly compressed E4M3 scale bytes) are
 prepared once at load: `prepare_nvfp4_csf_scales(fixed, exceptions)` validates the streams and
@@ -209,9 +434,14 @@ Unknown modes or keys raise. Keys are the tuner's options:
 - `runoff`: remeasure the finalists before crowning one (default `true`).
 - `basin_probes`: measure one anchor per categorical basin before the TPE (default `true`).
 - `max_refine_iters`: coordinate-refinement iterations (default `5`; `0` disables it).
+- `max_pair_trials`: two-axis neighbors of the refined winner measured after refinement (default `24`;
+  `0` disables the pair step).
+- `compile_workers`: threads that compile a tune's configs ahead of timing when it measures every pruned
+  config (default `0`: compile on first launch).
+- `force`: restrict tuning to configs with these values, e.g. `{"num_ctas": 2}` for every kernel (axes a
+  kernel lacks are ignored) or `{"<kernel name>": {...}}` for one kernel; `{"<function name>": "<path>"}`
+  pins a path choice (e.g. `{"int_weight_only_matmul_2d": "offline_dequant"}`).
 - `log_path`: append every measured config's timing as JSONL.
-- `rotate_weights`: rotate weight banks so tuning sees cold weights (default `true`);
-  `false` times warm graph replay instead. The two keep separate on-disk tuning results.
 - Debugging: `key_log_path` (tune-cache key decisions), `call_count_path` (per-kernel host launch
   counts, written at exit), `tracebacks` (full failure tracebacks), `lock_timeout` (seconds to wait
   for another rank's tune, default `1800`).

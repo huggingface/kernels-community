@@ -20,7 +20,9 @@ skipping at the reduce, and ``format`` forwarding. Op-level coverage (formats,
 epilogues, requant, routing variants against an independent torch oracle) lives in
 ``test_ops.py``; the weight formats come from the shared ``WEIGHTS`` registry."""
 
-from dataclasses import dataclass
+import inspect
+import math
+from dataclasses import dataclass, field
 from typing import Callable, Optional, Union
 
 import pytest
@@ -31,18 +33,30 @@ from utils import (  # type: ignore
     DTYPE_TAG,
     DTYPE_TO_TOL,
     finegrained_kernels,
+    int_fp8_global,
+    int_group,
     internals,
     make_gate_up,
     prepare_csf,
     SUPPORTS_SWIZZLED_SCALES,
     TEST_DEVICE,
     WEIGHTS,
+    INT_BITS,
+    INT_GROUP,
+    make_gptq_act_order,
+    maybe_compile,
+    quant_dequant_a,
+    dq_grouped,
+    is_sm10x,
+    dq_int,
 )
 
 moe = internals.moe
 scheduling = internals.scheduling
 swizzle_mx_scales = finegrained_kernels.swizzle_mx_scales
 fused_glu = internals.epilogue.fused_glu
+fold_act_order_into_gate_up = finegrained_kernels.fold_act_order_into_gate_up
+apply_glu = internals.epilogue.apply_glu
 
 
 @dataclass(frozen=True)
@@ -61,7 +75,12 @@ class MoEProblem:
     sentinel_fraction: float = 0.0
     negative_sentinels: bool = False  # off-rank routes as -1 rather than num_experts
     dtype: torch.dtype = torch.bfloat16
+    ci: bool = field(default=True, compare=False)  # carries the kernels_ci mark
+    # skipped on devices with less memory, e.g. the int32 offset-overflow guard's 3.2e9-element stack
+    min_device_memory_gib: float = field(default=0.0, compare=False)
     activation_format: Optional[str] = None
+    activation_scale_ub: Optional[float] = None
+    compile: bool = False
     swiglu_alpha: Optional[float] = None
     swiglu_limit: Optional[float] = None
     act_fn: Union[str, Callable] = "silu"  # a callable runs on the host between the GEMMs
@@ -72,6 +91,9 @@ class MoEProblem:
     static: bool = False  # calibrated (static) activation scale, one per expert
     post_expert_norm: Optional[str] = None  # a model's per-expert output norm, by name
     bias: bool = False  # a per-expert output bias on both projections (GPT-OSS ships them)
+    zero_points: bool = False  # asymmetric integer weights: a zero point per weight scale group
+    int_group: int | None = INT_GROUP  # None spans each projection's K (per-channel)
+    pre_quant_scale: bool = False  # shared gate/up AWQ input scale, per-expert down input scale
 
     @property
     def id(self):
@@ -89,6 +111,7 @@ class MoEProblem:
         return (
             f"{self.weights}_T{self.num_tokens}_E{self.num_experts}_H{self.hidden_dim}"
             f"_I{self.intermediate_dim}_top{self.num_top_k}_{DTYPE_TAG[self.dtype]}"
+            f"{'_capped' if self.activation_scale_ub is not None else ''}{'_compile' if self.compile else ''}"
             f"{act}{fmt}{'_swizzled' if self.swizzled else ''}"
             f"{'_csf' if self.csf_encoding else ''}"
             f"{'_inputglobals' if self.input_globals else ''}"
@@ -96,6 +119,9 @@ class MoEProblem:
             f"{'_static' if self.static else ''}"
             f"{'_' + self.post_expert_norm if self.post_expert_norm else ''}"
             f"{'_bias' if self.bias else ''}"
+            f"{'_zp' if self.zero_points else ''}"
+            f"{'_channel' if self.weights in INT_BITS and self.int_group is None else ''}"
+            f"{'_prequantscale' if self.pre_quant_scale else ''}"
             f"{'_sentinel' if self.sentinel_fraction > 0 else ''}"
             f"{'_negative' if self.negative_sentinels else ''}"
         )
@@ -132,6 +158,16 @@ MOE_PROBLEMS = [
     # out quantized instead (``quantize_routed_rows_per_expert``): 4096 routed rows, which the
     # 64-token cells above never reach, so only this one runs the kernel's pre-quantized arm
     MoEProblem(weights="fp8_tensor", num_tokens=1024, num_top_k=4, static=True),
+    # dynamic per-token activations (tensor-wide, row-wise): the intermediate's whole-row scale is
+    # beyond any gate_up epilogue tile, so the chain hands the down a bf16 intermediate to quantize
+    MoEProblem(ci=False, weights="fp8_tensor", num_top_k=4),
+    # row-wise weights (Llama 4 FP8 experts, top-1): decode, small batch, and a prefill batch
+    # deep enough per expert for the grouped kernel's big tiles
+    MoEProblem(ci=False, weights="fp8_rowwise", num_tokens=1, num_top_k=1),
+    MoEProblem(weights="fp8_rowwise", num_top_k=1),
+    MoEProblem(ci=False, weights="fp8_rowwise", num_top_k=1, activation_scale_ub=0.5, compile=True),
+    MoEProblem(ci=False, weights="fp8_rowwise", num_tokens=1024, num_top_k=1),
+    MoEProblem(weights="fp8_rowwise", num_top_k=4, static=True),
     # block-FP8 with UE8M0 (power-of-two) scales — the whole-model UE8M0 contract: acts,
     # weights, and the fused intermediate requant all power-of-two (DeepSeek-V4 attn / B200).
     MoEProblem(weights="fp8_128x128_ue8m0", num_tokens=1),
@@ -142,6 +178,9 @@ MOE_PROBLEMS = [
     # against the down's, the down consumes it — asymmetric threading breaks parity hard ──
     MoEProblem(weights="nvfp4", input_globals=True),
     MoEProblem(weights="nvfp4", num_tokens=1, input_globals=True),
+    MoEProblem(weights="nvfp4", input_globals=True, expert_globals=True, pre_quant_scale=True),
+    MoEProblem(weights="nvfp4", activation_format="fp8", static=True, num_top_k=2, pre_quant_scale=True),
+    MoEProblem(weights="mxfp4", activation_format="fp8", static=True, num_top_k=2, pre_quant_scale=True),
     # ── pre-swizzled weight scales (swizzle once at load — the deployment contract): the fused
     # grouped chain then runs scatter-free gate_up -> swizzled Cs -> down's 5D-As fast path, and
     # batched decode reads the descriptor scale load. Values unchanged, so parity holds as-is. ──
@@ -180,14 +219,18 @@ MOE_PROBLEMS = [
     MoEProblem(weights="bf16", num_tokens=1),
     MoEProblem(weights="bf16"),
     # ── contraction dims on the 64 grid but off the 128 grid (gpt-oss H=I=2880): only
-    # BK=64 divides, so the W4A4 chain runs the no-swap BK=64 dot_scaled rows ──
+    # BK=64 divides, so the W4A4 chain runs the no-swap BK=64 dot_scaled rows, and the BF16
+    # chain's descriptor-loaded BN=128/256 weight tiles overhang N ──
     MoEProblem(weights="mxfp4", hidden_dim=320, intermediate_dim=320),
+    MoEProblem(weights="bf16", hidden_dim=320, intermediate_dim=320),
     # ── explicit format forwarding: W4A8 chain on mxfp4 weights (default is W4A4) ──
     MoEProblem(weights="mxfp4", activation_format="mxfp8"),
-    # ── weight-only weight-only: bf16 acts × mxfp4 weights, dedicated dequant-then-bf16-dot
-    # kernels (the gpt-oss / matmul_ogs format); intermediate stays bf16 (no requant) ──
+    # ── weight-only: bf16 activations and intermediate (no requantization) ──
     MoEProblem(weights="mxfp4", activation_format="bf16", num_tokens=1),
     MoEProblem(weights="mxfp4", activation_format="bf16"),
+    MoEProblem(ci=False, weights="fp8_128x128", activation_format="bf16", num_tokens=1, bias=True),
+    MoEProblem(weights="fp8_128x128", activation_format="bf16", num_tokens=5, bias=True),
+    MoEProblem(weights="fp8_tensor", activation_format="bf16", num_tokens=5, num_top_k=2),
     # ── clamped/scaled SwiGLU (GPT-OSS / MiniMax-M3); glu is format-independent ──
     MoEProblem(weights="mxfp8", swiglu_alpha=1.702, swiglu_limit=7.0),
     # alpha / limit are independent glu branches — cover each alone
@@ -203,12 +246,31 @@ MOE_PROBLEMS = [
     MoEProblem(weights="fp8_128x128", bias=True),
     MoEProblem(weights="fp8_128x128", num_tokens=1, bias=True),
     MoEProblem(weights="fp8_tensor", num_top_k=4, static=True, bias=True),
+    MoEProblem(ci=False, weights="fp8_rowwise", num_top_k=4, bias=True),
     MoEProblem(weights="mxfp8", bias=True),
     MoEProblem(weights="nvfp4", input_globals=True, bias=True),
     MoEProblem(weights="mxfp4", activation_format="bf16", swiglu_alpha=1.702, swiglu_limit=7.0, num_tokens=1, bias=True),
+    # ── int4 weight-only (W4A16), symmetric and with zero points: decode, batch, the GPT-OSS-style gate_up
+    # (clamped SwiGLU + bias), and EP sentinels ──
+    MoEProblem(ci=False, weights="int4", num_tokens=1),
+    MoEProblem(ci=False, weights="int4"),
+    MoEProblem(ci=False, weights="int4", zero_points=True, num_tokens=1),
+    MoEProblem(weights="int4", zero_points=True, num_tokens=64, num_top_k=2),
+    MoEProblem(ci=False, weights="int4", zero_points=True, swiglu_alpha=1.702, swiglu_limit=7.0, bias=True),
+    MoEProblem(ci=False, weights="int4", num_tokens=8, sentinel_fraction=0.875),
+    MoEProblem(ci=False, weights="int4", num_tokens=8, sentinel_fraction=0.875, negative_sentinels=True),
+    MoEProblem(weights="int8", zero_points=True, num_tokens=4),
+    MoEProblem(weights="int2", zero_points=True, num_tokens=64, num_top_k=2),
+    MoEProblem(ci=False, weights="int4", int_group=None, zero_points=True),
+    MoEProblem(weights="int4", pre_quant_scale=True, num_tokens=4, num_top_k=2),
+    MoEProblem(weights="int4", activation_format="fp8", static=True, pre_quant_scale=True,
+               num_tokens=32, num_top_k=2),
+    MoEProblem(weights="int8", int_group=None, activation_format="int8", static=True, pre_quant_scale=True,
+               num_tokens=32, num_top_k=2),
     # ── expert parallelism: non-local experts sentinel-masked ──
     MoEProblem(weights="mxfp8", num_tokens=8, sentinel_fraction=0.875),
     MoEProblem(weights="fp8_128x128", num_tokens=8, sentinel_fraction=0.875),
+    MoEProblem(ci=False, weights="fp8_rowwise", num_tokens=8, sentinel_fraction=0.875),
     MoEProblem(weights="mxfp8", num_tokens=8, sentinel_fraction=0.875, negative_sentinels=True),
     # swizzled MX scales quantize the activations once per token into every routed row's tile, which a token
     # routed only to other ranks' experts must not write
@@ -218,17 +280,19 @@ MOE_PROBLEMS = [
     # gate_up offsets exceed 2^31 elements (127 * 2*2048 * 6144 = 3.196e9); a regressed
     # int64 cast corrupts the high-routed tokens vs the torch reference. E is a power of
     # two (the fused-grouped scheduling kernels require it).
-    pytest.param(
-        MoEProblem(
-            weights="fp8_128x128",
-            num_tokens=512,
-            num_experts=128,
-            hidden_dim=6144,
-            intermediate_dim=2048,
-            num_top_k=4,
-        ),
-        marks=pytest.mark.skipif(DEVICE_MEMORY_GIB < 40, reason="the overflow guard needs 40 GiB of device memory"),
+    MoEProblem(
+        weights="fp8_128x128",
+        num_tokens=512,
+        num_experts=128,
+        hidden_dim=6144,
+        intermediate_dim=2048,
+        num_top_k=4,
+        min_device_memory_gib=40,
     ),
+]
+
+_MOE_PARAMS = [
+    pytest.param(p, id=p.id, marks=pytest.mark.kernels_ci if p.ci else ()) for p in MOE_PROBLEMS
 ]
 
 
@@ -239,12 +303,27 @@ def _make_moe_weights(problem: MoEProblem):
     (6D — the shape carries the layout) and every forward consumes it directly — fused kernels
     read block pairs, the unfused plain GEMM remaps its block index in-kernel."""
     row = WEIGHTS[problem.weights]
-    gate_up, gate_up_s, gate_up_g = make_gate_up(
-        row, problem.intermediate_dim, problem.hidden_dim, problem.num_experts
+    make = row["make"]
+    if problem.weights in INT_BITS:  # INT groups run along K per row: the stack quantizes as is
+        gate_up, gate_up_s, gate_up_g = make(
+            2 * problem.intermediate_dim, problem.hidden_dim, problem.num_experts,
+            group=int_group(problem, problem.hidden_dim),
+        )
+    else:
+        gate_up, gate_up_s, gate_up_g = make_gate_up(
+            row, problem.intermediate_dim, problem.hidden_dim, problem.num_experts
+        )
+    down, down_s, down_g = make(
+        problem.hidden_dim, problem.intermediate_dim, problem.num_experts,
+        **({"group": int_group(problem, problem.intermediate_dim)} if problem.weights in INT_BITS else {}),
     )
-    down, down_s, down_g = row["make"](
-        problem.hidden_dim, problem.intermediate_dim, problem.num_experts
-    )
+    if problem.weights == "nvfp4" and problem.activation_format == "fp8":
+        gate_up_s, down_s = gate_up_s[..., ::2].contiguous(), down_s[..., ::2].contiguous()
+    if problem.weights in INT_BITS and problem.activation_format in ("fp8", "int8"):
+        gate_up_s, down_s = gate_up_s.float(), down_s.float()
+        if problem.activation_format == "fp8":
+            gate_up_g = int_fp8_global(gate_up, gate_up_s, int_group(problem, problem.hidden_dim))
+            down_g = int_fp8_global(down, down_s, int_group(problem, problem.intermediate_dim))
     if problem.swizzled:
         if not SUPPORTS_SWIZZLED_SCALES:
             pytest.skip("the SWIZZLE_32_4_4 scale layout is the tcgen05 fast path (CUDA-only)")
@@ -310,7 +389,12 @@ def _static_scales(problem: MoEProblem, hidden, gate_up, gate_up_s, top_k_index)
     routed to it. ``None`` on a dynamic problem, which quantizes at runtime instead."""
     if not problem.static:
         return None, None
-    weight = dequant_gate_up(WEIGHTS[problem.weights], gate_up, gate_up_s).float()
+    if problem.weights in INT_BITS:
+        weight = dq_int(gate_up, gate_up_s, group=int_group(problem, problem.hidden_dim))
+    elif problem.weights == "nvfp4" and problem.activation_format == "fp8":
+        weight = dq_grouped(gate_up, gate_up_s, 32)
+    else:
+        weight = dequant_gate_up(WEIGHTS[problem.weights], gate_up, gate_up_s).float()
     inter = fused_glu(
         torch.einsum("th,enh->etn", hidden.float(), weight),
         problem.act_fn,
@@ -320,7 +404,8 @@ def _static_scales(problem: MoEProblem, hidden, gate_up, gate_up_s, top_k_index)
     routed = torch.stack([(top_k_index == e).any(dim=1) for e in range(problem.num_experts)])
 
     def calibrate(seen):  # (E, T, C) over every token -> (E,) over the ones each expert sees
-        return (seen.abs() * routed[..., None]).amax(dim=(1, 2)).div(448.0).clamp(min=1e-12).float()
+        max_quant = 127.0 if problem.activation_format == "int8" else 448.0
+        return (seen.abs() * routed[..., None]).amax(dim=(1, 2)).div(max_quant).clamp(min=1e-12).float()
 
     scales = [calibrate(hidden.float().expand(problem.num_experts, -1, -1)), calibrate(inter)]
     return tuple(scale.contiguous() for scale in scales)
@@ -336,9 +421,21 @@ def _biases(problem: MoEProblem):
     return gate_up_bias, down_bias
 
 
+def _zero_points(problem: MoEProblem):
+    """The integer weights' zero points, one per scale group: ``(E, 2I, H // group)`` on gate_up and
+    ``(E, H, I // group)`` on down; ``None`` on a problem without them."""
+    if not problem.zero_points:
+        return None, None
+    E, H, inter = problem.num_experts, problem.hidden_dim, problem.intermediate_dim
+    high = 1 << INT_BITS[problem.weights]
+    gate_up_zero = torch.randint(0, high, (E, 2 * inter, H // int_group(problem, H)), device=TEST_DEVICE, dtype=torch.uint8)
+    down_zero = torch.randint(0, high, (E, H, inter // int_group(problem, inter)), device=TEST_DEVICE, dtype=torch.uint8)
+    return gate_up_zero, down_zero
+
+
 def _common_kwargs(problem: MoEProblem, hidden, top_k_index, gate_up, gate_up_s, gate_up_g, down_g):
-    """The kwargs every forward takes: the per-expert biases, the weights' second-level globals, the calibrated
-    activation globals and scales, the GLU knobs, and a model's per-expert output norm. The fused chain
+    """The kwargs every forward takes: the per-expert biases, the weights' second-level globals and zero points,
+    the calibrated activation globals and scales, the GLU knobs, and a model's per-expert output norm. The fused chain
     folds a named norm into its reduce while the unfused reference normalizes the routed rows in
     a pass of their own, so handing both the same weight is what makes that a parity check."""
     gate_up_in_g, down_in_g = _input_globals(problem, hidden)
@@ -349,7 +446,13 @@ def _common_kwargs(problem: MoEProblem, hidden, top_k_index, gate_up, gate_up_s,
         else None
     )
     gate_up_bias, down_bias = _biases(problem)
-    return dict(
+    gate_up_zero, down_zero = _zero_points(problem)
+    gate_up_pre_scale = down_pre_scale = None
+    if problem.pre_quant_scale:
+        gate_up_pre_scale = torch.linspace(0.5, 1.5, problem.hidden_dim, device=hidden.device, dtype=hidden.dtype)
+        down_pre_scale = torch.linspace(0.5, 1.5, problem.num_experts * problem.intermediate_dim,
+                                        device=hidden.device, dtype=hidden.dtype).view(problem.num_experts, problem.intermediate_dim)
+    kwargs = dict(
         gate_up_proj_bias=gate_up_bias,
         down_proj_bias=down_bias,
         gate_up_proj_weight_global_scale=gate_up_g,
@@ -365,14 +468,34 @@ def _common_kwargs(problem: MoEProblem, hidden, top_k_index, gate_up, gate_up_s,
         post_expert_norm=problem.post_expert_norm,
         post_expert_norm_weight=norm_weight,
     )
+    if problem.weights in INT_BITS:
+        kwargs.update(gate_up_proj_weight_zero_point=gate_up_zero, down_proj_weight_zero_point=down_zero)
+    if problem.pre_quant_scale:
+        kwargs.update(gate_up_proj_pre_quant_scale=gate_up_pre_scale, down_proj_pre_quant_scale=down_pre_scale)
+    if problem.activation_scale_ub is not None:
+        kwargs["activation_scale_ub"] = problem.activation_scale_ub
+    return kwargs
+
+
+def _fused_tolerance(problem: MoEProblem, ref):
+    """``assert_close`` tolerances between two of our launches (or one against the unfused reference). Integer and FP8
+    weight-only launches tune independently and can place the group scale differently (SCALE_MODE "tile" rounds each
+    dequantized weight, "acc" scales the exact dot): one weight rounding plus the output's own, two output ulps at the
+    largest output (a FP8 bias row reached 61184, where one bf16 ulp is 256 but 2^-8 of the max only 239)."""
+    atol, rtol = DTYPE_TO_TOL[problem.dtype]
+    weight_only = (problem.weights in INT_BITS and problem.activation_format in (None, "bf16")
+                   or problem.weights.startswith("fp8") and problem.activation_format == "bf16")
+    top = ref.float().abs().max().item()
+    if weight_only and top > 0:
+        atol = max(atol, 2 * torch.finfo(problem.dtype).eps * 2.0 ** math.floor(math.log2(top)))
+    return dict(atol=atol, rtol=rtol)
 
 
 def _assert_fused_correctness(out, ref, problem: MoEProblem):
     """Shape, dtype, and value checks against the unfused reference."""
     assert out.shape == (problem.num_tokens, problem.hidden_dim)
     assert out.dtype == problem.dtype
-    atol, rtol = DTYPE_TO_TOL[problem.dtype]
-    torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
+    torch.testing.assert_close(out, ref, **_fused_tolerance(problem, ref))
 
 
 def _fused_scales(problem: MoEProblem, gate_up_s, down_s):
@@ -392,6 +515,8 @@ def _fused_scales(problem: MoEProblem, gate_up_s, down_s):
 
 
 def _run_pair(problem: MoEProblem, fused_fn, unfused_fn):
+    if DEVICE_MEMORY_GIB < problem.min_device_memory_gib:
+        pytest.skip(f"needs {problem.min_device_memory_gib:g} GiB of device memory")
     torch.manual_seed(0)
     gate_up, gate_up_s, gate_up_g, down, down_s, down_g = _make_moe_weights(problem)
     hidden, top_k_index, top_k_weights = _make_moe_inputs(problem)
@@ -402,30 +527,48 @@ def _run_pair(problem: MoEProblem, fused_fn, unfused_fn):
         hidden, top_k_index, top_k_weights, gate_up, down, gate_up_s, down_s, **common
     )
     fused_gate_up_s, fused_down_s, csf = _fused_scales(problem, gate_up_s, down_s)
-    out = fused_fn(
-        hidden,
-        top_k_index,
-        top_k_weights,
-        gate_up,
-        down,
-        fused_gate_up_s,
-        fused_down_s,
-        simulate_unfused=True,
-        **common,
-         **csf,
-    )
+    # The parity holds per GEMM kernel: the reference runs the Triton grouped GEMMs, whose tuned tiles the fused
+    # chain shares on the `grouped` path. The `gluon` path matches the swapped tcgen05 tiles bit for bit but not an
+    # mma.sync crown (an ulp in ~1e-5 of the outputs), so it has its own test (test_fused_gluon_path).
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(moe.moe_fused_grouped.paths, "forced", "grouped")
+        out = maybe_compile(fused_fn, problem.compile)(
+            hidden,
+            top_k_index,
+            top_k_weights,
+            gate_up,
+            down,
+            fused_gate_up_s,
+            fused_down_s,
+            simulate_unfused=True,
+            **common,
+            **csf,
+        )
     _assert_fused_correctness(out, ref, problem)
+    if problem.activation_scale_ub is not None:
+        # Check both clipping sites independently: fused and unfused share their quantizer.
+        row = WEIGHTS[problem.weights]
+        ids = top_k_index.flatten().long()
+        aq = quant_dequant_a(hidden, problem.hidden_dim, activation_scale_ub=problem.activation_scale_ub)
+        aq = aq.repeat_interleave(problem.num_top_k, dim=0)
+        gu = torch.einsum("sk,snk->sn", aq, row["dequant"](gate_up, gate_up_s)[ids]).to(problem.dtype)
+        inter = apply_glu(gu[:, 0::2], gu[:, 1::2])
+        iq = quant_dequant_a(inter, problem.intermediate_dim, activation_scale_ub=problem.activation_scale_ub)
+        rows = torch.einsum("sk,snk->sn", iq, row["dequant"](down, down_s)[ids]).to(problem.dtype)
+        torch_ref = (rows.view(problem.num_tokens, problem.num_top_k, -1) * top_k_weights[..., None]).sum(1)
+        _assert_fused_correctness(out, torch_ref, problem)
 
 
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
+@pytest.mark.parametrize("num_tokens", [300, 1025])
 @pytest.mark.parametrize("sentinel_fraction", [0.5, 1.0])
 @pytest.mark.parametrize("negative", [False, True], ids=["past_experts", "negative"])
-def test_grouped_scheduling_defines_every_route(sentinel_fraction, negative):
+def test_grouped_scheduling_defines_every_route(sentinel_fraction, negative, num_tokens):
     """Both maps are a permutation of the ``S`` routes: the local rows expert-sorted up to ``expert_start[E]``,
     the EP-sentinel routes (another rank's experts, any id outside ``[0, E)``) after them, so a consumer over
     all ``S`` rows reads real slots and tokens."""
-    E, T, K = 8, 300, 4
+    E, T, K = 8, num_tokens, 4
     g = torch.Generator(device=TEST_DEVICE).manual_seed(0)
     expert_ids = torch.randint(0, E, (T, K), device=TEST_DEVICE, generator=g)
     off_rank = torch.rand(T, K, device=TEST_DEVICE, generator=g) < sentinel_fraction
@@ -444,9 +587,8 @@ def test_grouped_scheduling_defines_every_route(sentinel_fraction, negative):
     assert torch.equal(routed[:local].sort().values, routed[:local])
 
 
-@pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
-@pytest.mark.parametrize("problem", MOE_PROBLEMS, ids=lambda p: p.id)
+@pytest.mark.parametrize("problem", _MOE_PARAMS)
 def test_fused_batched(problem):
     """Fused two-kernel MoE (gate_up + activation + requant + down + top-k reduce) via
     ``moe_fused_batched`` vs the unfused reference. ``simulate_unfused`` rounds each
@@ -456,9 +598,8 @@ def test_fused_batched(problem):
     _run_pair(problem, moe.moe_fused_batched, moe.moe_unfused_batched)
 
 
-@pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
-@pytest.mark.parametrize("problem", MOE_PROBLEMS, ids=lambda p: p.id)
+@pytest.mark.parametrize("problem", _MOE_PARAMS)
 def test_fused_grouped(problem):
     """Fused grouped MoE (gather gate_up + activation + requant + grouped down + top-k
     reduce) via ``moe_fused_grouped`` vs the same unfused reference, with
@@ -504,6 +645,39 @@ def test_fused_production_arm(problem, fused_fn, unfused_fn):
     assert rel < 0.05, f"production fused arm diverges from unfused: rel={rel:.3e}"
 
 
+_GLUON_PROBLEMS = [
+    MoEProblem(weights="fp8_128x128", num_tokens=64, num_experts=16, num_top_k=4),
+    MoEProblem(weights="fp8_128x128_ue8m0", num_tokens=64, num_experts=16, num_top_k=4),
+    MoEProblem(weights="fp8_128x128_ue8m0", num_tokens=64, num_experts=16, num_top_k=4, sentinel_fraction=0.5),
+    MoEProblem(weights="fp8_tensor", num_tokens=64, num_experts=16, num_top_k=4, static=True),
+    MoEProblem(weights="fp8_rowwise", num_tokens=64, num_experts=16, num_top_k=4),
+    MoEProblem(weights="mxfp4", activation_format="bf16", swiglu_alpha=1.702, swiglu_limit=7.0, num_tokens=64,
+               num_experts=16, num_top_k=4, bias=True),
+]
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(moe.mx_weight_only_matmul_grouped_gluon is None or not is_sm10x(),
+                    reason="the Gluon grouped kernels need Triton >= 3.9 on sm_10x")
+@pytest.mark.parametrize("simulate_unfused", [False, True], ids=["fused", "simulate_unfused"])
+@pytest.mark.parametrize("problem", _GLUON_PROBLEMS, ids=lambda p: p.id)
+def test_fused_gluon_path(problem, simulate_unfused):
+    """``moe_fused_grouped``'s ``gluon`` path (persistent Gluon GEMMs) against its Triton ``grouped`` path: the same
+    chain and epilogue math (rounding included) on other GEMM kernels, so the tight tolerance holds (under EP too)."""
+    torch.manual_seed(0)
+    gate_up, gate_up_s, gate_up_g, down, down_s, down_g = _make_moe_weights(problem)
+    hidden, top_k_index, top_k_weights = _make_moe_inputs(problem)
+    common = _common_kwargs(problem, hidden, top_k_index, gate_up, gate_up_s, gate_up_g, down_g)
+    common["simulate_unfused"] = simulate_unfused
+    args = (hidden, top_k_index, top_k_weights, gate_up, down, gate_up_s, down_s)
+    bound = inspect.signature(moe.moe_fused_grouped).bind(*args, **common)
+    bound.apply_defaults()
+    assert moe._gluon_grouped_offered(bound.arguments), "the block should be offered the gluon path"
+    ref = moe.moe_fused_grouped.paths._run("grouped", args, common)
+    out = moe.moe_fused_grouped.paths._run("gluon", args, common)
+    _assert_fused_correctness(out, ref, problem)
+
+
 _TORCH_BASELINE_PROBLEMS = [
     MoEProblem(weights="mxfp8", num_tokens=64),
     MoEProblem(weights="mxfp4", num_tokens=64),
@@ -547,8 +721,8 @@ def test_torch_grouped_baseline(problem):
     assert rel < 0.05, f"torch baseline diverges from unfused reference: rel={rel:.3e}"
 
 
-def _run_compiled_across_shapes(fused_fn):
-    """TWO different mxfp4 problems through ONE ``torch.compile(fullgraph=True)`` function
+def _run_compiled_across_shapes(fused_fn, weights):
+    """TWO different problems through ONE ``torch.compile(fullgraph=True)`` function
     with no compiler reset in between: the recompile marks the weight shapes
     automatic-dynamic, and the family predicates must still return real bools — a lazy
     SymBool reaching ``is_x(gate) != is_x(down)`` builds a nested symbolic Eq that crashes
@@ -558,12 +732,11 @@ def _run_compiled_across_shapes(fused_fn):
     compiled path that returns wrong-but-finite numbers (e.g. a decomposed opaque op)."""
     torch.compiler.reset()
     compiled = torch.compile(fused_fn, fullgraph=True)
-    for problem in (
-        MoEProblem(weights="mxfp4", num_tokens=1),
-        MoEProblem(
-            weights="mxfp4", num_tokens=1, hidden_dim=320, intermediate_dim=320
-        ),
-    ):
+    if weights in INT_BITS or weights.startswith("fp8"):
+        second = MoEProblem(weights=weights, num_tokens=1, hidden_dim=640, intermediate_dim=384, int_group=None)
+    else:
+        second = MoEProblem(weights=weights, num_tokens=1, hidden_dim=320, intermediate_dim=320)
+    for problem in (MoEProblem(weights=weights, num_tokens=1), second):
         torch.manual_seed(0)
         gate_up, gate_up_s, gate_up_g, down, down_s, down_g = _make_moe_weights(problem)
         hidden, top_k_index, top_k_weights = _make_moe_inputs(problem)
@@ -574,23 +747,84 @@ def _run_compiled_across_shapes(fused_fn):
         ref = fused_fn(
             hidden, top_k_index, top_k_weights, gate_up, down, gate_up_s, down_s, **kw
         )
-        atol, rtol = DTYPE_TO_TOL[problem.dtype]
-        torch.testing.assert_close(out, ref, atol=atol, rtol=rtol, msg=problem.id)
+        torch.testing.assert_close(out, ref, **_fused_tolerance(problem, ref), msg=problem.id)
 
 
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
-def test_fused_batched_compiles_across_shapes():
+@pytest.mark.parametrize("weights", ["mxfp4", "int4", "fp8_128x128", "fp8_rowwise"])
+def test_fused_batched_compiles_across_shapes(weights):
     """``moe_fused_batched`` through the shared two-shape compile check (see
     ``_run_compiled_across_shapes`` for the dynamo failure class it guards)."""
-    _run_compiled_across_shapes(moe.moe_fused_batched)
+    _run_compiled_across_shapes(moe.moe_fused_batched, weights)
 
 
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
-def test_fused_grouped_compiles_across_shapes():
+@pytest.mark.parametrize("weights", ["mxfp4", "int4", "fp8_128x128", "fp8_rowwise"])
+def test_fused_grouped_compiles_across_shapes(weights):
     """``moe_fused_grouped`` through the same two-shape compile check — the grouped chain
     additionally puts ``compute_grouped_scheduling`` (an opaque custom op) inside the
     graph, which the batched sibling never exercises."""
-    _run_compiled_across_shapes(moe.moe_fused_grouped)
+    _run_compiled_across_shapes(moe.moe_fused_grouped, weights)
 
+
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
+@pytest.mark.parametrize("fold", [False, True])
+@pytest.mark.parametrize("num_tokens", [1, 32])
+@pytest.mark.parametrize("forward", [moe.moe_fused_grouped, moe.moe_fused_batched], ids=["grouped", "batched"])
+def test_fused_int4_act_order(forward, num_tokens, fold):
+    """The fused MoE chain on act-order GPTQ experts: gate|up gathers hidden's columns by its per-expert K order, and
+    the down's order is either gathered at runtime too or folded into the gate|up output rows at load
+    (``fold_act_order_into_gate_up``), in which case the down runs in natural order. Reference: the torch chain on
+    the weights dequantized in natural K order."""
+
+    torch.manual_seed(0)
+    E, H, inter, top_k = 8, 512, 256, 2
+    gu, gu_s, gu_z, gu_perm, gu_ref = make_gptq_act_order(2 * inter, H, E)
+    dn, dn_s, dn_z, dn_perm, dn_ref = make_gptq_act_order(H, inter, E)
+    hidden = torch.randn(num_tokens, H, device=TEST_DEVICE, dtype=torch.bfloat16)
+    top_k_index = torch.stack([torch.randperm(E, device=TEST_DEVICE)[:top_k] for _ in range(num_tokens)]).int()
+    top_k_weights = torch.rand(num_tokens, top_k, device=TEST_DEVICE, dtype=torch.bfloat16)
+    down_perm = dn_perm
+    if fold:
+        gu, gu_s, gu_z, _ = fold_act_order_into_gate_up(gu, gu_s, gu_z, None, dn_perm)
+        down_perm = None
+    out = forward(
+        hidden, top_k_index, top_k_weights, gu, dn, gu_s, dn_s,
+        gate_up_proj_weight_zero_point=gu_z, down_proj_weight_zero_point=dn_z,
+        gate_up_proj_weight_perm=gu_perm, down_proj_weight_perm=down_perm,
+    )
+    ref = torch.zeros(num_tokens, H, device=TEST_DEVICE)
+    for t in range(num_tokens):
+        for k in range(top_k):
+            e = top_k_index[t, k].long()
+            z = hidden[t].float() @ gu_ref[e].T
+            h = apply_glu(z[0::2], z[1::2], "silu", None, None).to(torch.bfloat16).float()
+            ref[t] += top_k_weights[t, k].float() * (h @ dn_ref[e].T)
+    err = ((out.float() - ref).norm() / ref.norm()).item()
+    assert err < 1e-2, f"{forward} T={num_tokens} fold={fold}: act-order MoE vs reference {err:.2e}"
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator required")
+@pytest.mark.parametrize("forward", [moe.moe_fused_batched, moe.moe_fused_grouped])
+@pytest.mark.parametrize("mismatch", ["width", "group", "zero", "full_precision"])
+def test_fused_int_recipe_mismatch(forward, mismatch):
+    """Integer fused blocks reject unsupported mixed recipes before launching either GEMM."""
+    problem = MoEProblem(weights="int4")
+    gu, gs, _, dn, ds, _ = _make_moe_weights(problem)
+    hidden, ids, weights = _make_moe_inputs(problem)
+    down_zero = None
+    if mismatch == "width":
+        dn, ds, _ = WEIGHTS["int2"]["make"](problem.hidden_dim, problem.intermediate_dim, problem.num_experts)
+    elif mismatch == "group":
+        ds = ds.repeat_interleave(2, dim=-1)
+    elif mismatch == "zero":
+        down_zero = torch.zeros_like(ds, dtype=torch.uint8)
+    else:
+        dn = torch.empty(problem.num_experts, problem.hidden_dim, problem.intermediate_dim,
+                         device=hidden.device, dtype=hidden.dtype)
+        ds = None
+    with pytest.raises(ValueError, match="same integer quantization recipe"):
+        forward(hidden, ids, weights, gu, dn, gs, ds, down_proj_weight_zero_point=down_zero)

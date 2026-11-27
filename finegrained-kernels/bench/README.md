@@ -1,34 +1,49 @@
 # finegrained-kernels bench
 
-`bench_moe.py` benchmarks the local **finegrained-kernels** kernel against the upstream
-**finegrained-fp8** kernel (`kernels-community/finegrained-fp8` @ `v4`) and external
-reference implementations, on real model shapes.
+`bench_moe.py` benchmarks the local **finegrained-kernels** kernel against third-party kernels and
+`transformers@main` (whose `finegrained_fp8` integration loads the legacy `finegrained-fp8` hub
+kernel), on real model shapes.
 
 ## What it compares
 
-Three figure rows, each a **decode | prefill** subplot pair:
+One figure contains every model and quantization recipe, including Llama 4 rowwise FP8 and
+FP8/integer weight-only cases. Its five rows are **decode | prefill** subplot pairs:
 
-- **quantized** — the MoE at every impl's best: `moe_fused_*` against finegrained-fp8, DeepGEMM,
-  vLLM, TRT-LLM, `transformers@main` and `triton_kernels`. Each impl contributes the shape it has —
+- **quantized** — the MoE at every impl's best: `moe_fused_*` against DeepGEMM, vLLM, FlashInfer,
+  `transformers@main` and `triton_kernels`. Each impl contributes the shape it has —
   fused where there is one, the two-GEMM shape for `transformers@main`, which has only that. There
   is no fused/unfused split in the figure: it is an internal distinction of ours that most of these
-  baselines do not have. The unfused arms (`moe_unfused_*`) stay in `ARMS`, but no problem's
-  baseline set enlists them, so they do not run by default.
+  baselines do not have. The unfused arm is included where a problem requests it.
+- **quantized weight-only** — the FP8 / integer weight-only MoE recipes (raw BF16 activations)
 - **linear quantized** — one qkv-shaped `matmul_2d` linear per model, in its deployment format
+- **linear weight-only** — the same linear with FP8 / integer weight-only weights
 - **unquantized (BF16)** — fused vs transformers `grouped_mm`/`batched_mm`, SonicMoE, vLLM,
   DeepGEMM BF16 and megablocks
 
-Baselines per problem ("all kinds"): upstream **finegrained-fp8** (`@ v4`), **DeepGEMM**
-(fp8/fp4/bf16), **vLLM**'s fused MoE, **FlashInfer**'s TRT-LLM routed-MoE kernels,
-**transformers** `grouped_mm`/`batched_mm` (= `torch._grouped_mm` / `torch.bmm`, the BF16
-torch/cuBLAS path), **SonicMoE**, the OpenAI **triton_kernels** MXFP4 path (GPT-OSS),
-**megablocks** (BF16 dMoE), **nvfp4-gemm** (the kernel behind transformers' `NVFP4Linear`) and
-**`torch.scaled_grouped_mm`** / **`torch.scaled_mm`** (the cuBLAS references). Each is
-import-guarded — a missing dependency skips that baseline instead of failing the run.
+Baselines (the arms in `IMPL_COLORS`; each runs only on the formats it supports):
+
+| Stack | Arms |
+| --- | --- |
+| transformers | `transformers@main` (quantized experts through the `finegrained-fp8` hub kernel), `grouped_mm` / `batched_mm` (BF16) |
+| DeepGEMM | FP8, FP4, BF16 |
+| vLLM | `fused_moe`, CUTLASS FP8/FP4 GEMMs, Marlin (FP8 W8A16, MXFP4, INT4/INT8), ExLlama, humming |
+| FlashInfer | TRT-LLM routed MoE (block / per-tensor FP8, FP4, MXINT4), CUTLASS fused MoE, `mm_fp4` / `mm_mxfp8`, SVDQuant linear |
+| torch / cuBLAS | `scaled_grouped_mm`, `scaled_mm` (linear rows, and per expert for row-wise MoE), runtime dequant + BF16 GEMM |
+| other | FBGEMM / MSLK, SonicMoE, OpenAI `triton_kernels` (MXFP4), megablocks (BF16 dMoE), nvfp4-gemm (transformers' `NVFP4Linear`) |
+
+Each is import-guarded: a missing dependency skips that baseline instead of failing the run.
 
 Every cell runs in three modes: `eager`, `cudagraph` (decode's deployment mode), and
-`compile` (`torch.compile(max-autotune, fullgraph)`). A cell that raises is a red ✕ marker;
-the others still run.
+`compile` (`torch.compile(max-autotune, fullgraph)`). Failures stay in the CSV; the other modes
+still run. Decode shows CUDA graph latency and prefill shows eager latency, on logarithmic axes
+so slow baselines do not flatten the faster kernels. Missing deployment-mode timings use red ✕
+markers; decode falls back to dotted eager bars when available. In both
+columns, a hatched outline shows compiled latency when it is faster. Every format uses these
+same plotting rules; the ordinary Torch weight-only arm also supplies its compiled measurement.
+
+Each case runs in a fresh process, including single-GPU runs, so an optional baseline's CUDA
+fault cannot invalidate later cases. The legacy finegrained-fp8 MX prefill readers behind
+`transformers@main` use 32-bit expert offsets, so that arm skips weight stacks above 2 GiB.
 
 On CUDA, every mode cycles through banks whose **active** weights exceed **twice the device's
 L2 cache**. For MoE, active bytes count only the routed experts, including weight scales, and
@@ -47,7 +62,7 @@ CSV rows record `cache_policy`; logs show bank counts, active bytes and checkpoi
 storage. Insufficient memory fails explicitly; it never falls back to warm weights. Replotting
 or merging old CSVs without matching cache metadata requires rerunning the benchmark. XPU
 retains its existing backend timing behavior and is labeled `backend_default`, not CUDA cold.
-Previously generated figures used warm CUDA graph timing; regenerate them for cold-weight comparisons.
+The committed figure uses this cold-weight policy.
 
 ## The pre-swizzled fast path
 
@@ -57,18 +72,17 @@ so its numbers reflect the tcgen05 fast path. Only MX weights on 128-aligned dim
 to measure the affine path instead.
 
 Correctness is cross-checked in-run: each baseline's output is compared to the finegrained-kernels
-anchor (`parity-vs-finegrained-kernels`, relative L2 distance). What the number means, by regime:
+anchor (`parity-vs-finegrained-kernels`, normalized maximum absolute difference). What the number means, by regime:
 
 - **fp8 ~3e-3 / MX ~1e-2 / fp4 ~5e-2** — arms that share our activation quant: only reduction order
   and epilogue rounding differ.
-- **up to ~1e-1** — stacks with their own act-quant kernels (TRT-LLM, vLLM, finegrained-fp8,
+- **up to ~1e-1** — stacks with their own act-quant kernels (TRT-LLM, vLLM, transformers@main,
   NVFP4Linear): the two arms quantize the activations independently (E4M3 has a 3-bit mantissa,
   E2M1 a 1-bit one, so two roundings of the same value differ by up to ~6% / ~25% per element) and
   the two quantized intermediates go through a second GEMM. These are measured values, not a
   bound, and this oracle cannot tell that regime apart from a bug of the same magnitude — the model
   smokes (generation) and the torch-reference tests carry that.
-- **of order 1 (measured 1.3–1.7)** — the outputs are uncorrelated: the relative distance between two
-  independent same-magnitude vectors is √2. A wrong gate|up row order (pairing the wrong halves in
+- **of order 1 (measured 1.3–1.7)** — a likely layout or routing mismatch. A wrong gate|up row order (pairing the wrong halves in
   the GLU) or a routing error lands here, which is how the stacked-vs-interleaved feed was caught.
 
 The bench's gate|up weights are STACKED (`[gate; up]`); the finegrained-kernels arms are fed the
@@ -78,8 +92,8 @@ row-interleaved view (`_interleave_gate_up`) because the kernels read gate|up in
 
 ```bash
 python bench/bench_moe.py                    # full grid, single GPU -> bench_moe.csv + bench_moe.png
-python bench/bench_moe.py --gpus 8           # shard problems across 8 GPUs (one process per GPU), then merge + plot
-python bench/bench_moe.py --gpus 5 --devices 3,4,5,6,7   # pin the shards to GPUs 3-7
+python bench/bench_moe.py --gpus 8           # 8 GPUs take cases from one shared queue, then merge + plot
+python bench/bench_moe.py --gpus 5 --devices 3,4,5,6,7   # the same queue on GPUs 3-7
 python bench/bench_moe.py --smoke            # fast everything-compiles pass (fast-mode tunes, 256-tok prefill)
 python bench/bench_moe.py --no-preswizzle    # affine MX scales instead of the fast path
 python bench/bench_moe.py gpt-oss            # substring filter on row/problem names
