@@ -22,10 +22,9 @@ on:
         type: string
         default: ""
       head_sha:
-        description: "PR head SHA (informational, shown in the report)"
-        required: false
+        description: "PR commit SHA to audit"
+        required: true
         type: string
-        default: ""
 
 jobs:
   security-audit:
@@ -47,13 +46,23 @@ jobs:
         env:
           INPUTS_PR_NUMBER: ${{ inputs.pr_number }}
 
-      # Check out the PR head so Claude can explore the actual changed code.
-      # refs/pull/N/head resolves for forked PRs too.
+      - name: Validate PR revision
+        shell: bash
+        env:
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          if [[ ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid head_sha input: audits require a full commit SHA"
+            exit 1
+          fi
+
+      # Use the same PR revision as the associated builds.
       - name: Checkout PR head
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: refs/pull/${{ inputs.pr_number }}/head
+          ref: ${{ inputs.head_sha }}
           fetch-depth: 0
+          persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -62,14 +71,21 @@ jobs:
       - name: Install Claude Code
         run: npm install -g @anthropic-ai/claude-code@2.1.139
 
-      # Diff the whole PR against its base. `gh pr diff` resolves the base/head
-      # automatically, including for forked PRs.
+      # Diff the checked-out revision against the PR base, including for forks.
       - name: Generate diff
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ inputs.pr_number }}
           REPO: ${{ github.repository }}
-        run: gh pr diff "${PR_NUMBER}" --repo "${REPO}" > /tmp/changes.diff
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          BASE_SHA=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.base.sha')
+          if [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid PR base: expected a full commit SHA"
+            exit 1
+          fi
+          git fetch --no-tags origin "$BASE_SHA"
+          git diff --no-ext-diff --no-textconv "$BASE_SHA...$HEAD_SHA" -- > /tmp/changes.diff
 
       # NOTE: in the invocation of Claude below, we restrict it to read-only
       # local tools to avoid potential token exfiltration attacks.

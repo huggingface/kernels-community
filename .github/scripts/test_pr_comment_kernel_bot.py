@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -145,6 +146,7 @@ def test_upload_preflight_failure_stops_before_merge_and_dispatch(
         bot,
         "get_pull_request",
         lambda *a, **k: {
+            "user": {"login": "maintainer"},
             "head": {"sha": "abc123"},
             "state": "open",
             "merged": False,
@@ -390,6 +392,238 @@ def test_authorized_via_pr_author_membership(monkeypatch):
     _patch_pr_author(monkeypatch, "alice")
     # Commenter is not on the team; the PR author is.
     assert bot.team_grants_access("api", "t", "build", "outsider", 42)
+
+
+HEAD = "a" * 40
+OLD = "b" * 40
+
+
+def _review(login, commit_id, state="APPROVED"):
+    return {"user": {"login": login}, "commit_id": commit_id, "state": state}
+
+
+def _external_pr(author="outsider", head=HEAD):
+    return {"user": {"login": author}, "head": {"sha": head}}
+
+
+def _patch_review_gate(monkeypatch, *, reviews, permissions=None):
+    """Untrusted author by default; `permissions` maps login -> repo permission."""
+    permissions = permissions or {}
+    monkeypatch.delenv("TEAM_READ_TOKEN", raising=False)
+    monkeypatch.setattr(
+        bot,
+        "get_user_permission",
+        lambda api_base, token, username: permissions.get(username),
+    )
+
+    def fake_reviews(*args):
+        if isinstance(reviews, int):
+            raise bot.urllib.error.HTTPError("url", reviews, "boom", None, None)
+        return reviews
+
+    monkeypatch.setattr(bot, "list_pull_request_reviews", fake_reviews)
+
+
+def test_review_on_head_by_commenter_counts():
+    reviews = [_review("maintainer", OLD), _review("maintainer", HEAD, "COMMENTED")]
+    assert bot.has_review_on_commit(reviews, "maintainer", HEAD)
+
+
+@pytest.mark.parametrize(
+    "review",
+    [
+        _review("maintainer", OLD),
+        _review("someone-else", HEAD),
+        _review("maintainer", HEAD, "DISMISSED"),
+        _review("maintainer", HEAD, "PENDING"),
+    ],
+)
+def test_review_not_on_head_by_commenter_does_not_count(review):
+    assert not bot.has_review_on_commit([review], "maintainer", HEAD)
+
+
+def test_gate_blocks_build_when_pushed_after_review(monkeypatch):
+    _patch_review_gate(monkeypatch, reviews=[_review("maintainer", OLD)])
+    error = bot.review_gate_error("api", "t", "build", "maintainer", _external_pr(), 42)
+    assert error is not None
+    assert HEAD[:12] in error
+
+
+def test_gate_allows_build_reviewed_on_head(monkeypatch):
+    _patch_review_gate(monkeypatch, reviews=[_review("maintainer", HEAD)])
+    assert bot.review_gate_error("api", "t", "build", "maintainer", _external_pr(), 42) is None
+
+
+@pytest.mark.parametrize("permission", ["write", "admin"])
+def test_gate_skips_trusted_author(monkeypatch, permission):
+    _patch_review_gate(monkeypatch, reviews=[], permissions={"insider": permission})
+    pr = _external_pr(author="insider")
+    assert bot.review_gate_error("api", "t", "build", "maintainer", pr, 42) is None
+
+
+def test_gate_skips_team_member_author(monkeypatch):
+    _patch_review_gate(monkeypatch, reviews=[])
+    monkeypatch.setenv("TEAM_READ_TOKEN", "tok")
+    _patch_membership(monkeypatch, {"teammate": "active"})
+    pr = _external_pr(author="teammate")
+    assert bot.review_gate_error("api", "t", "build", "maintainer", pr, 42) is None
+
+
+def test_gate_requires_review_when_author_lookup_fails(monkeypatch):
+    _patch_review_gate(monkeypatch, reviews=[])
+
+    def boom(*args):
+        raise bot.urllib.error.HTTPError("url", 500, "boom", None, None)
+
+    monkeypatch.setattr(bot, "get_user_permission", boom)
+    assert bot.review_gate_error("api", "t", "build", "maintainer", _external_pr(), 42)
+
+
+def test_gate_ignores_security_only(monkeypatch):
+    _patch_review_gate(monkeypatch, reviews=[])
+    assert bot.review_gate_error("api", "t", "security", "maintainer", _external_pr(), 42) is None
+
+
+@pytest.mark.parametrize(
+    "command", ["build", "build-and-stage", "security-and-build", "merge-and-upload"]
+)
+def test_gate_covers_commands_that_run_pr_code(monkeypatch, command):
+    _patch_review_gate(monkeypatch, reviews=[])
+    assert bot.review_gate_error("api", "t", command, "maintainer", _external_pr(), 42)
+
+
+@pytest.mark.parametrize(
+    "command, merged, allowed",
+    [
+        ("merge-and-upload", True, True),
+        ("merge-and-upload", False, False),
+        ("build", True, False),
+        ("build-and-stage", True, False),
+        ("security-and-build", True, False),
+    ],
+)
+def test_review_gate_for_merged_pr(monkeypatch, command, merged, allowed):
+    _patch_review_gate(monkeypatch, reviews=[])
+    pr = {**_external_pr(), "merged": merged}
+    error = bot.review_gate_error("api", "t", command, "maintainer", pr, 42)
+    assert (error is None) is allowed
+
+
+def test_merged_external_pr_upload_retry_dispatches_release(monkeypatch):
+    monkeypatch.setattr(
+        bot,
+        "_resolve_context_from_env",
+        lambda: {
+            "token": "token",
+            "repository": "owner/repo",
+            "comment": "/kernel-bot merge-and-upload example",
+            "comment_id": 7,
+            "issue_number": 42,
+            "default_branch": "main",
+            "commenter": "maintainer",
+        },
+    )
+    _patch_review_gate(monkeypatch, reviews=[], permissions={"maintainer": "write"})
+    pr = {**_external_pr(), "state": "closed", "merged": True}
+    monkeypatch.setattr(bot, "get_pull_request", lambda *a, **k: pr)
+    monkeypatch.setattr(bot, "try_post_issue_comment_reaction", lambda *a, **k: True)
+    monkeypatch.setattr(bot, "preflight_external_uploads", lambda *a, **k: [])
+    monkeypatch.setattr(bot, "try_create_issue_comment", lambda *a, **k: {"id": 8})
+    monkeypatch.setattr(bot, "try_send_issue_comment", lambda *a, **k: True)
+    monkeypatch.setattr(bot, "resolve_dispatch_run_urls", lambda *a, **k: None)
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("upload retries must not merge again or require a review")
+
+    monkeypatch.setattr(bot, "merge_pull_request", unexpected)
+    monkeypatch.setattr(bot, "list_pull_request_reviews", unexpected)
+    monkeypatch.setattr(bot, "try_post_issue_comment", unexpected)
+    dispatched = []
+
+    def fake_dispatch(*args, **kwargs):
+        dispatched.append(kwargs)
+        return SimpleNamespace(
+            notes=[], dispatched=[], failed=[], security_dispatched=[], security_failed=[]
+        )
+
+    monkeypatch.setattr(bot, "dispatch", fake_dispatch)
+    assert bot.main() == 0
+    assert len(dispatched) == 1
+    assert dispatched[0]["ref"] == "main"
+    assert dispatched[0]["pr_number"] == ""
+    assert dispatched[0]["mode"] == "release"
+    assert dispatched[0]["upload"] is True
+
+
+def test_gate_denies_when_reviews_cannot_be_listed(monkeypatch):
+    _patch_review_gate(monkeypatch, reviews=500)
+    error = bot.review_gate_error("api", "t", "build", "maintainer", _external_pr(), 42)
+    assert error is not None
+    assert "Could not verify PR reviews" in error
+
+
+def test_unreviewed_head_stops_before_dispatch(monkeypatch):
+    monkeypatch.setattr(
+        bot,
+        "_resolve_context_from_env",
+        lambda: {
+            "token": "token",
+            "repository": "owner/repo",
+            "comment": "/kernel-bot build example",
+            "comment_id": 7,
+            "issue_number": 42,
+            "default_branch": "main",
+            "commenter": "maintainer",
+        },
+    )
+    monkeypatch.setattr(bot, "try_post_issue_comment_reaction", lambda *a, **k: True)
+    _patch_review_gate(
+        monkeypatch,
+        reviews=[_review("maintainer", OLD)],
+        permissions={"maintainer": "write"},
+    )
+    monkeypatch.setattr(bot, "get_pull_request", lambda *a, **k: _external_pr())
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("dispatch must not run on an unreviewed head")
+
+    monkeypatch.setattr(bot, "dispatch", unexpected)
+    comments = []
+    monkeypatch.setattr(
+        bot,
+        "try_post_issue_comment",
+        lambda api_base, token, issue_number, message: comments.append(message),
+    )
+
+    assert bot.main() == 0
+    assert len(comments) == 1
+    assert "has no review on the current head commit" in comments[0]
+
+
+def test_merge_is_pinned_to_checked_head(monkeypatch):
+    sent = {}
+
+    def fake_request(url, token, method="GET", data=None):
+        sent.update(url=url, method=method, data=data)
+        return 200, "{}"
+
+    monkeypatch.setattr(bot, "github_api_request", fake_request)
+    bot.merge_pull_request("api", "t", 42, HEAD)
+    assert sent["method"] == "PUT"
+    assert sent["data"] == {"merge_method": "squash", "sha": HEAD}
+
+
+def test_reviews_are_paginated(monkeypatch):
+    pages = {1: [_review("u", OLD)] * bot.REVIEW_PAGE_SIZE, 2: [_review("u", HEAD)]}
+
+    def fake_request(url, token, method="GET", data=None):
+        page = int(url.rsplit("page=", 1)[1])
+        return 200, bot.json.dumps(pages.get(page, []))
+
+    monkeypatch.setattr(bot, "github_api_request", fake_request)
+    reviews = bot.list_pull_request_reviews("api", "t", 42)
+    assert len(reviews) == bot.REVIEW_PAGE_SIZE + 1
+    assert bot.has_review_on_commit(reviews, "u", HEAD)
 
 
 def _run_dry(comment, *extra):
