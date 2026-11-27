@@ -1663,8 +1663,9 @@ def mx_auxiliary_pruner():
       native split 26.2us), and at wide N the split crowds the swapped arm out (GLM-5.2 attn N18432 K6144: swap
       14.5us, scalar split 23.5us). SVDQuant (``LORA_RANK > 0``) keeps the native split (down: 27.4us vs FlashInfer
       33.1us).
-    - persistent (``PERSISTENT``): SVDQuant prefill (M >= 128) only, without warp specialization (Triton 3.9's
-      partition verifier rejects a warp-specialized persistent tile loop)."""
+    - persistent (``PERSISTENT``): SVDQuant prefill (M >= 128) only. Warp specialization stays on the K loop
+      (``PIPELINE="k_loop"``): Triton 3.9's partition verifier rejects a warp-specialized persistent tile loop
+      (``flattened``: PassManager::run failed). SVDQuant up r32 N=21504 K=5376 M=8192, B200: 500 -> 455us."""
 
     def ok(c, args):
         split = c.kwargs.get("SPLIT_K", 1)
@@ -1677,7 +1678,8 @@ def mx_auxiliary_pruner():
         if persistent:
             # a warp-specialized persistent tile loop (flattened or tile_loop) fails Triton 3.9's partition verifier:
             # "'scf.if' op partition ids in attr ttg.partition does not contain partition ids of all child ops"
-            return lora and args["M"] >= 128 and not c.kwargs.get("WARP_SPEC")
+            ws_tile_loop = c.kwargs.get("WARP_SPEC") and c.kwargs.get("PIPELINE", "k_loop") != "k_loop"
+            return lora and args["M"] >= 128 and not ws_tile_loop
         if c.kwargs["COMPUTE_MODE"] != "scalar" and not lora:
             return False
         return (
