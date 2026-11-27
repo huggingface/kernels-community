@@ -5,6 +5,8 @@
   "aiter-kernels": ["U08QF4E6614"],
   "aiter-rope": ["U08QF4E6614"],
   "aiter-sage-attention": [],
+  "bfl-mlx": [],
+  "bfl-torch": [],
   "bitsandbytes-mps": [],
   "causal-conv1d": [],
   "cv-utils": [],
