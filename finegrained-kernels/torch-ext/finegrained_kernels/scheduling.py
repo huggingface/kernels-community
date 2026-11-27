@@ -327,22 +327,37 @@ def _compute_grouped_scheduling(
     return perm_token, perm, expert_start
 
 
-# The packed schedule exists for ONE tile size: BM=128, the only region the resolve trade
-# wins (packed_schedule_scope_pruner) — so the table is a single section: header slot 0 =
-# total_m_tiles, then (expert_id, m_start, row_end) per tile.
+# The Triton kernels' packed schedule exists for ONE tile size: BM=128, the only region the resolve trade wins
+# (packed_schedule_scope_pruner); the Gluon grouped kernels build it at their own token tile. The table is a single
+# section: header slot 0 = total_m_tiles, then (expert_id, m_start, row_end) per tile.
 PACKED_SCHEDULE_BM = 128
 
 
-def packed_schedule_capacity(num_routed_tokens: int, num_experts: int) -> int:
+def packed_schedule_capacity(num_routed_tokens: int, num_experts: int, block_m: int = PACKED_SCHEDULE_BM) -> int:
     """Worst-case M-tile count: every expert pads its own last tile, so
     ``cdiv(S, BM) + E`` bounds ``sum_e(cdiv(freq_e, BM))``. Fixed shape — graph-capturable."""
-    return (num_routed_tokens + PACKED_SCHEDULE_BM - 1) // PACKED_SCHEDULE_BM + num_experts
+    return (num_routed_tokens + block_m - 1) // block_m + num_experts
 
 
-def packed_schedule_buffer(num_routed_tokens: int, num_experts: int, device: torch.device) -> torch.Tensor:
+def packed_schedule_buffer(
+    num_routed_tokens: int, num_experts: int, device: torch.device, block_m: int = PACKED_SCHEDULE_BM
+) -> torch.Tensor:
     """The packed tile schedule's buffer: fixed shape (graph-safe), shared by every config of a launch so the tuned
     configs see identical args; ``fill_packed_schedule`` writes it for the configs that read it."""
-    return torch.empty(1 + 3 * packed_schedule_capacity(num_routed_tokens, num_experts), dtype=torch.int32, device=device)
+    capacity = packed_schedule_capacity(num_routed_tokens, num_experts, block_m)
+    return torch.empty(1 + 3 * capacity, dtype=torch.int32, device=device)
+
+
+def build_packed_schedule(expert_start: torch.Tensor, num_routed_tokens: int, block_m: int) -> torch.Tensor:
+    """The packed schedule of ``block_m``-row tiles, built now (one launch)."""
+    num_experts = expert_start.shape[0] - 1
+    schedule = packed_schedule_buffer(num_routed_tokens, num_experts, expert_start.device, block_m)
+    pow2 = triton.next_power_of_2(num_experts)
+    with device_context(expert_start.device):
+        compile_time_only_triton_wrap(_packed_schedule_kernel)[(pow2,)](
+            expert_start, schedule, NUM_EXPERTS=pow2, BM=block_m
+        )
+    return schedule
 
 
 def fill_packed_schedule(nargs):
@@ -359,13 +374,12 @@ def fill_packed_schedule(nargs):
 
 
 @triton.jit
-def _packed_schedule_kernel(ExpertStart, Schedule, NUM_EXPERTS: tl.constexpr):
+def _packed_schedule_kernel(ExpertStart, Schedule, NUM_EXPERTS: tl.constexpr, BM: tl.constexpr = 128):
     """Build the packed tile schedule in one launch: one program per expert writes its
     tiles' ``(expert_id, m_start, row_end)`` triples (header slot 0 = total tile count,
     written by expert 0 from the full cumsum). Replaces the kernels' O(E)
     register-resident tile layout with O(1) loads — the packed-schedule tuner axis
     (register relief; wins at the pressure-walled BM=128 configs)."""
-    BM: tl.constexpr = 128  # PACKED_SCHEDULE_BM
     e = tl.program_id(0)
     e_start = tl.load(ExpertStart + e)
     e_end = tl.load(ExpertStart + e + 1)

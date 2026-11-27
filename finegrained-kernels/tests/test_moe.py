@@ -20,6 +20,7 @@ skipping at the reduce, and ``format`` forwarding. Op-level coverage (formats,
 epilogues, requant, routing variants against an independent torch oracle) lives in
 ``test_ops.py``; the weight formats come from the shared ``WEIGHTS`` registry."""
 
+import inspect
 import math
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Union
@@ -46,6 +47,7 @@ from utils import (  # type: ignore
     maybe_compile,
     quant_dequant_a,
     dq_grouped,
+    is_sm10x,
     dq_int,
 )
 
@@ -525,18 +527,23 @@ def _run_pair(problem: MoEProblem, fused_fn, unfused_fn):
         hidden, top_k_index, top_k_weights, gate_up, down, gate_up_s, down_s, **common
     )
     fused_gate_up_s, fused_down_s, csf = _fused_scales(problem, gate_up_s, down_s)
-    out = maybe_compile(fused_fn, problem.compile)(
-        hidden,
-        top_k_index,
-        top_k_weights,
-        gate_up,
-        down,
-        fused_gate_up_s,
-        fused_down_s,
-        simulate_unfused=True,
-        **common,
-         **csf,
-    )
+    # The parity holds per GEMM kernel: the reference runs the Triton grouped GEMMs, whose tuned tiles the fused
+    # chain shares on the `grouped` path. The `gluon` path matches the swapped tcgen05 tiles bit for bit but not an
+    # mma.sync crown (an ulp in ~1e-5 of the outputs), so it has its own test (test_fused_gluon_path).
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(moe.moe_fused_grouped.paths, "forced", "grouped")
+        out = maybe_compile(fused_fn, problem.compile)(
+            hidden,
+            top_k_index,
+            top_k_weights,
+            gate_up,
+            down,
+            fused_gate_up_s,
+            fused_down_s,
+            simulate_unfused=True,
+            **common,
+            **csf,
+        )
     _assert_fused_correctness(out, ref, problem)
     if problem.activation_scale_ub is not None:
         # Check both clipping sites independently: fused and unfused share their quantizer.
@@ -636,6 +643,39 @@ def test_fused_production_arm(problem, fused_fn, unfused_fn):
     denom = ref.float().norm().clamp(min=1e-6)
     rel = (out.float() - ref.float()).norm() / denom
     assert rel < 0.05, f"production fused arm diverges from unfused: rel={rel:.3e}"
+
+
+_GLUON_PROBLEMS = [
+    MoEProblem(weights="fp8_128x128", num_tokens=64, num_experts=16, num_top_k=4),
+    MoEProblem(weights="fp8_128x128_ue8m0", num_tokens=64, num_experts=16, num_top_k=4),
+    MoEProblem(weights="fp8_128x128_ue8m0", num_tokens=64, num_experts=16, num_top_k=4, sentinel_fraction=0.5),
+    MoEProblem(weights="fp8_tensor", num_tokens=64, num_experts=16, num_top_k=4, static=True),
+    MoEProblem(weights="fp8_rowwise", num_tokens=64, num_experts=16, num_top_k=4),
+    MoEProblem(weights="mxfp4", activation_format="bf16", swiglu_alpha=1.702, swiglu_limit=7.0, num_tokens=64,
+               num_experts=16, num_top_k=4, bias=True),
+]
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(moe.mx_weight_only_matmul_grouped_gluon is None or not is_sm10x(),
+                    reason="the Gluon grouped kernels need Triton >= 3.9 on sm_10x")
+@pytest.mark.parametrize("simulate_unfused", [False, True], ids=["fused", "simulate_unfused"])
+@pytest.mark.parametrize("problem", _GLUON_PROBLEMS, ids=lambda p: p.id)
+def test_fused_gluon_path(problem, simulate_unfused):
+    """``moe_fused_grouped``'s ``gluon`` path (persistent Gluon GEMMs) against its Triton ``grouped`` path: the same
+    chain and epilogue math (rounding included) on other GEMM kernels, so the tight tolerance holds (under EP too)."""
+    torch.manual_seed(0)
+    gate_up, gate_up_s, gate_up_g, down, down_s, down_g = _make_moe_weights(problem)
+    hidden, top_k_index, top_k_weights = _make_moe_inputs(problem)
+    common = _common_kwargs(problem, hidden, top_k_index, gate_up, gate_up_s, gate_up_g, down_g)
+    common["simulate_unfused"] = simulate_unfused
+    args = (hidden, top_k_index, top_k_weights, gate_up, down, gate_up_s, down_s)
+    bound = inspect.signature(moe.moe_fused_grouped).bind(*args, **common)
+    bound.apply_defaults()
+    assert moe._gluon_grouped_offered(bound.arguments), "the block should be offered the gluon path"
+    ref = moe.moe_fused_grouped.paths._run("grouped", args, common)
+    out = moe.moe_fused_grouped.paths._run("gluon", args, common)
+    _assert_fused_correctness(out, ref, problem)
 
 
 _TORCH_BASELINE_PROBLEMS = [

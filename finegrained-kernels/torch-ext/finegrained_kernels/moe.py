@@ -49,6 +49,7 @@ from .bayesian_autotuner import bayesian_autotune
 from .path_autotuner import path_autotune
 from ._ops import add_op_namespace_prefix
 from .compat import (
+    FP8_DTYPE,
     MX_SCALE_GROUP_K,
     NVFP4_SCALE_GROUP_K,
     ScalingType,
@@ -56,14 +57,17 @@ from .compat import (
     compile_time_only_triton_op,
     compile_time_only_triton_wrap,
     device_context,
+    is_sm10x,
     pdl_launch_kwargs,
 )
-from .formats import get_supported_act_fns, is_mx, is_per_expert_global, is_rowwise, mx_scale_family, normalize_global_scale, per_token_activations, ue8m0_as_uint8, weight_block_size, weight_format, INT_WEIGHT_DTYPES, int_weight_bits
+from .formats import get_supported_act_fns, is_mx, is_mxfp4, is_per_expert_global, is_rowwise, mx_scale_family, normalize_global_scale, per_token_activations, ue8m0_as_uint8, weight_block_size, weight_format, INT_WEIGHT_DTYPES, int_weight_bits
 from .norm import norm_column_factor, rms_inv_rows, rms_norm_rows
 from .loading.scales import csf_weight_scales
 from .quant import _launch_act_quant, MX_ACT_QUANT, mx_act_quant_routed_scales
 from .scheduling import compute_grouped_scheduling, expand_regime, is_off_rank, off_rank, routed_expert_start
 from .epilogue import fused_glu
+from .gluon import (mx_weight_only_matmul_grouped_gluon, w8a8_block_dynamic_fp8_matmul_grouped_gluon,
+                    w8a8_tensor_dynamic_fp8_matmul_grouped_gluon)
 
 
 @bayesian_autotune(
@@ -410,7 +414,71 @@ def _gate_up_activations(hidden, fmt, gate_up_scale, global_scale, activation_sc
     )
 
 
-@path_autotune(("grouped", "batched"))
+# moe_fused_grouped arguments the Gluon grouped kernels have no arm for: any one set keeps the block on Triton
+_GLUON_UNSUPPORTED = (
+    "gate_up_proj_scale_exceptions", "down_proj_scale_exceptions", "gate_up_proj_weight_global_scale",
+    "down_proj_weight_global_scale", "gate_up_proj_input_global_scale", "down_proj_input_global_scale",
+    "activation_scale_ub", "gate_up_proj_weight_zero_point", "down_proj_weight_zero_point", "gate_up_proj_weight_perm", "down_proj_weight_perm",
+    "gate_up_proj_pre_quant_scale", "down_proj_pre_quant_scale",
+)
+
+
+def _gluon_grouped_offered(params: dict) -> bool:
+    """Whether the persistent Gluon grouped GEMMs (``gluon/``) can run the block, on sm_10x under Triton >= 3.9, with the
+    gate|up GLU fused: 128x128 block-dynamic FP8 without bias (``grouped_block_fp8.py``), tensor-scale FP8 with
+    per-token or calibrated activation scales (``grouped_tensor_fp8.py``), or MXFP4 weight-only with affine scales
+    (``grouped_mx_w4a16.py``)."""
+    if w8a8_block_dynamic_fp8_matmul_grouped_gluon is None or not is_sm10x():
+        return False
+    act_fn = params["act_fn"]
+    if not (params["gate"] and isinstance(act_fn, str) and act_fn in get_supported_act_fns()):
+        return False
+    if any(params[k] is not None for k in _GLUON_UNSUPPORTED):
+        return False
+    pairs = ((params["gate_up_proj"], params["gate_up_proj_scale_inv"]),
+             (params["down_proj"], params["down_proj_scale_inv"]))
+    static = params["gate_up_proj_activation_scale"] is not None or params["down_proj_activation_scale"] is not None
+    if params["activation_format"] == "bf16":
+        return not static and all(s is not None and s.ndim == 3 and is_mxfp4(w, s) for w, s in pairs)
+    if params["activation_format"] not in (None, "fp8") or any(
+        w.dtype != FP8_DTYPE or s is None or is_mx(w, s) for w, s in pairs
+    ):
+        return False
+    if all(weight_block_size(w, s) is None for w, s in pairs):  # per-tensor / row-wise weight scales
+        return True
+    no_bias = params["gate_up_proj_bias"] is None and params["down_proj_bias"] is None
+    return not static and no_bias and all(weight_block_size(w, s) == [128, 128] for w, s in pairs)
+
+
+def _gluon_matmul_grouped(A, B, As=None, Bs=None, expert_start=None, gate=False, act_fn=None, swiglu_alpha=None,
+                          swiglu_limit=None, simulate_unfused=False, quantize_output=False, output_dtype=None,
+                          gather_idx=None, scatter_idx=None, activation_format=None, bias=None, **unset):
+    """``matmul_grouped``'s call on the Gluon kernels: MXFP4 weight-only under a ``"bf16"`` activation format, else
+    tensor-scale or block-dynamic FP8 by the weight scales. ``_gluon_grouped_offered`` admitted the block, so the
+    remaining arguments are all unset."""
+    assert all(v is None for v in unset.values()), unset
+    if activation_format == "bf16":
+        assert As is None and not quantize_output
+        out = mx_weight_only_matmul_grouped_gluon(
+            A, B, Bs, expert_start, gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, output_dtype,
+            gather_idx, scatter_idx, bias,
+        )
+    elif weight_block_size(B, Bs) is None:
+        assert not quantize_output
+        out = w8a8_tensor_dynamic_fp8_matmul_grouped_gluon(
+            A, B, As, Bs, expert_start, gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, output_dtype,
+            gather_idx, scatter_idx, bias,
+        )
+    else:
+        assert bias is None
+        out = w8a8_block_dynamic_fp8_matmul_grouped_gluon(
+            A, B, As, Bs, expert_start, gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, quantize_output,
+            output_dtype, gather_idx, scatter_idx,
+        )
+    return out[0] if len(out) == 1 else tuple(out)
+
+
+@path_autotune(("grouped", "batched", "gluon"))
 def moe_fused_grouped(
     hidden_states: torch.Tensor,  # (T, H)
     top_k_index: torch.Tensor,  # (T, K) int
@@ -475,18 +543,25 @@ def moe_fused_grouped(
     At a few routed rows per expert the block can instead run ``moe_fused_batched``, the same math: one program per
     (row, weight tile) and no routing sort (B200, T=1: GPT-OSS-120B MXFP4 W4A16 23.1 vs 31.9 us, DeepSeek-V4 MXFP4
     W4A8 26.5 vs 38.0 us; T=16 GPT-OSS a near tie, T=64 the grouped tiles 400 vs 644 us). The path tuner times both
-    per routed-rows bucket; where nothing can be timed, decode (below half a routed row per expert) runs batched."""
+    per routed-rows bucket; where nothing can be timed, decode (below half a routed row per expert) runs batched.
+    FP8 (128x128 block or tensor-scale) and MXFP4 weight-only blocks on sm_10x also offer the same grouped chain on the
+    persistent Gluon GEMMs (``gluon/``, see ``_gluon_grouped_offered``), timed alongside."""
     params = dict(locals())  # exactly the parameters here
     rows, num_experts = top_k_index.numel(), gate_up_proj.size(0)
     offered = ("batched", "grouped") if 2 * rows < num_experts else ("grouped", "batched")
     if simulate_unfused:  # the two chains round in different orders: a test of one keeps its rounding untimed
         offered = offered[:1]
+    if offered[0] == "grouped" and _gluon_grouped_offered(params):
+        # the grouped chain on the persistent Gluon GEMMs (64-token batches): its epilogue rounds as the grouped one
+        offered += ("gluon",)
     key = (
         num_experts, rows.bit_length(), tuple(gate_up_proj.shape[1:]), str(gate_up_proj.dtype),
         str(getattr(gate_up_proj_scale_inv, "dtype", None)), activation_format, str(hidden_states.dtype),
     )
-    if moe_fused_grouped.paths.choose(key, offered) == "batched":
+    path = moe_fused_grouped.paths.choose(key, offered)
+    if path == "batched":
         return moe_fused_batched(**params)
+    gemm = _gluon_matmul_grouped if path == "gluon" else matmul_grouped
     num_top_k = top_k_index.size(-1)
     expert_start, gather_idx, scatter_idx = compute_grouped_scheduling(
         top_k_index, num_experts, num_top_k
@@ -513,7 +588,7 @@ def moe_fused_grouped(
         hidden_states, fmt, gate_up_proj_scale_inv, gate_up_proj_input_global_scale,
         gate_up_proj_activation_scale, scatter_idx, expert_start, gate_up_proj_pre_quant_scale,
     )
-    gate_up_out = matmul_grouped(
+    gate_up_out = gemm(
         gate_up_in,
         gate_up_proj,
         As=gate_up_in_scale,
@@ -544,7 +619,7 @@ def moe_fused_grouped(
         inter = _host_glu(inter, act_fn, swiglu_alpha, swiglu_limit, gate)
     # Phase 2: grouped down over the expert-ordered pre-quantized intermediate (its dtypes
     # carry the format; gather_idx=None), scattering to routed rows (scatter_idx).
-    down_out = matmul_grouped(
+    down_out = gemm(
         inter,
         down_proj,
         As=down_proj_activation_scale if static_act else inter_scale,
