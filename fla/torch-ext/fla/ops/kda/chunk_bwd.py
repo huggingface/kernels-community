@@ -21,7 +21,7 @@ from ...ops.utils.cache import fla_cache_autotune
 from ...ops.utils.constant import RCP_LN2
 from ...ops.utils.graph import get_static_buffer
 from ...ops.utils.op import exp2
-from ...utils import IS_NPU, IS_NVIDIA_HOPPER, IS_NVIDIA_SM100, autotune_cache_kwargs, check_shared_mem
+from ...utils import IS_NVIDIA_HOPPER, IS_NVIDIA_SM100, autotune_cache_kwargs, check_shared_mem
 
 BK_LIST = [32, 64] if check_shared_mem() else [16, 32]
 BV_LIST = [64, 128] if check_shared_mem('ampere') else [16, 32]
@@ -412,9 +412,9 @@ def chunk_kda_bwd_wy_dqkg_fused(
     if use_graph:
         dq = get_static_buffer("wy_dq", (B, T, HV, K), torch.float, q.device)
         dk = get_static_buffer("wy_dk", (B, T, HV, K), torch.float, q.device)
-        dv2 = get_static_buffer("wy_dv2", tuple(v.shape), v.dtype, v.device, zero=IS_NPU)
+        dv2 = get_static_buffer("wy_dv2", tuple(v.shape), v.dtype, v.device)
         dg = get_static_buffer("wy_dg", tuple(g.shape), torch.float, g.device)
-        db = get_static_buffer("wy_db", tuple(beta.shape), torch.float, beta.device, zero=IS_NPU)
+        db = get_static_buffer("wy_db", tuple(beta.shape), torch.float, beta.device)
         dA = get_static_buffer("wy_dA", tuple(A.shape), torch.float, A.device)
     else:
         dq = g.new_empty(B, T, HV, K, dtype=torch.float)

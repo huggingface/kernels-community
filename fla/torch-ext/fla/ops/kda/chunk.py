@@ -323,7 +323,7 @@ def chunk_kda(
 
             - Pad ``cu_seqlens`` with zero-length tail sequences to exactly ``max_num_seqs + 1`` entries;
               kernels return immediately on sentinel rows (segment id < 0),
-              so output/gradient rows not covered by real tokens are left undefined on CUDA and zeroed on Ascend.
+              so output/gradient rows not covered by real tokens are left undefined.
             - Shape ``initial_state`` and the incoming ``dht`` gradient (when used) as ``[max_num_seqs, ...]``.
             - Warm up the captured step eagerly so kernel autotuning runs outside the graph;
               with ``cp_context``, this also includes NCCL communicator setup.
