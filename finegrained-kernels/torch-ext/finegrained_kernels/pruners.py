@@ -1349,6 +1349,12 @@ def mx_2d_swap_scope_pruner(max_m: int = 16):
             # B side as well was NOT needed, so the weight descriptor stays available to the
             # crown, and pointer-mode A keeps the decode arm this pruner exists for.
             and c.kwargs.get("A_MEMORY_MODE", "pointer") == "pointer"
+            # Triton 3.9's ptxas-blackwell aborts (C7907 internal compiler error) on the 2-warp swapped dot_scaled tile
+            # at BK >= 256 up to BN x BK = 128 x 512: 42 of 46 such configs at M=1, B200, NVFP4 5120x5120 and
+            # SVDQuant 5376x21504; every 4-warp config and 2-warp BN=256 x BK=512 compile.
+            and not (is_triton_greater_or_equal("3.9") and c.kwargs.get("COMPUTE_MODE") == "dot_scaled"
+                     and c.num_warps == 2 and c.kwargs["BLOCK_SIZE_K"] >= 256
+                     and c.kwargs["BLOCK_SIZE_N"] * c.kwargs["BLOCK_SIZE_K"] <= 128 * 512)
         )
 
     return config_filter(ok)
