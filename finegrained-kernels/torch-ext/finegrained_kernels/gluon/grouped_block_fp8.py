@@ -21,7 +21,8 @@ import torch
 import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
-from triton.experimental.gluon.language.nvidia.blackwell import TensorMemoryLayout, allocate_tensor_memory, tcgen05_mma
+from triton.experimental.gluon.language.nvidia.blackwell import (TensorMemoryLayout, allocate_tensor_memory,
+                                                                 tcgen05_commit, tcgen05_mma)
 from triton.experimental.gluon.language.nvidia.hopper import mbarrier, tma
 from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
@@ -55,8 +56,8 @@ def _decode_act_scale(scale):
 
 @gluon.jit
 def _loader(w_desc, a_desc, w_bufs, u_bufs, a_bufs, ready, slot_free, GatherIdx, Schedule, n_items, k_tiles,
-            NB: gl.constexpr, BN: gl.constexpr, BT: gl.constexpr, BK: gl.constexpr, NS: gl.constexpr,
-            GATE: gl.constexpr):
+            NB: gl.constexpr, BN: gl.constexpr, BT: gl.constexpr, BKL: gl.constexpr, NS: gl.constexpr,
+            KSUB: gl.constexpr, GATE: gl.constexpr):
     GATHER: gl.constexpr = GatherIdx is not None
     nbytes: gl.constexpr = ((2 if GATE else 1) * w_desc.block_type.nbytes
                             + (BT if GATHER else 1) * a_desc.block_type.nbytes)
@@ -67,42 +68,48 @@ def _loader(w_desc, a_desc, w_bufs, u_bufs, a_bufs, ready, slot_free, GatherIdx,
             src_rows = gather_rows(GatherIdx, m_start, row_end, a_desc.shape[0], BT)
         else:
             src_rows = m_start
-        for k in range(k_tiles):
+        for k in range(gl.cdiv(k_tiles, KSUB)):  # each stage carries KSUB 128-wide K steps
             s = c % NS
             mbarrier.wait(slot_free.index(s), ((c // NS) & 1) ^ 1)
             mbarrier.expect(ready.index(s), nbytes)
             if GATE:  # the stack interleaves gate (even) and up (odd) rows: one strided box each
-                tma.async_load(w_desc, [expert, nb * BN, 0, k * BK], ready.index(s), w_bufs.index(s))
-                tma.async_load(w_desc, [expert, nb * BN, 1, k * BK], ready.index(s), u_bufs.index(s))
+                tma.async_load(w_desc, [expert, nb * BN, 0, k * BKL], ready.index(s), w_bufs.index(s))
+                tma.async_load(w_desc, [expert, nb * BN, 1, k * BKL], ready.index(s), u_bufs.index(s))
             else:
-                tma.async_load(w_desc, [expert, nb * BN, k * BK], ready.index(s), w_bufs.index(s))
-            load_token_tile(a_desc, src_rows, m_start, k * BK, ready.index(s), a_bufs.index(s), GATHER)
+                tma.async_load(w_desc, [expert, nb * BN, k * BKL], ready.index(s), w_bufs.index(s))
+            load_token_tile(a_desc, src_rows, m_start, k * BKL, ready.index(s), a_bufs.index(s), GATHER)
             c += 1
 
 
 @gluon.jit
 def _mma(w_bufs, u_bufs, a_bufs, gate_parts, up_parts, ready, slot_free, part_ready, part_free, n_items, k_tiles,
-         BN: gl.constexpr, BK: gl.constexpr, NS: gl.constexpr, NBUF: gl.constexpr, GATE: gl.constexpr):
+         BN: gl.constexpr, BK: gl.constexpr, NS: gl.constexpr, NBUF: gl.constexpr, KSUB: gl.constexpr,
+         GATE: gl.constexpr):
     c = 0
     i = 0
     for it in range(gl.program_id(0), n_items, gl.num_programs(0)):
         # items alternate between the two rescale warpgroups, each with its own NBUF partials
         base = (i % 2) * NBUF
-        for k in range(k_tiles):
-            cw = (i // 2) * k_tiles + k  # the owning warpgroup's step count
+        for kl in range(gl.cdiv(k_tiles, KSUB)):
             s = c % NS
-            p = base + cw % NBUF
             mbarrier.wait(ready.index(s), (c // NS) & 1)
-            mbarrier.wait(part_free.index(p), ((cw // NBUF) & 1) ^ 1)
-            w = w_bufs.index(s).reshape([BN, BK])
-            a = a_bufs.index(s).permute((1, 0))
-            if GATE:  # one barrier covers both: tcgen05 completions are ordered
-                tcgen05_mma(w, a, gate_parts.index(p), use_acc=False)
-                tcgen05_mma(u_bufs.index(s).reshape([BN, BK]), a, up_parts.index(p), use_acc=False,
-                            mbarriers=[slot_free.index(s), part_ready.index(p)])
-            else:
-                tcgen05_mma(w, a, gate_parts.index(p), use_acc=False,
-                            mbarriers=[slot_free.index(s), part_ready.index(p)])
+            w_all = w_bufs.index(s).reshape([BN, KSUB * BK])
+            u_all = u_bufs.index(s).reshape([BN, KSUB * BK])
+            for sub in gl.static_range(KSUB):  # one fresh partial per 128-wide scale block of the stage
+                k = kl * KSUB + sub
+                if k < k_tiles:
+                    cw = (i // 2) * k_tiles + k  # the owning warpgroup's step count
+                    p = base + cw % NBUF
+                    mbarrier.wait(part_free.index(p), ((cw // NBUF) & 1) ^ 1)
+                    a = a_bufs.index(s).slice(sub * BK, BK, dim=1).permute((1, 0))
+                    if GATE:  # one barrier covers both: tcgen05 completions are ordered
+                        tcgen05_mma(w_all.slice(sub * BK, BK, dim=1), a, gate_parts.index(p), use_acc=False)
+                        tcgen05_mma(u_all.slice(sub * BK, BK, dim=1), a, up_parts.index(p), use_acc=False,
+                                    mbarriers=[part_ready.index(p)])
+                    else:
+                        tcgen05_mma(w_all.slice(sub * BK, BK, dim=1), a, gate_parts.index(p), use_acc=False,
+                                    mbarriers=[part_ready.index(p)])
+            tcgen05_commit(slot_free.index(s))  # the stage's MMAs all read it
             c += 1
         i += 1
 
@@ -173,16 +180,19 @@ def _rescale_epilogue(gate_parts, up_parts, part_ready, part_free, As, Bs, C, Cs
 
 
 def _configs():
-    """Token tile x TMA ring depth x partials per rescale warpgroup x its register budget."""
+    """Token tile x K width per load x TMA ring depth x partials per rescale warpgroup x its register budget. A
+    256-wide load (two 128-wide scale blocks) streams each weight row in 256-byte pieces."""
     return [
-        triton.Config(dict(BT=bt, NS=ns, NBUF=nbuf, RESCALE_REGS=regs), num_warps=4, pre_hook=grouped_pre_hook("a_desc"))
-        for bt, ns, nbuf, regs in itertools.product(TOKEN_TILES, (4, 5, 6, 8), (2, 3, 4), (152, 192, 232))
+        triton.Config(dict(BT=bt, BKL=bkl, NS=ns, NBUF=nbuf, RESCALE_REGS=regs), num_warps=4,
+                      pre_hook=grouped_pre_hook("a_desc", "w_desc", k_key="BKL"))
+        for bt, bkl, ns, nbuf, regs in itertools.product(TOKEN_TILES, (128, 256), (2, 3, 4, 5, 6, 8), (2, 3, 4),
+                                                         (152, 192, 232))
     ]
 
 
 def _stage_bytes(kwargs, gate):
     """One ring stage: the E4M3 weight rows (both projections under gate|up) and the token tile."""
-    return ((2 if gate else 1) * BLOCK_N + kwargs["BT"]) * BLOCK_K
+    return ((2 if gate else 1) * BLOCK_N + kwargs["BT"]) * kwargs["BKL"]
 
 
 @bayesian_autotune(
@@ -196,7 +206,8 @@ def _stage_bytes(kwargs, gate):
 def block_fp8_grouped_kernel(w_desc, a_desc, As, Bs, C, Cs, GatherIdx, ScatterIdx, Schedule, ExpertStart, N, K,
                              stride_as_m, stride_bs_e, stride_bs_n, stride_c_m, stride_cs_m,
                              tokens_per_expert_bit_length, BN: gl.constexpr, BT: gl.constexpr,
-                             BK: gl.constexpr, NS: gl.constexpr, NBUF: gl.constexpr, GATE: gl.constexpr,
+                             BK: gl.constexpr, BKL: gl.constexpr, NS: gl.constexpr, NBUF: gl.constexpr,
+                             GATE: gl.constexpr,
                              ACT_FN: gl.constexpr, SWIGLU_ALPHA: gl.constexpr, SWIGLU_LIMIT: gl.constexpr,
                              SIMULATE_UNFUSED: gl.constexpr, INTERMEDIATE_DTYPE: gl.constexpr, REQUANT: gl.constexpr,
                              RESCALE_REGS: gl.constexpr, num_warps: gl.constexpr):
@@ -205,7 +216,8 @@ def block_fp8_grouped_kernel(w_desc, a_desc, As, Bs, C, Cs, GatherIdx, ScatterId
     k_tiles = gl.cdiv(K, BK)
     w_bufs = gl.allocate_shared_memory(gl.float8e4nv, [NS] + w_desc.block_shape, w_desc.layout)
     u_bufs = gl.allocate_shared_memory(gl.float8e4nv, [NS if GATE else 1] + w_desc.block_shape, w_desc.layout)
-    a_bufs = gl.allocate_shared_memory(gl.float8e4nv, [NS, BT, BK], a_desc.layout)
+    KSUB: gl.constexpr = BKL // BK  # 128-wide scale blocks per load
+    a_bufs = gl.allocate_shared_memory(gl.float8e4nv, [NS, BT, BKL], a_desc.layout)
     tmem: gl.constexpr = TensorMemoryLayout([BN, BT], col_stride=1)
     gate_parts = allocate_tensor_memory(gl.float32, [2 * NBUF, BN, BT], tmem)
     up_parts = allocate_tensor_memory(gl.float32, [2 * NBUF if GATE else 1, BN, BT], tmem)
@@ -231,9 +243,9 @@ def block_fp8_grouped_kernel(w_desc, a_desc, As, Bs, C, Cs, GatherIdx, ScatterId
                              GATE, ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE, REQUANT,
                              1)),
         (_loader, (w_desc, a_desc, w_bufs, u_bufs, a_bufs, ready, slot_free, GatherIdx, Schedule, n_items, k_tiles, NB,
-                   BN, BT, BK, NS, GATE)),
+                   BN, BT, BKL, NS, KSUB, GATE)),
         (_mma, (w_bufs, u_bufs, a_bufs, gate_parts, up_parts, ready, slot_free, part_ready, part_free, n_items, k_tiles,
-                BN, BK, NS, NBUF, GATE)),
+                BN, BK, NS, NBUF, KSUB, GATE)),
     ], [4, 1, 1], [RESCALE_REGS, 24, 24])
 
 

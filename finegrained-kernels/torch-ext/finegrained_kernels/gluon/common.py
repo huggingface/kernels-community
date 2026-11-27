@@ -8,7 +8,8 @@ from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
 from ..scheduling import fill_packed_schedule_rows
 
-_GL_DTYPES = {torch.float8_e4m3fn: gl.float8e4nv, torch.bfloat16: gl.bfloat16, torch.float16: gl.float16}
+_GL_DTYPES = {torch.float8_e4m3fn: gl.float8e4nv, torch.bfloat16: gl.bfloat16, torch.float16: gl.float16,
+              torch.int32: gl.int32}
 
 
 def token_tile_descriptor(A: torch.Tensor, block_t: int, block_k: int, gather: bool) -> TensorDescriptor:
@@ -51,16 +52,25 @@ TOKEN_TILES = (16, 32)
 SMEM_BUDGET = 216 * 1024
 
 
-def grouped_pre_hook(desc_name: str):
+def grouped_pre_hook(desc_name: str, weight_desc_name: str | None = None, weight_values_per_element: int = 1,
+                     k_key: str = "BK", token_box_k: bool = True):
     """Per config, as at launch: the packed schedule of the config's ``BT``-row tiles (into ``Schedule``, sized for the
-    smallest tile) and the token tile's box over ``desc_name``."""
+    smallest tile) and the token tile's box over ``desc_name``. A config that tunes the K width of a load (``k_key``)
+    also gets it on that box and on the weight box over ``weight_desc_name``, whose elements pack
+    ``weight_values_per_element`` values along K; ``token_box_k=False`` keeps the token box's K, for a kernel that
+    loads one token tile per K step of a wider weight load."""
     def hook(nargs):
         bt = nargs["BT"]
         fill_packed_schedule_rows(nargs["ExpertStart"], nargs["Schedule"], bt)
         desc = nargs[desc_name]
-        block_k = desc.block_shape[-1]
-        desc.block_shape = [1 if nargs["GatherIdx"] is not None else bt, block_k]
-        desc.layout = gl.NVMMASharedLayout.get_default_for([bt, block_k], _GL_DTYPES[desc.base.dtype])
+        block_k = nargs.get(k_key, desc.block_shape[-1])
+        token_k = block_k if token_box_k else desc.block_shape[-1]
+        desc.block_shape = [1 if nargs["GatherIdx"] is not None else bt, token_k]
+        desc.layout = gl.NVMMASharedLayout.get_default_for([bt, token_k], _GL_DTYPES[desc.base.dtype])
+        if weight_desc_name is not None and k_key in nargs:
+            w_desc = nargs[weight_desc_name]
+            w_desc.block_shape = [*w_desc.block_shape[:-1], block_k // weight_values_per_element]
+            w_desc.layout = gl.NVMMASharedLayout.get_default_for(w_desc.block_shape, _GL_DTYPES[w_desc.base.dtype])
     return hook
 
 

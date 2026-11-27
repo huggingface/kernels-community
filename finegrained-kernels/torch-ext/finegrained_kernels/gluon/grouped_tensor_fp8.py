@@ -36,7 +36,7 @@ from .common import (TOKEN_TILES, gather_rows, grouped_pre_hook, load_token_tile
                      token_tile_descriptor)
 
 BLOCK_N = 128  # weight rows per item
-BLOCK_K = 128
+BLOCK_K = 128  # the launch's K step; the tuned configs set their own (BK)
 
 
 @gluon.jit
@@ -142,14 +142,15 @@ def _epilogue(acc_g, acc_u, acc_ready, acc_free, As, Bs, Y, Bias, GatherIdx, Sca
 
 
 def _configs():
-    """Token tile x TMA ring depth."""
-    return [triton.Config(dict(BT=bt, NS=ns), num_warps=4, pre_hook=grouped_pre_hook("a_desc"))
-            for bt, ns in itertools.product(TOKEN_TILES, (4, 5, 6, 8))]
+    """Token tile x K step x TMA ring depth. A 256-wide K step streams each weight row in 256-byte pieces (Mistral-4
+    T=64 gate|up, B200: 285 -> 272 us against 128)."""
+    return [triton.Config(dict(BT=bt, BK=bk, NS=ns), num_warps=4, pre_hook=grouped_pre_hook("a_desc", "w_desc"))
+            for bt, bk, ns in itertools.product(TOKEN_TILES, (128, 256), (2, 3, 4, 5, 6, 8))]
 
 
 def _stage_bytes(kwargs, gate):
     """One ring stage: the E4M3 weight rows (both projections under gate|up) and the token tile."""
-    return ((2 if gate else 1) * BLOCK_N + kwargs["BT"]) * BLOCK_K
+    return ((2 if gate else 1) * BLOCK_N + kwargs["BT"]) * kwargs["BK"]
 
 
 @bayesian_autotune(
@@ -213,7 +214,7 @@ def tensor_fp8_grouped_gluon(A, As, stride_as_m, stride_as_e, B, Bs, expert_star
         compile_time_only_triton_wrap(tensor_fp8_grouped_kernel)[(sm_count(A.device.index),)](
             w_desc, a_desc, As, Bs, Y, bias, gather_idx, scatter_idx, schedule, expert_start, N, K, stride_as_m,
             stride_as_e, Bs.stride(0), row_scale_stride(Bs), Y.stride(0), bias.stride(0) if bias is not None else 0,
-            tokens_per_expert_bucket(S, E), BN=BLOCK_N, BK=BLOCK_K, GATE=gate, ACT_FN=act_fn,
+            tokens_per_expert_bucket(S, E), BN=BLOCK_N, GATE=gate, ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha, SWIGLU_LIMIT=swiglu_limit, SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(Y.dtype),
         )
