@@ -9,7 +9,7 @@ from torch import Tensor
 from torch.distributed import ProcessGroup
 from ..utils.torch import custom_bwd, custom_fwd
 
-from einops import rearrange
+from .._deps import rearrange
 
 from ..distributed.distributed_utils import (
     all_gather_raw,

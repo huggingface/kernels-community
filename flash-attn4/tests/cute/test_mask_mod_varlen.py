@@ -20,7 +20,7 @@ from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 import kernels
 
-flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=1)
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=2)
 
 _flash_attn_fwd = flash_attn4.interface._flash_attn_fwd
 utils = flash_attn4.utils

@@ -11,7 +11,7 @@ from collections.abc import Sequence
 
 import torch
 import torch.nn.functional as F
-from einops import einsum
+from ..._deps import einsum
 
 
 def naive_attnres(

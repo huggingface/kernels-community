@@ -1,5 +1,7 @@
 __version__ = "2.2.4"
 
+from . import _deps  # noqa: F401 (resolves kernel dependencies at load time)
+
 from . import layers
 from .models import MambaLMHeadModel
 from .modules import Mamba, Mamba2

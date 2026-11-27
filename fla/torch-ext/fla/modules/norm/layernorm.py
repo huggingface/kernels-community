@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from einops import rearrange
+from ..._deps import rearrange
 from torch.distributed import DeviceMesh
 from torch.distributed.tensor import Replicate, Shard, distribute_module
 from torch.distributed.tensor.parallel import ParallelStyle

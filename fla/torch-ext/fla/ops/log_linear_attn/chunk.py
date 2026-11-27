@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from einops import reduce
+from ..._deps import reduce
 
 from ...ops.utils import chunk_local_cumsum
 from ...ops.utils.op import exp, unflatten_program_id

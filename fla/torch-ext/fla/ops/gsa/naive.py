@@ -6,7 +6,7 @@
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 import torch
-from einops import repeat
+from ..._deps import repeat
 
 
 def naive_recurrent_gsa(

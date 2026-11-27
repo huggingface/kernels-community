@@ -7,11 +7,12 @@ import random
 
 import pytest
 import torch
-from einops import rearrange
 
 import kernels
 
-flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=1)
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=2)
+einops = kernels.get_kernel("kernels-community/einops", version=1)
+rearrange = einops.rearrange
 
 JITCache = flash_attn4.cache_utils.JITCache
 _flash_attn_fwd = flash_attn4.interface._flash_attn_fwd

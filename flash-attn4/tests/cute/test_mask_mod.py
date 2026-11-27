@@ -24,7 +24,7 @@ import torch.nn.functional as F
 
 import kernels
 
-flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=1)
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=2)
 
 _flash_attn_fwd = flash_attn4.interface._flash_attn_fwd
 _flash_attn_bwd = flash_attn4.interface._flash_attn_bwd

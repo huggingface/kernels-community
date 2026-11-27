@@ -9,7 +9,9 @@ import operator
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 import kernels
 
-flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=1)
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=2)
+einops = kernels.get_kernel("kernels-community/einops", version=1)
+rearrange = einops.rearrange
 
 JITCache = flash_attn4.cache_utils.JITCache
 flash_attn_func = flash_attn4.interface.flash_attn_func
@@ -498,7 +500,6 @@ def test_cute_score_mod_with_aux_tensors_vectorized(
 
 def _generate_block_kvcache(seqlen_k, page_size, batch_size, nheads_k, d, device, dtype):
     import math
-    from einops import rearrange
 
     num_blocks = math.ceil(seqlen_k / page_size) * batch_size * 3
     k_cache_paged = torch.randn(num_blocks, page_size, nheads_k, d, device=device, dtype=dtype)
@@ -583,7 +584,6 @@ def test_score_mod_with_paged_kvcache(
 
     cache_seqlens = torch.randint(1, seqlen_kv + 1, (batch_size,), dtype=torch.int32, device=device)
 
-    from einops import rearrange
 
     arange = rearrange(torch.arange(seqlen_kv, device=device), "s -> 1 s")
     cache_seqlens_expanded = rearrange(cache_seqlens, "b -> b 1")
@@ -742,7 +742,6 @@ def test_score_mod_with_paged_kvcache_aux_tensors(
         aux_tensors = [head_bias, pos_scale]
         eager_score_mod = eager_score_mod_factory(head_bias, pos_scale)
 
-    from einops import rearrange
 
     arange = rearrange(torch.arange(seqlen_kv, device=device), "s -> 1 s")
     cache_seqlens_expanded = rearrange(cache_seqlens, "b -> b 1")

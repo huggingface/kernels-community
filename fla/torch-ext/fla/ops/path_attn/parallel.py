@@ -6,7 +6,7 @@
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 import torch
-from einops import reduce
+from ..._deps import reduce
 
 from ...ops.attn.parallel import parallel_attn_bwd_preprocess
 from ...ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd

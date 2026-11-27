@@ -6,7 +6,7 @@
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 import torch
-from einops import rearrange
+from ..._deps import rearrange
 
 
 def delta_rule_recurrence(q, k, v, beta, initial_state=None, output_final_state=True):

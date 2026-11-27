@@ -5,10 +5,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from einops import rearrange
 
-
-fla = kernels.get_kernel("kernels-community/fla", version=2)
+fla = kernels.get_kernel("kernels-community/fla", version=3)
+rearrange = kernels.get_kernel("kernels-community/einops", version=1).rearrange
 
 
 def naive_chunk_gated_delta_rule(

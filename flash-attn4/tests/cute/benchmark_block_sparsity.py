@@ -14,7 +14,7 @@ from cutlass.cute.testing import benchmark as cute_benchmark
 import cutlass.cute as cute
 import kernels
 
-flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=1)
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=2)
 
 BlockSparsityKernel = flash_attn4._private_for_testing.compute_block_sparsity.BlockSparsityKernel
 BlockSparseTensors = flash_attn4.block_sparsity.BlockSparseTensors

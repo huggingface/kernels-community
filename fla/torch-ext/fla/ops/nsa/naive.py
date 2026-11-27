@@ -8,7 +8,7 @@
 import warnings
 
 import torch
-from einops import repeat
+from ..._deps import repeat
 
 from ...ops.utils import prepare_chunk_offsets
 from ...ops.utils.pooling import mean_pooling

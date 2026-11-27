@@ -16,7 +16,7 @@ import torch
 
 import kernels
 
-flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=1)
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=2)
 
 FlashAttentionForwardSm90 = flash_attn4.flash_fwd_sm90.FlashAttentionForwardSm90
 from mask_mod_definitions import (

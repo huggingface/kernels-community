@@ -7,10 +7,12 @@ import torch.nn.functional as F
 
 import pytest
 
-from einops import rearrange, repeat
 
 
-mamba_ssm = kernels.get_kernel("kernels-community/mamba-ssm", version=5)
+mamba_ssm = kernels.get_kernel("kernels-community/mamba-ssm", version=6)
+einops = kernels.get_kernel("kernels-community/einops", version=1)
+rearrange = einops.rearrange
+repeat = einops.repeat
 
 layernorm_fn = mamba_ssm.ops.triton.layernorm_gated.layernorm_fn
 rms_norm_ref = mamba_ssm.ops.triton.layernorm_gated.rms_norm_ref

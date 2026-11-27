@@ -2,6 +2,8 @@
 
 __version__ = "4.0.0.beta30"
 
+from . import _deps  # noqa: F401 (resolves kernel dependencies at load time)
+
 from .interface import (
     flash_attn_func,
     flash_attn_varlen_func,

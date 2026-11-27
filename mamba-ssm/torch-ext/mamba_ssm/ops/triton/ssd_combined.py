@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from einops import rearrange, repeat
+from ..._deps import rearrange, repeat
 from packaging import version
 from torch import Tensor
 

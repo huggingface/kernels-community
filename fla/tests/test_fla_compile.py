@@ -89,7 +89,7 @@ def device():
 
 @pytest.fixture(scope="module")
 def fla(device):
-    return get_kernel("kernels-community/fla", version=2)
+    return get_kernel("kernels-community/fla", version=3)
 
 
 @pytest.fixture(autouse=True)

@@ -14,7 +14,7 @@ import os
 import torch
 import triton
 import triton.language as tl
-from einops import reduce
+from ..._deps import reduce
 
 from ...backends import dispatch
 from ...ops.utils import prepare_chunk_indices

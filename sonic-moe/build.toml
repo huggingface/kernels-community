@@ -1,10 +1,13 @@
 [general]
 name = "sonic-moe"
-version = 2
+version = 3
 edition = 6
 license = "Apache-2.0"
 backends = ["cuda"]
 python-depends = ["tvm-ffi"]
+kernel-depends = [
+    { repo-id = "kernels-community/einops", version = 1 },
+]
 
 [general.cuda]
 minver = "12.9"

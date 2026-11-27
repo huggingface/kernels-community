@@ -6,7 +6,7 @@
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 import torch
-from einops import rearrange
+from ..._deps import rearrange
 
 
 def naive_recurrent_linear_attn(

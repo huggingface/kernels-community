@@ -8,7 +8,7 @@
 import torch
 import triton
 import triton.language as tl
-from einops import rearrange
+from ..._deps import rearrange
 
 from ...ops.delta_rule.wy_fast import fwd_prepare_T
 from ...utils import autocast_custom_bwd, autocast_custom_fwd, autotune_cache_kwargs, input_guard

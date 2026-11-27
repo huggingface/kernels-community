@@ -2,7 +2,7 @@
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange, repeat
+from .._deps import rearrange, repeat
 
 from .._causal_conv1d import causal_conv1d_cuda, causal_conv1d_fn
 from .._ops import add_op_namespace_prefix, ops

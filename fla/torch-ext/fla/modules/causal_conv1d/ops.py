@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
-from einops import rearrange
+from ..._deps import rearrange
 
 from ...backends import dispatch
 from ...ops.cp import FLACPContext

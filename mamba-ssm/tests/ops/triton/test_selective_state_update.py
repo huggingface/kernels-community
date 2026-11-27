@@ -8,10 +8,12 @@ import torch
 import torch.nn.functional as F
 import pytest
 
-from einops import rearrange, repeat
 
 
-mamba_ssm = kernels.get_kernel("kernels-community/mamba-ssm", version=5)
+mamba_ssm = kernels.get_kernel("kernels-community/mamba-ssm", version=6)
+einops = kernels.get_kernel("kernels-community/einops", version=1)
+rearrange = einops.rearrange
+repeat = einops.repeat
 selective_state_update = mamba_ssm.ops.triton.selective_state_update
 
 

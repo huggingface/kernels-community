@@ -6,7 +6,7 @@ This is the same as Listing 1 from the paper.
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange, repeat
+from .._deps import rearrange, repeat
 
 from ..ops.triton.ssd_combined import mamba_chunk_scan_combined
 
