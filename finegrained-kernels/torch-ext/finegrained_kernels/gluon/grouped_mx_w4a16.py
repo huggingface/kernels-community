@@ -12,9 +12,11 @@ scatter) in the warp roles of TRT-LLM's batched GEMM, where a cast warpgroup upc
 
 64-token MoE batch, B200, CUDA graphs, op times (Triton grouped crown in brackets): GPT-OSS-120B gate_up 224 (272),
 down 119 (156) us."""
+import itertools
 from typing import List
 
 import torch
+import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.nvidia.blackwell import (TensorMemoryLayout, allocate_tensor_memory,
@@ -23,15 +25,18 @@ from triton.experimental.gluon.language.nvidia.hopper import mbarrier, tma
 from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
 from .._ops import add_op_namespace_prefix
-from ..compat import compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, launches_skipped
+from ..compat import (compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, launches_skipped,
+                      sm_count)
 from ..epilogue import glu
-from ..formats import e2m1_as_uint8, gate_out_cols, resolve_output_dtype, routed_rows, ue8m0_as_uint8
-from ..scheduling import build_packed_schedule
+from ..bayesian_autotuner import bayesian_autotune
+from ..formats import (e2m1_as_uint8, gate_out_cols, resolve_output_dtype, routed_rows, tokens_per_expert_bucket,
+                       ue8m0_as_uint8)
+from ..scheduling import packed_schedule_buffer
+from .common import (TOKEN_TILES, gather_rows, grouped_pre_hook, load_token_tile, schedule_item, smem_fit_pruner,
+                     token_tile_descriptor)
 
 BLOCK_N = 128  # weight rows per item
 BLOCK_K = 128  # K values per step: both projections' decoded bf16 tiles fit the tensor-memory ring
-BLOCK_T = 16  # token rows per item: the tcgen05 N side
-_SM_COUNT = {}
 
 
 @gluon.jit
@@ -52,20 +57,19 @@ def _mul_bf16x2(a, s):
 
 
 @gluon.jit
-def _item(it, Schedule, NB: gl.constexpr):
-    """Item ``it``'s (expert, first sorted row, row end, weight block) from the packed schedule."""
-    m = it // NB
-    entry = Schedule + 1 + m * 3
-    return gl.load(entry), gl.load(entry + 1), gl.load(entry + 2), it % NB
-
-
-@gluon.jit
-def _loader(w_desc, x_desc, w_bufs, u_bufs, x_bufs, ready, slot_free, Schedule, n_items, k_tiles,
-            NB: gl.constexpr, BN: gl.constexpr, BK: gl.constexpr, NS: gl.constexpr, GATE: gl.constexpr):
-    nbytes: gl.constexpr = (2 if GATE else 1) * w_desc.block_type.nbytes + x_desc.block_type.nbytes
+def _loader(w_desc, x_desc, w_bufs, u_bufs, x_bufs, ready, slot_free, GatherIdx, Schedule, n_items, k_tiles,
+            NB: gl.constexpr, BN: gl.constexpr, BT: gl.constexpr, BK: gl.constexpr, NS: gl.constexpr,
+            GATE: gl.constexpr):
+    GATHER: gl.constexpr = GatherIdx is not None
+    nbytes: gl.constexpr = ((2 if GATE else 1) * w_desc.block_type.nbytes
+                            + (BT if GATHER else 1) * x_desc.block_type.nbytes)
     c = 0
     for it in range(gl.program_id(0), n_items, gl.num_programs(0)):
-        expert, m_start, _, nb = _item(it, Schedule, NB)
+        expert, m_start, row_end, nb = schedule_item(it, Schedule, NB)
+        if GATHER:
+            src_rows = gather_rows(GatherIdx, m_start, row_end, x_desc.shape[0], BT)
+        else:
+            src_rows = m_start
         for k in range(k_tiles):
             s = c % NS
             mbarrier.wait(slot_free.index(s), ((c // NS) & 1) ^ 1)
@@ -75,7 +79,7 @@ def _loader(w_desc, x_desc, w_bufs, u_bufs, x_bufs, ready, slot_free, Schedule, 
                 tma.async_load(w_desc, [expert, nb * BN, 1, k * (BK // 8)], ready.index(s), u_bufs.index(s))
             else:
                 tma.async_load(w_desc, [expert, nb * BN, k * (BK // 8)], ready.index(s), w_bufs.index(s))
-            tma.async_load(x_desc, [m_start, k * BK], ready.index(s), x_bufs.index(s))
+            load_token_tile(x_desc, src_rows, m_start, k * BK, ready.index(s), x_bufs.index(s), GATHER)
             c += 1
 
 
@@ -131,7 +135,7 @@ def _decoder(w_bufs, u_bufs, dt_g, dt_u, ready, dec_ready, dec_free, S, Schedule
     cols = gl.arange(0, C, layout=gl.SliceLayout(0, L2))
     base = 0
     for it in range(gl.program_id(0), n_items, gl.num_programs(0)):
-        expert, _, _, nb = _item(it, Schedule, NB)
+        expert, _, _, nb = schedule_item(it, Schedule, NB)
         n = nb * BN + rr
         # gate|up: projection row n is stack row 2n (gate) / 2n + 1 (up), each with its own scale row
         srow = S + expert * stride_s_e + ((2 * n) if GATE else n)[:, None] * stride_s_n
@@ -162,7 +166,7 @@ def _epilogue(acc_g, acc_u, acc_ready, acc_free, Y, Bias, ScatterIdx, Schedule, 
     i = 0
     for it in range(gl.program_id(0), n_items, gl.num_programs(0)):
         a = i % 2
-        expert, m_start, row_end, nb = _item(it, Schedule, NB)
+        expert, m_start, row_end, nb = schedule_item(it, Schedule, NB)
         rows = m_start + tok
         valid = rows < row_end
         n = nb * BN + nn
@@ -190,9 +194,29 @@ def _epilogue(acc_g, acc_u, acc_ready, acc_free, Y, Bias, ScatterIdx, Schedule, 
         i += 1
 
 
+def _configs():
+    """Token tile x TMA ring depth x decoded-operand buffers x the decoders' register budget."""
+    return [
+        triton.Config(dict(BT=bt, NS=ns, NBUF=nbuf, DEC_REGS=regs), num_warps=4, pre_hook=grouped_pre_hook("x_desc"))
+        for bt, ns, nbuf, regs in itertools.product(TOKEN_TILES, (4, 6, 8), (2, 3), (152, 184))
+    ]
+
+
+def _stage_bytes(kwargs, gate):
+    """One ring stage: the packed E2M1 weight rows (both projections under gate|up) and the bf16 token tile."""
+    return (2 if gate else 1) * BLOCK_N * BLOCK_K // 2 + kwargs["BT"] * BLOCK_K * 2
+
+
+@bayesian_autotune(
+    _configs(),
+    ["N", "K", "GATE", "tokens_per_expert_bit_length"],
+    n_trials=24,
+    prune_configs_by={"early_config_prune": smem_fit_pruner(_stage_bytes)},
+)
 @gluon.jit
-def mx_w4a16_grouped_kernel(w_desc, x_desc, S, Y, Bias, ScatterIdx, Schedule, N, K, stride_s_e, stride_s_n,
-                            stride_y_t, stride_bias_e, BN: gl.constexpr, BT: gl.constexpr, BK: gl.constexpr,
+def mx_w4a16_grouped_kernel(w_desc, x_desc, S, Y, Bias, GatherIdx, ScatterIdx, Schedule, ExpertStart, N, K, stride_s_e,
+                            stride_s_n, stride_y_t, stride_bias_e, tokens_per_expert_bit_length, BN: gl.constexpr,
+                            BT: gl.constexpr, BK: gl.constexpr,
                             NS: gl.constexpr, NBUF: gl.constexpr, GATE: gl.constexpr, ACT_FN: gl.constexpr,
                             SWIGLU_ALPHA: gl.constexpr, SWIGLU_LIMIT: gl.constexpr, SIMULATE_UNFUSED: gl.constexpr,
                             DEC_REGS: gl.constexpr,
@@ -231,40 +255,36 @@ def mx_w4a16_grouped_kernel(w_desc, x_desc, S, Y, Bias, ScatterIdx, Schedule, N,
                     stride_s_e, stride_s_n, 0, NB, BN, BK, NS, NBUF, GATE)),
         (_decoder, (w_bufs, u_bufs, dt_g, dt_u, ready, dec_ready, dec_free, S, Schedule, n_items, k_tiles, N, K,
                     stride_s_e, stride_s_n, 1, NB, BN, BK, NS, NBUF, GATE)),
-        (_loader, (w_desc, x_desc, w_bufs, u_bufs, x_bufs, ready, slot_free, Schedule, n_items, k_tiles, NB, BN, BK, NS,
-                   GATE)),
+        (_loader, (w_desc, x_desc, w_bufs, u_bufs, x_bufs, ready, slot_free, GatherIdx, Schedule, n_items, k_tiles, NB,
+                   BN, BT, BK, NS, GATE)),
         (_mma, (x_bufs, dt_g, dt_u, acc_g, acc_u, dec_ready, dec_free, slot_free, acc_ready, acc_free, n_items,
                 k_tiles, NS, NBUF, GATE)),
     ], [4, 4, 1, 1], [DEC_REGS, DEC_REGS, 24, 24])
 
 
-def mx_w4a16_grouped_gluon(x, B, Bs, schedule, Y, N, gate, act_fn, swiglu_alpha, swiglu_limit, bias, scatter_idx,
-                           simulate_unfused=False, num_stages=None, num_part_buffers=3, dec_regs=184):
-    """Launch over expert-sorted bf16 ``x`` (S, K) and the packed E2M1 ``B`` (E, 2N|N, K // 2) with UE8M0 ``Bs``
-    (E, 2N|N, K // 32); ``schedule`` is the 16-row packed schedule. Writes ``Y`` at the sorted rows, or at
-    ``scatter_idx`` when given."""
+def mx_w4a16_grouped_gluon(x, B, Bs, expert_start, Y, N, gate, act_fn, swiglu_alpha, swiglu_limit, bias, gather_idx,
+                           scatter_idx, simulate_unfused=False):
+    """Launch over bf16 ``x`` (rows, K), expert-sorted or read through ``gather_idx``, and the packed E2M1 ``B``
+    (E, 2N|N, K // 2) with UE8M0 ``Bs`` (E, 2N|N, K // 32). Writes ``Y`` at the sorted rows, or at ``scatter_idx``
+    when given."""
     if launches_skipped():  # an opaque op's fake impl: the outputs are allocated, and descriptors need real pointers
         return
     E, rows, Kh = B.shape
     K = 2 * Kh
-    if num_stages is None:  # GPT-OSS T=64, B200: gate|up best at 6 (8 runs out of headroom), down at 8 (119 vs 121 us)
-        num_stages = 6 if gate else 8
+    S = Y.shape[0]
     words = B.view(torch.int32)  # (E, rows, K // 8)
     # gate|up: the (E, 2N, K // 8) stack viewed (E, N, 2, K // 8), so the gate (even) and up (odd) rows are one box each
     w_view, w_box = ((words.view(E, rows // 2, 2, Kh // 4), [1, BLOCK_N, 1, BLOCK_K // 8]) if gate
                      else (words, [1, BLOCK_N, BLOCK_K // 8]))
     w_desc = TensorDescriptor.from_tensor(w_view, w_box, gl.NVMMASharedLayout.get_default_for(w_box, gl.int32))
-    x_layout = gl.NVMMASharedLayout.get_default_for([BLOCK_T, BLOCK_K], gl.bfloat16)
-    x_desc = TensorDescriptor.from_tensor(x, [BLOCK_T, BLOCK_K], x_layout)
-    dev = x.device.index
-    if dev not in _SM_COUNT:
-        _SM_COUNT[dev] = torch.cuda.get_device_properties(dev).multi_processor_count
+    x_desc = token_tile_descriptor(x, min(TOKEN_TILES), BLOCK_K, gather_idx is not None)  # rebound per config
+    schedule = packed_schedule_buffer(S, E, x.device, min(TOKEN_TILES))  # filled per config
     with device_context(x.device):
-        compile_time_only_triton_wrap(mx_w4a16_grouped_kernel)[(_SM_COUNT[dev],)](
-            w_desc, x_desc, Bs, Y, bias, scatter_idx, schedule, N, K, Bs.stride(0), Bs.stride(1), Y.stride(0),
-            bias.stride(0) if bias is not None else 0, BN=BLOCK_N, BT=BLOCK_T, BK=BLOCK_K, NS=num_stages,
-            NBUF=num_part_buffers, GATE=gate, ACT_FN=act_fn, SWIGLU_ALPHA=swiglu_alpha, SWIGLU_LIMIT=swiglu_limit,
-            SIMULATE_UNFUSED=simulate_unfused, DEC_REGS=dec_regs, num_warps=4,
+        compile_time_only_triton_wrap(mx_w4a16_grouped_kernel)[(sm_count(x.device.index),)](
+            w_desc, x_desc, Bs, Y, bias, gather_idx, scatter_idx, schedule, expert_start, N, K, Bs.stride(0),
+            Bs.stride(1), Y.stride(0), bias.stride(0) if bias is not None else 0, tokens_per_expert_bucket(S, E),
+            BN=BLOCK_N, BK=BLOCK_K, GATE=gate, ACT_FN=act_fn, SWIGLU_ALPHA=swiglu_alpha, SWIGLU_LIMIT=swiglu_limit,
+            SIMULATE_UNFUSED=simulate_unfused,
         )
 
 
@@ -285,15 +305,12 @@ def mx_weight_only_matmul_grouped_gluon(
     bias: torch.Tensor | None = None,
 ) -> List[torch.Tensor]:
     """``mx_weight_only_matmul_grouped`` for MXFP4 weights (UE8M0 group-32 scales, no global scales) on the persistent
-    Gluon kernel. ``A`` is gathered into expert order once so every token tile is one TMA box."""
+    Gluon kernel, which gathers each token tile's rows with TMA."""
     num_experts, rows, _ = B.shape
     N = rows // 2 if gate else rows
     S = routed_rows(A, gather_idx, scatter_idx, expert_start, num_experts)
-    if gather_idx is not None:
-        A = A.index_select(0, gather_idx)
     output_dtype = resolve_output_dtype(output_dtype, A, None)
     Y = A.new_empty(S, gate_out_cols(N, gate, act_fn), dtype=output_dtype)
-    schedule = build_packed_schedule(expert_start, S, BLOCK_T)
-    mx_w4a16_grouped_gluon(A.contiguous(), e2m1_as_uint8(B), ue8m0_as_uint8(Bs), schedule, Y, N, gate, act_fn,
-                           swiglu_alpha, swiglu_limit, bias, scatter_idx, simulate_unfused)
+    mx_w4a16_grouped_gluon(A.contiguous(), e2m1_as_uint8(B), ue8m0_as_uint8(Bs), expert_start, Y, N, gate, act_fn,
+                           swiglu_alpha, swiglu_limit, bias, gather_idx, scatter_idx, simulate_unfused)
     return [Y]

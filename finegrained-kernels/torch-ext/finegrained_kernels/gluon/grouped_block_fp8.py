@@ -14,9 +14,11 @@ warp roles of TRT-LLM's batched GEMM.
 
 64-token MoE batch, B200, CUDA graphs, op times (Triton grouped crown in brackets): DeepSeek-V4-Base (UE8M0)
 gate_up 511 (550), down 252 (285); DeepSeek-V3 (fp32 scales) gate_up 1016 (1042), down 484 (512)."""
+import itertools
 from typing import List
 
 import torch
+import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.nvidia.blackwell import TensorMemoryLayout, allocate_tensor_memory, tcgen05_mma
@@ -25,27 +27,20 @@ from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
 from .._ops import add_op_namespace_prefix
 from ..compat import (FP8_DTYPE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context,
-                      launches_skipped, tl_dtype)
+                      launches_skipped, sm_count, tl_dtype)
 from ..epilogue import glu
-from ..formats import expert_weight_shape, gate_out_cols, resolve_output_dtype, routed_rows, ue8m0_as_uint8
+from ..formats import (expert_weight_shape, gate_out_cols, resolve_output_dtype, routed_rows,
+                       tokens_per_expert_bucket, ue8m0_as_uint8)
 from ..loading.scales import decode_group_scale
 from ..pruners import require_moe_dims_aligned
 from ..quant import fp8_act_quant_block_dynamic, fp8_act_quant_inline
-from ..scheduling import build_packed_schedule
+from ..bayesian_autotuner import bayesian_autotune
+from ..scheduling import packed_schedule_buffer
+from .common import (TOKEN_TILES, gather_rows, grouped_pre_hook, load_token_tile, schedule_item, smem_fit_pruner,
+                     token_tile_descriptor)
 
 BLOCK_N = 128  # weight rows per item (the 128-row scale block)
 BLOCK_K = 128  # one scale block per K step
-BLOCK_T = 16  # token rows per item: the tcgen05 N side
-_SMEM_BUDGET = 216 * 1024  # of B200's 227 KB per CTA, leaving room for barriers and the epilogue's scratch
-_SM_COUNT = {}
-
-
-@gluon.jit
-def _item(it, Schedule, NB: gl.constexpr):
-    """Item ``it``'s (expert, first sorted row, row end, weight block) from the packed schedule."""
-    m = it // NB
-    entry = Schedule + 1 + m * 3
-    return gl.load(entry), gl.load(entry + 1), gl.load(entry + 2), it % NB
 
 
 @gluon.jit
@@ -59,12 +54,19 @@ def _decode_act_scale(scale):
 
 
 @gluon.jit
-def _loader(w_desc, a_desc, w_bufs, u_bufs, a_bufs, ready, slot_free, Schedule, n_items, k_tiles,
-            NB: gl.constexpr, BN: gl.constexpr, BK: gl.constexpr, NS: gl.constexpr, GATE: gl.constexpr):
-    nbytes: gl.constexpr = (2 if GATE else 1) * w_desc.block_type.nbytes + a_desc.block_type.nbytes
+def _loader(w_desc, a_desc, w_bufs, u_bufs, a_bufs, ready, slot_free, GatherIdx, Schedule, n_items, k_tiles,
+            NB: gl.constexpr, BN: gl.constexpr, BT: gl.constexpr, BK: gl.constexpr, NS: gl.constexpr,
+            GATE: gl.constexpr):
+    GATHER: gl.constexpr = GatherIdx is not None
+    nbytes: gl.constexpr = ((2 if GATE else 1) * w_desc.block_type.nbytes
+                            + (BT if GATHER else 1) * a_desc.block_type.nbytes)
     c = 0
     for it in range(gl.program_id(0), n_items, gl.num_programs(0)):
-        expert, m_start, _, nb = _item(it, Schedule, NB)
+        expert, m_start, row_end, nb = schedule_item(it, Schedule, NB)
+        if GATHER:
+            src_rows = gather_rows(GatherIdx, m_start, row_end, a_desc.shape[0], BT)
+        else:
+            src_rows = m_start
         for k in range(k_tiles):
             s = c % NS
             mbarrier.wait(slot_free.index(s), ((c // NS) & 1) ^ 1)
@@ -74,7 +76,7 @@ def _loader(w_desc, a_desc, w_bufs, u_bufs, a_bufs, ready, slot_free, Schedule, 
                 tma.async_load(w_desc, [expert, nb * BN, 1, k * BK], ready.index(s), u_bufs.index(s))
             else:
                 tma.async_load(w_desc, [expert, nb * BN, k * BK], ready.index(s), w_bufs.index(s))
-            tma.async_load(a_desc, [m_start, k * BK], ready.index(s), a_bufs.index(s))
+            load_token_tile(a_desc, src_rows, m_start, k * BK, ready.index(s), a_bufs.index(s), GATHER)
             c += 1
 
 
@@ -106,7 +108,8 @@ def _mma(w_bufs, u_bufs, a_bufs, gate_parts, up_parts, ready, slot_free, part_re
 
 
 @gluon.jit
-def _rescale_epilogue(gate_parts, up_parts, part_ready, part_free, As, Bs, C, Cs, ScatterIdx, Schedule, n_items,
+def _rescale_epilogue(gate_parts, up_parts, part_ready, part_free, As, Bs, C, Cs, GatherIdx, ScatterIdx, Schedule,
+                      n_items,
                       k_tiles, stride_as_m, stride_bs_e, stride_bs_n, stride_c_m, stride_cs_m,
                       NB: gl.constexpr, BN: gl.constexpr, BT: gl.constexpr, NBUF: gl.constexpr, GATE: gl.constexpr,
                       ACT_FN: gl.constexpr, SWIGLU_ALPHA: gl.constexpr, SWIGLU_LIMIT: gl.constexpr,
@@ -119,10 +122,13 @@ def _rescale_epilogue(gate_parts, up_parts, part_ready, part_free, As, Bs, C, Cs
     nn = gl.arange(0, BN, layout=gl.SliceLayout(1, reg))
     c = 0
     for it in range(gl.program_id(0) + WG * gl.num_programs(0), n_items, 2 * gl.num_programs(0)):
-        expert, m_start, row_end, nb = _item(it, Schedule, NB)
+        expert, m_start, row_end, nb = schedule_item(it, Schedule, NB)
         rows = m_start + tok
         valid = rows < row_end
-        a_row = As + rows * stride_as_m
+        if GatherIdx is not None:  # gathered tiles read their activation scales at the source rows
+            a_row = As + gl.load(GatherIdx + rows, mask=valid, other=0) * stride_as_m
+        else:
+            a_row = As + rows * stride_as_m
         # gate|up: the item's (gate, up) scale blocks are the adjacent pair at 2 * nb (the stack's scales pair the
         # projections' blocks, its rows interleave them)
         w_row = Bs + expert * stride_bs_e + (2 * nb if GATE else nb) * stride_bs_n
@@ -166,9 +172,30 @@ def _rescale_epilogue(gate_parts, up_parts, part_ready, part_free, As, Bs, C, Cs
             gl.store(c_ptrs, out.to(C.dtype.element_ty), mask=valid[None, :])
 
 
+def _configs():
+    """Token tile x TMA ring depth x partials per rescale warpgroup x its register budget."""
+    return [
+        triton.Config(dict(BT=bt, NS=ns, NBUF=nbuf, RESCALE_REGS=regs), num_warps=4, pre_hook=grouped_pre_hook("a_desc"))
+        for bt, ns, nbuf, regs in itertools.product(TOKEN_TILES, (4, 5, 6, 8), (2, 3, 4), (152, 192, 232))
+    ]
+
+
+def _stage_bytes(kwargs, gate):
+    """One ring stage: the E4M3 weight rows (both projections under gate|up) and the token tile."""
+    return ((2 if gate else 1) * BLOCK_N + kwargs["BT"]) * BLOCK_K
+
+
+@bayesian_autotune(
+    _configs(),
+    # BN / BK are the 128x128 quant block (launch-pinned); the token bucket keys the tile choice
+    ["N", "K", "GATE", "tokens_per_expert_bit_length"],
+    n_trials=24,
+    prune_configs_by={"early_config_prune": smem_fit_pruner(_stage_bytes)},
+)
 @gluon.jit
-def block_fp8_grouped_kernel(w_desc, a_desc, As, Bs, C, Cs, ScatterIdx, Schedule, N, K, stride_as_m, stride_bs_e,
-                             stride_bs_n, stride_c_m, stride_cs_m, BN: gl.constexpr, BT: gl.constexpr,
+def block_fp8_grouped_kernel(w_desc, a_desc, As, Bs, C, Cs, GatherIdx, ScatterIdx, Schedule, ExpertStart, N, K,
+                             stride_as_m, stride_bs_e, stride_bs_n, stride_c_m, stride_cs_m,
+                             tokens_per_expert_bit_length, BN: gl.constexpr, BT: gl.constexpr,
                              BK: gl.constexpr, NS: gl.constexpr, NBUF: gl.constexpr, GATE: gl.constexpr,
                              ACT_FN: gl.constexpr, SWIGLU_ALPHA: gl.constexpr, SWIGLU_LIMIT: gl.constexpr,
                              SIMULATE_UNFUSED: gl.constexpr, INTERMEDIATE_DTYPE: gl.constexpr, REQUANT: gl.constexpr,
@@ -193,49 +220,45 @@ def block_fp8_grouped_kernel(w_desc, a_desc, As, Bs, C, Cs, ScatterIdx, Schedule
         mbarrier.init(part_ready.index(i), count=1)
         mbarrier.init(part_free.index(i), count=1)
     gl.warp_specialize([
-        (_rescale_epilogue, (gate_parts, up_parts, part_ready, part_free, As, Bs, C, Cs, ScatterIdx, Schedule, n_items,
+        (_rescale_epilogue, (gate_parts, up_parts, part_ready, part_free, As, Bs, C, Cs, GatherIdx, ScatterIdx, Schedule,
+                             n_items,
                              k_tiles, stride_as_m, stride_bs_e, stride_bs_n, stride_c_m, stride_cs_m, NB, BN, BT, NBUF,
                              GATE, ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE, REQUANT,
                              0)),
-        (_rescale_epilogue, (gate_parts, up_parts, part_ready, part_free, As, Bs, C, Cs, ScatterIdx, Schedule, n_items,
+        (_rescale_epilogue, (gate_parts, up_parts, part_ready, part_free, As, Bs, C, Cs, GatherIdx, ScatterIdx, Schedule,
+                             n_items,
                              k_tiles, stride_as_m, stride_bs_e, stride_bs_n, stride_c_m, stride_cs_m, NB, BN, BT, NBUF,
                              GATE, ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE, REQUANT,
                              1)),
-        (_loader, (w_desc, a_desc, w_bufs, u_bufs, a_bufs, ready, slot_free, Schedule, n_items, k_tiles, NB, BN, BK, NS,
-                   GATE)),
+        (_loader, (w_desc, a_desc, w_bufs, u_bufs, a_bufs, ready, slot_free, GatherIdx, Schedule, n_items, k_tiles, NB,
+                   BN, BT, BK, NS, GATE)),
         (_mma, (w_bufs, u_bufs, a_bufs, gate_parts, up_parts, ready, slot_free, part_ready, part_free, n_items, k_tiles,
                 BN, BK, NS, NBUF, GATE)),
     ], [4, 1, 1], [RESCALE_REGS, 24, 24])
 
 
-def block_fp8_grouped_gluon(A, As, B, Bs, schedule, C, Cs, N, gate, act_fn, swiglu_alpha, swiglu_limit,
-                            scatter_idx, simulate_unfused=False, intermediate_dtype=torch.bfloat16, num_stages=None,
-                            num_part_buffers=2, rescale_regs=192):
-    """Launch over expert-sorted ``A`` (S, K) E4M3 + ``As`` (S, K // 128) and the ``B`` (E, 2N|N, K) stack with ``Bs``
-    (E, 2N|N // 128, K // 128); ``schedule`` is the 16-row packed schedule. Writes ``C`` (and ``Cs`` when not None,
-    the requantized intermediate's scales) at the sorted rows, or at ``scatter_idx`` when given."""
+def block_fp8_grouped_gluon(A, As, B, Bs, expert_start, C, Cs, N, gate, act_fn, swiglu_alpha, swiglu_limit,
+                            gather_idx, scatter_idx, simulate_unfused=False, intermediate_dtype=torch.bfloat16):
+    """Launch over E4M3 ``A`` + ``As`` (rows, K // 128), expert-sorted or read through ``gather_idx``, and the ``B``
+    (E, 2N|N, K) stack with ``Bs`` (E, 2N|N // 128, K // 128). Writes ``C`` (and ``Cs`` when not None, the
+    requantized intermediate's scales) at the sorted rows, or at ``scatter_idx`` when given."""
     if launches_skipped():  # an opaque op's fake impl: the outputs are allocated, and descriptors need real pointers
         return
     E, rows, K = B.shape
-    WN = 2 * BLOCK_N if gate else BLOCK_N
-    if num_stages is None:  # 6 measured best for both projections (more only lengthens the startup)
-        num_stages = min(6, _SMEM_BUDGET // ((WN + BLOCK_T) * BLOCK_K))
+    S = C.shape[0]
     # gate|up: the (E, 2N, K) stack viewed (E, N, 2, K), so the gate (even) and up (odd) rows are one box each
     w_view, w_box = (B.view(E, rows // 2, 2, K), [1, BLOCK_N, 1, BLOCK_K]) if gate else (B, [1, BLOCK_N, BLOCK_K])
     w_layout = gl.NVMMASharedLayout.get_default_for(w_box, gl.float8e4nv)
-    a_layout = gl.NVMMASharedLayout.get_default_for([BLOCK_T, BLOCK_K], gl.float8e4nv)
     w_desc = TensorDescriptor.from_tensor(w_view, w_box, w_layout)
-    a_desc = TensorDescriptor.from_tensor(A, [BLOCK_T, BLOCK_K], a_layout)
-    dev = A.device.index
-    if dev not in _SM_COUNT:
-        _SM_COUNT[dev] = torch.cuda.get_device_properties(dev).multi_processor_count
+    a_desc = token_tile_descriptor(A, min(TOKEN_TILES), BLOCK_K, gather_idx is not None)  # rebound per config
+    schedule = packed_schedule_buffer(S, E, A.device, min(TOKEN_TILES))  # filled per config
     with device_context(A.device):
-        compile_time_only_triton_wrap(block_fp8_grouped_kernel)[(_SM_COUNT[dev],)](
-            w_desc, a_desc, As, Bs, C, Cs, scatter_idx, schedule, N, K, As.stride(0), Bs.stride(0), Bs.stride(1),
-            C.stride(0), Cs.stride(0) if Cs is not None else 0, BN=BLOCK_N, BT=BLOCK_T, BK=BLOCK_K, NS=num_stages,
-            NBUF=num_part_buffers, GATE=gate, ACT_FN=act_fn, SWIGLU_ALPHA=swiglu_alpha, SWIGLU_LIMIT=swiglu_limit,
-            SIMULATE_UNFUSED=simulate_unfused, INTERMEDIATE_DTYPE=tl_dtype(intermediate_dtype), REQUANT=Cs is not None,
-            RESCALE_REGS=rescale_regs, num_warps=4,
+        compile_time_only_triton_wrap(block_fp8_grouped_kernel)[(sm_count(A.device.index),)](
+            w_desc, a_desc, As, Bs, C, Cs, gather_idx, scatter_idx, schedule, expert_start, N, K, As.stride(0),
+            Bs.stride(0), Bs.stride(1), C.stride(0), Cs.stride(0) if Cs is not None else 0,
+            tokens_per_expert_bucket(S, E), BN=BLOCK_N, BK=BLOCK_K, GATE=gate, ACT_FN=act_fn,
+            SWIGLU_ALPHA=swiglu_alpha, SWIGLU_LIMIT=swiglu_limit, SIMULATE_UNFUSED=simulate_unfused,
+            INTERMEDIATE_DTYPE=tl_dtype(intermediate_dtype), REQUANT=Cs is not None,
         )
 
 
@@ -257,8 +280,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_gluon(
     scatter_idx: torch.Tensor | None = None,
 ) -> List[torch.Tensor]:
     """``w8a8_block_dynamic_fp8_matmul_grouped`` (128x128 blocks, no bias) on the persistent Gluon kernel. Raw ``A`` is
-    quantized, then gathered into expert order once (S rows x K bytes, a few us at the batch sizes this path serves)
-    so every token tile is one TMA box."""
+    quantized once in token order; the kernel gathers each tile's rows with TMA."""
     num_experts, n_rows, N = expert_weight_shape(B, gate)
     S = routed_rows(A, gather_idx, scatter_idx, expert_start, num_experts)
     K = A.shape[1]
@@ -266,8 +288,6 @@ def w8a8_block_dynamic_fp8_matmul_grouped_gluon(
     bs_u8 = ue8m0_as_uint8(Bs)
     if As is None:
         A, As = fp8_act_quant_block_dynamic(A, BLOCK_K, use_ue8m0=bs_u8.dtype == torch.uint8)
-    if gather_idx is not None:
-        A, As = A.index_select(0, gather_idx), As.index_select(0, gather_idx)
     output_dtype = resolve_output_dtype(output_dtype, A, As)
     if quantize_output:
         C = A.new_empty(S, N, dtype=FP8_DTYPE)
@@ -275,7 +295,6 @@ def w8a8_block_dynamic_fp8_matmul_grouped_gluon(
     else:
         C = A.new_empty(S, gate_out_cols(N, gate, act_fn), dtype=output_dtype)
         Cs = None
-    schedule = build_packed_schedule(expert_start, S, BLOCK_T)
-    block_fp8_grouped_gluon(A, As, B, bs_u8, schedule, C, Cs, N, gate, act_fn, swiglu_alpha, swiglu_limit, scatter_idx,
-                            simulate_unfused, output_dtype)
+    block_fp8_grouped_gluon(A, As, B, bs_u8, expert_start, C, Cs, N, gate, act_fn, swiglu_alpha, swiglu_limit, gather_idx,
+                            scatter_idx, simulate_unfused, output_dtype)
     return [C, Cs] if quantize_output else [C]

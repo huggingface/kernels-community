@@ -348,16 +348,14 @@ def packed_schedule_buffer(
     return torch.empty(1 + 3 * capacity, dtype=torch.int32, device=device)
 
 
-def build_packed_schedule(expert_start: torch.Tensor, num_routed_tokens: int, block_m: int) -> torch.Tensor:
-    """The packed schedule of ``block_m``-row tiles, built now (one launch)."""
-    num_experts = expert_start.shape[0] - 1
-    schedule = packed_schedule_buffer(num_routed_tokens, num_experts, expert_start.device, block_m)
-    pow2 = triton.next_power_of_2(num_experts)
+def fill_packed_schedule_rows(expert_start: torch.Tensor, schedule: torch.Tensor, block_m: int) -> None:
+    """Write the packed schedule of ``block_m``-row tiles into ``schedule`` (one launch), a buffer sized for that or a
+    smaller tile (``packed_schedule_buffer``)."""
+    pow2 = triton.next_power_of_2(expert_start.shape[0] - 1)
     with device_context(expert_start.device):
         compile_time_only_triton_wrap(_packed_schedule_kernel)[(pow2,)](
             expert_start, schedule, NUM_EXPERTS=pow2, BM=block_m
         )
-    return schedule
 
 
 def fill_packed_schedule(nargs):
