@@ -13,7 +13,7 @@ import triton.language as tl
 
 from ...ops.utils.op import exp
 from ...ops.utils.softplus import softplus
-from ...utils import input_guard
+from ...utils import IS_NVIDIA_HOPPER, input_guard
 
 
 @triton.heuristics({
@@ -204,7 +204,14 @@ def fused_recurrent_gated_delta_rule_fwd(
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
     BK = triton.next_power_of_2(K)
-    BV = min(8, triton.next_power_of_2(V)) if gv is None else triton.next_power_of_2(V)
+    if gv is not None:
+        BV = triton.next_power_of_2(V)
+    elif IS_NVIDIA_HOPPER and gk is None and not state_v_first:
+        # [K, V] state on H100/H200: BV=16 runs half as many programs per head as BV=8, so less repeated
+        # per-program q/k work; it is faster across measured decode shapes.
+        BV = min(16, triton.next_power_of_2(V))
+    else:
+        BV = min(8, triton.next_power_of_2(V))
     NV = triton.cdiv(V, BV)
 
     o = torch.empty_like(v)
@@ -438,10 +445,16 @@ def fused_recurrent_gated_delta_rule(
                 f"The number of initial states is expected to be equal to the number of input sequences, "
                 f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}.",
             )
+    H, HV = k.shape[2], v.shape[2]
+    if HV % H != 0:
+        raise ValueError(
+            f"For GVA, num_v_heads (HV={HV}) must be evenly divisible by "
+            f"num_heads (H={H}), but got HV % H = {HV % H}"
+        )
     if scale is None:
         scale = k.shape[-1] ** -0.5
     if beta is None:
-        beta = torch.ones_like(q[..., 0])
+        beta = torch.ones_like(v[..., 0])
     if use_gate_in_kernel:
         if A_log is None:
             raise ValueError("`A_log` must be provided when `use_gate_in_kernel=True`.")

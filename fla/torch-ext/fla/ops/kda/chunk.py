@@ -206,7 +206,9 @@ class ChunkKDAFunction(torch.autograd.Function):
         if ctx.use_beta_sigmoid_in_kernel:
             db = fused_beta_sigmoid_bwd(x=beta_raw, dy=db, scale=2.0 if ctx.allow_neg_eigval else 1.0)
 
-        return (dq.to(q), dk.to(k), dv.to(v), dg.to(g_input), db.to(beta_raw), dA, dbias, None, dh0,
+        # graph scratch buffers may be reused before autograd accumulates these gradients.
+        return (dq.to(q, copy=ctx.use_graph), dk.to(k, copy=ctx.use_graph), dv.to(v, copy=ctx.use_graph),
+                dg.to(g_input), db.to(beta_raw), dA, dbias, None, dh0,
                 None, None, None, None, None, None, None, None, None, None, None, None, None, None,
                 None, None)
 
@@ -269,10 +271,9 @@ def chunk_kda(
             Whether to compute the log-space KDA decay internally.
             - If ``True``:
               The passed ``g`` acts as the raw input for ``-exp(A_log) * softplus(g + dt_bias.view(HV, K))``.
-              Note that as part of the input arguments,
-              ``A_log`` (shape ``[HV]``) and the optional ``dt_bias`` (shape ``[HV * K]``) should be provided.
-              When ``lower_bound`` is set, ``A_log`` may be ``None``,
-              in which case the gate is ``lower_bound * sigmoid(g + dt_bias)``.
+              ``A_log`` (shape ``[HV]``) and ``dt_bias`` (shape ``[HV * K]``) are optional.
+              When ``A_log`` is ``None``, the decay scale is 1, equivalent to ``A_log=0``.
+              When ``lower_bound`` is set, the gate is ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))``.
             - If ``False``, ``g`` is expected to be the pre-computed decay value.
             Default: ``False``.
         use_beta_sigmoid_in_kernel (bool, Optional):
@@ -468,8 +469,6 @@ def chunk_kda(
     A_log, dt_bias = None, None
     if use_gate_in_kernel:
         A_log, dt_bias = kwargs.get("A_log"), kwargs.get("dt_bias")
-        if A_log is None and lower_bound is None:
-            raise ValueError("`A_log` must be provided when `use_gate_in_kernel=True` and `lower_bound` is not set.")
 
     chunk_size = kwargs.pop("chunk_size", 64)
     if chunk_size not in (32, 64):
