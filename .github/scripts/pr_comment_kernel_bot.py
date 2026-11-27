@@ -456,6 +456,9 @@ def review_gate_error(
     """Return why `command` must not run on the current head, or None if it may."""
     if command not in REVIEW_GATED_COMMANDS:
         return None
+    # Upload retries for merged PRs build the default branch in release mode.
+    if command == "merge-and-upload" and pull_request.get("merged"):
+        return None
     pr_author = (pull_request.get("user") or {}).get("login", "")
     if pr_author_is_trusted(api_base, token, pr_author):
         return None

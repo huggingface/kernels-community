@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -489,6 +490,69 @@ def test_gate_ignores_security_only(monkeypatch):
 def test_gate_covers_commands_that_run_pr_code(monkeypatch, command):
     _patch_review_gate(monkeypatch, reviews=[])
     assert bot.review_gate_error("api", "t", command, "maintainer", _external_pr(), 42)
+
+
+@pytest.mark.parametrize(
+    "command, merged, allowed",
+    [
+        ("merge-and-upload", True, True),
+        ("merge-and-upload", False, False),
+        ("build", True, False),
+        ("build-and-stage", True, False),
+        ("security-and-build", True, False),
+    ],
+)
+def test_review_gate_for_merged_pr(monkeypatch, command, merged, allowed):
+    _patch_review_gate(monkeypatch, reviews=[])
+    pr = {**_external_pr(), "merged": merged}
+    error = bot.review_gate_error("api", "t", command, "maintainer", pr, 42)
+    assert (error is None) is allowed
+
+
+def test_merged_external_pr_upload_retry_dispatches_release(monkeypatch):
+    monkeypatch.setattr(
+        bot,
+        "_resolve_context_from_env",
+        lambda: {
+            "token": "token",
+            "repository": "owner/repo",
+            "comment": "/kernel-bot merge-and-upload example",
+            "comment_id": 7,
+            "issue_number": 42,
+            "default_branch": "main",
+            "commenter": "maintainer",
+        },
+    )
+    _patch_review_gate(monkeypatch, reviews=[], permissions={"maintainer": "write"})
+    pr = {**_external_pr(), "state": "closed", "merged": True}
+    monkeypatch.setattr(bot, "get_pull_request", lambda *a, **k: pr)
+    monkeypatch.setattr(bot, "try_post_issue_comment_reaction", lambda *a, **k: True)
+    monkeypatch.setattr(bot, "preflight_external_uploads", lambda *a, **k: [])
+    monkeypatch.setattr(bot, "try_create_issue_comment", lambda *a, **k: {"id": 8})
+    monkeypatch.setattr(bot, "try_send_issue_comment", lambda *a, **k: True)
+    monkeypatch.setattr(bot, "resolve_dispatch_run_urls", lambda *a, **k: None)
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("upload retries must not merge again or require a review")
+
+    monkeypatch.setattr(bot, "merge_pull_request", unexpected)
+    monkeypatch.setattr(bot, "list_pull_request_reviews", unexpected)
+    monkeypatch.setattr(bot, "try_post_issue_comment", unexpected)
+    dispatched = []
+
+    def fake_dispatch(*args, **kwargs):
+        dispatched.append(kwargs)
+        return SimpleNamespace(
+            notes=[], dispatched=[], failed=[], security_dispatched=[], security_failed=[]
+        )
+
+    monkeypatch.setattr(bot, "dispatch", fake_dispatch)
+    assert bot.main() == 0
+    assert len(dispatched) == 1
+    assert dispatched[0]["ref"] == "main"
+    assert dispatched[0]["pr_number"] == ""
+    assert dispatched[0]["mode"] == "release"
+    assert dispatched[0]["upload"] is True
 
 
 def test_gate_denies_when_reviews_cannot_be_listed(monkeypatch):
