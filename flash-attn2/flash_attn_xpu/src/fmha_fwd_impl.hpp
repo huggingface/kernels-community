@@ -207,6 +207,7 @@ struct FMHAConfig {
          args.is_rotary_interleaved},
         {},
         hw_info};
+    arguments.kernel.min_seqlen_q = args.min_seqlen_q;
 
     auto params = FMHAKernel::to_underlying_arguments(arguments, nullptr);
 

@@ -13,6 +13,7 @@
 
 #include "fmha_bwd_types.hpp"
 #include "kernel/fmha_bwd_kernel.hpp"
+#include "decode/grf_mode.hpp"
 
 using namespace cute;
 
@@ -1002,6 +1003,12 @@ struct BwdKernelLauncher {
     static constexpr int kNSGs = FABwdKernel::kNSGs;
     static constexpr int SubgroupSize = FABwdKernel::SubgroupSize;
     static constexpr int smem_size = FABwdKernel::smem_size;
+    // GRF sizes. Without a size (0 / 512), CRI gets the 512 of
+    // [general.xpu] cri-grf-size and other devices pick one; 256 is what
+    // they pick on BMG.
+    static constexpr int kGrfBwd =
+        (kHeadDim == 160 || kHeadDim == 192 || kHeadDim == 512) ? 512 : 256;
+    static constexpr int kGrfOdoCvt = kHeadDim <= 128 ? 0 : 256;
 
     cutlass::Status
     run(sycl::queue& queue, const fmha_bwd_args_t& args) {
@@ -1072,7 +1079,8 @@ struct BwdKernelLauncher {
         auto dimBlock0 = compat::dim3(size(kNSGs * SubgroupSize), size(1), size(1));
         compat::experimental::launch_properties launch_props0{};
         compat::experimental::kernel_properties kernel_props0{
-            sycl::ext::oneapi::experimental::sub_group_size<SubgroupSize>};
+            flash_xpu_grf::with_grf<kGrfOdoCvt>(
+                sycl::ext::oneapi::experimental::sub_group_size<SubgroupSize>)};
         compat::experimental::launch_policy policy0{dimGrid0, dimBlock0, launch_props0, kernel_props0};
         compat::experimental::launch<
             mha_dot_do_o<decltype(trait)>,
@@ -1099,7 +1107,8 @@ struct BwdKernelLauncher {
             sycl::ext::oneapi::experimental::work_group_scratch_size(smem_size),
         };
         compat::experimental::kernel_properties kernel_props1{
-            sycl::ext::oneapi::experimental::sub_group_size<SubgroupSize>};
+            flash_xpu_grf::with_grf<kGrfBwd>(
+                sycl::ext::oneapi::experimental::sub_group_size<SubgroupSize>)};
         compat::experimental::launch_policy policy1{dimGrid1, dimBlock1, launch_props1, kernel_props1};
         compat::experimental::launch<
             mha_backward_seq<decltype(trait)>,
@@ -1112,7 +1121,8 @@ struct BwdKernelLauncher {
         auto dimBlock2 = compat::dim3(size(kNSGs * SubgroupSize), size(1), size(1));
         compat::experimental::launch_properties launch_props2{};
         compat::experimental::kernel_properties kernel_props2{
-            sycl::ext::oneapi::experimental::sub_group_size<SubgroupSize>};
+            flash_xpu_grf::with_grf<kGrfOdoCvt>(
+                sycl::ext::oneapi::experimental::sub_group_size<SubgroupSize>)};
         compat::experimental::launch_policy policy2{dimGrid2, dimBlock2, launch_props2, kernel_props2};
         compat::experimental::launch<
             mhd_convert_dq<decltype(trait)>,

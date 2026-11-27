@@ -41,10 +41,10 @@ struct prefill_policy_head96 {
 
 // Xe2 (BMG / Arc Pro B60) tuned: smaller K tile + fewer subgroups to fit GRF.
 struct prefill_policy_head128 {
-  using ShapeQK = Shape<_128, _32, _32>;
-  using ShapePV = Shape<_128, _32, _32>;
-  using ShapeOut = Shape<_128, _128>;
-  using SubgroupLayoutQK = Layout<Shape<_8, _1, _1>>;
+  using ShapeQK = Shape<_256, _32, _32>;
+  using ShapePV = Shape<_256, _32, _32>;
+  using ShapeOut = Shape<_256, _128>;
+  using SubgroupLayoutQK = Layout<Shape<_16, _1, _1>>;
 };
 
 struct prefill_policy_head160 {

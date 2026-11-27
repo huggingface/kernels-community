@@ -2,7 +2,7 @@
   description = "Flake for flash-attn kernel";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/flatten-before-kernel-flake";
+    kernel-builder.url = "github:jiqing-feng/kernels/xpu-cri-grf-size";
   };
 
   outputs =
