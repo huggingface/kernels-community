@@ -61,6 +61,8 @@ so MX (per-row K-groups) and block-FP8 (128x128 blocks) are the same code path a
 divisors, and no new arm is needed to add a format whose scales tile the same way.
 """
 
+import inspect
+
 import torch
 import triton
 import triton.language as tl
@@ -73,9 +75,11 @@ from .compat import (
     device_context,
     get_accelerator_autotuning_configs,
     sm_count,
+    split_k_autotuning_configs,
 )
 from .descriptors import maybe_descriptor, rebind_dgrad_descriptors, rebind_dgrad_grouped_descriptors, weight_descriptor
-from .matmul import matmul_2d
+from . import batched, grouped, matmul, moe
+from .matmul import SPLIT_K_VALUES, matmul_2d, split_k_reduce, split_k_workspace
 from .pruners import (
     PATH_ANCHOR_AXES,
     block_within_dim_pruner,
@@ -83,14 +87,19 @@ from .pruners import (
     descriptor_support_pruner,
     dgrad_grouped_warps_pruner,
     compose_pruners,
+    int_split_k_pruner,
     smem_pruner,
     warp_spec_compile_guard_pruner,
+    warp_spec_small_act_box_pruner,
 )
 from .formats import global_scale_stride, normalize_global_scale, ue8m0_as_uint8
+from .swizzle import unswizzle_mx_scales
 from .quant import e2m1_cols_to_bf16, e2m1_cols_to_f32
 from .loading.scales import decode_group_scale
+from .mma import int_dequant_tile
 from .loading.tiles import load_grouped_act_tile, operand_tile_ptrs
-from .scheduling import build_tile_layout, resolve_grouped_tile
+from .norm import norm_column_factor
+from .scheduling import build_tile_layout, is_off_rank, resolve_grouped_tile
 
 
 # Internal: these are the gradient PRODUCTS, not API. Backward hangs off the forward ops via
@@ -141,32 +150,75 @@ def _dgrad_weight_tile(
     bf16, and the multiply is a cheap exponent shift), fp32 for the scalar reduce, which widens
     anyway and for which the bf16/E4M3 hop is pure cost. Single return; only the taken arm
     compiles."""
-    NG: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
-    if OUT_DTYPE == tl.float32:  # scalar-reduce arm: unpack straight to fp32, no narrow hop
+    TILE_GROUP: tl.constexpr = SCALE_GROUP_K if SCALE_GROUP_K < BLOCK_SIZE_K else BLOCK_SIZE_K  # a group wider than the tile
+    NG: tl.constexpr = BLOCK_SIZE_K // TILE_GROUP
+    if w_scale is None:  # full-precision weight
+        out = w.to(OUT_DTYPE)
+    elif OUT_DTYPE == tl.float32:  # scalar-reduce arm: unpack straight to fp32, no narrow hop
         vals = e2m1_cols_to_f32(w) if w.dtype == tl.uint8 else w.to(tl.float32)
         sc = decode_group_scale(w_scale).to(tl.float32)[:, :, None]
     else:  # MMA arm: dequantize in bf16, exactly as the forward's weight upcast does
         vals = e2m1_cols_to_bf16(w) if w.dtype == tl.uint8 else w.to(tl.bfloat16)
         sc = decode_group_scale(w_scale).to(tl.bfloat16)[:, :, None]
-    tile = vals.reshape(BLOCK_SIZE_N, NG, SCALE_GROUP_K) * sc
-    return tile.reshape(BLOCK_SIZE_N, BLOCK_SIZE_K).to(OUT_DTYPE)
+    if w_scale is not None:
+        out = (vals.reshape(BLOCK_SIZE_N, NG, TILE_GROUP) * sc).reshape(BLOCK_SIZE_N, BLOCK_SIZE_K).to(OUT_DTYPE)
+    return out
 
 
-@bayesian_autotune(
-    # Plain-dot loop over the N reduction — same physics as the full-precision 2D kernel (tile +
-    # WS), no memory-mode axis: the dequantize is in-tile so both operands read through pointers,
-    # and no COMPUTE_MODE axis because the scaled MMA cannot reduce over an unscaled axis.
-    get_accelerator_autotuning_configs(
+@triton.jit
+def _dgrad_scale_cols(pid_k, K, BLOCK_SIZE_K: tl.constexpr, SCALE_GROUP_K: tl.constexpr):
+    """The scale columns of K tile ``pid_k``, one per ``min(SCALE_GROUP_K, BLOCK_SIZE_K)`` sub-group: the tile's own
+    groups, or the one group it lies inside (repeated) when groups are wider than the tile."""
+    TILE_GROUP: tl.constexpr = SCALE_GROUP_K if SCALE_GROUP_K < BLOCK_SIZE_K else BLOCK_SIZE_K
+    starts = pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K // TILE_GROUP) * TILE_GROUP
+    return tl.minimum(starts // SCALE_GROUP_K, K // SCALE_GROUP_K - 1)
+
+
+@triton.jit
+def _dgrad_int_tile(w, w_scale, w_zero, divisor, BLOCK_SIZE_K: tl.constexpr, SCALE_GROUP_K: tl.constexpr,
+                    INT_BITS: tl.constexpr, OUT_DTYPE: tl.constexpr):
+    """One forward-oriented ``[BN, BK]`` integer weight tile from its ``[BN, BK // VPW]`` interleaved words, the value
+    the forward multiplies by: ``int_dequant_tile`` rounded in the scale dtype into ``OUT_DTYPE`` (the activation
+    dtype), or, under ModelOpt W4A8 (``divisor``: the second-level scale), into E4M3 against it."""
+    TILE_GROUP: tl.constexpr = SCALE_GROUP_K if SCALE_GROUP_K < BLOCK_SIZE_K else BLOCK_SIZE_K
+    if divisor is None:
+        out = tl.trans(int_dequant_tile(w, w_scale, w_zero, True, TILE_GROUP, INT_BITS, OUT_DTYPE))
+    else:
+        out = tl.trans(int_dequant_tile(w, w_scale, w_zero, True, TILE_GROUP, INT_BITS, tl.float8e4nv, divisor=divisor))
+        out = out.to(OUT_DTYPE)
+    return out
+
+
+# Decode band of the 2D dgrad's N split: the launch sizes its partials for these tiles.
+DGRAD_SPLIT_MAX_M = 256
+DGRAD_SPLIT_MAX_BLOCK_M = 64
+DGRAD_SPLIT_MIN_BLOCK = 16
+DGRAD_SPLIT_MAX_BLOCK_K = 512
+
+
+def _dgrad_2d_configs():
+    """The plain-dot grid, plus decode tiles splitting the N reduction: the output is only ``M x K``, so at decode a
+    ``K=2048`` dgrad runs 16 programs that each stream all of N (7168x2048 block FP8, M=1, B200: 48us unsplit)."""
+    configs = get_accelerator_autotuning_configs(
         tune_block_nk=True,
         tune_block_m=True,
         warp_spec=True,
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
         pre_hook=rebind_dgrad_descriptors,
-    ),
+    )
+    decode = [c for c in configs if c.kwargs["BLOCK_SIZE_M"] <= DGRAD_SPLIT_MAX_BLOCK_M and not c.kwargs["WARP_SPEC"]]
+    return configs + split_k_autotuning_configs(SPLIT_K_VALUES, decode)
+
+
+@bayesian_autotune(
+    # Plain-dot loop over the N reduction — same physics as the full-precision 2D kernel (tile +
+    # WS), no memory-mode axis: the dequantize is in-tile so both operands read through pointers,
+    # and no COMPUTE_MODE axis because the scaled MMA cannot reduce over an unscaled axis.
+    _dgrad_2d_configs(),
     ["N", "K", "m_bit_length"],
     n_trials=100,
-    path_anchor_axes=PATH_ANCHOR_AXES,
+    path_anchor_axes=(*PATH_ANCHOR_AXES, "SPLIT_K"),
     finite_check_args=("C",),
     prune_configs_by={
         "early_config_prune": compose_pruners(
@@ -174,10 +226,13 @@ def _dgrad_weight_tile(
             config_filter(  # the scale row advances by BN // SCALE_ROW_DIV — must be whole
                 lambda c, a: c.kwargs["BLOCK_SIZE_N"] % max(a.get("SCALE_ROW_DIV", 1), 1) == 0
             ),
-            config_filter(  # BK below one scale group gives NG=0 -> tl.arange(0, 0)
-                lambda c, a: c.kwargs["BLOCK_SIZE_K"] % max(a.get("SCALE_GROUP_K", 1), 1) == 0
+            config_filter(  # a K tile holds whole scale groups, or lies inside one (per-channel INT, wide groups)
+                lambda c, a: c.kwargs["BLOCK_SIZE_K"] % a.get("SCALE_GROUP_K", 1) == 0
+                or a.get("SCALE_GROUP_K", 1) % c.kwargs["BLOCK_SIZE_K"] == 0
             ),
+            int_split_k_pruner("M", DGRAD_SPLIT_MAX_M, dim="N", tile="BLOCK_SIZE_N"),
             warp_spec_compile_guard_pruner(),
+            warp_spec_small_act_box_pruner(),
             descriptor_support_pruner(),
             smem_pruner("BLOCK_SIZE_K"),
         )
@@ -190,8 +245,12 @@ def dgrad_matmul_2d_kernel(
     B,  # (N, K) quantized weight, K-contiguous — read in its FORWARD orientation
     BDescriptor,  # host TMA descriptor over B, box (BN, BK_bytes); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (N // SCALE_ROW_DIV, K // SCALE_GROUP_K) weight scales
-    BsGlobal,  # fp32 NVFP4 second-level weight global; folded on the accumulator, None folds out
+    Bz,  # (N, K // SCALE_GROUP_K) integer zero points; None for a symmetric or non-integer weight
+    BsGlobal,  # fp32 NVFP4 / W4A8 second-level weight scale; folded on the accumulator, None folds out
     C,  # (M, K) output gradient
+    Perm,  # (K,) act-order K order: column j of the product is stored at Perm[j]; None = natural
+    Partials,  # (SPLIT_K_MAX, tiles, BM, BK) fp32 split partial sums; read iff SPLIT_K > 1
+    TileCounters,  # (tiles,) int32 split arrival counters, zero between launches; read iff SPLIT_K > 1
     # Shape
     M,
     N,
@@ -204,6 +263,8 @@ def dgrad_matmul_2d_kernel(
     stride_b_k,
     stride_bs_n,
     stride_bs_k,
+    stride_bz_n,
+    stride_bz_k,
     stride_c_m,
     stride_c_k,
     # Format
@@ -217,6 +278,8 @@ def dgrad_matmul_2d_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     WARP_SPEC: tl.constexpr,
+    SPLIT_K: tl.constexpr = 1,  # decode: the N reduction split across SPLIT_K programs (grid axis 2), reduced in-kernel
+    INT_BITS: tl.constexpr = 0,  # integer weight width; 0: E2M1 / E4M3 / full-precision weight
 ):
     pid_m = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -228,26 +291,25 @@ def dgrad_matmul_2d_kernel(
         + tl.arange(0, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE),
         K // WEIGHT_VALUES_PER_BYTE - 1,
     )
-    offs_kg = tl.minimum(
-        (pid_k * BLOCK_SIZE_K) // SCALE_GROUP_K + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K),
-        K // SCALE_GROUP_K - 1,
-    )
+    offs_kg = _dgrad_scale_cols(pid_k, K, BLOCK_SIZE_K, SCALE_GROUP_K)
     m_mask = offs_m < M
     k_mask = offs_k < K
 
     # BLOCK_SIZE_N divides N (block_within_dim_pruner), so the reduction loop is EXACT: no tail
     # mask on the activation, no clamp on the weight rows, and the addresses advance by a constant
     # stride instead of being rebuilt from offsets each step — the forward's loop shape.
-    offs_n0 = tl.arange(0, BLOCK_SIZE_N)
+    split = tl.program_id(2) if SPLIT_K > 1 else 0
+    offs_n0 = split * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     # SWAP_AB is the WEIGHT's viewpoint, inverted for activations: True = rows-major [BM, BN]
     dy_ptrs = operand_tile_ptrs(A, offs_m, offs_n0, stride_a_m, stride_a_n, A_MEMORY_MODE, True)
     b_ptrs = operand_tile_ptrs(B, offs_n0, offs_kb, stride_b_n, stride_b_k, B_MEMORY_MODE, True)
-    bs_ptrs = (
-        Bs + (offs_n0[:, None] // SCALE_ROW_DIV) * stride_bs_n + offs_kg[None, :] * stride_bs_k
-    )
+    if Bs is not None:
+        bs_ptrs = Bs + (offs_n0[:, None] // SCALE_ROW_DIV) * stride_bs_n + offs_kg[None, :] * stride_bs_k
+    if Bz is not None:
+        bz_ptrs = Bz + offs_n0[:, None] * stride_bz_n + offs_kg[None, :] * stride_bz_k
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_K), dtype=tl.float32)
-    for n in tl.range(0, tl.cdiv(N, BLOCK_SIZE_N), warp_specialize=WARP_SPEC):
+    for n in tl.range(split, tl.cdiv(N, BLOCK_SIZE_N), SPLIT_K, warp_specialize=WARP_SPEC):
         n_off = n * BLOCK_SIZE_N
         dy = load_grouped_act_tile(
             dy_ptrs, ADescriptor, pid_m * BLOCK_SIZE_M, n_off, m_mask, 0, A_MEMORY_MODE
@@ -258,28 +320,42 @@ def dgrad_matmul_2d_kernel(
             pid_k * (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE),
             BLOCK_SIZE_N, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE, B_MEMORY_MODE,
         )
-        w_scale = tl.load(bs_ptrs)
-        accumulator += tl.dot(
-            dy.to(tl.bfloat16),
-            _dgrad_weight_tile(
-                w, w_scale, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, tl.bfloat16
-            ),
+        w_scale = tl.load(bs_ptrs) if Bs is not None else None
+        if INT_BITS:
+            w_zero = tl.load(bz_ptrs) if Bz is not None else None
+            divisor = tl.load(BsGlobal) if BsGlobal is not None else None
+            accumulator += tl.dot(dy, _dgrad_int_tile(w, w_scale, w_zero, divisor, BLOCK_SIZE_K, SCALE_GROUP_K, INT_BITS, dy.dtype))
+        else:
+            accumulator += tl.dot(
+                dy.to(tl.bfloat16),
+                _dgrad_weight_tile(w, w_scale, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, tl.bfloat16),
+            )
+        dy_ptrs += SPLIT_K * BLOCK_SIZE_N * stride_a_n
+        b_ptrs += SPLIT_K * BLOCK_SIZE_N * stride_b_n
+        if Bs is not None:
+            bs_ptrs += SPLIT_K * (BLOCK_SIZE_N // SCALE_ROW_DIV) * stride_bs_n
+        if Bz is not None:
+            bz_ptrs += SPLIT_K * BLOCK_SIZE_N * stride_bz_n
+
+    if SPLIT_K > 1:
+        accumulator, last = split_k_reduce(
+            accumulator, Partials, TileCounters, pid_m * tl.num_programs(1) + pid_k,
+            tl.num_programs(0) * tl.num_programs(1), BLOCK_SIZE_M, BLOCK_SIZE_K, SPLIT_K,
         )
-        dy_ptrs += BLOCK_SIZE_N * stride_a_n
-        b_ptrs += BLOCK_SIZE_N * stride_b_n
-        bs_ptrs += (BLOCK_SIZE_N // SCALE_ROW_DIV) * stride_bs_n
+    else:
+        last = True
+    if last:
+        if BsGlobal is not None:  # the second-level scale: one matrix, so one value
+            accumulator = accumulator * tl.load(BsGlobal)
+        cols = tl.load(Perm + offs_k, mask=k_mask, other=0) if Perm is not None else offs_k
+        tl.store(
+            C + offs_m.to(tl.int64)[:, None] * stride_c_m + cols[None, :] * stride_c_k,
+            accumulator.to(C.dtype.element_ty),
+            mask=m_mask[:, None] & k_mask[None, :],
+        )
 
-    if BsGlobal is not None:  # NVFP4's second level — one matrix, so one value
-        accumulator = accumulator * tl.load(BsGlobal)
 
-    tl.store(
-        C + offs_m.to(tl.int64)[:, None] * stride_c_m + offs_k[None, :] * stride_c_k,
-        accumulator.to(C.dtype.element_ty),
-        mask=m_mask[:, None] & k_mask[None, :],
-    )
-
-
-@compile_time_only_triton_op("finegrained::dgrad_matmul_2d", mutates_args=())
+@compile_time_only_triton_op(add_op_namespace_prefix("dgrad_matmul_2d"), mutates_args=())
 def dgrad_matmul_2d(
     dY: torch.Tensor,
     W: torch.Tensor,
@@ -288,6 +364,9 @@ def dgrad_matmul_2d(
     scale_row_div: int,
     output_dtype: torch.dtype | None = None,
     w_global_scale: torch.Tensor | None = None,
+    w_zero: torch.Tensor | None = None,
+    perm: torch.Tensor | None = None,
+    int_bits: int = 0,
 ) -> torch.Tensor:
     """``dX = dY @ W`` against the FORWARD-oriented quantized weight — the gradient a frozen
     quantized base weight passes to whatever trains in front of it (LoRA adapters, earlier
@@ -295,10 +374,11 @@ def dgrad_matmul_2d(
 
     ``W`` is ``(N, K)`` exactly as the forward holds it; nothing is transposed or re-quantized.
     ``scale_group_k``/``scale_row_div`` describe the scale grid (MX: ``32, 1``; block-FP8:
-    ``128, 128``), which is the only thing that differs between formats."""
+    ``128, 128``), which is the only thing that differs between formats. An integer weight (``int_bits``) is its
+    interleaved uint32 words, with ``w_zero`` its zero points and ``perm`` its act-order K order."""
     assert dY.ndim == 2 and W.ndim == 2, f"expected 2D operands, got {dY.ndim}D and {W.ndim}D"
     M, N = dY.shape
-    values_per_byte = 2 if W.dtype == torch.uint8 else 1
+    values_per_byte = 32 // int_bits if int_bits else 2 if W.dtype == torch.uint8 else 1
     K = W.shape[1] * values_per_byte
     assert W.shape[0] == N, f"weight rows {W.shape[0]} != dY's N {N}"
     assert K % scale_group_k == 0, (
@@ -309,7 +389,18 @@ def dgrad_matmul_2d(
     grid = lambda META: (  # noqa: E731
         triton.cdiv(M, META["BLOCK_SIZE_M"]),
         triton.cdiv(K, META["BLOCK_SIZE_K"]),
+        META.get("SPLIT_K", 1),
     )
+    # split scratch (int_split_k_pruner): partials for the widest split over the split tiles' padded grid, counters
+    # for the narrowest tile's grid
+    partials = counters = None
+    if M <= DGRAD_SPLIT_MAX_M:
+        partials, counters = split_k_workspace(
+            dY.device,
+            SPLIT_K_VALUES[-1] * triton.cdiv(M, DGRAD_SPLIT_MAX_BLOCK_M) * DGRAD_SPLIT_MAX_BLOCK_M
+            * triton.cdiv(K, DGRAD_SPLIT_MAX_BLOCK_K) * DGRAD_SPLIT_MAX_BLOCK_K,
+            triton.cdiv(M, DGRAD_SPLIT_MIN_BLOCK) * triton.cdiv(K, DGRAD_SPLIT_MIN_BLOCK),
+        )
     with device_context(dY.device):
         # built INSIDE the device context: the tensormap is created against the CURRENT context,
         # so constructing it before the switch fails as "invalid device context" whenever the
@@ -323,8 +414,12 @@ def dgrad_matmul_2d(
             W,
             b_descriptor,
             Ws,
+            w_zero,
             w_global_scale,
             dX,
+            perm,
+            partials,
+            counters,
             M,
             N,
             K,
@@ -333,13 +428,14 @@ def dgrad_matmul_2d(
             dY.stride(1),
             W.stride(0),
             W.stride(1),
-            Ws.stride(0),
-            Ws.stride(1),
+            *_scale_strides(Ws, 2),
+            *_scale_strides(w_zero, 2),
             dX.stride(0),
             dX.stride(1),
             SCALE_GROUP_K=scale_group_k,
             SCALE_ROW_DIV=scale_row_div,
             WEIGHT_VALUES_PER_BYTE=values_per_byte,
+            INT_BITS=int_bits,
         )
     return dX
 
@@ -360,10 +456,6 @@ def dgrad_matmul_2d(
     n_trials=100,
     path_anchor_axes=PATH_ANCHOR_AXES,
     finite_check_args=("C",),
-    # C is ACCUMULATED into (tl.atomic_add: several routed rows share a source token), so the
-    # kernel is not idempotent. Benchmarking calls each config many times against one buffer, and
-    # without this every repetition adds again — the tune reads a correct kernel as 1.7e5x wrong.
-    reset_to_zero=("C",),
     prune_configs_by={
         "early_config_prune": compose_pruners(
             dgrad_grouped_warps_pruner(),
@@ -371,8 +463,9 @@ def dgrad_matmul_2d(
             config_filter(  # the scale row advances by BN // SCALE_ROW_DIV — must be whole
                 lambda c, a: c.kwargs["BLOCK_SIZE_N"] % max(a.get("SCALE_ROW_DIV", 1), 1) == 0
             ),
-            config_filter(  # BK below one scale group gives NG=0 -> tl.arange(0, 0)
-                lambda c, a: c.kwargs["BLOCK_SIZE_K"] % max(a.get("SCALE_GROUP_K", 1), 1) == 0
+            config_filter(  # a K tile holds whole scale groups, or lies inside one (per-channel INT, wide groups)
+                lambda c, a: c.kwargs["BLOCK_SIZE_K"] % a.get("SCALE_GROUP_K", 1) == 0
+                or a.get("SCALE_GROUP_K", 1) % c.kwargs["BLOCK_SIZE_K"] == 0
             ),
             warp_spec_compile_guard_pruner(),
             descriptor_support_pruner(),
@@ -387,11 +480,14 @@ def dgrad_matmul_grouped_kernel(
     B,  # (E, N, K) quantized weights, K-contiguous — the forward orientation
     BDescriptor,  # host TMA descriptor over B, box (1, BN, BK_bytes)
     Bs,  # (E, N // SCALE_ROW_DIV, K // SCALE_GROUP_K) weight scales
-    BsGlobal,  # fp32 NVFP4 weight global, per tensor or per expert; folded on the accumulator
+    Bz,  # (E, N, K // SCALE_GROUP_K) integer zero points; None for a symmetric or non-integer weight
+    BsGlobal,  # fp32 NVFP4 / W4A8 second-level weight scale, per tensor or per expert; folded on the accumulator
     stride_bs_global,  # expert stride of BsGlobal (0 broadcasts a scalar)
     C,  # (S, K) output gradient, written in the forward's INPUT row order
+    Perm,  # (E, K) act-order K orders: column j of an expert's product is stored at Perm[e, j]; None = natural
     GatherIdx,  # (S,) sorted position -> source row of the forward's A
     ScatterIdx,  # (S,) sorted position -> destination row of the forward's C
+    RoutedIdx,  # (S,) sorted position -> its token-major routed row, for a gather-only launch; else None
     ExpertStart,  # (NUM_EXPERTS_POW2 + 1,) cumulative row starts, S sentinel
     # Shape
     S,
@@ -407,6 +503,10 @@ def dgrad_matmul_grouped_kernel(
     stride_bs_e,
     stride_bs_n,
     stride_bs_k,
+    stride_bz_e,
+    stride_bz_n,
+    stride_bz_k,
+    stride_perm_e,
     stride_c_m,
     stride_c_k,
     # Format
@@ -422,7 +522,8 @@ def dgrad_matmul_grouped_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     WARP_SPEC: tl.constexpr,
     B_MEMORY_MODE: tl.constexpr,
-    ROUTED_OUT: tl.constexpr = False,
+    STORE: tl.constexpr = "position",
+    INT_BITS: tl.constexpr = 0,  # integer weight width; 0: E2M1 / E4M3 / full-precision weight
 ):
     """Grouped dgrad. The tile resolver is reused verbatim with K-tiles in its N-tile slot —
     it is generic in that second axis, so ``offs_bn`` comes back as this kernel's K offsets and
@@ -459,12 +560,8 @@ def dgrad_matmul_grouped_kernel(
             + tl.arange(0, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE),
             K // WEIGHT_VALUES_PER_BYTE - 1,
         )
-        offs_kg = tl.minimum(
-            (pid_k * BLOCK_SIZE_K) // SCALE_GROUP_K + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K),
-            K // SCALE_GROUP_K - 1,
-        )
+        offs_kg = _dgrad_scale_cols(pid_k, K, BLOCK_SIZE_K, SCALE_GROUP_K)
         b_base = B + expert_id64 * stride_b_e
-        bs_base = Bs + expert_id64 * stride_bs_e
 
         # exact N-loop (BLOCK_SIZE_N divides N): maskless weight, constant-stride advance
         offs_n0 = tl.arange(0, BLOCK_SIZE_N)
@@ -478,11 +575,15 @@ def dgrad_matmul_grouped_kernel(
         b_ptrs = operand_tile_ptrs(
             b_base, offs_n0, offs_kb, stride_b_n, stride_b_k, B_MEMORY_MODE, True
         )
-        bs_ptrs = (
-            bs_base
-            + (offs_n0[:, None] // SCALE_ROW_DIV) * stride_bs_n
-            + offs_kg[None, :] * stride_bs_k
-        )
+        if Bs is not None:
+            bs_ptrs = (
+                Bs + expert_id64 * stride_bs_e
+                + (offs_n0[:, None] // SCALE_ROW_DIV) * stride_bs_n
+                + offs_kg[None, :] * stride_bs_k
+            )
+        if Bz is not None:
+            bz_ptrs = Bz + expert_id64 * stride_bz_e + offs_n0[:, None] * stride_bz_n + offs_kg[None, :] * stride_bz_k
+        divisor = tl.load(BsGlobal + expert_id64 * stride_bs_global) if INT_BITS and BsGlobal is not None else None
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_K), dtype=tl.float32)
         for n in tl.range(0, tl.cdiv(N, BLOCK_SIZE_N), warp_specialize=WARP_SPEC):
@@ -501,55 +602,53 @@ def dgrad_matmul_grouped_kernel(
                 pid_k * (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE),
                 BLOCK_SIZE_N, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE, B_MEMORY_MODE, True,
             )
-            w_scale = tl.load(bs_ptrs)
-            accumulator += tl.dot(
-                dy.to(tl.bfloat16),
-                _dgrad_weight_tile(
-                    w, w_scale, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, tl.bfloat16
-                ),
-            )
+            w_scale = tl.load(bs_ptrs) if Bs is not None else None
+            if INT_BITS:
+                w_zero = tl.load(bz_ptrs) if Bz is not None else None
+                accumulator += tl.dot(dy, _dgrad_int_tile(w, w_scale, w_zero, divisor, BLOCK_SIZE_K, SCALE_GROUP_K, INT_BITS, dy.dtype))
+            else:
+                accumulator += tl.dot(
+                    dy.to(tl.bfloat16),
+                    _dgrad_weight_tile(w, w_scale, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, tl.bfloat16),
+                )
             dy_ptrs += BLOCK_SIZE_N * stride_a_n
             b_ptrs += BLOCK_SIZE_N * stride_b_n
-            bs_ptrs += (BLOCK_SIZE_N // SCALE_ROW_DIV) * stride_bs_n
+            if Bs is not None:
+                bs_ptrs += (BLOCK_SIZE_N // SCALE_ROW_DIV) * stride_bs_n
+            if Bz is not None:
+                bz_ptrs += BLOCK_SIZE_N * stride_bz_n
 
-        # Fallback when the rows are NOT token-major (no scatter map): accumulate straight into
-        # the source token. `in_row` is that token, and with top_k > 1 several routed rows share
-        # one, so a store would keep whichever tile landed last and drop the rest — invisible to
-        # any test whose gather map is the identity (S == M), which is how it survived one.
-        #
-        # The FORWARD reduces without atomics (`weighted_reduce`: (S, H) -> (T, H)) — but its
-        # routed-space tensor already exists, because the down GEMM's natural output IS (S, H), and
-        # its reduce also applies routing weights and skips EP sentinels, which an atomic could not
-        # express. dgrad is the transpose: its natural output is SOURCE space, so mirroring the
-        # forward would mean materializing a (S, K) buffer purely to avoid atomics.
-        #
-        # Measured and rejected: store-into-(S, K) + index_add_ ran 4038 vs 4181us at DSV3 top_k=8
-        # (-3.4%), 1278 vs 1294 at GPT-OSS top_k=4, and SLOWER at decode (411 vs 404) — to buy that
-        # you pay a top_k x fp32 intermediate, ~940MB at DSV3 shapes. top_k-way contention is not
-        # the bottleneck here; the GEMM is.
-        if BsGlobal is not None:  # NVFP4's second level, this tile's expert
+        if BsGlobal is not None:  # the second-level scale, this tile's expert
             accumulator = accumulator * tl.load(BsGlobal + expert_id64 * stride_bs_global)
 
-        if ROUTED_OUT:
-            # Plain store at the TOKEN-MAJOR routed row (`out_row`), then the caller sums the
-            # top_k rows per token. This is the FORWARD's shape — it stores routed rows and
-            # reduces them with `weighted_reduce` — and it is 1.40x faster than atomics at DSV3
-            # top_k=8 (3003 vs 4215us), 1.13x at GPT-OSS top_k=4, break-even at decode. top_k-way
-            # atomic contention is the difference; the reduce itself is nearly free.
-            tl.store(
-                C + out_row.to(tl.int64)[:, None] * stride_c_m + offs_k[None, :] * stride_c_k,
-                accumulator,
-                mask=row_mask[:, None] & (offs_k[None, :] < K),
-            )
-        else:
-            tl.atomic_add(
-                C + in_row.to(tl.int64)[:, None] * stride_c_m + offs_k[None, :] * stride_c_k,
-                accumulator,
-                mask=row_mask[:, None] & (offs_k[None, :] < K),
-            )
+        k_mask = offs_k < K
+        cols = tl.load(Perm + expert_id64 * stride_perm_e + offs_k, mask=k_mask, other=0) if Perm is not None else offs_k
+        _store_dgrad_rows(C, accumulator, in_row, out_row, row_mask, cols, k_mask, stride_c_m, stride_c_k, RoutedIdx, STORE)
 
 
-@compile_time_only_triton_op("finegrained::dgrad_matmul_grouped", mutates_args=())
+@triton.jit
+def _store_dgrad_rows(C, accumulator, in_row, out_row, row_mask, cols, col_mask, stride_c_m, stride_c_k,
+                      RoutedIdx, STORE: tl.constexpr):
+    """Store a dgrad tile where its rows' gradients belong, each row exactly once, no atomics:
+    - ``"routed"``: each position's TOKEN-MAJOR routed row (``out_row`` with a scatter map, ``RoutedIdx`` of a
+      gather-only launch), so the caller sums each token's top_k rows contiguously: the forward's own shape
+      (``weighted_reduce``), 1.40x faster than atomics at DeepSeek-V3 top_k=8 (3003 vs 4215 us).
+    - ``"position"``: ``in_row``, the sorted position of a scatter-only launch or the source row of a gather
+      that is a permutation (one position per input row)."""
+    if STORE == "position":
+        row = in_row
+    elif RoutedIdx is not None:
+        row = tl.load(RoutedIdx + out_row, mask=row_mask, other=0)
+    else:
+        row = out_row
+    tl.store(
+        C + row.to(tl.int64)[:, None] * stride_c_m + cols[None, :] * stride_c_k,
+        accumulator,
+        mask=row_mask[:, None] & col_mask[None, :],
+    )
+
+
+@compile_time_only_triton_op(add_op_namespace_prefix("dgrad_matmul_grouped"), mutates_args=())
 def dgrad_matmul_grouped(
     dY: torch.Tensor,
     W: torch.Tensor,
@@ -562,16 +661,23 @@ def dgrad_matmul_grouped(
     output_dtype: torch.dtype | None = None,
     num_input_rows: int | None = None,
     w_global_scale: torch.Tensor | None = None,
+    routed_idx: torch.Tensor | None = None,
+    w_zero: torch.Tensor | None = None,
+    perm: torch.Tensor | None = None,
+    int_bits: int = 0,
 ) -> torch.Tensor:
     """Routed ``dX = dY @ W[expert]`` over expert-sorted positions — the MoE counterpart of
     ``dgrad_matmul_2d``.
 
     ``gather_idx`` / ``scatter_idx`` are the FORWARD's maps, passed unchanged: the kernel swaps
     their roles itself (reads ``dY`` at the forward's scatter destination, writes ``dX`` at its
-    gather source), so callers hand over the same two tensors the forward got."""
+    gather source), so callers hand over the same two tensors the forward got. A gathered launch sums each
+    token's top_k rows, so it needs them token-major: its scatter map, or ``routed_idx`` (each position's
+    token-major routed row, the chain's scatter map) when it has none. An integer weight (``int_bits``) is its
+    interleaved uint32 words, with ``w_zero`` its zero points and ``perm`` its per-expert act-order K orders."""
     assert dY.ndim == 2 and W.ndim == 3, f"expected (S,N) and (E,N,K), got {dY.shape}, {W.shape}"
     S, N = dY.shape
-    values_per_byte = 2 if W.dtype == torch.uint8 else 1
+    values_per_byte = 32 // int_bits if int_bits else 2 if W.dtype == torch.uint8 else 1
     K = W.shape[2] * values_per_byte
     assert W.shape[1] == N, f"weight N {W.shape[1]} != dY's N {N}"
     assert K % scale_group_k == 0, (
@@ -580,15 +686,16 @@ def dgrad_matmul_grouped(
 
     num_experts = W.shape[0]
     num_sms = sm_count(dY.device.index)
-    # (num_input_rows, K), ZERO-initialised: the kernel accumulates each routed row's gradient
-    # into its source token, so the buffer is indexed in SOURCE space and must start empty.
-    # fp32 because that is what tl.atomic_add takes.
     rows = S if num_input_rows is None else num_input_rows
-    # Token-major store + a top_k sum beats atomics whenever the scatter map makes the rows
-    # token-major (see the kernel). It costs a top_k x fp32 intermediate, which is why the atomic
-    # arm stays as the fallback for gather-only launches.
-    routed_out = scatter_idx is not None and rows > 0 and S % rows == 0
-    dX = torch.zeros(S if routed_out else rows, K, device=dY.device, dtype=torch.float32)
+    # a gather that is a permutation (one position per input row) has nothing to sum: each position stores at its
+    # gather source; otherwise every position stores token-major and the top_k rows are summed below
+    store = "position" if gather_idx is None or rows == S else "routed"
+    assert store == "position" or scatter_idx is not None or routed_idx is not None, (
+        "a gathered launch needs a token-major map: its scatter map or routed_idx"
+    )
+    assert store == "position" or S % rows == 0, f"{S} positions are not top_k rows of {rows} tokens"
+    # zero-initialised: the EP sentinel positions are never stored
+    dX = torch.zeros(S, K, device=dY.device, dtype=torch.float32)
     with device_context(dY.device):
         # inside the context — see dgrad_matmul_2d; placeholder boxes, rebound by the pre_hook
         a_descriptor = maybe_descriptor(dY, [1, 128])
@@ -599,11 +706,14 @@ def dgrad_matmul_grouped(
             W,
             b_descriptor,
             Ws,
+            w_zero,
             w_global_scale,
             global_scale_stride(w_global_scale),
             dX,
+            perm,
             gather_idx,
             scatter_idx,
+            routed_idx if store == "routed" and scatter_idx is None else None,
             expert_start,
             S,
             N,
@@ -614,9 +724,9 @@ def dgrad_matmul_grouped(
             W.stride(0),
             W.stride(1),
             W.stride(2),
-            Ws.stride(0),
-            Ws.stride(1),
-            Ws.stride(2),
+            *_scale_strides(Ws, 3),
+            *_scale_strides(w_zero, 3),
+            perm.stride(0) if perm is not None else 0,
             dX.stride(0),
             dX.stride(1),
             SCALE_GROUP_K=scale_group_k,
@@ -624,9 +734,10 @@ def dgrad_matmul_grouped(
             WEIGHT_VALUES_PER_BYTE=values_per_byte,
             NUM_EXPERTS_POW2=triton.next_power_of_2(num_experts),
             NUM_SMS=num_sms,
-            ROUTED_OUT=routed_out,
+            STORE=store,
+            INT_BITS=int_bits,
         )
-    if routed_out:
+    if store == "routed":
         dX = dX.view(rows, S // rows, K).sum(1)
     return dX.to(output_dtype or dY.dtype)
 
@@ -732,6 +843,82 @@ def glu_backward(
     return dZ
 
 
+@triton.jit
+def _weighted_reduce_backward_kernel(
+    DY,  # (num_groups, H) upstream gradient of the reduced rows
+    Rows,  # (num_groups * NUM_TOP_K, H) the forward's rows, group-major
+    Ids,  # (num_groups * NUM_TOP_K,) per-row id; an ``is_off_rank`` row is skipped
+    Weights,  # (num_groups * NUM_TOP_K,) per-row routing weight
+    NormWeight,  # (H,) fused norm weight; None folds the arm out
+    NormInv,  # (num_groups * NUM_TOP_K,) the forward's per-row rsqrt
+    DRows,  # (num_groups * NUM_TOP_K, H) out: gradient of the rows
+    DWeights,  # (num_groups * NUM_TOP_K,) out: gradient of the routing weights
+    H,
+    stride_dy_m,
+    stride_rows_m,
+    stride_drows_m,
+    NUM_TOP_K: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    NORM: tl.constexpr = None,
+):
+    """``weighted_reduce``'s backward, one program per row ``r`` of group ``g = r // NUM_TOP_K``. Both gradients share
+    one reduction, ``R = sum_h dY[g] * x * factor`` (factor 1 without a norm):
+    - ``dWeights[r] = inv * R``;
+    - ``DRows[r] = w * dY[g] * factor * inv``, plus under a norm the term through ``inv``,
+      ``-w * R * inv**3 / H * x`` (times ``factor**2`` in the input-scaled form, whose rsqrt is over ``x * factor``).
+    A sentinel row's values and rsqrt are masked at the load: they were never written."""
+    r = tl.program_id(0).to(tl.int64)
+    kept = ~is_off_rank(tl.load(Ids + r), NUM_EXPERTS)
+    weight = tl.where(kept, tl.load(Weights + r).to(tl.float32), 0.0)
+    inv = 1.0
+    if NORM is not None:
+        inv = tl.load(NormInv + r, mask=kept, other=0.0).to(tl.float32)
+    dy_row = DY + (r // NUM_TOP_K) * stride_dy_m
+    acc = tl.zeros((BLOCK_H,), tl.float32)
+    for h in range(0, H, BLOCK_H):
+        offs_h = h + tl.arange(0, BLOCK_H)
+        mask = offs_h < H
+        dy = tl.load(dy_row + offs_h, mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(Rows + r * stride_rows_m + offs_h, mask=mask & kept, other=0.0).to(tl.float32)
+        if NORM is not None:
+            x = x * norm_column_factor(NormWeight, offs_h, mask, NORM)
+        acc += dy * x
+    reduced = tl.sum(acc, axis=0)
+    tl.store(DWeights + r, (inv * reduced).to(DWeights.dtype.element_ty))
+    through_inv = -weight * reduced * inv * inv * inv / H
+    for h in range(0, H, BLOCK_H):
+        offs_h = h + tl.arange(0, BLOCK_H)
+        mask = offs_h < H
+        d_row = weight * tl.load(dy_row + offs_h, mask=mask, other=0.0).to(tl.float32)
+        if NORM is not None:
+            x = tl.load(Rows + r * stride_rows_m + offs_h, mask=mask & kept, other=0.0).to(tl.float32)
+            factor = norm_column_factor(NormWeight, offs_h, mask, NORM)
+            if NORM == "input_scaled_rms_norm":
+                d_row = d_row * factor * inv + through_inv * x * factor * factor
+            else:
+                d_row = d_row * factor * inv + through_inv * x
+        tl.store(DRows + r * stride_drows_m + offs_h, d_row.to(DRows.dtype.element_ty), mask=mask)
+
+
+def _weighted_reduce_dgrad(ctx, dY, rows, top_k_index, top_k_weights, num_experts, norm, norm_inv, norm_weight):
+    """Row ``t*K + k`` is token ``t``'s ``k``-th route, so each row's upstream gradient is its token's: the rows' and
+    the routing weights' gradients in one pass per row (``_weighted_reduce_backward_kernel``)."""
+    rows, dY = rows.contiguous(), dY.contiguous()  # the kernel walks H at unit stride
+    num_rows = rows.shape[0]
+    d_rows = torch.empty_like(rows)
+    d_weights = torch.empty(num_rows, device=rows.device, dtype=top_k_weights.dtype)
+    with device_context(rows.device):
+        compile_time_only_triton_wrap(_weighted_reduce_backward_kernel)[(num_rows,)](
+            dY, rows, top_k_index.reshape(-1).contiguous(), top_k_weights.reshape(-1).contiguous(),
+            norm_weight, None if norm_inv is None else norm_inv.reshape(-1), d_rows, d_weights,
+            rows.shape[1], dY.stride(0), rows.stride(0), d_rows.stride(0),
+            NUM_TOP_K=top_k_index.shape[1], NUM_EXPERTS=num_experts,
+            BLOCK_H=min(triton.next_power_of_2(rows.shape[1]), 1024), NORM=norm, num_warps=4,
+        )
+    return {"rows": d_rows, "top_k_weights": d_weights.view_as(top_k_weights)}
+
+
 @bayesian_autotune(
     # Neither a BLOCK_SIZE_M nor a WARP_SPEC axis. One row per program (the rows are not
     # expert-sorted, so a tile cannot span them) and the reduce is FMA rather than MMA, so there is
@@ -752,14 +939,17 @@ def dgrad_matmul_batched_kernel(
     A,  # (S, N) upstream gradient
     B,  # (E, N, K) quantized weights, K-contiguous — the forward orientation
     Bs,  # (E, N // SCALE_ROW_DIV, K // SCALE_GROUP_K) weight scales
-    BsGlobal,  # fp32 NVFP4 weight global, per tensor or per expert; folded on the accumulator
+    Bz,  # (E, N, K // SCALE_GROUP_K) integer zero points; None for a symmetric or non-integer weight
+    BsGlobal,  # fp32 NVFP4 / W4A8 second-level weight scale, per tensor or per expert; folded on the accumulator
     stride_bs_global,  # expert stride of BsGlobal (0 broadcasts a scalar)
     C,  # (S, K) output gradient
-    ExpertIds,  # (S,) which expert each row routed to
+    Perm,  # (E, K) act-order K orders: column j of an expert's product is stored at Perm[e, j]; None = natural
+    ExpertIds,  # (S,) which expert each row routed to; an ``is_off_rank`` row (EP sentinel) gets a zero gradient
     # Shape
     S,
     N,
     K,
+    num_experts,
     # Strides
     stride_a_m,
     stride_a_n,
@@ -769,6 +959,10 @@ def dgrad_matmul_batched_kernel(
     stride_bs_e,
     stride_bs_n,
     stride_bs_k,
+    stride_bz_e,
+    stride_bz_n,
+    stride_bz_k,
+    stride_perm_e,
     stride_c_m,
     stride_c_k,
     # Format
@@ -778,6 +972,7 @@ def dgrad_matmul_batched_kernel(
     # Meta-parameters
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    INT_BITS: tl.constexpr = 0,  # integer weight width; 0: E2M1 / E4M3 / full-precision weight
 ):
     """Batched dgrad: ``dX[s] = dY[s] @ B[ExpertIds[s]]``.
 
@@ -788,6 +983,8 @@ def dgrad_matmul_batched_kernel(
     pid_k = tl.program_id(1)
     row_ok = pid_m < S
     expert_id = tl.load(ExpertIds + pid_m, mask=row_ok, other=0).to(tl.int64)
+    kept = ~is_off_rank(expert_id, num_experts)  # a sentinel names no local weight: no loop, a zero row
+    expert_id = tl.where(kept, expert_id, 0)
 
     offs_k = pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
     offs_kb = tl.minimum(
@@ -795,19 +992,15 @@ def dgrad_matmul_batched_kernel(
         + tl.arange(0, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE),
         K // WEIGHT_VALUES_PER_BYTE - 1,
     )
-    offs_kg = tl.minimum(
-        (pid_k * BLOCK_SIZE_K) // SCALE_GROUP_K + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K),
-        K // SCALE_GROUP_K - 1,
-    )
+    offs_kg = _dgrad_scale_cols(pid_k, K, BLOCK_SIZE_K, SCALE_GROUP_K)
     b_base = B + expert_id * stride_b_e
-    bs_base = Bs + expert_id * stride_bs_e
 
     # CUDA-core FMA reduce, NOT tl.dot: one row per program is an M=1 GEVM, and feeding the MMA a
     # broadcast [1, BN] operand runs it emulated at a fraction of peak. The forward reaches the same
     # conclusion for its decode path (``mx_weight_only_scalar_swapped``) — the scalar arm wins at
     # M=1 and the tuner picks it there. Same reduction, no MMA, no padded M dimension.
     accumulator = tl.zeros((BLOCK_SIZE_K,), dtype=tl.float32)
-    for n in tl.range(0, tl.cdiv(N, BLOCK_SIZE_N)):
+    for n in tl.range(0, tl.where(kept, tl.cdiv(N, BLOCK_SIZE_N), 0)):
         offs_n = n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         dy = tl.load(
             A + pid_m * stride_a_m + offs_n * stride_a_n,
@@ -817,26 +1010,27 @@ def dgrad_matmul_batched_kernel(
         offs_nc = tl.minimum(offs_n, N - 1)  # clamp: dy is already zeroed past N
         w = tl.load(b_base + offs_nc[:, None] * stride_b_n + offs_kb[None, :] * stride_b_k)
         w_scale = tl.load(
-            bs_base
-            + (offs_nc[:, None] // SCALE_ROW_DIV) * stride_bs_n
-            + offs_kg[None, :] * stride_bs_k
-        )
-        wdeq = _dgrad_weight_tile(
-            w, w_scale, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, tl.float32
-        )
+            Bs + expert_id * stride_bs_e + (offs_nc[:, None] // SCALE_ROW_DIV) * stride_bs_n + offs_kg[None, :] * stride_bs_k
+        ) if Bs is not None else None
+        if INT_BITS:
+            w_zero = tl.load(
+                Bz + expert_id * stride_bz_e + offs_nc[:, None] * stride_bz_n + offs_kg[None, :] * stride_bz_k
+            ) if Bz is not None else None
+            divisor = tl.load(BsGlobal + expert_id * stride_bs_global) if BsGlobal is not None else None
+            wdeq = _dgrad_int_tile(
+                w, w_scale, w_zero, divisor, BLOCK_SIZE_K, SCALE_GROUP_K, INT_BITS, A.dtype.element_ty
+            ).to(tl.float32)
+        else:
+            wdeq = _dgrad_weight_tile(w, w_scale, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, tl.float32)
         accumulator += tl.sum(dy[:, None] * wdeq, axis=0)
-
-    if BsGlobal is not None:  # NVFP4's second level, this row's expert
+    if BsGlobal is not None:  # the second-level scale, this row's expert
         accumulator = accumulator * tl.load(BsGlobal + expert_id * stride_bs_global)
-
-    tl.store(
-        C + pid_m * stride_c_m + offs_k * stride_c_k,
-        accumulator.to(C.dtype.element_ty),
-        mask=row_ok & (offs_k < K),
-    )
+    k_mask = row_ok & (offs_k < K)
+    cols = tl.load(Perm + expert_id * stride_perm_e + offs_k, mask=k_mask, other=0) if Perm is not None else offs_k
+    tl.store(C + pid_m * stride_c_m + cols * stride_c_k, accumulator.to(C.dtype.element_ty), mask=k_mask)
 
 
-@compile_time_only_triton_op("finegrained::dgrad_matmul_batched", mutates_args=())
+@compile_time_only_triton_op(add_op_namespace_prefix("dgrad_matmul_batched"), mutates_args=())
 def dgrad_matmul_batched(
     dY: torch.Tensor,
     W: torch.Tensor,
@@ -846,6 +1040,9 @@ def dgrad_matmul_batched(
     scale_row_div: int,
     output_dtype: torch.dtype | None = None,
     w_global_scale: torch.Tensor | None = None,
+    w_zero: torch.Tensor | None = None,
+    perm: torch.Tensor | None = None,
+    int_bits: int = 0,
 ) -> torch.Tensor:
     """``dX[s] = dY[s] @ W[expert_ids[s]]`` — the batched (per-row expert) counterpart of
     ``dgrad_matmul_grouped``. Registered because the batched experts forward is a SELECTABLE
@@ -853,7 +1050,7 @@ def dgrad_matmul_batched(
     silently produces no gradient."""
     assert dY.ndim == 2 and W.ndim == 3, f"expected (S,N) and (E,N,K), got {dY.shape}, {W.shape}"
     S, N = dY.shape
-    values_per_byte = 2 if W.dtype == torch.uint8 else 1
+    values_per_byte = 32 // int_bits if int_bits else 2 if W.dtype == torch.uint8 else 1
     K = W.shape[2] * values_per_byte
     assert W.shape[1] == N, f"weight N {W.shape[1]} != dY's N {N}"
 
@@ -861,14 +1058,17 @@ def dgrad_matmul_batched(
     grid = lambda META: (S, triton.cdiv(K, META["BLOCK_SIZE_K"]))  # noqa: E731
     with device_context(dY.device):
         compile_time_only_triton_wrap(dgrad_matmul_batched_kernel)[grid](
-            dY, W, Ws, w_global_scale, global_scale_stride(w_global_scale), dX, expert_ids, S, N, K,
+            dY, W, Ws, w_zero, w_global_scale, global_scale_stride(w_global_scale), dX, perm, expert_ids, S, N, K, W.shape[0],
             dY.stride(0), dY.stride(1),
             W.stride(0), W.stride(1), W.stride(2),
-            Ws.stride(0), Ws.stride(1), Ws.stride(2),
+            *_scale_strides(Ws, 3),
+            *_scale_strides(w_zero, 3),
+            perm.stride(0) if perm is not None else 0,
             dX.stride(0), dX.stride(1),
             SCALE_GROUP_K=scale_group_k,
             SCALE_ROW_DIV=scale_row_div,
             WEIGHT_VALUES_PER_BYTE=values_per_byte,
+            INT_BITS=int_bits,
         )
     return dX
 
@@ -878,174 +1078,258 @@ def dgrad_matmul_batched(
 # What each format's dgrad actually computes. ``backward.py`` holds only the table saying which
 # op gets which of these — compute lives here, attachment lives there.
 
-def _dgrad_mx(dY, B, Bs, b_global, out_dtype):
-    """dA for an MX/NVFP4 weight: contract N on the forward-oriented weight (see backward.py).
+def _scale_strides(Ws, ndim):
+    """The scale grid's strides, zeros for a full-precision weight (no grid)."""
+    return Ws.stride() if Ws is not None else (0,) * ndim
 
-    The scale grid is DERIVED FROM SHAPES, not from a format constant — ``Bs`` is
-    ``(N // row_div, K // group)``, so the divisors read straight off it. That covers group-32
-    UE8M0 (MX) and group-16 E4M3 (NVFP4) without either being named here, and cannot drift when a
-    format's block changes.
 
-    Containers are normalized, not reinterpreted: packed E2M1 reaches the kernel as ``int8`` or
-    ``uint8`` depending on the producer, and UE8M0 as ``float8_e8m0fnu`` or ``uint8``. The kernel
-    keys its unpack/decode off ``uint8``, and decoding UE8M0 bytes as floats is off by orders of
-    magnitude — the failure mode is a non-finite dX, which the tuner's numerics veto turns into an
-    all-inf tune rather than a wrong answer.
+def _dgrad_operands(W, Ws):
+    """``(W, Ws, scale_group_k, scale_row_div)`` as the dgrad kernels read them:
+    - packed E2M1 and UE8M0 as ``uint8`` bytes (UE8M0 decoded as floats is off by orders of magnitude);
+    - a SWIZZLE_32_4_4 artifact back on the affine grid (group 16 for NVFP4's E4M3 scales, else 32);
+    - one scale per tensor, expert or output row as a stride-0 view of the group-32 grid it equals;
+    - the divisors read off the grid's shape, so MX group-32 and NVFP4 group-16 need no naming here;
+    - a full-precision weight with no grid, its divisors only satisfying the tile rules."""
+    if Ws is None:
+        return W, None, 32, 1
+    values_per_byte = 2 if W.dtype in (torch.int8, torch.uint8) else 1
+    grid = (*W.shape[:-1], W.shape[-1] * values_per_byte // 32)
+    if Ws.numel() == 1:
+        Ws = Ws.reshape([1] * len(grid)).expand(grid)
+    elif W.ndim == 3 and Ws.numel() == W.shape[0]:
+        Ws = Ws.reshape(-1, 1, 1).expand(grid)
+    elif Ws.shape[-1] == 1:  # row-wise
+        Ws = Ws.reshape(*W.shape[:-1], 1).expand(grid)
+    elif Ws.ndim == 5:
+        group = 16 if Ws.dtype == torch.float8_e4m3fn else 32
+        Ws = unswizzle_mx_scales(Ws, W.shape[-2], W.shape[-1] * values_per_byte // group,
+                                 num_experts=W.shape[0] if W.ndim == 3 else None)
+    if W.dtype == torch.int8:
+        W = W.view(torch.uint8)
+    Ws = ue8m0_as_uint8(Ws)
+    return W, Ws, W.shape[-1] * values_per_byte // Ws.shape[-1], max(W.shape[-2] // Ws.shape[-2], 1)
 
-    The NVFP4 second-level global rides into the kernel, which folds it on the accumulator —
-    one value here, a 2D weight being one matrix."""
-    if B.dtype == torch.int8:
-        B = B.view(torch.uint8)
-    Bs = ue8m0_as_uint8(Bs)
-    values_per_byte = 2 if B.dtype == torch.uint8 else 1
-    K = B.shape[-1] * values_per_byte
-    group = K // Bs.shape[-1]
-    row_div = max(B.shape[-2] // Bs.shape[-2], 1)
-    dX = dgrad_matmul_2d(
-        dY.contiguous(), B, Bs, group, row_div, output_dtype=torch.float32,
-        w_global_scale=normalize_global_scale(b_global, 1),
+
+def _token_sum(routed_rows, ctx):
+    """Each token's gradient from its token-major routed rows ``(T * top_k, K)``: a contiguous fp32 top_k sum, no
+    atomics."""
+    return routed_rows.view(ctx.a_rows, -1, routed_rows.shape[1]).sum(1, dtype=torch.float32).to(ctx.a_dtype)
+
+
+def _int_dgrad_2d(ctx, dY, B, Bs, b_zero=None, b_perm=None, b_scale2=None):
+    """Integer dA on the dgrad kernel: the interleaved words decoded in registers to the value the forward multiplies
+    by (zero points, group or per-channel scales, ModelOpt W4A8's E4M3 rounding against ``b_scale2``), the act-order
+    columns stored back through ``b_perm``."""
+    return dgrad_matmul_2d(
+        dY.contiguous(), B, Bs, ctx.a_cols // Bs.shape[-1], 1, output_dtype=ctx.a_dtype,
+        **_int_operands(ctx, B, Bs, b_zero, b_perm, b_scale2, 1),
     )
-    return dX.to(out_dtype)
 
-def _dgrad_transposed_weight(dY, B, Bs, out_dtype):
-    """dA on the QUANTIZED weight, reoriented by transposition. Valid when the scale does not
-    bind a group to K: a per-tensor scalar is orientation-free, and a BLOCK grid subdivides both
-    axes, so transposing it is the same reindexing as transposing the tile.
 
-    The scale grid is made CONTIGUOUS, not just transposed: reading it column-major cost 79us on
-    a 4096x8192x6144 dgrad (405.7 -> 326.5us) while the copy is ~3KB, because every tile re-reads
-    it strided. The weight itself stays a view — materializing it saves a further 47us but costs
-    211us to produce, so that only pays when the caller already keeps both orientations."""
-    Bs_t = Bs if Bs.numel() == 1 else Bs.t().contiguous()
-    return matmul_2d(dY.contiguous(), B.t(), None, Bs_t, output_dtype=out_dtype)
-
-def _dgrad_grouped(ctx, dY, B, Bs, expert_start, gather_idx, scatter_idx, b_global):
-    """Routed dgrad. GATE is not a case to handle: the gradient of a gate|up GEMM is an UNGATED
-    product at the doubled N extent, which is what a 2N-row weight already is. The forward's two
-    row maps are passed through unchanged — the kernel swaps their roles itself. The NVFP4
-    global folds in the kernel, which already resolves each tile's expert."""
-    if B.dtype == torch.int8:
-        B = B.view(torch.uint8)
-    Bs = ue8m0_as_uint8(Bs)
-    values_per_byte = 2 if B.dtype == torch.uint8 else 1
-    K = B.shape[-1] * values_per_byte
-    dX = dgrad_matmul_grouped(
-        dY.contiguous(), B, Bs, expert_start,
-        K // Bs.shape[-1], max(B.shape[-2] // Bs.shape[-2], 1),
-        gather_idx=gather_idx, scatter_idx=scatter_idx, output_dtype=torch.float32,
-        num_input_rows=getattr(ctx, "a_rows", None),
-        w_global_scale=normalize_global_scale(b_global, B.shape[0]),
+def _int_operands(ctx, B, Bs, b_zero, b_perm, b_scale2, num_experts):
+    """The dgrad kernels' integer kwargs: zero points, act-order, the W4A8 second level and the bit width (read off
+    the word count against the input's K)."""
+    return dict(
+        w_zero=b_zero, perm=b_perm, w_global_scale=normalize_global_scale(b_scale2, num_experts),
+        int_bits=32 // (ctx.a_cols // B.shape[-1]),
     )
-    return dX.to(ctx.a_dtype)
+
+
+def _int_grouped_dgrad(ctx, dY, B, expert_start, Bs, gather_idx=None, scatter_idx=None, routed_idx=None,
+                       b_zero=None, b_perm=None, b_scale2=None):
+    """Integer routed dA on the grouped dgrad kernel (``_int_dgrad_2d``'s decode, per expert)."""
+    return dgrad_matmul_grouped(
+        dY.contiguous(), B, Bs, expert_start, ctx.a_cols // Bs.shape[-1], 1, gather_idx=gather_idx,
+        scatter_idx=scatter_idx, output_dtype=ctx.a_dtype, num_input_rows=ctx.a_rows, routed_idx=routed_idx,
+        **_int_operands(ctx, B, Bs, b_zero, b_perm, b_scale2, B.shape[0]),
+    )
+
+
+def _int_batched_dgrad(ctx, dY, B, expert_ids, Bs, scatter_idx=None, b_zero=None, b_perm=None, b_scale2=None):
+    """Integer per-row-expert dA on the batched dgrad kernel, a gate|up launch's top_k rows summed per token."""
+    summed = expert_ids.shape[0] != ctx.a_rows
+    if scatter_idx is not None:
+        dY = dY.index_select(0, scatter_idx)
+    rows = dgrad_matmul_batched(
+        dY.contiguous(), B, Bs, expert_ids, ctx.a_cols // Bs.shape[-1], 1,
+        output_dtype=torch.float32 if summed else ctx.a_dtype,
+        **_int_operands(ctx, B, Bs, b_zero, b_perm, b_scale2, B.shape[0]),
+    )
+    return _token_sum(rows, ctx) if summed else rows
+
+
+def _ungated_scale_rows(Bs, rows):
+    """A gate|up weight's block-scale grid as the ungated ``rows``-row product over it reads it, one scale row per
+    weight row. Checkpoints quantize gate and up apart and interleave their rows and scale blocks, so the forward maps
+    row ``r`` to scale row ``2 * ((r // 2) // block) + r % 2`` (``weight_scale_rows``), not ``r // block``. A grid
+    already per row (MX, NVFP4, INT, row-wise), per tensor or swizzled is returned as is."""
+    if Bs is None or Bs.ndim not in (2, 3) or Bs.shape[-2] in (1, rows):
+        return Bs
+    block = rows // Bs.shape[-2]
+    r = torch.arange(rows, device=Bs.device)
+    return Bs.index_select(-2, 2 * ((r // 2) // block) + r % 2)
+
+
+def _dgrad_2d(ctx, dY, B, Bs, b_global_scale=None):
+    """dA on the dgrad kernel (``dgrad_matmul_2d``): contract N against the forward-oriented tile decoded in registers,
+    the NVFP4 second-level global folded on the accumulator."""
+    W, Ws, group, row_div = _dgrad_operands(B, Bs)
+    return dgrad_matmul_2d(
+        dY.contiguous(), W, Ws, group, row_div, output_dtype=ctx.a_dtype,
+        w_global_scale=normalize_global_scale(b_global_scale, 1),
+    )
+
+
+def _dgrad_transposed_weight(ctx, dY, B, Bs):
+    """dA on the quantized weight reoriented by transposition: a per-tensor scalar is orientation-free and a block
+    grid subdivides both axes, so transposing the grid is the tile's own reindexing. The grid is made contiguous
+    (strided, every tile's re-read cost 79 us of a 4096x8192x6144 dgrad for a ~3 KB copy); the weight stays a view.
+    A gate|up weight's grid is per row by then (``_ungated_scale_rows``), which only the dgrad kernel reads."""
+    if ctx.fused_glu:
+        return _dgrad_2d(ctx, dY, B, Bs)
+    return matmul_2d(dY.contiguous(), B.t(), None, Bs if Bs.numel() == 1 else Bs.t().contiguous(), output_dtype=ctx.a_dtype)
+
+
+def _dgrad_full_precision_2d(ctx, dY, B):
+    """dA for an unquantized weight: ``dY @ B``."""
+    return (dY.to(B.dtype) @ B).to(ctx.a_dtype)
+
+
+def _grouped_dgrad(ctx, dY, B, expert_start, Bs=None, gather_idx=None, scatter_idx=None, routed_idx=None,
+                   b_global_scale=None):
+    """Routed dA for every format: the grouped dgrad kernel contracts N against the forward-oriented weight tile,
+    decoded in registers, and turns the forward's maps around itself."""
+    W, Ws, group, row_div = _dgrad_operands(B, Bs)
+    return dgrad_matmul_grouped(
+        dY.contiguous(), W, Ws, expert_start, group, row_div, gather_idx=gather_idx, scatter_idx=scatter_idx,
+        output_dtype=ctx.a_dtype, num_input_rows=ctx.a_rows,
+        w_global_scale=normalize_global_scale(b_global_scale, W.shape[0]), routed_idx=routed_idx,
+    )
+
+
+def _batched_dgrad(ctx, dY, B, expert_ids, Bs=None, scatter_idx=None, b_global_scale=None):
+    """Per-row-expert dA, one GEVM per routed row (``dgrad_matmul_batched``) on the forward-oriented weight tile:
+    routed row ``r`` reads ``dY`` at its forward destination, and a launch reading one row per token (the gate|up on
+    the unexpanded hidden) sums each token's top_k rows."""
+    summed = expert_ids.shape[0] != ctx.a_rows
+    W, Ws, group, row_div = _dgrad_operands(B, Bs)
+    if scatter_idx is not None:
+        dY = dY.index_select(0, scatter_idx)
+    rows = dgrad_matmul_batched(
+        dY.contiguous(), W, Ws, expert_ids, group, row_div, output_dtype=torch.float32 if summed else ctx.a_dtype,
+        w_global_scale=normalize_global_scale(b_global_scale, W.shape[0]),
+    )
+    return _token_sum(rows, ctx) if summed else rows
+
+
+def _with_input_transform(dgrad):
+    """``dgrad`` for an op that may transform its input before the GEMM:
+    - ``a_pre_quant_scale`` (AWQ / ModelOpt smoothing, ``A * s`` before quantizing): ``dA = dgrad ⊙ s``; a per-expert
+      scale would apply per routed row before the token sum, which is not implemented;
+    - SVDQuant's low-rank correction: an inference-only recipe, refused."""
+
+    def wrapped(ctx, dY, a_pre_quant_scale=None, svdquant_lora_a=None, **kwargs):
+        if svdquant_lora_a is not None:
+            raise NotImplementedError("no backward for SVDQuant: it is an inference-only recipe")
+        dA = dgrad(ctx, dY, **kwargs)
+        if a_pre_quant_scale is None:
+            return dA
+        if a_pre_quant_scale.numel() != dA.shape[-1]:
+            raise NotImplementedError("no backward for a per-expert pre-quant scale")
+        return (dA.float() * a_pre_quant_scale.float().reshape(-1)).to(dA.dtype)
+
+    return wrapped
 
 
 __all__: list[str] = []
 
-def _register(name: str, saved: tuple[int, ...], dgrad):
-    """Attach a backward to one op. ``saved`` names the positional inputs backward needs — they
-    differ per op, e.g. the MX signature is ``(A, B, As, Bs, ...)`` so its weight scale is index
-    3, not 2.
 
-    Everything but the activation gets None — weights and scales take no gradient, the rest is
-    non-differentiable config."""
+def _register(op, reads, dgrad):
+    """Attach ``dgrad`` to ``op``. It receives ``ctx``, the output gradient and the ``reads`` parameters by name, and
+    returns the first input's gradient, or ``{name: gradient}`` for several inputs. Every other input stays frozen,
+    and asking it for a gradient raises: weights and scales take none (a quantized tensor cannot be an autograd leaf),
+    and neither do biases or norm weights.
+    A fused GLU (``gate`` with an ``act_fn``) differentiates through ``glu_backward`` at its saved pre-activation (the
+    op's last output under ``save_pre_activation``, set by the dispatchers whenever the input takes a gradient), the
+    resulting ``(rows, 2N)`` gradient then an ungated product over the 2N-row gate|up weight."""
+    names = list(inspect.signature(op).parameters)
 
     def setup_context(ctx, inputs, output):
-        ctx.save_for_backward(*(inputs[i] for i in saved))
-        ctx.a_dtype = inputs[0].dtype
-        # routed dgrad accumulates into SOURCE tokens, which is a different row count from the
-        # routed rows the op consumed whenever a gather map is in play
-        ctx.a_rows = inputs[0].shape[0]
-
+        bound = dict(zip(names, inputs))
+        ctx.fused_glu = bool(bound.get("gate")) and bound.get("act_fn") is not None
+        ctx.glu = (bound.get("act_fn"), bound.get("swiglu_alpha"), bound.get("swiglu_limit"))
+        values = {name: bound.get(name) for name in reads}
+        if ctx.fused_glu and bound.get("save_pre_activation"):
+            values["pre_activation"] = output[-1]
+        ctx.set_materialize_grads(False)  # only the primary output's gradient is read
+        ctx.tensor_names = [name for name, value in values.items() if isinstance(value, torch.Tensor)]
+        ctx.save_for_backward(*(values[name] for name in ctx.tensor_names))
+        ctx.config = {name: value for name, value in values.items() if name not in ctx.tensor_names}
+        # a gathered launch's rows sum back to its source rows, a different count from the routed rows it consumed
+        ctx.a_dtype, ctx.a_rows, ctx.a_cols = inputs[0].dtype, inputs[0].shape[0], inputs[0].shape[-1]
 
     def backward(ctx, *grads):
-        # torch matches backward's return against `tree_flatten(args, is_leaf=not_list_of_tensor)`
-        # of the args AS INVOKED — which setup_context cannot see (it gets the bound args, with
-        # defaults filled). `needs_input_grad` is sized to that same flattened list plus the
-        # trailing metadata arg, so it is the one place the right count is observable. torch
-        # appends the metadata's own None itself, so this returns exactly that many.
+        # `needs_input_grad` is sized to the args as invoked plus torch's trailing metadata slot
         n_grads = len(ctx.needs_input_grad)
-        if not ctx.needs_input_grad[0]:
-            return (None,) * n_grads
-        # the ops return list[Tensor] (a second entry under output_format), so autograd hands the
-        # gradient back in that shape — unwrap to the gradient of the primary output
         dY = grads[0]
-        while isinstance(dY, (list, tuple)):
+        while isinstance(dY, (list, tuple)):  # the ops return list[Tensor]
             dY = dY[0]
-        return (dgrad(ctx, dY, *ctx.saved_tensors),) + (None,) * (n_grads - 1)
+        if dY is None or not any(ctx.needs_input_grad):
+            return (None,) * n_grads
+        saved = dict(zip(ctx.tensor_names, ctx.saved_tensors))
+        pre_activation = saved.pop("pre_activation", None)
+        if ctx.fused_glu:
+            if pre_activation is None:
+                raise NotImplementedError(f"{op.__name__}: a fused GLU's gradient needs save_pre_activation=True")
+            dY = glu_backward(dY.reshape(pre_activation.shape[0], -1).contiguous(), pre_activation, *ctx.glu)
+            if "Bs" in saved:
+                saved["Bs"] = _ungated_scale_rows(saved["Bs"], pre_activation.shape[1])
+        computed = dgrad(ctx, dY, **saved, **ctx.config)
+        if not isinstance(computed, dict):
+            computed = {names[0]: computed}
+        out = [computed.get(name) if needed else None for name, needed in zip(names, ctx.needs_input_grad)]
+        for name, needed, grad in zip(names, ctx.needs_input_grad, out):
+            if needed and grad is None:
+                raise NotImplementedError(f"{op.__name__}: no gradient for {name!r}, which the backward keeps frozen")
+        return (*out, *(None,) * (n_grads - len(out)))
 
-    torch.library.register_autograd(
-        add_op_namespace_prefix(name), backward, setup_context=setup_context
-    )
-
-
-# block-FP8 (128x128 / 1x128, fp32 or UE8M0 scales): the grid subdivides both axes, so dgrad
-# reuses the quantized weight through a transposed view.
-_register(
-    "w8a8_block_dynamic_fp8_matmul", saved=(1, 2),
-    dgrad=lambda ctx, dY, B, Bs: _dgrad_transposed_weight(dY, B, Bs, ctx.a_dtype),
-)
-
-# per-tensor FP8: a scalar scale is orientation-free, so the same route needs no reorientation.
-_register(
-    "w8a8_tensor_dynamic_fp8_matmul", saved=(1, 2),
-    dgrad=lambda ctx, dY, B, Bs: _dgrad_transposed_weight(dY, B, Bs, ctx.a_dtype),
-)
-
-# MX / NVFP4: per-row group scales bind to K and packed E2M1 packs along K, so the weight cannot
-# be reoriented by a VIEW — but it does not need to be. The reduction runs over N against the
-# weight's natural (N, K) tile, dequantized per-tile in-register, so the FORWARD-oriented weight
-# serves dgrad as-is: no transposed copy, no second quantized orientation, no fp32 materialization.
-_register(
-    "mx_dynamic_matmul", saved=(1, 3, 13),
-    dgrad=lambda ctx, dY, B, Bs, b_global: _dgrad_mx(dY, B, Bs, b_global, ctx.a_dtype),
-)
-
-# Weight-only (W4A16 / W8A16) — the QLoRA format: a frozen 4-bit base weight with raw bf16
-# activations. Same route; the weight takes no gradient, so nothing here needs a master copy.
-_register(
-    "mx_weight_only_matmul_2d", saved=(1, 2, 9),
-    dgrad=lambda ctx, dY, B, Bs, b_global: _dgrad_mx(dY, B, Bs, b_global, ctx.a_dtype),
-)
+    torch.library.register_autograd(add_op_namespace_prefix(op.__name__), backward, setup_context=setup_context)
 
 
-def _dgrad_batched(ctx, dY, B, Bs, expert_ids, b_global):
-    """Per-row-expert dgrad. Same shape-derived scale grid as the others; the only difference from
-    ``_dgrad_grouped`` is that the expert comes from a per-row index rather than sorted ranges."""
-    if B.dtype == torch.int8:
-        B = B.view(torch.uint8)
-    Bs = ue8m0_as_uint8(Bs)
-    values_per_byte = 2 if B.dtype == torch.uint8 else 1
-    K = B.shape[-1] * values_per_byte
-    dX = dgrad_matmul_batched(
-        dY.contiguous(), B, Bs, expert_ids,
-        K // Bs.shape[-1], max(B.shape[-2] // Bs.shape[-2], 1),
-        output_dtype=torch.float32,
-        w_global_scale=normalize_global_scale(b_global, B.shape[0]),
-    )
-    return dX.to(ctx.a_dtype)
+_GROUPED = ("B", "Bs", "expert_start", "gather_idx", "scatter_idx", "routed_idx")
+# 2D. Block FP8: the transposed weight view on the forward GEMM (a block grid subdivides both axes). Per-tensor /
+# row-wise FP8, MX / NVFP4 and weight-only (the QLoRA base): the dgrad kernel contracts N against the forward-oriented
+# tile, so a scale bound to the output rows or to K-groups decodes as stored.
+for _op in (matmul.w8a8_block_dynamic_fp8_matmul, matmul.w8a8_block_static_fp8_matmul):
+    _register(_op, ("B", "Bs"), _dgrad_transposed_weight)
+_register(matmul.w8a8_tensor_dynamic_fp8_matmul, ("B", "Bs"), _dgrad_2d)
+_register(matmul.mx_dynamic_matmul, ("B", "Bs", "b_global_scale", "a_pre_quant_scale", "svdquant_lora_a"),
+          _with_input_transform(_dgrad_2d))
+_register(matmul.mx_weight_only_matmul_2d, ("B", "Bs", "b_global_scale"), _dgrad_2d)
+_register(matmul.block_fp8_weight_only_matmul_2d, ("B", "Bs"), _dgrad_2d)
+_register(matmul.int_weight_only_matmul_2d, ("B", "Bs", "b_zero", "b_perm", "b_scale2", "a_pre_quant_scale"),
+          _with_input_transform(_int_dgrad_2d))
+_register(matmul.full_precision_matmul_2d, ("B",), _dgrad_full_precision_2d)
+# grouped: every format on the grouped dgrad kernel
+for _op in (grouped.w8a8_block_dynamic_fp8_matmul_grouped, grouped.w8a8_block_static_fp8_matmul_grouped,
+            grouped.w8a8_tensor_dynamic_fp8_matmul_grouped, grouped.full_precision_matmul_grouped):
+    _register(_op, _GROUPED, _grouped_dgrad)
+_register(grouped.mx_dynamic_matmul_grouped, (*_GROUPED, "b_global_scale", "a_pre_quant_scale"),
+          _with_input_transform(_grouped_dgrad))
+_register(grouped.mx_weight_only_matmul_grouped, (*_GROUPED, "b_global_scale"), _grouped_dgrad)
+_register(grouped.block_fp8_weight_only_matmul_grouped, _GROUPED, _grouped_dgrad)
+_INT = ("b_zero", "b_perm", "b_scale2", "a_pre_quant_scale")
+_register(grouped.int_weight_only_matmul_grouped, (*_GROUPED, *_INT), _with_input_transform(_int_grouped_dgrad))
+# batched: the batched experts forward is a selectable dispatch in transformers, not a decode-only path
+_BATCHED = ("B", "Bs", "expert_ids", "scatter_idx", "b_global_scale")
+for _op in (batched.w8a8_block_dynamic_fp8_matmul_batched, batched.w8a8_block_static_fp8_matmul_batched,
+            batched.w8a8_tensor_dynamic_fp8_matmul_batched, batched.mx_weight_only_matmul_batched,
+            batched.block_fp8_weight_only_matmul_batched, batched.full_precision_matmul_batched):
+    _register(_op, _BATCHED, _batched_dgrad)
+_register(batched.mx_dynamic_matmul_batched, (*_BATCHED, "a_pre_quant_scale"), _with_input_transform(_batched_dgrad))
+_register(batched.int_weight_only_matmul_batched, ("B", "Bs", "expert_ids", "scatter_idx", *_INT),
+          _with_input_transform(_int_batched_dgrad))
 
-
-# Routed MoE, weight-only — QLoRA on an MoE model. Positional slots: B=1, Bs=2, expert_start=3,
-# gather_idx=10, scatter_idx=11, b_global_scale=12.
-_register(
-    "mx_weight_only_matmul_grouped", saved=(1, 2, 3, 10, 11, 12),
-    dgrad=_dgrad_grouped,
-)
-
-# Routed MoE, block-FP8. Same product as the weight-only grouped op — a 128x128 block grid is
-# the per-row K-group layout at wider divisors, which `_dgrad_grouped` derives from `Bs.shape` —
-# but it is a DIFFERENT op, and only registering the weight-only one left the grouped block-FP8
-# path with no grad_fn at all. That is the path a PEFT LoRA on fp8 experts actually runs.
-# Positional slots: B=1, Bs=3, expert_start=4, gather_idx=14, scatter_idx=15; no global scale.
-_register(
-    "w8a8_block_dynamic_fp8_matmul_grouped", saved=(1, 3, 4, 14, 15),
-    dgrad=lambda ctx, dY, B, Bs, es, gi, si: _dgrad_grouped(ctx, dY, B, Bs, es, gi, si, None),
-)
-
-# The batched experts forward is a SELECTABLE dispatch in transformers, not a decode-only path, so
-# it needs a formula too — without one, finetuning against `batched_mm` silently trains nothing.
-# Rows are not expert-sorted here: slot 3 is per-row `expert_ids`, not `expert_start`.
-_register(
-    "mx_weight_only_matmul_batched", saved=(1, 2, 3, 12),
-    dgrad=_dgrad_batched,
-)
+# routing-weighted top-k reduce: the rows' and the routing weights' gradients
+_register(moe.weighted_reduce, ("rows", "top_k_index", "top_k_weights", "num_experts", "norm", "norm_inv",
+                                "norm_weight"), _weighted_reduce_dgrad)

@@ -1696,11 +1696,12 @@ def mx_auxiliary_pruner():
     return config_filter(ok)
 
 
-def int_split_k_pruner(m_arg: str, max_m: int, block_k_arg: str | None = None):
+def int_split_k_pruner(m_arg: str, max_m: int, block_k_arg: str | None = None, dim: str = "K", tile: str = "BLOCK_SIZE_K"):
     """``early_config_prune`` for a split-K axis: splits only in the decode band (``m_arg`` <= ``max_m``, where the
-    launch allocates the partials) and only where the split divides the K tiles. Sub-16 dot tiles cover the
+    launch allocates the partials) and only where the split divides the reduction tiles. Sub-16 dot tiles cover the
     launch's rows in one tile, keeping the counter grid within its allocation and avoiding repeated weight reads.
-    ``block_k_arg`` names the launch arg holding the K tile when the configs do not tune one (block FP8)."""
+    ``block_k_arg`` names the launch arg holding the K tile when the configs do not tune one (block FP8);
+    ``dim``/``tile`` name the reduction axis and its tile (the dgrad reduces over ``N`` in ``BLOCK_SIZE_N``)."""
 
     def ok(c, args):
         bm = c.kwargs.get("BLOCK_SIZE_M", 16)
@@ -1709,7 +1710,7 @@ def int_split_k_pruner(m_arg: str, max_m: int, block_k_arg: str | None = None):
         split = c.kwargs.get("SPLIT_K", 1)
         if split == 1:
             return True
-        k_tiles = args["K"] // (args[block_k_arg] if block_k_arg else c.kwargs["BLOCK_SIZE_K"])
+        k_tiles = args[dim] // (args[block_k_arg] if block_k_arg else c.kwargs[tile])
         return args[m_arg] <= max_m and k_tiles % split == 0 and k_tiles >= split
 
     return config_filter(ok)
@@ -1749,6 +1750,22 @@ def descriptor_needs_prequant_pruner():
     return config_filter(
         ok, when=lambda args: args["A"].dtype not in (torch.float8_e4m3fn, torch.int8, torch.uint8)
     )
+
+
+def warp_spec_small_act_box_pruner(row_tile: str = "BLOCK_SIZE_M", col_tile: str = "BLOCK_SIZE_N", min_box_bytes: int = 128):
+    """Miscompile gate: warp specialization with a host-TMA activation box under ``min_box_bytes`` traps the device
+    (sticky CUDA 716 "misaligned address"). Charted on B200 / Triton 3.9 on the 2D dgrad, one fresh process per
+    config (swapped, BM 1-16, BN 32/64/128, BK 64/128, stages 2-5, both weight memory modes, INT4 and MXFP4):
+    - every ``[1, 32]`` bf16 box (64 B) traps;
+    - the same tile with a pointer activation, or without warp specialization, runs correct;
+    - every box of 128 B or more runs correct."""
+
+    def ok(c, args):
+        if not c.kwargs.get("WARP_SPEC") or c.kwargs.get("A_MEMORY_MODE", "pointer") == "pointer":
+            return True
+        return config_dim(c, args, row_tile) * config_dim(c, args, col_tile) * args["A"].element_size() >= min_box_bytes
+
+    return config_filter(ok, when=lambda args: get_active_device_type() == "cuda")
 
 
 def descriptor_support_pruner():
